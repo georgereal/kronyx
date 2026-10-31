@@ -1,0 +1,125 @@
+{
+	"name": "kronyx",
+	"displayName": "Kronyx",
+	"description": "Agentic coding in VS Code on the Cline SDK, with a run-oriented UI and Kronyx-owned file tools.",
+	"version": "0.0.1",
+	"publisher": "kronyx",
+	"private": true,
+	"license": "UNLICENSED",
+	"engines": {
+		"vscode": "^1.105.0",
+		"node": ">=22"
+	},
+	"categories": [
+		"AI",
+		"Programming Languages"
+	],
+	"main": "./dist/extension.js",
+	"activationEvents": [],
+	"contributes": {
+		"viewsContainers": {
+			"activitybar": [
+				{
+					"id": "kronyx",
+					"title": "Kronyx",
+					"icon": "media/kronyx.svg"
+				}
+			]
+		},
+		"views": {
+			"kronyx": [
+				{
+					"type": "webview",
+					"id": "kronyx.runView",
+					"name": "Run"
+				}
+			]
+		},
+		"commands": [
+			{
+				"command": "kronyx.runTask",
+				"title": "Run task",
+				"category": "Kronyx"
+			},
+			{
+				"command": "kronyx.stop",
+				"title": "Stop run",
+				"category": "Kronyx"
+			},
+			{
+				"command": "kronyx.newTask",
+				"title": "New task",
+				"category": "Kronyx"
+			},
+			{
+				"command": "kronyx.setApiKey",
+				"title": "Set API key",
+				"category": "Kronyx"
+			},
+			{
+				"command": "kronyx.clearApiKey",
+				"title": "Clear API key",
+				"category": "Kronyx"
+			},
+			{
+				"command": "kronyx.focus",
+				"title": "Show run view",
+				"category": "Kronyx"
+			}
+		],
+		"configuration": {
+			"title": "Kronyx",
+			"properties": {
+				"kronyx.provider.id": {
+					"type": "string",
+					"default": "openai-compatible",
+					"description": "Cline SDK provider id. Use openai-compatible for Vercel AI Gateway or any OpenAI-compatible endpoint."
+				},
+				"kronyx.provider.baseUrl": {
+					"type": "string",
+					"default": "https://ai-gateway.vercel.sh/v1",
+					"description": "Base URL of the OpenAI-compatible API."
+				},
+				"kronyx.provider.modelId": {
+					"type": "string",
+					"default": "anthropic/claude-sonnet-4.6",
+					"description": "Model id sent to the provider (Vercel AI Gateway uses provider/model)."
+				},
+				"kronyx.agent.maxIterations": {
+					"type": "number",
+					"default": 40,
+					"minimum": 1,
+					"description": "Maximum agent steps per run."
+				},
+				"kronyx.approval.autoApproveWrites": {
+					"type": "boolean",
+					"default": false,
+					"description": "Apply file changes without asking."
+				}
+			}
+		}
+	},
+	"scripts": {
+		"build": "node esbuild.mjs",
+		"watch": "node esbuild.mjs --watch",
+		"package": "node esbuild.mjs --production",
+		"typecheck": "tsc --noEmit",
+		"lint": "eslint src test",
+		"test": "vitest run",
+		"check": "npm run typecheck && npm run lint && npm run test && npm run build"
+	},
+	"devDependencies": {
+		"@types/node": "^22.20.5",
+		"@types/vscode": "^1.105.0",
+		"esbuild": "^0.28.2",
+		"eslint": "^10.14.0",
+		"typescript": "^5.9.3",
+		"typescript-eslint": "^8.72.1",
+		"vitest": "^5.0.5"
+	},
+	"dependencies": {
+		"@cline/agents": "^0.2.0",
+		"@cline/shared": "^0.2.0",
+		"@opentelemetry/api": "~1.10.0"
+	}
+}

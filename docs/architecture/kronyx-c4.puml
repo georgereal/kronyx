@@ -1,0 +1,55 @@
+@startuml kronyx-c4
+!pragma layout smetana
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+LAYOUT_TOP_DOWN()
+title Kronyx - container view (proposed)
+
+Person(dev, "Developer", "Works in VS Code; reviews plans, diffs, checks")
+
+System_Boundary(kx, "Kronyx") {
+  Container_Boundary(ext, "VS Code extension (TypeScript, thin shell)") {
+    Component(ui, "Webview UI", "React", "Chat, run timeline, step status, comments, tool buttons")
+    Component(native, "Native VS Code surfaces", "VS Code API", "Diff editor, Problems, CommentController, TreeView, status bar, terminal")
+    Component(bridge, "Core bridge", "JSON-RPC", "Streams run events, approvals, tool requests")
+  }
+  Container_Boundary(core, "Kronyx core (headless TypeScript on the Cline SDK; runs in extension host, CLI or microVM)") {
+    Component(orch, "Agent orchestrator", "State machine", "Plan > act > verify > reflect loop, checkpoints, approvals policy")
+    Component(gw, "Model gateway", "Provider adapters", "OpenAI-compatible, Anthropic, Azure, Ollama/vLLM; per-model profiles, routing, cost")
+    Component(tools, "Tool registry", "Built-in + MCP", "Typed tool schemas, permission tiers")
+    Component(ctx, "Context engine", "tree-sitter, ripgrep, LSP", "Repo map, symbol graph, outline, hybrid retrieval, compaction")
+    Component(edit, "Edit engine", "Multi-strategy", "Anchored line edits, fuzzy search/replace, AST edits, diff apply, validation")
+    Component(verify, "Verification engine", "Runners + parsers", "Lint, type-check, test, build, SAST; SARIF diagnostics")
+    Component(mem, "Memory service", "Tiers", "Rules, project facts, episodic trajectories, feedback")
+  }
+  ContainerDb(store, "Local stores", "SQLite + LanceDB / sqlite-vec", "Code index, embeddings, memory, run history")
+  Container(sbx, "Sandbox layer", "Local / Docker / Firecracker", "Isolated exec, FS snapshots, network policy")
+}
+
+System_Ext(llm, "LLM APIs", "Custom / hosted / self-hosted models")
+System_Ext(emb, "Embedding + rerank models", "API or local open weights")
+System_Ext(runner, "Kronyx runner service", "Linux + KVM host for Firecracker microVMs")
+System_Ext(train, "Learning pipeline (later)", "Dataset export, eval harness, LoRA / DPO on open-weights models")
+System_Ext(git, "Git host", "Branches, PRs")
+
+Rel(dev, ui, "Asks, approves, comments")
+Rel(dev, native, "Reviews diffs and problems")
+Rel(ui, bridge, "Events / commands")
+Rel(native, bridge, "Accept / reject hunks")
+Rel(bridge, orch, "JSON-RPC")
+Rel(orch, gw, "Prompts + tool calls")
+Rel(orch, tools, "Invokes")
+Rel(tools, ctx, "read / search / outline")
+Rel(tools, edit, "edit / create / move")
+Rel(tools, verify, "run checks")
+Rel(orch, mem, "Recall / record")
+Rel(ctx, store, "Index")
+Rel(mem, store, "Persist")
+Rel(verify, sbx, "Exec commands")
+Rel(gw, llm, "HTTPS")
+Rel(ctx, emb, "Embed / rerank")
+Rel(sbx, runner, "Agentic runs in microVMs")
+Rel(mem, train, "Trajectories + feedback")
+Rel(orch, git, "Branch / PR")
+SHOW_LEGEND()
+@enduml
