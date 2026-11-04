@@ -211,10 +211,12 @@
 		}
 		const activeName = msg.values["provider.profile"] || "";
 		profiles.forEach((p) => {
-			const block = document.createElement("div");
-			block.className = "profile-card";
-			const head = document.createElement("div");
-			head.className = "row";
+			const block = document.createElement("details");
+			block.className = "profile-card provider-section";
+			block.open = p.name === activeName;
+			const head = document.createElement("summary");
+			head.className = "provider-summary";
+			head.appendChild(Object.assign(document.createElement("span"), { className: "twisty", textContent: "›" }));
 			head.appendChild(Object.assign(document.createElement("strong"), { textContent: p.name }));
 			head.appendChild(Object.assign(document.createElement("em"), { textContent: p.baseUrl || "no base URL" }));
 			if (p.modelId) head.appendChild(Object.assign(document.createElement("code"), { textContent: p.modelId }));
@@ -463,6 +465,13 @@
 		}
 		if (msg.type === "modelsResult") modelsResult.textContent = msg.text;
 		if (msg.type === "profileModels") {
+			// Keep the local profiles array in sync so a later saveProfiles() doesn't
+			// write back a stale catalog and wipe the persisted models.
+			const p = profiles.find((x) => x.name === msg.name);
+			if (p && msg.models?.length) {
+				p.models = msg.models;
+				p.modelsFetchedAt = Date.now();
+			}
 			for (const fn of modelSubs.get(msg.name) ?? []) fn(msg);
 		}
 	});

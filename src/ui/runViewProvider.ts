@@ -22,7 +22,8 @@ export type WebviewMessage =
 	| { type: "showHistory" }
 	| { type: "permissionResponse"; id: string; decision: "allow" | "always" | "deny" | "alwaysTool" }
 	| { type: "openFile"; path: string }
-	| { type: "implementPlan"; path: string };
+	| { type: "implementPlan"; path: string }
+	| { type: "runInTerminal"; command: string };
 
 export interface ViewState {
 	mode: AgentMode;

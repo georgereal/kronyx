@@ -152,7 +152,7 @@ input[type="checkbox"] {
 .row em {
 	font-style: normal;
 	opacity: 0.7;
-	font-size: 0.85em;
+	font-size: 0.95em;
 }
 button {
 	background: var(--vscode-button-background);
@@ -212,7 +212,7 @@ details.advanced summary {
 .providers-table {
 	width: 100%;
 	border-collapse: collapse;
-	font-size: 0.88em;
+	font-size: 1em;
 }
 .providers-table th {
 	text-align: left;
@@ -238,7 +238,7 @@ button.tiny {
 	white-space: nowrap;
 }
 .providers-table em {
-	font-size: 0.8em;
+	font-size: 0.9em;
 	opacity: 0.75;
 	margin-right: 4px;
 }
@@ -252,18 +252,18 @@ button.tiny {
 	border: 1px solid var(--vscode-input-border, transparent);
 	border-radius: 6px;
 	font-family: inherit;
-	font-size: 0.9em;
+	font-size: 1em;
 }
 .models-table .model-name {
 	font-weight: 600;
 }
 .models-table .model-id {
-	font-size: 0.78em;
+	font-size: 0.9em;
 	opacity: 0.7;
 	font-family: var(--vscode-editor-font-family, monospace);
 }
 .models-table .model-desc {
-	font-size: 0.8em;
+	font-size: 0.9em;
 	opacity: 0.75;
 	margin-top: 2px;
 	display: -webkit-box;
@@ -275,10 +275,10 @@ button.tiny {
 .models-table td.num {
 	white-space: nowrap;
 	font-variant-numeric: tabular-nums;
-	font-size: 0.85em;
+	font-size: 0.95em;
 }
 .models-table .model-tags {
-	font-size: 0.78em;
+	font-size: 0.9em;
 	opacity: 0.75;
 	max-width: 14em;
 }
@@ -305,7 +305,7 @@ tr.model-detail > td {
 	padding: 8px 4px;
 }
 .detail-item {
-	font-size: 0.82em;
+	font-size: 0.9em;
 	min-width: 0;
 }
 .detail-key {
@@ -341,4 +341,33 @@ tr.model-detail > td {
 	font-family: inherit;
 	font-size: 0.85em;
 	max-width: 150px;
+}
+
+.provider-section {
+	padding: 0;
+}
+.provider-section > summary.provider-summary {
+	list-style: none;
+	cursor: pointer;
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 10px 12px;
+	flex-wrap: wrap;
+}
+.provider-section > summary.provider-summary::-webkit-details-marker {
+	display: none;
+}
+.provider-summary .twisty {
+	display: inline-block;
+	transition: transform 0.12s;
+	opacity: 0.6;
+}
+.provider-section[open] > summary.provider-summary .twisty {
+	transform: rotate(90deg);
+}
+.provider-section > .model-controls,
+.provider-section > .providers-table {
+	margin: 0 12px 10px;
+	width: calc(100% - 24px);
 }

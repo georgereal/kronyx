@@ -1,7 +1,9 @@
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { AgentRunner, type AgentMode } from "../agent/runner";
+import { AgentRunner, type AgentMode, type RunDigest } from "../agent/runner";
+import type { PriorTranscript } from "../agent/recall";
+import type { AgentMessage } from "@cline/shared";
 import { checksOnFinish, runChecks } from "../checks";
 import { E2bSandbox, sandboxBackend, sandboxEnabled } from "../sandbox/e2b";
 import { indexFile, logEpisode } from "../agent/memory";
@@ -55,6 +57,8 @@ export interface RunRecord {
 	at: number;
 	tokensIn?: number;
 	tokensOut?: number;
+	cacheRead?: number;
+	cacheWrite?: number;
 }
 
 export interface SessionDeps {
@@ -68,9 +72,13 @@ export interface SessionDeps {
 	comments: RunComments;
 	recordRun: (entry: RunRecord) => void;
 	isSidebar?: (controller: SessionController) => boolean;
-	recordUsage: (entry: { session: string; task: string; tokensIn: number; tokensOut: number; at: number }) => void;
+	recordUsage: (entry: { session: string; task: string; tokensIn: number; tokensOut: number; cacheRead?: number; cacheWrite?: number; at: number }) => void;
 	persistEvent: (session: string, event: Parameters<RunViewProvider["post"]>[0]) => void;
 	loadEvents: (session: string) => Promise<Parameters<RunViewProvider["post"]>[0][]>;
+	saveDigest?: (session: string, digests: readonly RunDigest[]) => void;
+	loadDigest?: (session: string) => Promise<RunDigest[]>;
+	saveTranscript?: (session: string, messages: readonly AgentMessage[]) => void;
+	loadTranscripts?: (session: string) => Promise<PriorTranscript[]>;
 	clearEvents: (session: string) => void;
 	setStatus: (state: "idle" | "running" | "failed") => void;
 	refreshModels: () => Promise<void>;
@@ -84,15 +92,30 @@ export class SessionController {
 	private changedPaths = new Set<string>();
 	private runStartedAt = 0;
 	private runTask = "";
-	private lastUsage = { inputTokens: 0, outputTokens: 0 };
+	private lastUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+	private transcripts: PriorTranscript[] = [];
 	private sandbox: E2bSandbox | undefined;
 	private sandboxSynced = false;
 
 	constructor(
-		readonly name: string,
+		public name: string,
 		private readonly surface: RunViewProvider,
 		private readonly deps: SessionDeps,
 	) {}
+
+	private static sessionCounter = 0;
+
+	/** Start a fresh named session in the same window — like Copilot's "new chat". */
+	async startNewSession(): Promise<void> {
+		this.runner?.reset();
+		this.approveAll = false;
+		this.permittedTools.clear();
+		SessionController.sessionCounter += 1;
+		this.name = `${this.name.replace(/ \d+$/, "")} ${SessionController.sessionCounter}`;
+		this.deps.clearEvents(this.name);
+		this.surface.post({ type: "reset" });
+		this.deps.setStatus("idle");
+	}
 
 	get isRunning(): boolean {
 		return this.runner?.isRunning ?? false;
@@ -159,14 +182,19 @@ export class SessionController {
 				break;
 			}
 			case "newSession":
-				// In the sidebar the canonical pane hosts one conversation at a time: start fresh.
-				// Editor-tab sessions get a real new tab.
+				// Sidebar/right-window surfaces start a fresh named session; editor tabs spawn a new tab.
 				if (this.name === "Side Session" || this.deps.isSidebar?.(this)) {
-					await this.handle({ type: "new" });
+					await this.startNewSession();
 				} else {
 					await vscode.commands.executeCommand("kronyx.newSession");
 				}
 				break;
+			case "runInTerminal": {
+				const terminal = vscode.window.createTerminal({ name: "Kronyx" });
+				terminal.show();
+				terminal.sendText(String(message.command ?? ""), true);
+				break;
+			}
 			case "openSettings":
 				await vscode.commands.executeCommand("kronyx.openSettingsPage");
 				break;
@@ -217,7 +245,16 @@ export class SessionController {
 				currentMode: () => this.deps.modeRef.current,
 				onBeforeWrite: (abs, before) => this.deps.diffReview.record(abs, before),
 				execCommand: (command) => this.execCommand(command),
+				priorTranscripts: () => this.transcripts,
+				saveTranscript: (messages) => {
+					this.transcripts = [...this.transcripts, { label: `run ${this.transcripts.length + 1}`, messages }].slice(-5);
+					this.deps.saveTranscript?.(this.name, messages);
+				},
 				emit: (event) => this.onEvent(event),
+			});
+			void this.deps.loadDigest?.(this.name).then((d) => this.runner?.setRunDigests(d));
+			void this.deps.loadTranscripts?.(this.name).then((t) => {
+				this.transcripts = t;
 			});
 		}
 		return this.runner;
@@ -239,12 +276,19 @@ export class SessionController {
 			});
 		}
 		if (event.type === "usage") {
-			this.lastUsage = { inputTokens: event.inputTokens, outputTokens: event.outputTokens };
+			this.lastUsage = {
+				inputTokens: event.inputTokens,
+				outputTokens: event.outputTokens,
+				cacheReadTokens: event.cacheReadTokens,
+				cacheWriteTokens: event.cacheWriteTokens,
+			};
 			this.deps.recordUsage({
 				session: this.name,
 				task: this.runTask,
 				tokensIn: event.inputTokens,
 				tokensOut: event.outputTokens,
+				cacheRead: event.cacheReadTokens,
+				cacheWrite: event.cacheWriteTokens,
 				at: Date.now(),
 			});
 		}
@@ -264,7 +308,10 @@ export class SessionController {
 				at: Date.now(),
 				tokensIn: this.lastUsage.inputTokens,
 				tokensOut: this.lastUsage.outputTokens,
+				cacheRead: this.lastUsage.cacheReadTokens,
+				cacheWrite: this.lastUsage.cacheWriteTokens,
 			});
+			this.recordDigest(event.status, event.text);
 			void this.onFinished(event.status);
 		}
 		if (event.type === "run-failed") {
@@ -276,7 +323,16 @@ export class SessionController {
 				durationMs: Date.now() - this.runStartedAt,
 				at: Date.now(),
 			});
+			this.recordDigest("failed", event.error);
 		}
+	}
+
+	private recordDigest(status: string, summary: string): void {
+		const files = [...this.changedPaths].map((abs) =>
+			this.runnerRoot ? path.relative(this.runnerRoot, abs).split(path.sep).join("/") : abs,
+		);
+		this.runner?.addRunDigest({ task: this.runTask, status, summary, filesChanged: files, at: Date.now() });
+		this.deps.saveDigest?.(this.name, this.runner?.runDigests ?? []);
 	}
 
 	private async startRun(task: string, mode?: AgentMode): Promise<void> {
@@ -395,11 +451,49 @@ export class SessionController {
 	private pendingPermissions = new Map<string, (decision: "allow" | "always" | "deny" | "alwaysTool") => void>();
 	private permittedTools = new Set<string>();
 
+	/** Compute a preview diff for the permission card — real hunks for write_file, pseudo-diff from edits otherwise. */
+	private async pendingDiff(root: string, file: string, toolName: string, input: unknown): Promise<string | undefined> {
+		try {
+			const inp = input as {
+				content?: string;
+				edits?: { old_text?: string; new_text?: string; old?: string; new?: string }[];
+				lines?: string;
+				position?: number;
+			};
+			if (toolName === "write_file" && typeof inp?.content === "string") {
+				const { computeHunks, formatHunks } = await import("../diff/hunks");
+				let before = "";
+				try {
+					before = (await fs.readFile(path.join(root, file), "utf8")) ?? "";
+				} catch {
+					/* new file */
+				}
+				return formatHunks(computeHunks(before, inp.content));
+			}
+			if (toolName === "edit_file" && Array.isArray(inp?.edits)) {
+				return inp.edits
+					.flatMap((e) => [
+						...String(e.old_text ?? e.old ?? "").split("\n").map((l) => `-${l}`),
+						...String(e.new_text ?? e.new ?? "").split("\n").map((l) => `+${l}`),
+					])
+					.join("\n");
+			}
+		} catch {
+			/* diff preview is best-effort */
+		}
+		return undefined;
+	}
+
 	private async confirmWrite(root: string, toolName: string, input: unknown): Promise<boolean> {
 		if (autoApproveWrites() || this.approveAll || this.permittedTools.has(toolName)) return true;
-		const file = (input as { path?: string })?.path ?? "(unknown file)";
+		const file =
+			(input as { path?: string })?.path ??
+			(toolName === "run_command" ? (input as { command?: string })?.command : undefined) ??
+			(input as { pattern?: string })?.pattern ??
+			"(unknown file)";
 		const id = `perm-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-		const event = { type: "permission-request" as const, id, tool: toolName, path: file };
+		const diff = await this.pendingDiff(root, file, toolName, input);
+		const event = { type: "permission-request" as const, id, tool: toolName, path: file, diff };
 		this.surface.post(event);
 		this.deps.persistEvent(this.name, event);
 		void root;

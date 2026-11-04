@@ -15,6 +15,7 @@ export interface EvalCase {
 
 export interface EvalResult {
 	name: string;
+	model?: string;
 	status: string;
 	passed: boolean;
 	details: string;
@@ -67,6 +68,7 @@ export async function runSuite(
 		const details = await verify(root, evalCase);
 		results.push({
 			name: evalCase.name,
+			model: settings.modelId,
 			status,
 			passed: status === "completed" && details.length === 0,
 			details: details.join("; "),
@@ -96,6 +98,12 @@ async function verify(root: string, evalCase: EvalCase): Promise<string[]> {
 export async function writeReport(root: string, results: EvalResult[]): Promise<string> {
 	const file = path.join(root, ".kronyx", "eval-report.json");
 	await fs.mkdir(path.dirname(file), { recursive: true });
+	const at = Date.now();
+	try {
+		const { openStore, insertEvalResult } = await import("./store");
+		const d = await openStore(root);
+		for (const r of results) insertEvalResult(d, { ...r, at }, root);
+	} catch { /* eval persistence is best-effort */ }
 	const passed = results.filter((r) => r.passed).length;
 	await fs.writeFile(
 		file,

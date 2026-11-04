@@ -20,7 +20,14 @@ export interface FileToolOptions {
 	maxReadLines?: number;
 }
 
-export const WRITE_TOOL_NAMES = new Set(["write_file", "edit_file", "append_file", "insert_lines", "run_command"]);
+export const WRITE_TOOL_NAMES = new Set([
+	"write_file",
+	"edit_file",
+	"append_file",
+	"insert_lines",
+	"run_command",
+	"file_editor",
+]);
 
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 
@@ -360,6 +367,181 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 		},
 	};
 
+	const undoStack = new Map<string, (string | null)[]>();
+
+	interface FileEditorInput {
+		command: "view" | "create" | "str_replace" | "insert" | "undo_edit" | "symbols" | "replace_function";
+		path: string;
+		file_text?: string;
+		old_str?: string;
+		new_str?: string;
+		name?: string;
+		insert_line?: number;
+		view_range?: [number, number];
+	}
+
+	const SYMBOL_RE =
+		/^\s*(?:export\s+|async\s+|static\s+|public\s+|private\s+|protected\s+|abstract\s+|const\s+|let\s+|var\s+)*\s*(?:function\s+|async\s+function\s+|class\s+|interface\s+|type\s+|enum\s+|struct\s+|def\s+|func\s+|impl\s+|fn\s+|const\s+|let\s+|var\s+|public\s+|private\s+|func\s+)?([A-Za-z_$][\w$]*)\s*(?:<[^>]*>)?\s*(?:\(|=|:|\{|\s*=>\s*)/;
+
+	/** Find the declaration line index and end index of a named block (brace- or indent-scoped). */
+	const findSymbolBlock = (lines: string[], name: string): { start: number; end: number } | null => {
+		const decl = lines.findIndex((l) => {
+			const m = l.match(SYMBOL_RE);
+			return m?.[1] === name;
+		});
+		if (decl < 0) return null;
+		const line = lines[decl];
+		// Brace-scoped: count { } from decl line until balanced close.
+		const braceDelta = (s: string) => s.replace(/['"`].*?['"`]/g, "").split("").reduce((n, c) => n + (c === "{" ? 1 : c === "}" ? -1 : 0), 0);
+		if (line.includes("{")) {
+			let depth = 0;
+			for (let i = decl; i < lines.length; i++) {
+				depth += braceDelta(lines[i]);
+				if (depth <= 0 && i > decl) return { start: decl, end: i };
+			}
+			return { start: decl, end: lines.length - 1 };
+		}
+		// Indent-scoped (Python/YAML): ends at first non-blank line with indent ≤ decl indent.
+		const indent = line.match(/^\s*/)?.[0].length ?? 0;
+		let end = decl;
+		for (let i = decl + 1; i < lines.length; i++) {
+			const l = lines[i];
+			if (l.trim() === "") { end = i; continue; }
+			const ind = l.match(/^\s*/)?.[0].length ?? 0;
+			if (ind <= indent) break;
+			end = i;
+		}
+		return { start: decl, end };
+	};
+
+	const fileEditor: AgentTool<FileEditorInput, string> = {
+		name: "file_editor",
+		description:
+			"Unified file editor. Commands: view (numbered lines, optional view_range), create (new file; fails if exists), " +
+			"str_replace (exact unique match old_str→new_str), insert (new_str after insert_line), undo_edit (restore last write), " +
+			"symbols (list function/class/type declarations with line numbers), replace_function (replace a named function/class block with new_str). " +
+			"Prefer this over raw edit_file for structured edits.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				command: { type: "string", enum: ["view", "create", "str_replace", "insert", "undo_edit", "symbols", "replace_function"] },
+				path: { type: "string", description: "Path relative to workspace root." },
+				file_text: { type: "string", description: "Full content for create." },
+				old_str: { type: "string", description: "Exact text to replace (str_replace)." },
+				new_str: { type: "string", description: "Replacement text (str_replace/insert/replace_function)." },
+				name: { type: "string", description: "Symbol name (replace_function)." },
+				insert_line: { type: "integer", description: "Insert after this line (1-based; 0 = top of file)." },
+				view_range: { type: "array", items: { type: "integer" }, description: "[start, end] line range (view)." },
+			},
+			required: ["command", "path"],
+		},
+		async execute(input) {
+			const abs = guard.resolve(input.path);
+			const cmd = input.command;
+			const snapshot = async () => {
+				const stack = undoStack.get(abs) ?? [];
+				stack.push((await exists(abs)) ? await readText(abs) : null);
+				undoStack.set(abs, stack);
+			};
+			switch (cmd) {
+				case "view": {
+					const text = normalizeEol(await readText(abs));
+					const lines = text.split("\n");
+					const [s, e] = input.view_range ?? [1, lines.length];
+					const start = Math.max(1, s);
+					const end = Math.min(lines.length, e);
+					return lines
+						.slice(start - 1, end)
+						.map((l, i) => `${start + i}| ${l}`)
+						.join("\n");
+				}
+				case "symbols": {
+					const lines = normalizeEol(await readText(abs)).split("\n");
+					const out: string[] = [];
+					lines.forEach((l, i) => {
+						const m = l.match(SYMBOL_RE);
+						if (m?.[1] && !/^(if|for|while|return|new|else|switch|catch|await|yield|import|from)$/.test(m[1]))
+							out.push(`${i + 1}| ${l.trim().slice(0, 120)}`);
+					});
+					return out.length ? out.join("\n") : "No declarations found.";
+				}
+				case "create": {
+					if (await exists(abs)) throw new Error(`${guard.relative(abs)} already exists. Use str_replace to modify it.`);
+					assertWritable(abs);
+					await snapshot();
+					await writeText(abs, normalizeEol(input.file_text ?? ""));
+					return `Created ${guard.relative(abs)}`;
+				}
+				case "str_replace": {
+					const text = normalizeEol(await readText(abs));
+					const oldText = normalizeEol(input.old_str ?? "");
+					if (!oldText) throw new Error("old_str is empty.");
+					const matches = findMatches(text, oldText);
+					if (matches.length === 0)
+						throw new Error(
+							noMatchMessage("str_replace", guard.relative(abs), text, oldText) +
+								` Next: view the region, retry with exact text; or replace_function "${input.name ?? "<name>"}" for a whole-function swap; or write_file for a full rewrite.`,
+						);
+					if (matches.length > 1 && matches[0].strategy === "exact")
+						throw new Error(
+							`old_str matched ${matches.length} locations — add more surrounding context, or split into separate str_replace calls.`,
+						);
+					const match = matches[0];
+					const newText = normalizeEol(input.new_str ?? "");
+					const replacement = match.strategy === "exact" ? newText : adaptIndentation(text.slice(match.start, match.end), oldText, newText);
+					assertWritable(abs);
+					await snapshot();
+					await writeText(abs, text.slice(0, match.start) + replacement + text.slice(match.end));
+					return `Edited ${guard.relative(abs)} (lines ${lineNumberAt(text, match.start)}+).`;
+				}
+				case "insert": {
+					const text = normalizeEol(await readText(abs));
+					const lines = text.split("\n");
+					const at = Math.max(0, Math.min(lines.length, input.insert_line ?? lines.length));
+					assertWritable(abs);
+					await snapshot();
+					lines.splice(at, 0, ...(input.new_str ?? "").split("\n"));
+					await writeText(abs, lines.join("\n"));
+					return `Inserted after line ${at} in ${guard.relative(abs)}`;
+				}
+				case "replace_function": {
+					const text = normalizeEol(await readText(abs));
+					const lines = text.split("\n");
+					const block = findSymbolBlock(lines, input.name ?? "");
+					if (!block)
+						throw new Error(
+							`No declaration named "${input.name}" in ${guard.relative(abs)} — run file_editor symbols to list declarations, or fall back to str_replace with the exact text.`,
+						);
+					assertWritable(abs);
+					await snapshot();
+					const indent = lines[block.start].match(/^\s*/)?.[0] ?? "";
+					const replacement = (input.new_str ?? "")
+						.split("\n")
+						.map((l) => (l.trim() ? indent + l.replace(/^\s+/, "") : l))
+						.join("\n");
+					lines.splice(block.start, block.end - block.start + 1, replacement);
+					await writeText(abs, lines.join("\n"));
+					return `Replaced ${input.name} (lines ${block.start + 1}-${block.end + 1}) in ${guard.relative(abs)}`;
+				}
+				case "undo_edit": {
+					const stack = undoStack.get(abs);
+					if (!stack?.length) throw new Error(`Nothing to undo for ${guard.relative(abs)}.`);
+					const prev = stack.pop()!;
+					assertWritable(abs);
+					if (prev === null) {
+						await fs.rm(abs, { force: true });
+						options.onFileChanged?.(abs, "modified", { added: 0, removed: 0, diff: "" });
+						return `Undid creation of ${guard.relative(abs)}`;
+					}
+					await writeText(abs, prev);
+					return `Undid last edit in ${guard.relative(abs)}`;
+				}
+				default:
+					throw new Error(`Unknown command "${cmd}"`);
+			}
+		},
+	};
+
 	const savePlan: AgentTool<{ content: string; slug?: string }, string> = {
 		name: "save_plan",
 		description:
@@ -383,7 +565,7 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 		},
 	};
 
-	return [readFile, writeFile, editFile, appendFile, insertLines, listFiles, searchFiles, memoryWrite, runCommand, savePlan];
+	return [readFile, writeFile, editFile, appendFile, insertLines, listFiles, searchFiles, memoryWrite, runCommand, fileEditor, savePlan];
 }
 
 function noMatchMessage(label: string, file: string, text: string, oldText: string): string {

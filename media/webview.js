@@ -16,7 +16,8 @@
 	const menu = /** @type {HTMLElement} */ (document.getElementById("menu"));
 	/** @type {Map<string, HTMLElement>} */
 	const tools = new Map();
-	let usage = { inputTokens: 0, outputTokens: 0 };
+	let openToolCard = null;
+	let usage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
 	let startedAt = 0;
 
 	const persisted = vscode.getState() || {};
@@ -100,6 +101,7 @@
 	let streamText = "";
 	let streamReasoning = null;
 	let reasoningText = "";
+	let thoughts = null;
 	let mdTimer = 0;
 	let lastVerb = "";
 
@@ -126,22 +128,68 @@
 		streamText = "";
 		streamReasoning = null;
 		reasoningText = "";
+		thoughts = null;
 		timeline.querySelector(".empty")?.remove();
 		timeline.appendChild(group);
+	};
+
+	const fmtDur = (secs) => {
+		if (secs < 60) return `${secs}s`;
+		const m = Math.floor(secs / 60), s = secs % 60;
+		return s ? `${m}m ${s}s` : `${m}m`;
 	};
 
 	const updateGroupTitle = (prefix) => {
 		if (!runGroup) return;
 		const secs = startedAt ? Math.round((Date.now() - startedAt) / 1000) : 0;
-		const stats = groupStats.added || groupStats.removed ? `  +${groupStats.added} −${groupStats.removed}` : "";
-		runGroup.querySelector(".group-title").textContent = `${prefix} ${secs}s${stats}`;
+		const stats = groupStats.added || groupStats.removed ? ` +${groupStats.added} −${groupStats.removed}` : "";
+		runGroup.querySelector(".group-title").textContent =
+			secs > 0 ? `${prefix} ${fmtDur(secs)}${stats}` : `${prefix.replace(/\s+for$/, "ed").trim()}${stats}`;
+	};
+
+	// First line of assistant text becomes a bold header; the rest renders as markdown.
+	const narrationNodes = (text) => {
+		const idx = text.indexOf("\n");
+		const rawHead = (idx === -1 ? text : text.slice(0, idx)).trim();
+		const head = rawHead.length > 140 ? rawHead.slice(0, 140) + "…" : rawHead || "…";
+		const nodes = [el("div", "narration-head", head)];
+		if (idx !== -1) {
+			const body = text.slice(idx + 1).trim();
+			if (body) nodes.push(renderMd(body));
+		}
+		return nodes;
+	};
+
+	// Each reasoning segment gets its own inline collapsed section at the position it occurs.
+	const newThoughtSegment = () => {
+		// Only the newest thoughts segment stays expanded; earlier ones collapse.
+		runGroup?.querySelectorAll(".thoughts-group[open]").forEach((t) => (t.open = false));
+		thoughts = el("details", "thoughts-group dim");
+		thoughts.open = true;
+		const s = el("summary");
+		s.appendChild(el("span", "twisty", "›"));
+		s.appendChild(el("span", "tool-name", "Thoughts"));
+		thoughts.appendChild(s);
+		add(thoughts);
+		return thoughts;
+	};
+
+	const collapseAux = () => {
+		runGroup?.querySelectorAll(".thoughts-group").forEach((t) => (t.open = false));
 	};
 
 	const closeGroup = (label) => {
 		if (!runGroup) return;
+		collapseAux();
 		updateGroupTitle(label);
 		runGroup.open = false;
 		runGroup = null;
+	};
+
+	// Work events lazily open a segment; assistant text closes it — yielding
+	// sequential "Worked for Xs" sections interleaved with messages.
+	const ensureSegment = () => {
+		if (!runGroup) startGroup();
 	};
 
 	const setRunning = (running) => {
@@ -162,8 +210,9 @@
 		status.textContent = (text === "Running..." && lastVerb ? lastVerb : text) + elapsed;
 		tokchip.hidden = total === 0;
 		if (total > 0) {
-			tokchip.textContent = `in ${fmt(usage.inputTokens)} · out ${fmt(usage.outputTokens)}`;
-			tokchip.title = `Tokens — input ${usage.inputTokens.toLocaleString()}, output ${usage.outputTokens.toLocaleString()}`;
+			tokchip.textContent = `in ${fmt(usage.inputTokens)} · out ${fmt(usage.outputTokens)}` +
+				(usage.cacheReadTokens > 0 ? ` · cached ${fmt(usage.cacheReadTokens)}` : "");
+			tokchip.title = `Tokens — input ${usage.inputTokens.toLocaleString()}, output ${usage.outputTokens.toLocaleString()}, cache read ${usage.cacheReadTokens.toLocaleString()}, cache write ${usage.cacheWriteTokens.toLocaleString()}`;
 		}
 	};
 
@@ -183,8 +232,12 @@
 	};
 
 	const describeInput = (name, input) => {
+		if (typeof input === "string") {
+			try { input = JSON.parse(input); } catch { return input.length > 90 ? input.slice(0, 87) + "…" : input; }
+		}
 		if (!input || typeof input !== "object") return "";
-		const p = input.path ?? input.pattern ?? input.command ?? "";
+		const p = input.path ?? input.pattern ?? input.command ?? input.cmd ?? "";
+		if (name === "run_command") return String(p).replace(/\s+/g, " ").slice(0, 90);
 		if (name === "read_file" && input.start_line) return `${p} (${input.start_line}-${input.end_line ?? "end"})`;
 		if (name === "edit_file" && Array.isArray(input.edits)) return `${p} (${input.edits.length} edit(s))`;
 		return String(p);
@@ -541,14 +594,13 @@
 			case "reset":
 				showEmpty();
 				tools.clear();
-				usage = { inputTokens: 0, outputTokens: 0 };
+				usage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
 				setRunning(false);
 				stopTimer();
 				setStatus("Idle");
 				break;
 			case "run-started": {
 				startedAt = Date.now();
-				startGroup();
 				startTimer();
 				const card = el("div", "step task");
 				const bubble = el("div", "body bubble");
@@ -561,44 +613,44 @@
 				break;
 			}
 			case "reasoning": {
+				ensureSegment();
 				streamReasoning = null;
 				reasoningText = "";
-				const card = el("details", "step reasoning");
-				const summary = el("summary");
-				summary.appendChild(el("span", "twisty", "›"));
-				summary.appendChild(el("span", "tool-name", "Thoughts"));
-				card.appendChild(summary);
-				card.appendChild(el("div", "reasoning-text", msg.text));
-				add(card);
+				newThoughtSegment().appendChild(el("div", "reasoning-text", msg.text));
+				scrollMaybe();
 				break;
 			}
 			case "reasoning-delta": {
+				ensureSegment();
 				if (!streamReasoning) {
-					const card = el("details", "step reasoning streaming");
-					card.open = true;
-					const summary = el("summary");
-					summary.appendChild(el("span", "twisty", "›"));
-					summary.appendChild(el("span", "tool-name", "Thoughts"));
-					card.appendChild(summary);
-					card.appendChild(el("div", "reasoning-text", ""));
-					streamReasoning = card;
-					add(card);
+					reasoningText = "";
+					streamReasoning = el("div", "reasoning-text streaming", "");
+					newThoughtSegment().appendChild(streamReasoning);
 				}
 				reasoningText += msg.text;
-				streamReasoning.querySelector(".reasoning-text").textContent = reasoningText;
+				streamReasoning.textContent = reasoningText;
 				scrollMaybe();
 				break;
 			}
 			case "assistant-text": {
+				closeGroup("Worked for");
 				streamMsg = null;
 				streamText = "";
 				const card = el("div", "step assistant");
-				card.appendChild(renderMd(msg.text));
+				card.appendChild(
+					el(
+						"span",
+						"msg-time",
+						new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }),
+					),
+				);
+				for (const n of narrationNodes(msg.text)) card.appendChild(n);
 				add(card);
 				break;
 			}
 			case "assistant-delta": {
 				if (!streamMsg) {
+					closeGroup("Worked for");
 					streamMsg = el("div", "step assistant");
 					streamMsg.appendChild(renderMd(""));
 					add(streamMsg);
@@ -607,13 +659,13 @@
 				clearTimeout(mdTimer);
 				mdTimer = setTimeout(() => {
 					if (!streamMsg) return;
-					const md = streamMsg.querySelector(".md");
-					md.replaceWith(renderMd(streamText + "▍"));
+					streamMsg.replaceChildren(...narrationNodes(streamText + "▍"));
 				}, 60);
 				scrollMaybe();
 				break;
 			}
 			case "tool-started": {
+				ensureSegment();
 				const [icon, verb] = toolVerb(msg.name);
 				lastVerb = `${verb} ${describeInput(msg.name, msg.input)}…`;
 				setStatus("Running...");
@@ -630,7 +682,13 @@
 				input.appendChild(el("pre", "io", JSON.stringify(msg.input, null, 2)));
 				card.appendChild(input);
 				card.dataset.toolId = msg.id;
+				if (msg.name === "run_command" && msg.input?.command) card.dataset.cmd = msg.input.command;
 				tools.set(msg.id, card);
+				// Open while running; collapse the previous card so only one stays expanded.
+				if (openToolCard && openToolCard !== card) openToolCard.open = false;
+				card.open = true;
+				input.open = true;
+				openToolCard = card;
 				add(card);
 				break;
 			}
@@ -639,19 +697,62 @@
 				if (!card) break;
 				card.classList.remove("running");
 				card.classList.add(msg.ok ? "ok" : "error");
+				// Consolidate to a single line: icon verb arg ✓/✗ duration
+				const summary = card.querySelector("summary");
 				const stat = card.querySelector(".tool-status");
 				if (stat) stat.textContent = `${msg.ok ? "✓" : "✗"} ${msg.durationMs}ms`;
-				if (msg.output) {
-					const out = el("pre", `io${msg.ok ? "" : " io-err"}`, msg.output);
-					card.appendChild(out);
+				card.classList.add("done-line");
+				card.open = false;
+				if (openToolCard === card) openToolCard = null;
+				if (summary) {
+					card.innerHTML = "";
+					card.appendChild(summary);
 				}
+				if (card.dataset.cmd) {
+					const cmdDet = el("details", "tool-output");
+					cmdDet.appendChild(el("summary", "", "Command"));
+					cmdDet.appendChild(el("pre", "io cmd-full", card.dataset.cmd));
+					const runBtn = el("button", "perm-btn", "\u29c9 Run in terminal");
+					runBtn.addEventListener("click", (e) => {
+						e.stopPropagation();
+						vscode.postMessage({ type: "runInTerminal", command: card.dataset.cmd });
+					});
+					cmdDet.appendChild(runBtn);
+					card.appendChild(cmdDet);
+				}
+				const cleanOutput = String(msg.output || "").replace(/\x1b\[[0-9;]*m/g, "").trim();
+				if (cleanOutput) card.appendChild(el("pre", `io${msg.ok ? "" : " io-err"}`, cleanOutput));
 				lastVerb = "";
 				break;
 			}
+			case "mode-blocked": {
+				ensureSegment();
+				const card = el("div", "step mode-blocked");
+				card.appendChild(
+					el("div", "mb-label", `Writes are disabled in ${msg.mode === "plan" ? "Plan" : "Ask"} mode.`),
+				);
+				const btn = el("button", "perm-btn allow", "Switch to Code");
+				btn.addEventListener("click", () => {
+					vscode.postMessage({ type: "setMode", mode: "code" });
+					card.remove();
+				});
+				card.appendChild(btn);
+				add(card);
+				break;
+			}
+			case "loop-detected":
+				add(el("div", "step info", `⏹ Stopped: \`${msg.tool}\` repeated ${msg.count}× — the model was looping.`));
+				setRunning(false);
+				stopTimer();
+				closeGroup("Stopped · worked for");
+				setStatus("Stopped (loop detected)");
+				break;
 			case "info":
+				ensureSegment();
 				add(el("div", "step info", `ⓘ ${msg.text}`));
 				break;
 			case "file-changed": {
+				ensureSegment();
 				groupStats.added += msg.added || 0;
 				groupStats.removed += msg.removed || 0;
 				updateGroupTitle("Working for");
@@ -677,6 +778,7 @@
 				add(row);
 				if (msg.diff) {
 					const det = el("details", "diff-detail");
+					det.open = startedAt > 0;
 					det.appendChild(el("summary", "", "Changes"));
 					const pre = el("pre", "diff-body");
 					for (const line of String(msg.diff).split("\n")) {
@@ -689,6 +791,7 @@
 				break;
 			}
 			case "check": {
+				ensureSegment();
 				const card = el("details", `step tool ${msg.ok ? "ok" : "error"}`);
 				const summary = el("summary");
 				summary.appendChild(el("span", "twisty", "›"));
@@ -701,6 +804,7 @@
 				break;
 			}
 			case "permission-request": {
+				ensureSegment();
 				const row = el("div", "step permission");
 				row.dataset.permId = msg.id;
 				const titles = { run_command: "Run a command?", memory_write: "Save a fact?" };
@@ -708,6 +812,14 @@
 				const card = el("div", "perm-card");
 				card.appendChild(el("div", "perm-label", msg.tool === "run_command" ? "Command" : msg.tool === "memory_write" ? "Fact" : "Path"));
 				card.appendChild(el("code", "perm-body", msg.path));
+				if (msg.diff) {
+					const pre = el("pre", "diff-body");
+					for (const line of String(msg.diff).split("\n")) {
+						const cls = line.startsWith("+") ? "dl add" : line.startsWith("-") ? "dl del" : line.startsWith("@@") ? "dl head" : "dl sep";
+						pre.appendChild(el("span", cls, line + "\n"));
+					}
+					card.appendChild(pre);
+				}
 				row.appendChild(card);
 				const btns = el("div", "perm-btns");
 				const resolve = (decision, label) => {
@@ -740,8 +852,12 @@
 				wrap.appendChild(allowBtn);
 				wrap.appendChild(dropBtn);
 				wrap.appendChild(menu);
+				const wand = el("button", "perm-btn perm-wand", "🪄");
+				wand.title = "Always allow this tool";
+				wand.addEventListener("click", () => resolve("alwaysTool", "✓ always allow this tool"));
 				const rejectBtn = el("button", "perm-btn deny", "Reject");
 				rejectBtn.addEventListener("click", () => resolve("deny", "✗ rejected"));
+				btns.appendChild(wand);
 				btns.appendChild(wrap);
 				btns.appendChild(rejectBtn);
 				row.appendChild(btns);
@@ -773,12 +889,17 @@
 				break;
 			}
 			case "usage":
-				usage = { inputTokens: msg.inputTokens, outputTokens: msg.outputTokens };
+				usage = {
+					inputTokens: msg.inputTokens,
+					outputTokens: msg.outputTokens,
+					cacheReadTokens: msg.cacheReadTokens || 0,
+					cacheWriteTokens: msg.cacheWriteTokens || 0,
+				};
 				setStatus("Running...");
 				break;
 			case "run-finished": {
 				const secs = ((Date.now() - startedAt) / 1000).toFixed(1);
-				const card = el("div", `step done ${msg.status}`);
+				const card = el("div", `step done final-answer ${msg.status}`);
 				card.appendChild(el("div", "label", `Finished (${msg.status}) · ${secs}s · ${msg.iterations} step(s)`));
 				if (msg.text) card.appendChild(renderMd(msg.text));
 				add(card);

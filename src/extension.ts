@@ -1,14 +1,15 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
-import type { AgentMode } from "./agent/runner";
-import { clearApiKey, configuredModels, fetchModelCatalog, promptForApiKey, readProviderSettings } from "./config";
+import type { AgentMode, RunDigest } from "./agent/runner";
+import type { PriorTranscript } from "./agent/recall";
+import { activeProfile, clearApiKey, configuredModels, fetchModelCatalog, profiles, promptForApiKey, readProviderSettings } from "./config";
 import { RunViewProvider } from "./ui/runViewProvider";
 import { renderPage } from "./ui/pageHtml";
 import { SessionController } from "./ui/sessionController";
 import { initLog, log } from "./log";
-import { refreshUserConfig, seedUserConfig, userConfigDir } from "./userConfig";
+import { refreshUserConfig, saveUserConfig, seedUserConfig, userConfigDir } from "./userConfig";
 import { loadSuite, runSuite, writeReport } from "./evals";
-import { appendEvent, clearEvents, insertRun, insertUsage, kvSet, listEvents, listRuns, latestSession, openStore, setStorageDir, setWasmDir, storeError } from "./store";
+import { appendEvent, clearEvents, insertRun, insertTranscript, insertUsage, kvGet, kvSet, listEvents, listRuns, listTranscripts, latestSession, openStore, setStorageDir, setWasmDir, storeError } from "./store";
 import { RunLock, type SessionDeps } from "./ui/sessionController";
 import { RunComments } from "./ui/comments";
 import { DiffReview, ORIGINAL_SCHEME } from "./ui/diffReview";
@@ -21,6 +22,7 @@ const HISTORY_KEY = "kronyx.history";
 const KNOWN_MODEL_KEY = "kronyx.knownModel";
 let pendingGate: string | undefined; // prior model to restore if a gated eval run fails
 let sidebarController: SessionController | undefined; // the canonical right-sidebar session
+let rightController: SessionController | undefined; // the session in the dedicated right window
 let gateSuppressed = false; // set briefly while reverting modelId
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -30,6 +32,11 @@ export function activate(context: vscode.ExtensionContext): void {
 		path.join(userConfigDir(), "extension.log"),
 	]);
 	log("init", `Kronyx activated (log: ${path.join(userConfigDir(), "extension.log")})`);
+	if (context.extensionMode === vscode.ExtensionMode.Development) {
+		// npm run dev / F5: surface the Kronyx output channel and log everything.
+		output.show(true);
+		log("init", "development mode — verbose logging on");
+	}
 	const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
 	status.command = "kronyx.focus";
 	// Reveal the dedicated right-sidebar Kronyx window on activation.
@@ -86,11 +93,29 @@ export function activate(context: vscode.ExtensionContext): void {
 				if (root) void openStore(root).then((d) => insertRun(d, entry, root));
 			});
 		},
-		isSidebar: (controller) => controller === sidebarController,
+		isSidebar: (controller) => controller === sidebarController || controller === rightController,
 		recordUsage: (entry) => {
 			void storeRoot.then((root) => {
 				if (root) void openStore(root).then((d) => insertUsage(d, entry, root));
 			});
+		},
+		saveDigest: (session, digests) => {
+			void storeRoot.then((root) => {
+				if (root) void openStore(root).then((d) => kvSet(d, `digest:${session}`, digests));
+			});
+		},
+		loadDigest: async (session) => {
+			const root = await storeRoot;
+			return root ? (kvGet<RunDigest[]>(await openStore(root), `digest:${session}`) ?? []) : [];
+		},
+		saveTranscript: (session, messages) => {
+			void storeRoot.then((root) => {
+				if (root) void openStore(root).then((d) => insertTranscript(d, session, messages, root));
+			});
+		},
+		loadTranscripts: async (session) => {
+			const root = await storeRoot;
+			return root ? (listTranscripts(await openStore(root), session, root) as unknown as PriorTranscript[]) : [];
 		},
 		persistEvent: (session, event) => {
 			void storeRoot.then((root) => {
@@ -110,10 +135,40 @@ export function activate(context: vscode.ExtensionContext): void {
 		refreshModels: () => refreshModels(),
 	};
 
-	const refreshModels = async (): Promise<void> => {
+	let refreshInFlight: Promise<void> | undefined;
+	const refreshModels = (force = false): Promise<void> => {
+		// Dedupe concurrent callers — activation + requestState can race to the network.
+		if (!force && refreshInFlight) return refreshInFlight;
+		refreshInFlight = doRefreshModels(force).finally(() => {
+			refreshInFlight = undefined;
+		});
+		return refreshInFlight;
+	};
+
+	const doRefreshModels = async (force: boolean): Promise<void> => {
 		const settings = await readProviderSettings(context.secrets);
 		if (!settings) {
 			log("models", "skipped — no runnable provider settings (saved profiles exist but none is active)");
+			return;
+		}
+		// Use the persisted catalog (profile.models or per-baseUrl globalState cache) — no network unless forced.
+		const norm = (u: string) => u.replace(/\/+$/, "");
+		const profileCached = activeProfile()?.models;
+		const cacheMap = context.globalState.get<Record<string, { models: { id: string }[] }>>(MODELS_CACHE_KEY) ?? {};
+		const stateCached = cacheMap[norm(settings.baseUrl)];
+		const cached =
+			profileCached && profileCached.length > 0
+				? profileCached
+				: stateCached && stateCached.models.length > 0
+					? stateCached.models
+					: undefined;
+		if (!force && cached) {
+			log("models", `using cached catalog (${cached.length} models)`);
+			deps.viewState = {
+				modelId: settings.modelId,
+				models: cached.some((m) => m.id === settings.modelId) ? cached : [{ id: settings.modelId }, ...cached],
+			};
+			for (const surface of deps.surfaces) surface.setState(deps.viewState);
 			return;
 		}
 		log("models", `fetching ${settings.baseUrl}/models (key ${settings.apiKey ? "set" : "not set"})`);
@@ -125,15 +180,22 @@ export function activate(context: vscode.ExtensionContext): void {
 				: `fetch failed for ${settings.baseUrl}: ${error ?? "no models returned"}`,
 		);
 		if (remote.length > 0) {
-			await context.globalState.update(MODELS_CACHE_KEY, { baseUrl: settings.baseUrl, models: remote });
+			cacheMap[norm(settings.baseUrl)] = { models: remote };
+			await context.globalState.update(MODELS_CACHE_KEY, cacheMap);
+			// Also persist onto the active profile so the Models page renders from cache.
+			const profile = activeProfile();
+			if (profile) {
+				profile.models = remote;
+				profile.modelsFetchedAt = Date.now();
+				const list = profiles();
+				const i = list.findIndex((p) => p.name === profile.name);
+				if (i >= 0) {
+					list[i] = profile;
+					await saveUserConfig({ profiles: list });
+				}
+			}
 		}
-		const cached = context.globalState.get<{ baseUrl: string; models: { id: string }[] }>(MODELS_CACHE_KEY);
-		const models =
-			remote.length > 0
-				? remote
-				: cached?.baseUrl === settings.baseUrl && cached.models.length > 0
-					? cached.models
-					: configuredModels();
+		const models = remote.length > 0 ? remote : cached && cached.length > 0 ? cached : configuredModels();
 		const merged = models.some((m) => m.id === settings.modelId)
 			? models
 			: [{ id: settings.modelId }, ...models];
@@ -281,8 +343,13 @@ export function activate(context: vscode.ExtensionContext): void {
 							(viewId === "kronyx.sessionView" ? root && latestSession(d, root) : undefined) ??
 							(viewId === "kronyx.sessionView" ? "Side Session" : "Right Session");
 						const controller = new SessionController(name, surface, deps);
+						log("view", `${viewId} resolved — session "${name}"`);
 						if (viewId === "kronyx.sessionView") sidebarController = controller;
-						view.webview.onDidReceiveMessage((m) => void controller.handle(m));
+						else rightController = controller;
+						view.webview.onDidReceiveMessage((m) => {
+							log("ui", `${viewId} message: ${(m as { type?: string }).type ?? typeof m}`);
+							void controller.handle(m);
+						});
 						surface.attach(view.webview);
 						surface.setState({ mode: deps.modeRef.current, modelId: deps.viewState.modelId, models: deps.viewState.models });
 						const events = await deps.loadEvents(name);
@@ -291,6 +358,7 @@ export function activate(context: vscode.ExtensionContext): void {
 						view.onDidDispose(() => {
 							deps.surfaces.delete(surface);
 							if (sidebarController === controller) sidebarController = undefined;
+							if (rightController === controller) rightController = undefined;
 							void controller.handle({ type: "stop" });
 						});
 					})();
@@ -321,7 +389,10 @@ export function activate(context: vscode.ExtensionContext): void {
 		vscode.commands.registerCommand("kronyx.focusRight", () =>
 			vscode.commands.executeCommand(`${RunViewProvider.rightViewId}.focus`),
 		),
-		vscode.commands.registerCommand("kronyx.newSession", () => openSessionPanel(context, deps)),
+		vscode.commands.registerCommand("kronyx.newSession", () => {
+			log("cmd", "kronyx.newSession — opening session tab");
+			return openSessionPanel(context, deps);
+		}),
 		vscode.commands.registerCommand("kronyx.newCloudSession", () => openCloudSessionPanel(context, deps)),
 		vscode.commands.registerCommand("kronyx.openSettings", () =>
 			vscode.commands.executeCommand("workbench.action.openSettings", "@ext:kronyx.kronyx"),
@@ -350,7 +421,10 @@ export function activate(context: vscode.ExtensionContext): void {
 					label: `${run.status === "completed" ? "$(check)" : "$(error)"} ${run.task.slice(0, 80)}`,
 					description: `${run.session} · ${(run.durationMs / 1000).toFixed(1)}s · ${new Date(run.at).toLocaleTimeString()}${
 						"tokens_in" in run && (run as { tokens_in?: number }).tokens_in
-							? ` · in ${(run as { tokens_in: number }).tokens_in.toLocaleString()} tok`
+							? ` · in ${(run as { tokens_in: number }).tokens_in.toLocaleString()} tok` +
+								((run as { cache_read?: number }).cache_read
+									? ` (${((run as { cache_read?: number }).cache_read ?? 0).toLocaleString()} cached)`
+									: "")
 							: ""
 					}`,
 					run,
@@ -362,8 +436,9 @@ export function activate(context: vscode.ExtensionContext): void {
 		vscode.commands.registerCommand("kronyx.runTask", async () => {
 			const task = await vscode.window.showInputBox({ title: "Kronyx: run task", prompt: "Describe the change" });
 			if (task) {
+				log("cmd", "kronyx.runTask — running task via session");
 				await vscode.commands.executeCommand(`${RunViewProvider.rightViewId}.focus`);
-				const session = sidebarController ?? focusSessionPanel(context, deps);
+				const session = sidebarController ?? rightController ?? focusSessionPanel(context, deps);
 				await session.handle({ type: "run", task, mode: deps.modeRef.current });
 			}
 		}),

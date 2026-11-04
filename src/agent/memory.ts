@@ -5,7 +5,7 @@ import * as vscode from "vscode";
 const MEMORY_DIR = ".kronyx";
 const RULES = "rules.md";
 const FACTS = "memory/facts.md";
-const EPISODES = "memory/episodes.jsonl";
+
 
 export function memoryEnabled(): boolean {
 	return vscode.workspace.getConfiguration("kronyx").get<boolean>("memory.enabled", true);
@@ -177,13 +177,11 @@ export async function searchMemory(root: string, query: string, baseUrl: string,
 		.map((c) => `// ${c.path}\n${c.text.slice(0, 800)}`);
 }
 
-/** Feedback capture: accept/reject decisions per PLAN-006 provenance. */
+/** Feedback capture: accept/reject decisions per PLAN-006 provenance. Stored in the
+ * extension-global DB (telemetry, not project data) — not in the workspace. */
 export async function logEpisode(root: string, entry: Record<string, unknown>): Promise<void> {
 	if (!memoryEnabled()) return;
-	const file = path.join(root, MEMORY_DIR, EPISODES);
-	await fs.mkdir(path.dirname(file), { recursive: true });
 	const at = new Date().toISOString();
-	await fs.appendFile(file, `${JSON.stringify({ at, ...entry })}\n`);
 	const { openStore, insertEpisode } = await import("../store");
 	insertEpisode(
 		await openStore(root),
@@ -192,6 +190,7 @@ export async function logEpisode(root: string, entry: Record<string, unknown>): 
 			path: String(entry.path ?? ""),
 			task: String(entry.task ?? ""),
 			at,
+			data: { at, ...entry },
 		},
 		root,
 	);

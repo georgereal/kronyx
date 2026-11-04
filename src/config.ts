@@ -39,6 +39,7 @@ export function providerErrorMessage(err: ProviderError): string {
 		case "no-active-profile":
 			return `No active provider — select one in Settings → Provider (${err.providers.join(", ")}).`;
 		case "missing-field":
+			if (err.field === "modelId") return "No model selected — pick one in the composer or Settings → Models.";
 			return `Provider "${err.provider}" is missing ${err.field} — complete it in Settings → Provider.`;
 		case "no-api-key":
 			return `No API key for provider "${err.provider}" — set it in Settings → Provider.`;
@@ -63,13 +64,16 @@ export async function resolveProvider(secrets: vscode.SecretStorage): Promise<{ 
 		if (!settings.baseUrl) return { error: { reason: "missing-field", provider: "default", field: "baseUrl" } };
 		if (!settings.modelId) return { error: { reason: "missing-field", provider: "default", field: "modelId" } };
 		if (!apiKey) return { error: { reason: "no-api-key", provider: "default" } };
+		settings.contextWindow = modelContextWindow(settings.modelId, undefined);
 		return { settings };
 	}
 	const name = userConfig().activeProfile;
 	if (!name) return { error: { reason: "no-active-profile", providers: list.map((p) => p.name) } };
 	const profile = list.find((p) => p.name === name);
 	if (!profile) return { error: { reason: "no-active-profile", providers: list.map((p) => p.name) } };
-	const field = !profile.providerId ? "providerId" : !profile.baseUrl ? "baseUrl" : !profile.modelId ? "modelId" : "";
+	// The composer picker is the single source of truth for the model — settings only pre-fill it.
+	const modelId = userConfig().modelId || profile.modelId || config.get<string>("provider.modelId", "");
+	const field = !profile.providerId ? "providerId" : !profile.baseUrl ? "baseUrl" : !modelId ? "modelId" : "";
 	if (field) return { error: { reason: "missing-field", provider: name, field } };
 	const apiKey = await profileApiKey(secrets, name);
 	if (!apiKey) return { error: { reason: "no-api-key", provider: name } };
@@ -77,12 +81,22 @@ export async function resolveProvider(secrets: vscode.SecretStorage): Promise<{ 
 		settings: {
 			providerId: profile.providerId!,
 			baseUrl: profile.baseUrl!,
-			modelId: profile.modelId!,
+			modelId,
 			profile: name,
 			maxIterations,
 			apiKey,
+			contextWindow: modelContextWindow(modelId, profile),
 		},
 	};
+}
+
+/** Context window for a model, from the profile's cached catalog or configured models. */
+function modelContextWindow(modelId: string, profile: ProviderProfile | undefined): number | undefined {
+	return (
+		profile?.models?.find((m) => m.id === modelId)?.contextWindow ??
+		configuredModels().find((m) => m.id === modelId)?.contextWindow ??
+		profiles().flatMap((p) => p.models ?? []).find((m) => m.id === modelId)?.contextWindow
+	);
 }
 
 /** Write a provider-related value to the shared user config; other keys stay in VS Code settings. */
@@ -90,6 +104,16 @@ export async function writeProviderValue(key: string, value: unknown): Promise<b
 	if (!isProviderKey(key)) return false;
 	const field = providerKeyToField(key);
 	await saveUserConfig({ [field]: value } as UserProviderConfig);
+	// Picking a model from the composer also pins it on the active provider profile.
+	if (key === "provider.modelId" && typeof value === "string") {
+		const list = profiles();
+		const name = userConfig().activeProfile;
+		const profile = name ? list.find((p) => p.name === name) : undefined;
+		if (profile) {
+			profile.modelId = value;
+			await saveUserConfig({ profiles: list });
+		}
+	}
 	return true;
 }
 
