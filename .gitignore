@@ -8,3 +8,4 @@ coverage/
 # kronyx runtime state (keep only the shared rules file)
 .kronyx/*
 !.kronyx/rules.md
+.revert-backup-*/
