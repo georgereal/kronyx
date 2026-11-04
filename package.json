@@ -4,6 +4,10 @@
 	"description": "Agentic coding in VS Code on the Cline SDK, with a run-oriented UI and Kronyx-owned file tools.",
 	"version": "0.0.1",
 	"publisher": "kronyx",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/kronyx/kronyx"
+	},
 	"private": true,
 	"license": "UNLICENSED",
 	"engines": {
@@ -15,7 +19,9 @@
 		"Programming Languages"
 	],
 	"main": "./dist/extension.js",
-	"activationEvents": [],
+	"activationEvents": [
+		"onStartupFinished"
+	],
 	"contributes": {
 		"viewsContainers": {
 			"activitybar": [
@@ -24,14 +30,28 @@
 					"title": "Kronyx",
 					"icon": "media/kronyx.svg"
 				}
+			],
+			"secondarySidebar": [
+				{
+					"id": "kronyx-right",
+					"title": "Kronyx",
+					"icon": "media/kronyx.svg"
+				}
 			]
 		},
 		"views": {
 			"kronyx": [
 				{
-					"type": "webview",
-					"id": "kronyx.runView",
-					"name": "Run"
+					"id": "kronyx.sessionView",
+					"name": "Session",
+					"type": "webview"
+				}
+			],
+			"kronyx-right": [
+				{
+					"id": "kronyx.runViewRight",
+					"name": "Session",
+					"type": "webview"
 				}
 			]
 		},
@@ -49,7 +69,8 @@
 			{
 				"command": "kronyx.newTask",
 				"title": "New task",
-				"category": "Kronyx"
+				"category": "Kronyx",
+				"icon": "$(edit)"
 			},
 			{
 				"command": "kronyx.setApiKey",
@@ -65,6 +86,150 @@
 				"command": "kronyx.focus",
 				"title": "Show run view",
 				"category": "Kronyx"
+			},
+			{
+				"command": "kronyx.focusRight",
+				"title": "Show run view (right sidebar)",
+				"category": "Kronyx"
+			},
+			{
+				"command": "kronyx.newSession",
+				"title": "New session",
+				"category": "Kronyx",
+				"icon": "$(add)"
+			},
+			{
+				"command": "kronyx.newCloudSession",
+				"title": "New cloud session (E2B + PR)",
+				"category": "Kronyx",
+				"icon": "$(cloud)"
+			},
+			{
+				"command": "kronyx.reviewChanges",
+				"title": "Review changes",
+				"category": "Kronyx",
+				"icon": "$(diff)"
+			},
+			{
+				"command": "kronyx.acceptHunk",
+				"title": "Accept hunk",
+				"category": "Kronyx",
+				"enablement": "false"
+			},
+			{
+				"command": "kronyx.rejectHunk",
+				"title": "Revert hunk",
+				"category": "Kronyx",
+				"enablement": "false"
+			},
+			{
+				"command": "kronyx.dismissComments",
+				"title": "Dismiss run comments",
+				"category": "Kronyx"
+			},
+			{
+				"command": "kronyx.indexWorkspace",
+				"title": "Index workspace for semantic memory",
+				"category": "Kronyx"
+			},
+			{
+				"command": "kronyx.runEvals",
+				"title": "Run eval suite",
+				"category": "Kronyx"
+			},
+			{
+				"command": "kronyx.showHistory",
+				"title": "Show run history",
+				"category": "Kronyx",
+				"icon": "$(history)"
+			},
+			{
+				"command": "kronyx.openSettings",
+				"title": "Open settings",
+				"category": "Kronyx",
+				"icon": "$(gear)"
+			},
+			{
+				"command": "kronyx.openSettingsPage",
+				"title": "Open settings page (custom UI)",
+				"category": "Kronyx",
+				"icon": "$(settings-gear)"
+			},
+			{
+				"command": "kronyx.openSettingsWindow",
+				"title": "Open settings window (browser)",
+				"category": "Kronyx"
+			}
+		],
+		"menus": {
+			"editor/title": [
+				{
+					"command": "kronyx.newSession",
+					"when": "activeWebviewPanelId == 'kronyx.session'",
+					"group": "navigation@1"
+				},
+				{
+					"command": "kronyx.showHistory",
+					"when": "activeWebviewPanelId == 'kronyx.session'",
+					"group": "navigation@2"
+				},
+				{
+					"command": "kronyx.reviewChanges",
+					"when": "activeWebviewPanelId == 'kronyx.session'",
+					"group": "navigation@3"
+				},
+				{
+					"command": "kronyx.newTask",
+					"when": "activeWebviewPanelId == 'kronyx.session'"
+				},
+				{
+					"command": "kronyx.openSettingsPage",
+					"when": "activeWebviewPanelId == 'kronyx.session'"
+				},
+				{
+					"command": "kronyx.openSettings",
+					"when": "activeWebviewPanelId == 'kronyx.session'"
+				}
+			],
+			"view/title": [
+				{
+					"command": "kronyx.newSession",
+					"when": "view == kronyx.sessionView || view == kronyx.runViewRight",
+					"group": "navigation@1"
+				},
+				{
+					"command": "kronyx.showHistory",
+					"when": "view == kronyx.sessionView || view == kronyx.runViewRight",
+					"group": "navigation@2"
+				},
+				{
+					"command": "kronyx.newTask",
+					"when": "view == kronyx.sessionView || view == kronyx.runViewRight"
+				},
+				{
+					"command": "kronyx.reviewChanges",
+					"when": "view == kronyx.sessionView || view == kronyx.runViewRight"
+				},
+				{
+					"command": "kronyx.openSettingsPage",
+					"when": "view == kronyx.sessionView || view == kronyx.runViewRight"
+				},
+				{
+					"command": "kronyx.openSettings",
+					"when": "view == kronyx.sessionView || view == kronyx.runViewRight"
+				}
+			]
+		},
+		"keybindings": [
+			{
+				"command": "kronyx.focus",
+				"key": "ctrl+alt+k",
+				"mac": "cmd+alt+k"
+			},
+			{
+				"command": "kronyx.newSession",
+				"key": "ctrl+alt+shift+k",
+				"mac": "cmd+alt+shift+k"
 			}
 		],
 		"configuration": {
@@ -85,11 +250,187 @@
 					"default": "anthropic/claude-sonnet-4.6",
 					"description": "Model id sent to the provider (Vercel AI Gateway uses provider/model)."
 				},
+				"kronyx.provider.models": {
+					"type": "array",
+					"default": [],
+					"items": {
+						"type": "object",
+						"properties": {
+							"id": {
+								"type": "string"
+							},
+							"label": {
+								"type": "string"
+							}
+						}
+					},
+					"description": "Fallback model list shown in the model picker when the provider's /models endpoint is unreachable."
+				},
+				"kronyx.agent.defaultMode": {
+					"type": "string",
+					"enum": [
+						"code",
+						"smart",
+						"ask",
+						"plan",
+						"bypass"
+					],
+					"default": "code",
+					"description": "Agent mode used when none has been chosen in the run view."
+				},
 				"kronyx.agent.maxIterations": {
 					"type": "number",
 					"default": 40,
 					"minimum": 1,
 					"description": "Maximum agent steps per run."
+				},
+				"kronyx.sandbox.enabled": {
+					"type": "boolean",
+					"default": false,
+					"description": "Run the agent inside a sandbox. Planned \u2014 not yet enforced."
+				},
+				"kronyx.sandbox.backend": {
+					"type": "string",
+					"enum": [
+						"local",
+						"docker",
+						"devcontainer",
+						"e2b",
+						"firecracker"
+					],
+					"default": "local",
+					"description": "Sandbox backend. Planned \u2014 not yet enforced."
+				},
+				"kronyx.sandbox.image": {
+					"type": "string",
+					"default": "",
+					"description": "Sandbox image or snapshot to boot. Planned \u2014 not yet enforced."
+				},
+				"kronyx.sandbox.cpus": {
+					"type": "number",
+					"default": 2,
+					"minimum": 1,
+					"description": "vCPUs for the sandbox. Planned \u2014 not yet enforced."
+				},
+				"kronyx.sandbox.memoryMb": {
+					"type": "number",
+					"default": 4096,
+					"minimum": 256,
+					"description": "Memory in MB for the sandbox. Planned \u2014 not yet enforced."
+				},
+				"kronyx.sandbox.host": {
+					"type": "string",
+					"default": "",
+					"description": "Remote runner service URL for microVM backends (Firecracker needs Linux/KVM). Planned \u2014 not yet enforced."
+				},
+				"kronyx.sandbox.vendor": {
+					"type": "string",
+					"default": "",
+					"description": "MicroVM vendor/provider identifier for the remote runner. Planned \u2014 not yet enforced."
+				},
+				"kronyx.cloud.idleTimeoutMin": {
+					"type": "number",
+					"default": 15,
+					"minimum": 1,
+					"description": "Minutes an E2B sandbox stays alive without activity (keepalive resets while runs are active)."
+				},
+				"kronyx.cloud.autoPr": {
+					"type": "boolean",
+					"default": true,
+					"description": "Push the branch and open/update a GitHub PR when a cloud run finishes."
+				},
+				"kronyx.cloud.defaultBase": {
+					"type": "string",
+					"default": "main",
+					"description": "Base branch for cloud-run pull requests."
+				},
+				"kronyx.eval.gateOnModelChange": {
+					"type": "string",
+					"enum": [
+						"prompt",
+						"always",
+						"off"
+					],
+					"default": "prompt",
+					"description": "Gate model/profile changes on the eval suite: prompt to run it, always run it, or ignore."
+				},
+				"kronyx.eval.suite": {
+					"type": "string",
+					"default": ".kronyx/evals.json",
+					"description": "Path to the eval suite file (JSON array or {cases: [...]}) relative to the workspace root."
+				},
+				"kronyx.memory.embeddingModel": {
+					"type": "string",
+					"default": "",
+					"description": "Embedding model for semantic memory/code search (e.g. text-embedding-3-small). Empty disables the vector tier."
+				},
+				"kronyx.memory.topK": {
+					"type": "number",
+					"default": 5,
+					"description": "Top semantic-search snippets injected into the agent context per run."
+				},
+				"kronyx.memory.enabled": {
+					"type": "boolean",
+					"default": true,
+					"description": "Load workspace rules/facts into the agent context and record feedback episodes."
+				},
+				"kronyx.checks.commands": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"default": [],
+					"description": "Shell commands run as post-run checks (e.g. [\"npm run typecheck\", \"npm run test\"])."
+				},
+				"kronyx.checks.runOnFinish": {
+					"type": "boolean",
+					"default": false,
+					"description": "Run checks automatically when a run completes."
+				},
+				"kronyx.provider.profile": {
+					"type": "string",
+					"default": "",
+					"description": "Name of the active provider profile from kronyx.provider.profiles, or empty for the plain provider settings."
+				},
+				"kronyx.provider.profiles": {
+					"type": "array",
+					"default": [],
+					"items": {
+						"type": "object",
+						"properties": {
+							"name": {
+								"type": "string"
+							},
+							"providerId": {
+								"type": "string"
+							},
+							"baseUrl": {
+								"type": "string"
+							},
+							"modelId": {
+								"type": "string"
+							}
+						},
+						"required": [
+							"name"
+						]
+					},
+					"description": "Named provider+model presets selectable in the settings page."
+				},
+				"kronyx.git.autoBranch": {
+					"type": "boolean",
+					"default": false,
+					"description": "Create a git branch before each run."
+				},
+				"kronyx.git.branchPrefix": {
+					"type": "string",
+					"default": "kronyx/",
+					"description": "Prefix for auto-created run branches."
+				},
+				"kronyx.git.commitOnFinish": {
+					"type": "boolean",
+					"default": false,
+					"description": "Commit files changed by a run when it completes."
 				},
 				"kronyx.approval.autoApproveWrites": {
 					"type": "boolean",
@@ -102,7 +443,9 @@
 	"scripts": {
 		"build": "node esbuild.mjs",
 		"watch": "node esbuild.mjs --watch",
+		"dev": "node esbuild.mjs && code --extensionDevelopmentPath=$PWD --user-data-dir=$PWD/.devhost/user-data --extensions-dir=$PWD/.devhost/extensions",
 		"package": "node esbuild.mjs --production",
+		"vsix": "node esbuild.mjs --production && vsce package --no-dependencies --allow-missing-repository",
 		"typecheck": "tsc --noEmit",
 		"lint": "eslint src test",
 		"test": "vitest run",
@@ -110,7 +453,9 @@
 	},
 	"devDependencies": {
 		"@types/node": "^22.20.5",
+		"@types/sql.js": "^1.4.11",
 		"@types/vscode": "^1.105.0",
+		"@vscode/vsce": "^4.1.0",
 		"esbuild": "^0.28.2",
 		"eslint": "^10.14.0",
 		"typescript": "^5.9.3",
@@ -120,6 +465,9 @@
 	"dependencies": {
 		"@cline/agents": "^0.2.0",
 		"@cline/shared": "^0.2.0",
-		"@opentelemetry/api": "~1.10.0"
+		"@opentelemetry/api": "~1.10.0",
+		"diff": "9.0.0",
+		"e2b": "^2.62.0",
+		"sql.js": "^1.15.2"
 	}
 }

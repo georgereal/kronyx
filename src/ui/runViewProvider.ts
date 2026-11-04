@@ -1,60 +1,96 @@
 import * as vscode from "vscode";
-import type { RunViewEvent } from "../agent/runner";
+import type { AgentMode, RunViewEvent } from "../agent/runner";
+import type { ModelOption } from "../config";
+import { renderPage } from "./pageHtml";
 
-export type WebviewMessage = { type: "run"; task: string } | { type: "stop" } | { type: "new" } | { type: "setApiKey" };
+export type { AgentMode, ModelOption };
 
+export type WebviewMessage =
+	| { type: "run"; task: string; mode: AgentMode }
+	| { type: "stop" }
+	| { type: "new" }
+	| { type: "setApiKey" }
+	| { type: "requestState" }
+	| { type: "setMode"; mode: AgentMode }
+	| { type: "setModel"; modelId: string }
+	| { type: "attach"; kind: "file" | "directory" | "upload" }
+	| { type: "newSession" }
+	| { type: "openSettings" }
+	| { type: "review"; path: string }
+	| { type: "acceptChange"; path: string }
+	| { type: "rejectChange"; path: string }
+	| { type: "showHistory" }
+	| { type: "permissionResponse"; id: string; decision: "allow" | "always" | "deny" | "alwaysTool" }
+	| { type: "openFile"; path: string }
+	| { type: "implementPlan"; path: string };
+
+export interface ViewState {
+	mode: AgentMode;
+	modelId: string;
+	models: ModelOption[];
+}
+
+export type ViewEvent = RunViewEvent | { type: "reset" };
+
+/**
+ * Hosts the run UI in one or more webview surfaces (sidebar views, editor panels).
+ * Events broadcast to all resolved views; unresolved events queue in a backlog
+ * replayed to the next view that opens.
+ */
 export class RunViewProvider implements vscode.WebviewViewProvider {
 	static readonly viewId = "kronyx.runView";
-	private view: vscode.WebviewView | undefined;
-	private readonly backlog: RunViewEvent[] = [];
+	static readonly rightViewId = "kronyx.runViewRight";
+	private readonly views = new Set<vscode.Webview>();
+	private readonly backlog: ViewEvent[] = [];
+	private state: ViewState = { mode: "code", modelId: "", models: [] };
 
-	constructor(
-		private readonly extensionUri: vscode.Uri,
-		private readonly onMessage: (message: WebviewMessage) => void,
-	) {}
+	onMessage: (message: WebviewMessage) => void = () => {};
+
+	constructor(private readonly extensionUri: vscode.Uri) {}
 
 	resolveWebviewView(view: vscode.WebviewView): void {
-		this.view = view;
 		const media = vscode.Uri.joinPath(this.extensionUri, "media");
 		view.webview.options = { enableScripts: true, localResourceRoots: [media] };
-		view.webview.html = this.html(view.webview, media);
+		view.webview.html = renderPage(view.webview, this.extensionUri);
 		view.webview.onDidReceiveMessage((message: WebviewMessage) => this.onMessage(message));
-		view.onDidDispose(() => {
-			this.view = undefined;
-		});
-		for (const event of this.backlog.splice(0)) void view.webview.postMessage(event);
+		this.attach(view.webview);
+		view.onDidDispose(() => this.detach(view.webview));
 	}
 
-	post(event: RunViewEvent | { type: "reset" }): void {
-		if (this.view) void this.view.webview.postMessage(event);
-		else if (event.type !== "reset") this.backlog.push(event);
+	/** Attach a bare webview (e.g. an editor WebviewPanel) to this session surface. */
+	attach(webview: vscode.Webview): void {
+		this.views.add(webview);
+		for (const event of this.backlog) void webview.postMessage(event);
+		this.postState();
 	}
 
-	private html(webview: vscode.Webview, media: vscode.Uri): string {
-		const script = webview.asWebviewUri(vscode.Uri.joinPath(media, "webview.js"));
-		const style = webview.asWebviewUri(vscode.Uri.joinPath(media, "webview.css"));
-		const nonce = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
-		return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link rel="stylesheet" href="${style}">
-</head>
-<body>
-<div id="timeline" class="timeline"><p class="empty">No runs yet. Describe a change below.</p></div>
-<form id="composer" class="composer">
-  <textarea id="task" rows="3" placeholder="Describe the change you want..."></textarea>
-  <div class="actions">
-    <button type="submit" id="run">Run</button>
-    <button type="button" id="stop" class="secondary" disabled>Stop</button>
-    <button type="button" id="new" class="secondary">New task</button>
-  </div>
-  <div id="status" class="status">Idle</div>
-</form>
-<script nonce="${nonce}" src="${script}"></script>
-</body>
-</html>`;
+	detach(webview: vscode.Webview): void {
+		this.views.delete(webview);
+	}
+
+	post(event: ViewEvent): void {
+		if (event.type === "reset") this.backlog.length = 0;
+		else {
+			this.backlog.push(event);
+			if (this.backlog.length > 500) this.backlog.shift();
+		}
+		for (const webview of this.views) void webview.postMessage(event);
+	}
+
+	setState(state: Partial<ViewState>): void {
+		this.state = { ...this.state, ...state };
+		this.postState();
+	}
+
+	getState(): ViewState {
+		return this.state;
+	}
+
+	insertMention(text: string): void {
+		for (const webview of this.views) void webview.postMessage({ type: "insertMention", text });
+	}
+
+	private postState(): void {
+		for (const webview of this.views) void webview.postMessage({ type: "state", ...this.state });
 	}
 }

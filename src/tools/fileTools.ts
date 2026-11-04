@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import type { AgentTool } from "@cline/shared";
+import { computeHunks, formatHunks } from "../diff/hunks";
 import { adaptIndentation, findMatches, lineNumberAt, mostSimilarRegion } from "./matching";
 import { IGNORED_DIRS, WorkspaceGuard } from "./workspace";
 
@@ -10,11 +11,16 @@ export interface FileToolOptions {
 	root: string;
 	/** Returns true when the file has unsaved changes in the editor. */
 	isDirty?: (absPath: string) => boolean;
-	onFileChanged?: (absPath: string, kind: FileChangeKind) => void;
+	onFileChanged?: (absPath: string, kind: FileChangeKind, stats?: { added: number; removed: number; diff: string }) => void;
+	/** Called once before the first write to a file, with its prior content (null for new files). */
+	onBeforeWrite?: (absPath: string, before: string | null) => void;
+	/** Executes a shell command; return null to fall back to local execution in root. */
+	execCommand?: (command: string) => Promise<string | null>;
+	planDir?: () => string;
 	maxReadLines?: number;
 }
 
-export const WRITE_TOOL_NAMES = new Set(["write_file", "edit_file", "append_file", "insert_lines"]);
+export const WRITE_TOOL_NAMES = new Set(["write_file", "edit_file", "append_file", "insert_lines", "run_command"]);
 
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 
@@ -49,9 +55,27 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 
 	const writeText = async (abs: string, text: string) => {
 		const existed = await exists(abs);
+		let before: string | null = null;
+		if (options.onBeforeWrite || options.onFileChanged) {
+			before = existed ? (await fs.readFile(abs)).toString("utf8") : null;
+		}
+		if (options.onBeforeWrite) options.onBeforeWrite(abs, before);
 		await fs.mkdir(path.dirname(abs), { recursive: true });
 		await fs.writeFile(abs, text, "utf8");
-		options.onFileChanged?.(abs, existed ? "modified" : "created");
+		if (options.onFileChanged) {
+			let added = 0;
+			let removed = 0;
+			const hunks = computeHunks(before ?? "", text);
+			for (const hunk of hunks) {
+				added += hunk.newLines.length;
+				removed += hunk.oldLines.length;
+			}
+			options.onFileChanged(abs, existed ? "modified" : "created", {
+				added,
+				removed,
+				diff: formatHunks(hunks),
+			});
+		}
 		return existed;
 	};
 
@@ -292,7 +316,74 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 		},
 	};
 
-	return [readFile, writeFile, editFile, appendFile, insertLines, listFiles, searchFiles];
+	const memoryWrite: AgentTool<{ fact: string }, string> = {
+		name: "memory_write",
+		description:
+			"Record a durable fact about this project for future runs (build/test commands, conventions, gotchas). Appends to .kronyx/memory/facts.md.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				fact: { type: "string", description: "One concise fact to remember." },
+			},
+			required: ["fact"],
+		},
+		async execute(input) {
+			const { appendFact } = await import("../agent/memory");
+			await appendFact(options.root, input.fact);
+			return "Fact recorded.";
+		},
+	};
+
+	const runCommand: AgentTool<{ command: string }, string> = {
+		name: "run_command",
+		description:
+			"Run a shell command (build, test, install, etc). Executes in the configured sandbox when enabled, else in the workspace root. Returns exit code and output.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				command: { type: "string", description: "Shell command to run." },
+			},
+			required: ["command"],
+		},
+		async execute(input) {
+			if (options.execCommand) {
+				const out = await options.execCommand(input.command);
+				if (out !== null) return out;
+			}
+			const { exec } = await import("node:child_process");
+			return new Promise((resolve) => {
+				exec(input.command, { cwd: options.root, timeout: 60_000 }, (error, stdout, stderr) => {
+					const out = `${stdout}${stderr}`.trim();
+					resolve(`exit ${error ? 1 : 0}\n${out.length > 8000 ? `${out.slice(0, 8000)}\n... (truncated)` : out}`);
+				});
+			});
+		},
+	};
+
+	const savePlan: AgentTool<{ content: string; slug?: string }, string> = {
+		name: "save_plan",
+		description:
+			"Save the implementation plan to .kronyx/plans/<slug>.md. Only usable in Plan mode. Ends the planning phase — the user reviews the plan and starts implementation.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				content: { type: "string", description: "The plan as markdown: summary, numbered steps, files to modify, verification." },
+				slug: { type: "string", description: "Optional filename slug for the plan file (no extension)." },
+			},
+			required: ["content"],
+		},
+		async execute(input) {
+			const slug = (input.slug || "plan").replace(/[^\w-]+/g, "-").slice(0, 60) || "plan";
+			const rel = `${(options.planDir?.() ?? ".kronyx/plans").replace(/\/+$/, "")}/${slug}.md`;
+			const abs = path.join(options.root, rel);
+			await fs.mkdir(path.dirname(abs), { recursive: true });
+			await fs.writeFile(abs, input.content, "utf8");
+			options.onFileChanged?.(abs, (await exists(abs)) ? "modified" : "created", { added: 0, removed: 0, diff: "" });
+			return `Plan saved to ${rel}`;
+		},
+	};
+
+	return [readFile, writeFile, editFile, appendFile, insertLines, listFiles, searchFiles, memoryWrite, runCommand, savePlan];
 }
 
 function noMatchMessage(label: string, file: string, text: string, oldText: string): string {

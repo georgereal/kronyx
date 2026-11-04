@@ -2,7 +2,20 @@
 	"version": "0.2.0",
 	"configurations": [
 		{
-			"name": "Run Kronyx extension",
+			"name": "Run Kronyx (clean)",
+			"type": "extensionHost",
+			"request": "launch",
+			"args": [
+				"--extensionDevelopmentPath=${workspaceFolder}",
+				"--user-data-dir=${workspaceFolder}/.devhost/user-data",
+				"--extensions-dir=${workspaceFolder}/.devhost/extensions",
+				"${workspaceFolder}"
+			],
+			"outFiles": ["${workspaceFolder}/dist/**/*.js"],
+			"preLaunchTask": "npm: build"
+		},
+		{
+			"name": "Run Kronyx (same profile)",
 			"type": "extensionHost",
 			"request": "launch",
 			"args": ["--extensionDevelopmentPath=${workspaceFolder}"],
