@@ -7,6 +7,9 @@
 	const sendBtn = /** @type {HTMLButtonElement} */ (document.getElementById("send"));
 	const stopBtn = /** @type {HTMLButtonElement} */ (document.getElementById("stop"));
 	const attachBtn = /** @type {HTMLButtonElement} */ (document.getElementById("attach"));
+	const cloudStatus = /** @type {HTMLElement} */ (document.getElementById("cloudstatus"));
+	const envLocal = /** @type {HTMLButtonElement} */ (document.getElementById("env-local"));
+	const envCloud = /** @type {HTMLButtonElement} */ (document.getElementById("env-cloud"));
 	const modeBtn = /** @type {HTMLButtonElement} */ (document.getElementById("mode"));
 	const modelBtn = /** @type {HTMLButtonElement} */ (document.getElementById("model"));
 	const modeLabel = /** @type {HTMLElement} */ (document.getElementById("mode-label"));
@@ -14,6 +17,9 @@
 	const status = /** @type {HTMLElement} */ (document.getElementById("status"));
 	const tokchip = /** @type {HTMLElement} */ (document.getElementById("tokchip"));
 	const menu = /** @type {HTMLElement} */ (document.getElementById("menu"));
+	const authBanner = /** @type {HTMLElement} */ (document.getElementById("authbanner"));
+	const authSignIn = /** @type {HTMLButtonElement} */ (document.getElementById("auth-signin"));
+	const authDismiss = /** @type {HTMLButtonElement} */ (document.getElementById("auth-dismiss"));
 	/** @type {Map<string, HTMLElement>} */
 	const tools = new Map();
 	let openToolCard = null;
@@ -39,7 +45,30 @@
 		{ id: "bypass", label: "Bypass Permissions", desc: "Auto-approve all tool calls" },
 	];
 
-	const persist = () => vscode.setState({ mode, modelId, models, recentModels, draft: task.value });
+	const persist = () => vscode.setState({ mode, modelId, models, recentModels, draft: task.value, authDismissed, cloudEnv });
+
+	let cloudEnv = persisted.cloudEnv === true;
+	const refreshEnv = () => {
+		envLocal.classList.toggle("active", !cloudEnv);
+		envCloud.classList.toggle("active", cloudEnv);
+	};
+	envLocal.addEventListener("click", () => { cloudEnv = false; refreshEnv(); persist(); });
+	envCloud.addEventListener("click", () => { cloudEnv = true; refreshEnv(); persist(); });
+	refreshEnv();
+
+	const persistedAuth = persisted.authDismissed === true;
+	let authDismissed = persistedAuth;
+	let signedIn = undefined;
+	const refreshAuthBanner = () => {
+		authBanner.hidden = signedIn !== false || authDismissed;
+	};
+	authSignIn.addEventListener("click", () => vscode.postMessage({ type: "signIn" }));
+	authDismiss.addEventListener("click", () => {
+		authDismissed = true;
+		refreshAuthBanner();
+		persist();
+	});
+	refreshAuthBanner();
 
 	const el = (tag, cls, text) => {
 		const node = document.createElement(tag);
@@ -289,7 +318,7 @@
 	const submit = () => {
 		const text = task.value.trim();
 		if (!text || sendBtn.hidden) return;
-		vscode.postMessage({ type: "run", task: text, mode });
+		vscode.postMessage(cloudEnv ? { type: "runCloud", task: text, mode } : { type: "run", task: text, mode });
 		task.value = "";
 		autogrow();
 	};
@@ -581,6 +610,8 @@
 				mode = msg.mode || mode;
 				modelId = msg.modelId || modelId;
 				models = msg.models || models;
+				if (typeof msg.signedIn === "boolean") signedIn = msg.signedIn;
+				refreshAuthBanner();
 				refreshChips();
 				persist();
 				break;
@@ -591,6 +622,10 @@
 				autogrow();
 				break;
 			}
+			case "cloud-status":
+				cloudStatus.hidden = false;
+				cloudStatus.textContent = `☁ ${msg.text}`;
+				break;
 			case "reset":
 				showEmpty();
 				tools.clear();

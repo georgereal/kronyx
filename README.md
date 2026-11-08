@@ -1,6 +1,14 @@
 # Kronyx
 
+> **From Prompts to Production.** — Kronyx transforms developer intent into production-ready software through intelligent agentic engineering.
+
 VS Code extension for agentic coding, built on the [Cline SDK](https://github.com/cline/cline/tree/main/sdk) with its own run-oriented UI and Kronyx-owned file tools. Design docs and the decision/plan tracker live in [docs/](docs/README.md).
+
+## Why "Kronyx"?
+
+Named after **Cronus (Κρόνος)**, the Greek Titan associated with time and the cosmic order — a fitting patron for a run-oriented agent that plans, acts, verifies and learns over time. *Kronyx* is a modern, technology-oriented adaptation: the brand idea is **power, orchestration, autonomy and control**.
+
+A playful reading some of us like: **K** = *Knowledge*, **RONYX** = a distinctive, futuristic identity. (That's a branding interpretation — the mythology is the original rationale.)
 
 ## Status (Phase 0)
 
@@ -19,6 +27,22 @@ npm run check      # typecheck, lint, unit tests, build
 ```
 
 Press F5 ("Run Kronyx extension") to open an Extension Development Host.
+
+## Build and install
+
+```sh
+npm run build      # dev bundle via esbuild -> dist/extension.js
+npm run package    # production bundle
+npm run vsix       # production bundle + vsce package -> kronyx-<version>.vsix
+```
+
+Install the packaged extension locally:
+
+```sh
+code --install-extension kronyx-0.0.1.vsix
+```
+
+Bump `version` in `package.json` before packaging a new release. Marketplace publishing is not configured (the extension is `private`).
 
 ## Configure
 

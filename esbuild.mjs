@@ -12,7 +12,7 @@ const ctx = await esbuild.context({
 	platform: "node",
 	target: "node22",
 	outfile: "dist/extension.js",
-	external: ["vscode"],
+	external: ["vscode", "better-sqlite3"],
 	sourcemap: !production,
 	minify: production,
 	logLevel: "info",

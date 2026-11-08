@@ -15,11 +15,20 @@ export function renderPage(webview: vscode.Webview, extensionUri: vscode.Uri): s
 <link rel="stylesheet" href="${style}">
 </head>
 <body>
+<div id="cloudstatus" class="cloudstatus" hidden></div>
+<div id="authbanner" class="authbanner" hidden>
+  <span>Connect your Kronyx account to sync usage and settings across devices.</span>
+  <button type="button" id="auth-signin">Sign in</button>
+  <button type="button" id="auth-dismiss" class="auth-dismiss" title="Dismiss">&times;</button>
+</div>
 <div id="timeline" class="timeline"><p class="empty">No runs yet. Describe a change below.</p></div>
 <div id="composer" class="composer">
   <textarea id="task" rows="3" placeholder="Ask, plan, or describe a change..."></textarea>
   <div class="composer-bar">
     <button type="button" id="attach" class="icon-btn" title="Add context">+</button>
+    <div id="envseg" class="envseg" title="Where the run executes">
+      <button type="button" id="env-local" class="envseg-btn active">Local</button><button type="button" id="env-cloud" class="envseg-btn">☁ Cloud</button>
+    </div>
     <button type="button" id="mode" class="chip" title="Agent mode"><span class="chip-icon" id="mode-icon">&#9679;</span><span class="chip-text" id="mode-label">Code</span><span class="caret">&#9662;</span></button>
     <span class="spacer"></span>
     <span id="tokchip" class="tok" title="Tokens in / out" hidden></span>

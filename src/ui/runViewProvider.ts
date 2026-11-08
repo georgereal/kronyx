@@ -23,15 +23,32 @@ export type WebviewMessage =
 	| { type: "permissionResponse"; id: string; decision: "allow" | "always" | "deny" | "alwaysTool" }
 	| { type: "openFile"; path: string }
 	| { type: "implementPlan"; path: string }
-	| { type: "runInTerminal"; command: string };
+	| { type: "runInTerminal"; command: string }
+	| { type: "signIn" }
+	| { type: "runCloud"; task: string; mode: AgentMode }
+	| { type: "fixSetup"; key: string }
+	| { type: "githubPat" }
+	| { type: "githubCancel" }
+	| { type: "githubOpen"; url: string };
 
 export interface ViewState {
 	mode: AgentMode;
 	modelId: string;
 	models: ModelOption[];
+	signedIn?: boolean;
+	userEmail?: string;
+	cloudRepo?: string;
+	cloudBranch?: string;
+	cloudPr?: string;
 }
 
-export type ViewEvent = RunViewEvent | { type: "reset" };
+export type ViewEvent =
+	| RunViewEvent
+	| { type: "reset" }
+	| { type: "cloud-status"; text: string }
+	| { type: "setup"; step: number; label: string; state: "run" | "ok" | "fail"; detail?: string }
+	| { type: "setupStatus"; items: { key: string; label: string; ok: boolean; detail?: string; fixLabel?: string }[] }
+	| { type: "github-enable"; repo: string; url: string };
 
 /**
  * Hosts the run UI in one or more webview surfaces (sidebar views, editor panels).

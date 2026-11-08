@@ -7,7 +7,8 @@ import type { AgentMessage } from "@cline/shared";
 import { checksOnFinish, runChecks } from "../checks";
 import { E2bSandbox, sandboxBackend, sandboxEnabled } from "../sandbox/e2b";
 import { indexFile, logEpisode } from "../agent/memory";
-import { autoApproveWrites, implementPrompt, promptForApiKey, providerErrorMessage, readProviderSettings, resolveProvider, writeProviderValue } from "../config";
+import { autoApproveWrites, implementPrompt, modelPricing, promptForApiKey, providerErrorMessage, readProviderSettings, resolveProvider, writeProviderValue } from "../config";
+import type { ApiCallRow } from "../store";
 import * as git from "../git";
 import type { RunComments } from "./comments";
 import type { DiffReview } from "./diffReview";
@@ -59,6 +60,7 @@ export interface RunRecord {
 	tokensOut?: number;
 	cacheRead?: number;
 	cacheWrite?: number;
+	runId?: string;
 }
 
 export interface SessionDeps {
@@ -66,14 +68,16 @@ export interface SessionDeps {
 	output: vscode.OutputChannel;
 	runLock: RunLock;
 	modeRef: { current: AgentMode };
-	viewState: { modelId: string; models: ModelOption[] };
+	viewState: { modelId: string; models: ModelOption[]; signedIn?: boolean; userEmail?: string };
 	surfaces: Set<RunViewProvider>;
 	diffReview: DiffReview;
 	comments: RunComments;
 	recordRun: (entry: RunRecord) => void;
 	isSidebar?: (controller: SessionController) => boolean;
 	recordUsage: (entry: { session: string; task: string; tokensIn: number; tokensOut: number; cacheRead?: number; cacheWrite?: number; at: number }) => void;
-	persistEvent: (session: string, event: Parameters<RunViewProvider["post"]>[0]) => void;
+	/** Insert one per-request usage row into the api_calls ledger; returns the row id (or -1). */
+	recordApiCall?: (call: ApiCallRow) => number;
+	persistEvent: (session: string, event: Parameters<RunViewProvider["post"]>[0], runId?: string) => void;
 	loadEvents: (session: string) => Promise<Parameters<RunViewProvider["post"]>[0][]>;
 	saveDigest?: (session: string, digests: readonly RunDigest[]) => void;
 	loadDigest?: (session: string) => Promise<RunDigest[]>;
@@ -81,6 +85,7 @@ export interface SessionDeps {
 	loadTranscripts?: (session: string) => Promise<PriorTranscript[]>;
 	clearEvents: (session: string) => void;
 	setStatus: (state: "idle" | "running" | "failed") => void;
+	syncSettings?: () => Promise<void>;
 	refreshModels: () => Promise<void>;
 }
 
@@ -91,8 +96,11 @@ export class SessionController {
 	private approveAll = false;
 	private changedPaths = new Set<string>();
 	private runStartedAt = 0;
+	private replayed = false;
 	private runTask = "";
 	private lastUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+	private lastUsageAt = 0;
+	private runProvider: { providerId: string; baseUrl: string; modelId: string; profile?: string } | undefined;
 	private transcripts: PriorTranscript[] = [];
 	private sandbox: E2bSandbox | undefined;
 	private sandboxSynced = false;
@@ -152,6 +160,12 @@ export class SessionController {
 				await this.deps.refreshModels();
 				break;
 			case "requestState":
+				if (!this.replayed) {
+					this.replayed = true;
+					const evs = await this.deps.loadEvents(this.name);
+					evs.forEach((e) => this.surface.post(e));
+					this.deps.output.appendLine(`[store] replayed "${this.name}" with ${evs.length} event(s)`);
+				}
 				await this.deps.refreshModels();
 				break;
 			case "setMode":
@@ -197,6 +211,12 @@ export class SessionController {
 			}
 			case "openSettings":
 				await vscode.commands.executeCommand("kronyx.openSettingsPage");
+				break;
+			case "signIn":
+				await vscode.commands.executeCommand("kronyx.signIn");
+				break;
+			case "runCloud":
+				if (message.task.trim()) void vscode.commands.executeCommand("kronyx.newCloudSession", message.task, message.mode);
 				break;
 			case "showHistory":
 				await vscode.commands.executeCommand("kronyx.showHistory");
@@ -276,6 +296,16 @@ export class SessionController {
 			});
 		}
 		if (event.type === "usage") {
+			const now = Date.now();
+			// usage-updated is cumulative per run — the delta from the previous event
+			// approximates the most recent provider request.
+			const prev = this.lastUsage;
+			const delta = {
+				inputTokens: Math.max(0, event.inputTokens - prev.inputTokens),
+				outputTokens: Math.max(0, event.outputTokens - prev.outputTokens),
+				cacheReadTokens: Math.max(0, event.cacheReadTokens - prev.cacheReadTokens),
+				cacheWriteTokens: Math.max(0, event.cacheWriteTokens - prev.cacheWriteTokens),
+			};
 			this.lastUsage = {
 				inputTokens: event.inputTokens,
 				outputTokens: event.outputTokens,
@@ -289,14 +319,35 @@ export class SessionController {
 				tokensOut: event.outputTokens,
 				cacheRead: event.cacheReadTokens,
 				cacheWrite: event.cacheWriteTokens,
-				at: Date.now(),
+				at: now,
 			});
+			const p = this.runProvider;
+			const pricing = p ? modelPricing(p.modelId, undefined) : undefined;
+			this.deps.recordApiCall?.({
+				session: this.name,
+				task: this.runTask,
+				at: now,
+				status: "ok",
+				provider: p?.providerId,
+				baseUrl: p?.baseUrl,
+				model: p?.modelId,
+				profile: p?.profile,
+				keyLabel: p?.profile ?? "default",
+				tokensIn: delta.inputTokens,
+				tokensOut: delta.outputTokens,
+				cacheRead: delta.cacheReadTokens,
+				cacheWrite: delta.cacheWriteTokens,
+				costUsd: estimateCost(delta, pricing),
+				durationMs: this.lastUsageAt ? now - this.lastUsageAt : now - this.runStartedAt,
+			});
+			this.lastUsageAt = now;
 		}
 		if (event.type === "run-started") {
 			this.deps.comments.clear();
 			this.deps.setStatus("running");
 			this.runStartedAt = Date.now();
 			this.runTask = event.task;
+			this.lastUsageAt = 0;
 		}
 		if (event.type === "run-finished") {
 			this.deps.setStatus("idle");
@@ -315,6 +366,25 @@ export class SessionController {
 			void this.onFinished(event.status);
 		}
 		if (event.type === "run-failed") {
+			// The failing request never reports usage — still log it so the ledger
+			// shows non-2xx calls like a provider dashboard would.
+			if (this.lastUsageAt || this.runStartedAt) {
+				const p = this.runProvider;
+				this.deps.recordApiCall?.({
+					session: this.name,
+					task: this.runTask,
+					at: Date.now(),
+					status: "failed",
+					provider: p?.providerId,
+					baseUrl: p?.baseUrl,
+					model: p?.modelId,
+					profile: p?.profile,
+					keyLabel: p?.profile ?? "default",
+					tokensIn: 0,
+					tokensOut: 0,
+					durationMs: Date.now() - (this.lastUsageAt || this.runStartedAt),
+				});
+			}
 			this.deps.setStatus("failed");
 			this.deps.recordRun({
 				task: this.runTask,
@@ -355,6 +425,12 @@ export class SessionController {
 			}
 			const settings = resolved.settings!;
 			if (!settings) return;
+			this.runProvider = {
+				providerId: settings.providerId,
+				baseUrl: settings.baseUrl,
+				modelId: settings.modelId,
+				profile: settings.profile,
+			};
 			this.deps.output.appendLine(
 				`[${this.name}] Run with ${settings.providerId} ${settings.modelId} at ${settings.baseUrl} (mode: ${this.deps.modeRef.current})`,
 			);
@@ -584,6 +660,15 @@ function summarizePrior(events: Parameters<RunViewProvider["post"]>[0][]): strin
 		lastText?.text ? `Last summary: ${lastText.text.slice(-600)}` : "",
 	].filter(Boolean);
 	return parts.join("\n").slice(0, 1500);
+}
+
+/** Estimated USD cost from catalog pricing (per-token). Undefined when pricing is unknown. */
+function estimateCost(
+	delta: { inputTokens: number; outputTokens: number },
+	pricing: { input?: number; output?: number } | undefined,
+): number | undefined {
+	if (!pricing || (pricing.input === undefined && pricing.output === undefined)) return undefined;
+	return delta.inputTokens * (pricing.input ?? 0) + delta.outputTokens * (pricing.output ?? 0);
 }
 
 function errorMessage(error: unknown): string {

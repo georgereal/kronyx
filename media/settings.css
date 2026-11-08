@@ -86,7 +86,7 @@ section {
 label {
 	max-width: 460px;
 }
-input:not([type="checkbox"]):not([type="number"]),
+input:not([type="checkbox"]):not([type="number"]):not([type="radio"]),
 select,
 textarea {
 	width: 100%;
@@ -370,4 +370,352 @@ tr.model-detail > td {
 .provider-section > .providers-table {
 	margin: 0 12px 10px;
 	width: calc(100% - 24px);
+}
+
+/* ---- Providers (modern reskin) ---- */
+.prov-head {
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
+	margin-bottom: 14px;
+}
+.prov-head h2 {
+	margin: 0;
+}
+.prov-sub {
+	font-size: 0.82em;
+	opacity: 0.6;
+	margin: 2px 0 0;
+}
+.prov-empty {
+	border: 1px dashed var(--vscode-panel-border);
+	border-radius: 10px;
+	padding: 28px;
+	text-align: center;
+	opacity: 0.7;
+}
+.preset-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+	gap: 8px;
+	margin: 10px 0 16px;
+}
+.preset-tile {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+	gap: 2px;
+	padding: 12px 14px;
+	border: 1px solid var(--vscode-panel-border);
+	border-radius: 10px;
+	background: transparent;
+	color: inherit;
+	text-align: left;
+	cursor: pointer;
+}
+.preset-tile:hover {
+	border-color: var(--vscode-focusBorder);
+	background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.08));
+}
+.preset-tile em {
+	font-style: normal;
+	font-size: 0.78em;
+	opacity: 0.55;
+}
+details.prov {
+	border: 1px solid var(--vscode-panel-border);
+	border-radius: 10px;
+	margin: 8px 0;
+	overflow: hidden;
+}
+details.prov > summary.prov-row {
+	list-style: none;
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 11px 14px;
+	cursor: pointer;
+}
+details.prov > summary.prov-row::-webkit-details-marker {
+	display: none;
+}
+details.prov > summary.prov-row:hover {
+	background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.06));
+}
+.dot {
+	width: 8px;
+	height: 8px;
+	border-radius: 50%;
+	background: var(--vscode-disabledForeground, #555);
+	flex-shrink: 0;
+	cursor: pointer;
+}
+.dot.on {
+	background: #4ec9b0;
+	box-shadow: 0 0 0 3px rgba(78, 201, 176, 0.15);
+}
+.prov-name {
+	font-weight: 600;
+}
+.prov-meta {
+	font-size: 0.85em;
+	opacity: 0.55;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	flex: 1;
+	min-width: 0;
+}
+.prov-right {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin-left: auto;
+	flex-shrink: 0;
+}
+.chip {
+	font-size: 0.78em;
+	padding: 2px 8px;
+	border-radius: 6px;
+	background: var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.15));
+	max-width: 26em;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.pill {
+	font-size: 0.72em;
+	padding: 1px 8px;
+	border-radius: 8px;
+	border: 1px solid var(--vscode-panel-border);
+	opacity: 0.75;
+	white-space: nowrap;
+}
+.pill.on {
+	background: var(--vscode-focusBorder);
+	border-color: transparent;
+	color: #fff;
+	opacity: 1;
+}
+.pill.dim {
+	opacity: 0.45;
+}
+.chev {
+	transition: transform 0.12s;
+	opacity: 0.5;
+}
+details.prov[open] .chev {
+	transform: rotate(90deg);
+}
+.prov-editor {
+	border-top: 1px solid var(--vscode-panel-border);
+	padding: 14px 16px 12px;
+}
+.prov-status {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	font-size: 0.85em;
+	margin-bottom: 12px;
+}
+.prov-status em {
+	font-style: normal;
+	opacity: 0.6;
+}
+.prov-status .ghost {
+	margin-left: auto;
+}
+.prov-fields {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	gap: 10px 16px;
+}
+.fld {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	min-width: 0;
+}
+.fld.wide {
+	grid-column: 1 / -1;
+}
+.fld-label {
+	font-size: 0.68em;
+	text-transform: uppercase;
+	letter-spacing: 0.06em;
+	opacity: 0.55;
+	font-weight: 600;
+}
+.prov-keyrow {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	margin-top: 12px;
+	padding: 8px 12px;
+	border: 1px solid var(--vscode-panel-border);
+	border-radius: 8px;
+}
+.prov-keyrow .masked {
+	letter-spacing: 2px;
+	opacity: 0.8;
+}
+.prov-keyrow em.dim {
+	font-style: normal;
+	opacity: 0.5;
+}
+.prov-models {
+	margin-top: 12px;
+	border-top: 1px solid var(--vscode-panel-border);
+	padding-top: 8px;
+}
+.prov-models > summary {
+	list-style: none;
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	cursor: pointer;
+	padding: 4px 0;
+	font-size: 0.9em;
+}
+.prov-models > summary::-webkit-details-marker {
+	display: none;
+}
+.prov-models > summary .twisty {
+	display: inline-block;
+	transition: transform 0.12s;
+	opacity: 0.6;
+}
+.prov-models[open] > summary .twisty {
+	transform: rotate(90deg);
+}
+.prov-models > summary em {
+	font-style: normal;
+	opacity: 0.55;
+	font-size: 0.85em;
+}
+.prov-models .models-head {
+	margin: 4px 0 6px;
+	gap: 6px;
+}
+.prov-tablewrap {
+	overflow: auto;
+	max-width: 100%;
+	max-height: 60vh;
+	border: 1px solid var(--vscode-panel-border);
+	border-radius: 8px;
+	margin-bottom: 8px;
+}
+.prov-tablewrap .models-table {
+	width: max-content;
+	min-width: 100%;
+}
+.prov-tablewrap thead th {
+	position: sticky;
+	top: 0;
+	background: var(--vscode-editor-background, #1e1e1e);
+	z-index: 1;
+	white-space: nowrap;
+}
+.prov-tablewrap th.sortable {
+	cursor: pointer;
+	user-select: none;
+}
+.prov-tablewrap th.sortable:hover {
+	opacity: 1;
+	color: var(--vscode-textLink-foreground);
+}
+.models-table tbody tr:nth-child(even) {
+	background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.06));
+}
+.models-table tbody tr:hover {
+	background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.12));
+}
+.models-table tr.model-detail > td {
+	background: var(--vscode-textBlockQuote-background, rgba(128, 128, 128, 0.1));
+}
+tr.filter-row td {
+	padding: 2px 6px;
+	border-bottom: 1px solid var(--vscode-panel-border);
+	vertical-align: middle;
+}
+.col-filter {
+	width: 100%;
+	box-sizing: border-box;
+	padding: 2px 6px;
+	font-size: 0.85em;
+	background: var(--vscode-input-background);
+	color: var(--vscode-input-foreground);
+	border: 1px solid var(--vscode-input-border, transparent);
+	border-radius: 4px;
+}
+.col-filter.num {
+	max-width: 70px;
+}
+.models-table td.c-model {
+	min-width: 16em;
+}
+.models-table th.c-model {
+	min-width: 16em;
+}
+.models-table td.c-actions {
+	white-space: nowrap;
+}
+.colpick {
+	position: relative;
+	display: inline-block;
+}
+.colpick-panel {
+	position: absolute;
+	top: 100%;
+	right: 0;
+	z-index: 10;
+	min-width: 150px;
+	background: var(--vscode-menu-background, var(--vscode-editor-background));
+	border: 1px solid var(--vscode-menu-border, var(--vscode-panel-border));
+	border-radius: 8px;
+	padding: 6px;
+	box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+}
+.colpick-item {
+	flex-direction: row;
+	align-items: center;
+	gap: 6px;
+	margin: 0;
+	padding: 3px 6px;
+	font-size: 0.85em;
+	cursor: pointer;
+	border-radius: 4px;
+	white-space: nowrap;
+}
+.colpick-item:hover {
+	background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.1));
+}
+.prov-foot {
+	display: flex;
+	justify-content: flex-end;
+	margin-top: 10px;
+}
+button.ghost {
+	background: transparent;
+	color: var(--vscode-textLink-foreground);
+	border: 1px solid transparent;
+	padding: 3px 10px;
+	font-size: 0.85em;
+}
+button.ghost:hover {
+	background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.12));
+}
+button.ghost.danger {
+	color: var(--vscode-errorForeground);
+}
+button.link {
+	background: none;
+	border: none;
+	color: var(--vscode-textLink-foreground);
+	cursor: pointer;
+	font-size: 0.85em;
+	padding: 8px 0 0;
+}
+button.link:hover {
+	text-decoration: underline;
 }

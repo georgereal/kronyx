@@ -1,0 +1,74 @@
+:root { --line: var(--vscode-panel-border, rgba(128,128,128,0.25)); }
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body { font: 13px var(--vscode-font-family); color: var(--vscode-foreground); display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+
+#hdr { display: flex; align-items: center; gap: 10px; padding: 8px 14px; border-bottom: 1px solid var(--line); flex: none; }
+#hdr-icon { color: #7c9eff; font-size: 16px; }
+.hdr-status { font-weight: 600; }
+.chip { font-size: 11px; padding: 2px 8px; border: 1px solid var(--line); border-radius: 10px; opacity: 0.85; }
+.mono { font-family: var(--vscode-editor-font-family, monospace); }
+.pr { color: #7c9eff; text-decoration: none; font-size: 12px; }
+.pr:hover { text-decoration: underline; }
+
+#split { flex: 1; display: flex; min-height: 0; }
+#left { flex: 1; display: flex; flex-direction: column; min-width: 0; border-right: 1px solid var(--line); }
+.timeline { flex: 1; overflow-y: auto; padding: 10px 14px; display: flex; flex-direction: column; gap: 6px; }
+.empty { color: var(--vscode-descriptionForeground); padding: 30px 0; text-align: center; }
+.step { padding: 4px 6px; border-radius: 4px; display: flex; gap: 8px; align-items: baseline; font-size: 12.5px; line-height: 1.5; }
+.step.tool { font-family: var(--vscode-editor-font-family, monospace); font-size: 11.5px; opacity: 0.85; }
+.step.failed { color: var(--vscode-errorForeground, #f14c4c); }
+.step.cloud { color: #7c9eff; }
+.tool-args { opacity: 0.6; overflow: hidden; text-overflow: ellipsis; }
+.file-path { font-family: var(--vscode-editor-font-family, monospace); color: #4caf50; }
+.md p:first-child { margin-top: 0; }
+.md p:last-child { margin-bottom: 0; }
+.md code { font-size: 0.9em; }
+.md pre { background: rgba(128,128,128,0.12); padding: 8px; border-radius: 4px; overflow-x: auto; }
+
+#composer { flex: none; border-top: 1px solid var(--line); padding: 8px 10px; }
+#composer textarea { width: 100%; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, var(--line)); border-radius: 4px; padding: 6px; font: inherit; resize: none; }
+.bar { display: flex; margin-top: 6px; }
+.spacer { flex: 1; }
+#send, #stop { border: none; border-radius: 4px; padding: 3px 12px; cursor: pointer; background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+#stop { background: var(--vscode-errorForeground, #f14c4c); }
+
+#right { width: 42%; min-width: 260px; display: flex; flex-direction: column; }
+#tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--line); flex: none; }
+.tab { border: none; background: transparent; color: var(--vscode-foreground); padding: 7px 14px; cursor: pointer; opacity: 0.6; font-size: 12px; border-bottom: 2px solid transparent; }
+.tab.active { opacity: 1; border-bottom-color: #7c9eff; }
+.pane { display: none; flex: 1; overflow-y: auto; padding: 8px; font-size: 12px; }
+.pane.active { display: block; }
+.pane-empty { color: var(--vscode-descriptionForeground); padding: 20px 10px; }
+.file-row { padding: 4px 6px; font-family: var(--vscode-editor-font-family, monospace); font-size: 11.5px; border-bottom: 1px solid var(--line); }
+.diff-block { margin-bottom: 14px; }
+.diff-file { font-weight: 600; font-size: 11px; padding: 4px 0; }
+.diff-body { background: rgba(128,128,128,0.1); padding: 8px; border-radius: 4px; overflow-x: auto; font-size: 11px; white-space: pre; }
+.shell-line { font-family: var(--vscode-editor-font-family, monospace); font-size: 11.5px; padding: 2px 0; color: #7c9eff; }
+.shell-out { font-family: var(--vscode-editor-font-family, monospace); font-size: 11px; padding: 2px 0 6px; opacity: 0.7; white-space: pre-wrap; }
+
+/* ---------- setup checklist ---------- */
+.step.setup { font-size: 12px; }
+.step.setup .setup-mark { width: 16px; flex: none; color: #4caf50; }
+.step.setup.fail .setup-mark { color: #f14c4c; }
+.step.setup .setup-detail { margin-left: auto; font-size: 11px; }
+
+/* ---------- setup status chip ---------- */
+.setupchip { margin-left: auto; border: 1px solid var(--line); background: transparent; color: var(--vscode-foreground); border-radius: 10px; font-size: 11px; padding: 3px 10px; cursor: pointer; }
+.setupchip.ok { color: #4caf50; }
+.setupchip.warn { color: #e8a13f; border-color: #e8a13f; }
+.setupmenu { position: absolute; top: 36px; right: 12px; z-index: 20; min-width: 240px; background: var(--vscode-menu-background, #252526); border: 1px solid var(--line); border-radius: 6px; padding: 6px; box-shadow: 0 4px 16px rgba(0,0,0,0.4); }
+.setup-row { display: flex; align-items: center; gap: 8px; padding: 5px 6px; font-size: 12px; }
+.setup-row .setup-mark { width: 14px; color: #4caf50; }
+.setup-row.fail .setup-mark { color: #f14c4c; }
+.setup-row .setup-l { flex: 1; }
+.setup-fix { border: none; border-radius: 3px; font-size: 11px; padding: 2px 8px; cursor: pointer; background: var(--vscode-button-secondaryBackground, #3a3d41); color: #fff; }
+.setup-fix:empty { display: none; }
+
+/* ---------- github enablement card ---------- */
+.ghcard { border: 1px solid #e8a13f55; border-radius: var(--radius); padding: 12px 14px; margin: 10px 0; background: rgba(232,161,63,0.06); }
+.ghcard-title { font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+.ghcard-hint { font-size: 11.5px; margin-bottom: 10px; }
+.ghcard-actions { display: flex; gap: 8px; }
+.ghcard .btn-sm { font-size: 12px; padding: 4px 12px; border-radius: 4px; border: 1px solid var(--line); cursor: pointer; background: var(--vscode-button-background); color: #fff; }
+.ghcard .btn-sm.ghost { background: transparent; color: var(--vscode-foreground); }

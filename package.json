@@ -42,6 +42,11 @@
 		"views": {
 			"kronyx": [
 				{
+					"id": "kronyx.agentsView",
+					"name": "Agents",
+					"type": "webview"
+				},
+				{
 					"id": "kronyx.sessionView",
 					"name": "Session",
 					"type": "webview"
@@ -99,6 +104,11 @@
 				"icon": "$(add)"
 			},
 			{
+				"command": "kronyx.checkCloudSetup",
+				"title": "Check cloud setup",
+				"category": "Kronyx"
+			},
+			{
 				"command": "kronyx.newCloudSession",
 				"title": "New cloud session (E2B + PR)",
 				"category": "Kronyx",
@@ -142,6 +152,35 @@
 				"title": "Show run history",
 				"category": "Kronyx",
 				"icon": "$(history)"
+			},
+			{
+				"command": "kronyx.showUsage",
+				"title": "Show AI usage",
+				"category": "Kronyx",
+				"icon": "$(pulse)"
+			},
+			{
+				"command": "kronyx.signIn",
+				"title": "Sign in (GitHub)",
+				"category": "Kronyx",
+				"icon": "$(account)"
+			},
+			{
+				"command": "kronyx.account",
+				"title": "Account",
+				"category": "Kronyx",
+				"icon": "$(account)"
+			},
+			{
+				"command": "kronyx.signOut",
+				"title": "Sign out",
+				"category": "Kronyx"
+			},
+			{
+				"command": "kronyx.syncNow",
+				"title": "Sync usage now",
+				"category": "Kronyx",
+				"icon": "$(cloud-upload)"
 			},
 			{
 				"command": "kronyx.openSettings",
@@ -201,6 +240,26 @@
 					"command": "kronyx.showHistory",
 					"when": "view == kronyx.sessionView || view == kronyx.runViewRight",
 					"group": "navigation@2"
+				},
+				{
+					"command": "kronyx.showUsage",
+					"when": "view == kronyx.sessionView || view == kronyx.runViewRight",
+					"group": "navigation@3"
+				},
+				{
+					"command": "kronyx.newCloudSession",
+					"when": "(view == kronyx.sessionView || view == kronyx.runViewRight)",
+					"group": "navigation@4"
+				},
+				{
+					"command": "kronyx.signIn",
+					"when": "(view == kronyx.sessionView || view == kronyx.runViewRight) && !kronyx.signedIn",
+					"group": "navigation@5"
+				},
+				{
+					"command": "kronyx.account",
+					"when": "(view == kronyx.sessionView || view == kronyx.runViewRight) && kronyx.signedIn",
+					"group": "navigation@5"
 				},
 				{
 					"command": "kronyx.newTask",
@@ -287,7 +346,7 @@
 				"kronyx.sandbox.enabled": {
 					"type": "boolean",
 					"default": false,
-					"description": "Run the agent inside a sandbox. Planned \u2014 not yet enforced."
+					"description": "Run the agent inside a sandbox. Planned — not yet enforced."
 				},
 				"kronyx.sandbox.backend": {
 					"type": "string",
@@ -299,34 +358,39 @@
 						"firecracker"
 					],
 					"default": "local",
-					"description": "Sandbox backend. Planned \u2014 not yet enforced."
+					"description": "Sandbox backend. Planned — not yet enforced."
 				},
 				"kronyx.sandbox.image": {
 					"type": "string",
 					"default": "",
-					"description": "Sandbox image or snapshot to boot. Planned \u2014 not yet enforced."
+					"description": "Sandbox image or snapshot to boot. Planned — not yet enforced."
 				},
 				"kronyx.sandbox.cpus": {
 					"type": "number",
 					"default": 2,
 					"minimum": 1,
-					"description": "vCPUs for the sandbox. Planned \u2014 not yet enforced."
+					"description": "vCPUs for the sandbox. Planned — not yet enforced."
 				},
 				"kronyx.sandbox.memoryMb": {
 					"type": "number",
 					"default": 4096,
 					"minimum": 256,
-					"description": "Memory in MB for the sandbox. Planned \u2014 not yet enforced."
+					"description": "Memory in MB for the sandbox. Planned — not yet enforced."
 				},
 				"kronyx.sandbox.host": {
 					"type": "string",
 					"default": "",
-					"description": "Remote runner service URL for microVM backends (Firecracker needs Linux/KVM). Planned \u2014 not yet enforced."
+					"description": "Remote runner service URL for microVM backends (Firecracker needs Linux/KVM). Planned — not yet enforced."
 				},
 				"kronyx.sandbox.vendor": {
 					"type": "string",
 					"default": "",
-					"description": "MicroVM vendor/provider identifier for the remote runner. Planned \u2014 not yet enforced."
+					"description": "MicroVM vendor/provider identifier for the remote runner. Planned — not yet enforced."
+				},
+				"kronyx.cloud.pauseAfterRunMin": {
+					"type": "number",
+					"default": 12,
+					"description": "Minutes to wait after a cloud run finishes before pausing its sandbox (cancels if a new task starts)"
 				},
 				"kronyx.cloud.idleTimeoutMin": {
 					"type": "number",
@@ -338,6 +402,21 @@
 					"type": "boolean",
 					"default": true,
 					"description": "Push the branch and open/update a GitHub PR when a cloud run finishes."
+				},
+				"kronyx.cloud.template": {
+					"type": "string",
+					"default": "",
+					"description": "E2B template id/name for cloud sandboxes (blank = base image)."
+				},
+				"kronyx.cloud.ttlMinutes": {
+					"type": "number",
+					"default": 60,
+					"description": "Sandbox lifetime cap in minutes."
+				},
+				"kronyx.cloud.idlePauseMinutes": {
+					"type": "number",
+					"default": 10,
+					"description": "Beta-pause the sandbox after this many idle minutes (auto-resumes on next run). 0 disables."
 				},
 				"kronyx.cloud.defaultBase": {
 					"type": "string",
@@ -436,6 +515,21 @@
 					"type": "boolean",
 					"default": false,
 					"description": "Apply file changes without asking."
+				},
+				"kronyx.sync.enabled": {
+					"type": "boolean",
+					"default": false,
+					"description": "Upload usage records to the Kronyx dashboard when signed in."
+				},
+				"kronyx.sync.providerKeys": {
+					"type": "boolean",
+					"default": false,
+					"description": "Sync provider API keys to your Kronyx account for use on other devices. Keys are stored on our servers — enable only if you accept that."
+				},
+				"kronyx.sync.endpoint": {
+					"type": "string",
+					"default": "http://localhost:3000",
+					"description": "Base URL of the Kronyx web app (ingest API lives at /api/ingest). Change to your deployed app URL in production."
 				}
 			}
 		}
@@ -466,6 +560,8 @@
 		"@cline/agents": "^0.2.0",
 		"@cline/shared": "^0.2.0",
 		"@opentelemetry/api": "~1.10.0",
+		"@types/better-sqlite3": "^9.6.0",
+		"better-sqlite3": "^13.0.3",
 		"diff": "9.0.0",
 		"e2b": "^2.62.0",
 		"sql.js": "^1.15.2"

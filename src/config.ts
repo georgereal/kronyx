@@ -209,6 +209,15 @@ export interface ModelOption {
 	reasoning?: string[];
 }
 
+/** Per-token USD pricing for a model, from the profile's cached catalog or configured models. */
+export function modelPricing(modelId: string, profile?: ProviderProfile): { input?: number; output?: number } | undefined {
+	return (
+		profile?.models?.find((m) => m.id === modelId)?.pricing ??
+		configuredModels().find((m) => m.id === modelId)?.pricing ??
+		profiles().flatMap((p) => p.models ?? []).find((m) => m.id === modelId)?.pricing
+	);
+}
+
 export function configuredModels(): ModelOption[] {
 	return vscode.workspace.getConfiguration("kronyx").get<ModelOption[]>("provider.models", []);
 }

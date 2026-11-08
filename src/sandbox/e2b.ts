@@ -26,9 +26,56 @@ async function apiKey(secrets: vscode.SecretStorage): Promise<string | undefined
  */
 export class E2bSandbox {
 	private sandbox: Sandbox | undefined;
+	private idleTimer: ReturnType<typeof setTimeout> | undefined;
+	private onPause: (() => void) | undefined;
+	/** Lifecycle reporter — cloudController wires this to insertSandboxEvent. */
+	onLifecycle: ((event: string, sandboxId: string) => void) | undefined;
+	private report(event: string): void {
+		const id = this.sandboxId;
+		if (id) this.onLifecycle?.(event, id);
+	}
+
+	/** Called when the sandbox is about to be beta-paused (idle hot-load). */
+	setPauseHook(fn: () => void): void {
+		this.onPause = fn;
+	}
+
+	/** E2B template override from settings; "" = base image. */
+	private template(): string {
+		return vscode.workspace.getConfiguration("kronyx").get<string>("cloud.template", "");
+	}
+
+	private armIdlePause(): void {
+		clearTimeout(this.idleTimer);
+		const minutes = vscode.workspace.getConfiguration("kronyx").get<number>("cloud.idlePauseMinutes", 10);
+		if (minutes <= 0) return;
+		this.idleTimer = setTimeout(() => {
+			void this.pause().then((ok) => ok && this.onPause?.());
+		}, minutes * 60_000);
+	}
+
+	/** Pause the sandbox (snapshot filesystem/memory); resumes via connect(). */
+	async pause(): Promise<boolean> {
+		if (!this.sandbox) return false;
+		const id = this.sandboxId;
+		if (!id) return false;
+		try {
+			const ok = await Sandbox.betaPause(id);
+			if (ok) {
+				this.onLifecycle?.("pause", id);
+				this.sandbox = undefined;
+			}
+			return ok;
+		} catch {
+			return false;
+		}
+	}
 
 	async ensure(secrets: vscode.SecretStorage): Promise<Sandbox> {
-		if (this.sandbox) return this.sandbox;
+		if (this.sandbox) {
+			this.armIdlePause();
+			return this.sandbox;
+		}
 		const key = await apiKey(secrets);
 		if (!key) {
 			const entered = await vscode.window.showInputBox({
@@ -39,11 +86,22 @@ export class E2bSandbox {
 			});
 			if (!entered) throw new Error("No E2B API key configured.");
 			await secrets.store("kronyx.sandbox.e2bApiKey", entered.trim());
-			this.sandbox = await Sandbox.create({ apiKey: entered.trim() });
+			this.sandbox = await this.create(entered.trim());
 		} else {
-			this.sandbox = await Sandbox.create({ apiKey: key });
+			this.sandbox = await this.create(key);
 		}
+		this.armIdlePause();
 		return this.sandbox;
+	}
+
+	private async create(key: string): Promise<Sandbox> {
+		const template = this.template();
+		const ttlMs = vscode.workspace.getConfiguration("kronyx").get<number>("cloud.ttlMinutes", 60) * 60_000;
+		const opts = { apiKey: key, timeoutMs: ttlMs };
+		const sbx = template ? await Sandbox.create(template, opts) : await Sandbox.create(opts);
+		this.sandbox = sbx;
+		this.report("start");
+		return sbx;
 	}
 
 	/** Upload workspace files (text, capped) into the sandbox work dir. */
@@ -72,6 +130,8 @@ export class E2bSandbox {
 	}
 
 	async close(): Promise<void> {
+		clearTimeout(this.idleTimer);
+		this.report("stop");
 		await this.sandbox?.kill().catch(() => {});
 		this.sandbox = undefined;
 	}
@@ -80,10 +140,12 @@ export class E2bSandbox {
 		return (this.sandbox as unknown as { sandboxId?: string })?.sandboxId;
 	}
 
-	/** Reconnect to an existing sandbox by id; returns null if it's gone. */
+	/** Reconnect to a running or paused sandbox by id (auto-resumes); null if gone. */
 	async connect(id: string): Promise<Sandbox | null> {
 		try {
 			this.sandbox = await Sandbox.connect(id);
+			this.report("resume");
+			this.armIdlePause();
 			return this.sandbox;
 		} catch {
 			this.sandbox = undefined;

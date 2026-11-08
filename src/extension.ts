@@ -1,3 +1,4 @@
+import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import type { AgentMode, RunDigest } from "./agent/runner";
@@ -7,20 +8,27 @@ import { RunViewProvider } from "./ui/runViewProvider";
 import { renderPage } from "./ui/pageHtml";
 import { SessionController } from "./ui/sessionController";
 import { initLog, log } from "./log";
-import { refreshUserConfig, saveUserConfig, seedUserConfig, userConfigDir } from "./userConfig";
+import { refreshUserConfig, saveUserConfig, seedUserConfig, setUserConfigSavedListener, userConfigDir } from "./userConfig";
+import { SettingsSync, deviceName, getDeviceId } from "./settingsSync";
 import { loadSuite, runSuite, writeReport } from "./evals";
-import { appendEvent, clearEvents, insertRun, insertTranscript, insertUsage, kvGet, kvSet, listEvents, listRuns, listTranscripts, latestSession, openStore, setStorageDir, setWasmDir, storeError } from "./store";
+import { appendEvent, clearEvents, insertApiCall, insertRun, insertTranscript, insertUsage, kvGet, kvSet, listEvents, listRuns, listTranscripts, latestSession, openStore, refreshStore, migrateLegacyStore, setStorageDir, setWasmDir, storeError } from "./store";
 import { RunLock, type SessionDeps } from "./ui/sessionController";
 import { RunComments } from "./ui/comments";
 import { DiffReview, ORIGINAL_SCHEME } from "./ui/diffReview";
 import { focusSessionPanel, openCloudSessionPanel, openSessionPanel, registerSessionSerializer } from "./ui/sessionPanel";
+import { AgentsView } from "./ui/agentsView";
+import { checkCloudSetup } from "./ui/cloudController";
 import { openSettingsPage, openSettingsWindow, setProviderSavedListener } from "./ui/settingsPage";
+import { openUsagePage } from "./ui/usagePage";
+import { currentUser, handleAuthUri, onAuthChanged, signIn, signOut, webAppUrl } from "./auth";
+import { UsageSync } from "./sync";
 
 const MODE_STATE_KEY = "kronyx.mode";
 const MODELS_CACHE_KEY = "kronyx.modelsCache";
 const HISTORY_KEY = "kronyx.history";
 const KNOWN_MODEL_KEY = "kronyx.knownModel";
 let pendingGate: string | undefined; // prior model to restore if a gated eval run fails
+let syncWorker: UsageSync | undefined; // usage sync worker (set in activate)
 let sidebarController: SessionController | undefined; // the canonical right-sidebar session
 let rightController: SessionController | undefined; // the session in the dedicated right window
 let gateSuppressed = false; // set briefly while reverting modelId
@@ -39,6 +47,8 @@ export function activate(context: vscode.ExtensionContext): void {
 	}
 	const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
 	status.command = "kronyx.focus";
+	const accountStatus = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 49);
+	accountStatus.command = "kronyx.account";
 	// Reveal the dedicated right-sidebar Kronyx window on activation.
 	setTimeout(() => void vscode.commands.executeCommand(`${RunViewProvider.rightViewId}.focus`), 800);
 	setStatus(status, "idle");
@@ -48,7 +58,7 @@ export function activate(context: vscode.ExtensionContext): void {
 		.getConfiguration("kronyx")
 		.get<AgentMode>("agent.defaultMode", "code");
 
-	const storeRoot = Promise.resolve(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath);
+	const storeRoot = Promise.resolve(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? context.globalStorageUri.fsPath);
 	void refreshUserConfig().then(() => {
 		const config = vscode.workspace.getConfiguration("kronyx");
 		void seedUserConfig({
@@ -64,7 +74,24 @@ export function activate(context: vscode.ExtensionContext): void {
 	void storeRoot.then(async (root) => {
 		const d = await openStore(root ?? context.globalStorageUri.fsPath);
 		output.appendLine(d ? `[store] opened ${context.globalStorageUri.fsPath}/kronyx.db` : `[store] FAILED: ${storeError()}`);
+		// Import rows from legacy per-workspace stores into the shared profile db.
+		for (const f of [path.join(root ?? "", ".kronyx", "kronyx.db"), path.join(os.homedir(), ".kronyx", "kronyx.db")]) {
+			try { migrateLegacyStore(f); } catch { /* best-effort */ }
+		}
 	});
+
+	// Usage sync: local-first ledger + burst upload when signed in.
+	syncWorker = new UsageSync(context, async () => {
+		const root = await storeRoot;
+		return openStore(root ?? context.globalStorageUri.fsPath);
+	});
+	context.subscriptions.push(syncWorker);
+
+	// Cross-device settings sync: push on config writes, pull on sign-in.
+	const settingsSync = new SettingsSync(context);
+	context.subscriptions.push(settingsSync);
+	setUserConfigSavedListener(() => settingsSync.schedulePush());
+	void refreshUserConfig().then(() => settingsSync.pull());
 
 	// Background index on activation when embeddings are configured (incremental, no-op when current).
 	void (async () => {
@@ -76,6 +103,33 @@ export function activate(context: vscode.ExtensionContext): void {
 	})();
 	const diffReview = new DiffReview();
 	const comments = new RunComments();
+	// Reflect sign-in state in the context key, status bar, and all webview surfaces.
+	const applyAuthState = async (user: Awaited<ReturnType<typeof currentUser>>): Promise<void> => {
+		const signedIn = !!user;
+		await vscode.commands.executeCommand("setContext", "kronyx.signedIn", signedIn);
+		accountStatus.text = signedIn ? `$(account) ${user!.email ?? user!.name ?? "account"}` : "$(account) Sign in";
+		accountStatus.show();
+		deps.viewState = { ...deps.viewState, signedIn, userEmail: user?.email };
+		for (const surface of deps.surfaces) surface.setState(deps.viewState);
+	};
+	onAuthChanged((user) => {
+		void applyAuthState(user);
+		if (user) void settingsSync.pull().then(() => settingsSync.push());
+	});
+	void currentUser(context).then(applyAuthState);
+	// Soft-required onboarding: one-time prompt on first activation when signed out.
+	void (async () => {
+		if (context.globalState.get("kronyx.onboarded")) return;
+		const user = await currentUser(context);
+		if (user) return;
+		const pick = await vscode.window.showInformationMessage(
+			"Connect your Kronyx account to sync usage and settings across devices.",
+			"Sign in",
+			"Skip",
+		);
+		await context.globalState.update("kronyx.onboarded", true);
+		if (pick === "Sign in") void vscode.commands.executeCommand("kronyx.signIn");
+	})();
 	const deps: SessionDeps = {
 		context,
 		output,
@@ -99,6 +153,16 @@ export function activate(context: vscode.ExtensionContext): void {
 				if (root) void openStore(root).then((d) => insertUsage(d, entry, root));
 			});
 		},
+		recordApiCall: (call) => {
+			void (async () => {
+				const root = await storeRoot;
+				if (!root) return;
+				const d = await openStore(root);
+				insertApiCall(d, { ...call, device: deviceName(), deviceId: await getDeviceId(context) }, root);
+				syncWorker?.kick();
+			})();
+			return -1; // row insert is async; callers don't depend on the id
+		},
 		saveDigest: (session, digests) => {
 			void storeRoot.then((root) => {
 				if (root) void openStore(root).then((d) => kvSet(d, `digest:${session}`, digests));
@@ -117,14 +181,22 @@ export function activate(context: vscode.ExtensionContext): void {
 			const root = await storeRoot;
 			return root ? (listTranscripts(await openStore(root), session, root) as unknown as PriorTranscript[]) : [];
 		},
-		persistEvent: (session, event) => {
+		persistEvent: (session, event, runId) => {
 			void storeRoot.then((root) => {
-				if (root) void openStore(root).then((d) => appendEvent(d, session, event, root));
+				if (root) void openStore(root).then((d) => appendEvent(d, session, event, root, runId));
 			});
 		},
 		loadEvents: async (session) => {
 			const root = await storeRoot;
-			return root ? (listEvents(await openStore(root), session, root) as Parameters<RunViewProvider["post"]>[0][]) : [];
+			if (!root) return [];
+			await refreshStore().catch(() => {});
+			const d = await openStore(root);
+			// Root-scoped first; fall back to session-only if nothing matched
+			// (rows written under a different root column or empty root).
+			const scoped = listEvents(d, session, root) as Parameters<RunViewProvider["post"]>[0][];
+			const all = listEvents(d, session) as Parameters<RunViewProvider["post"]>[0][];
+			output.appendLine(`[store] loadEvents "${session}" — scoped(root=${root})=${scoped.length}, session-only=${all.length}`);
+			return scoped.length ? scoped : all;
 		},
 		clearEvents: (session) => {
 			void storeRoot.then((root) => {
@@ -132,6 +204,7 @@ export function activate(context: vscode.ExtensionContext): void {
 			});
 		},
 		setStatus: (state) => setStatus(status, state),
+		syncSettings: () => settingsSync.pull(),
 		refreshModels: () => refreshModels(),
 	};
 
@@ -328,6 +401,8 @@ export function activate(context: vscode.ExtensionContext): void {
 			}
 		}),
 		registerSessionSerializer(context, deps),
+		// Devin-style Agents sidebar: live sessions + recent runs with cloud links.
+		vscode.window.registerWebviewViewProvider(AgentsView.viewId, new AgentsView(deps)),
 		// Session webview provider — registered for both the left activity-bar view and the dedicated right-sidebar container.
 		...["kronyx.sessionView", RunViewProvider.rightViewId].map((viewId) =>
 			vscode.window.registerWebviewViewProvider(viewId, {
@@ -352,9 +427,7 @@ export function activate(context: vscode.ExtensionContext): void {
 						});
 						surface.attach(view.webview);
 						surface.setState({ mode: deps.modeRef.current, modelId: deps.viewState.modelId, models: deps.viewState.models });
-						const events = await deps.loadEvents(name);
-						events.forEach((e) => surface.post(e));
-						output.appendLine(`[store] ${viewId} restored "${name}" with ${events.length} event(s)`);
+						output.appendLine(`[store] ${viewId} resolved session "${name}"`);
 						view.onDidDispose(() => {
 							deps.surfaces.delete(surface);
 							if (sidebarController === controller) sidebarController = undefined;
@@ -393,7 +466,18 @@ export function activate(context: vscode.ExtensionContext): void {
 			log("cmd", "kronyx.newSession — opening session tab");
 			return openSessionPanel(context, deps);
 		}),
-		vscode.commands.registerCommand("kronyx.newCloudSession", () => openCloudSessionPanel(context, deps)),
+		vscode.commands.registerCommand("kronyx.openSession", (name: string) => {
+			log("cmd", `openSession "${name}"`);
+			openSessionPanel(context, deps, name);
+		}),
+		vscode.commands.registerCommand("kronyx.checkCloudSetup", () => checkCloudSetup(context)),
+		vscode.commands.registerCommand("kronyx.newCloudSession", (task?: string) =>
+			// Devin-style: a dedicated agent window — flag consumed by the new
+			// window's extension host on activation (see below).
+			void context.globalState
+				.update("kronyx.cloudLaunch", { task: task ?? null, at: Date.now() })
+				.then(() => vscode.commands.executeCommand("workbench.action.newWindow")),
+		),
 		vscode.commands.registerCommand("kronyx.openSettings", () =>
 			vscode.commands.executeCommand("workbench.action.openSettings", "@ext:kronyx.kronyx"),
 		),
@@ -402,6 +486,50 @@ export function activate(context: vscode.ExtensionContext): void {
 			openSettingsPage(context);
 		}),
 		vscode.commands.registerCommand("kronyx.openSettingsWindow", () => void openSettingsWindow(context)),
+		vscode.commands.registerCommand("kronyx.showUsage", () => openUsagePage(context)),
+		vscode.commands.registerCommand("kronyx.account", async () => {
+			const user = await currentUser(context);
+			if (!user) return void vscode.commands.executeCommand("kronyx.signIn");
+			const pick = await vscode.window.showQuickPick(
+				[
+					{ label: `$(account) ${user.email ?? user.name ?? user.uid}`, kind: vscode.QuickPickItemKind.Separator },
+					{ label: "$(dashboard) Open dashboard", id: "dashboard" },
+					{ label: "$(cloud-upload) Sync usage now", id: "sync" },
+					{ label: "$(sign-out) Sign out", id: "signout" },
+				],
+				{ title: `Kronyx account` },
+			);
+			const item = pick as ({ id?: string } & vscode.QuickPickItem) | undefined;
+			if (item?.id === "dashboard" && webAppUrl()) void vscode.env.openExternal(vscode.Uri.parse(webAppUrl()));
+			if (item?.id === "sync") void vscode.commands.executeCommand("kronyx.syncNow");
+			if (item?.id === "signout") void vscode.commands.executeCommand("kronyx.signOut");
+		}),
+		vscode.commands.registerCommand("kronyx.signIn", async () => {
+			const user = await signIn(context);
+			if (user) {
+				void vscode.window.showInformationMessage(`Kronyx: signed in as ${user.email ?? user.uid}`);
+				syncWorker?.resume();
+			}
+		}),
+		vscode.window.registerUriHandler({
+			handleUri: (uri) => {
+				void handleAuthUri(context, uri).then((user) => user && syncWorker?.resume());
+			},
+		}),
+		vscode.commands.registerCommand("kronyx.signOut", async () => {
+			await signOut(context);
+			void vscode.window.showInformationMessage("Kronyx: signed out.");
+		}),
+		vscode.commands.registerCommand("kronyx.syncNow", async () => {
+			const user = await currentUser(context);
+			if (!user) {
+				const pick = await vscode.window.showInformationMessage("Kronyx: sign in first to sync usage.", "Sign in");
+				if (pick === "Sign in") void vscode.commands.executeCommand("kronyx.signIn");
+				return;
+			}
+			await syncWorker?.flush();
+			void vscode.window.showInformationMessage("Kronyx: usage sync attempted (see Kronyx output for details).");
+		}),
 		vscode.commands.registerCommand("kronyx.showHistory", async () => {
 			const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 			const db = root ? await openStore(root) : undefined;
@@ -453,6 +581,16 @@ export function activate(context: vscode.ExtensionContext): void {
 			if (event.affectsConfiguration("kronyx.provider")) void refreshModels();
 		}),
 	);
+
+	// Dedicated cloud window: if this activation was launched by
+	// kronyx.newCloudSession (flag is fresh), boot straight into the cloud page.
+	void (async () => {
+		const launch = context.globalState.get<{ task?: string | null; at?: number }>("kronyx.cloudLaunch");
+		if (launch?.at && Date.now() - launch.at < 30_000) {
+			await context.globalState.update("kronyx.cloudLaunch", undefined);
+			setTimeout(() => openCloudSessionPanel(context, deps, launch.task ?? undefined), 600);
+		}
+	})();
 
 	setProviderSavedListener(() => void refreshModels());
 	void refreshModels();

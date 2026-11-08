@@ -36,6 +36,12 @@ export function userConfig(): UserProviderConfig {
 	return cached ?? {};
 }
 
+/** Fired after every saveUserConfig write — extension wires this to settings sync. */
+export let onUserConfigSaved: (() => void) | undefined;
+export function setUserConfigSavedListener(fn: () => void): void {
+	onUserConfigSaved = fn;
+}
+
 export async function saveUserConfig(patch: UserProviderConfig): Promise<void> {
 	const base = await refreshUserConfig();
 	cached = { ...base, ...patch };
@@ -43,6 +49,7 @@ export async function saveUserConfig(patch: UserProviderConfig): Promise<void> {
 	const tmp = `${userConfigPath()}.tmp`;
 	await fs.writeFile(tmp, JSON.stringify(cached, null, 2));
 	await fs.rename(tmp, userConfigPath());
+	onUserConfigSaved?.();
 }
 
 /** Seed the shared file from existing settings values (called once at activation). */
