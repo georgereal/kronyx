@@ -57,6 +57,7 @@ export async function runSuite(
 			isDirty: () => false,
 			confirmWrite: async () => true,
 			currentMode: () => "bypass",
+			planDir: `${root}/.kronyx/plans`,
 			emit: (event) => {
 				if (event.type === "run-finished") {
 					status = event.status;

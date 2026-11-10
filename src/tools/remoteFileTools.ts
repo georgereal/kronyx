@@ -10,18 +10,27 @@ interface EditInput {
 	replace_all?: boolean;
 }
 
+export interface RemoteToolOptions {
+	/** Absolute directory for save_plan output; defaults to "<workdir>/.kronyx/plans". */
+	planDir?: string;
+}
+
 /**
  * File tools that execute inside an E2B sandbox: reads/writes via the files
  * API, edits by fetching the file and applying the local matching engine.
  */
-export function createRemoteFileTools(sandbox: Sandbox, workdir: string): AgentTool<any, string>[] {
+export function createRemoteFileTools(sandbox: Sandbox, workdir: string, opts: RemoteToolOptions = {}): AgentTool<any, string>[] {
 	const run = async (command: string): Promise<{ exitCode: number; stdout: string; stderr: string }> => {
 		const r = await sandbox.commands.run(command, { cwd: workdir, timeoutMs: 60_000 });
 		return { exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr };
 	};
 
+	// Agents sometimes pass absolute paths — resolve them instead of
+	// double-prefixing workdir ("/home/user/repo//home/user/repo/x" → 404).
+	const abs = (rel: string): string => (rel.startsWith("/") ? rel : `${workdir}/${rel}`);
+
 	const readText = async (rel: string): Promise<string> => {
-		const content = await sandbox.files.read(`${workdir}/${rel}`).catch(() => {
+		const content = await sandbox.files.read(abs(rel)).catch(() => {
 			throw new Error(`File not found or unreadable: ${rel}`);
 		});
 		if (content.length > MAX_FILE_BYTES) throw new Error(`${rel} is larger than 2 MB.`);
@@ -30,12 +39,12 @@ export function createRemoteFileTools(sandbox: Sandbox, workdir: string): AgentT
 
 	const writeText = async (rel: string, text: string): Promise<boolean> => {
 		const existed = await exists(rel);
-		await sandbox.files.write(`${workdir}/${rel}`, text);
+		await sandbox.files.write(abs(rel), text);
 		return existed;
 	};
 
 	const exists = async (rel: string): Promise<boolean> => {
-		const r = await run(`test -e "${rel}"`);
+		const r = await run(`test -e "${abs(rel)}"`);
 		return r.exitCode === 0;
 	};
 
@@ -261,5 +270,26 @@ export function createRemoteFileTools(sandbox: Sandbox, workdir: string): AgentT
 		},
 	};
 
-	return [readFile, writeFile, editFile, appendFile, insertLines, listFiles, searchFiles, runCommand];
+	const savePlan: AgentTool<{ slug: string; plan: string }, string> = {
+		name: "save_plan",
+		description:
+			"Save the implementation plan to <planDir>/<slug>.md. Only usable in Plan mode. Ends the planning phase — the user reviews the plan and starts implementation.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				slug: { type: "string", description: "Short kebab-case file name (no extension)." },
+				plan: { type: "string", description: "The full plan as markdown." },
+			},
+			required: ["slug", "plan"],
+		},
+		async execute(input) {
+			const slug = String(input.slug || "plan").replace(/[^\w-]+/g, "-").slice(0, 60) || "plan";
+			const dir = (opts.planDir ?? `${workdir}/.kronyx/plans`).replace(/\/+$/, "");
+			await sandbox.commands.run(`mkdir -p ${JSON.stringify(dir)}`);
+			await sandbox.files.write(`${dir}/${slug}.md`, input.plan);
+			return `Saved plan to ${dir}/${slug}.md — share it with the user and stop.`;
+		},
+	};
+
+	return [readFile, writeFile, editFile, appendFile, insertLines, listFiles, searchFiles, runCommand, savePlan];
 }

@@ -84,7 +84,7 @@ async function collectValues(context: vscode.ExtensionContext): Promise<Record<s
 			"sandbox.vendor": config.get("sandbox.vendor", ""),
 			"cloud.autoPr": config.get("cloud.autoPr", true),
 			"sync.enabled": config.get("sync.enabled", false),
-			"sync.providerKeys": config.get("sync.providerKeys", false),
+			"sync.providerKeys": config.get("sync.providerKeys", true),
 			"sync.endpoint": config.get("sync.endpoint", ""),
 			"cloud.defaultBase": config.get("cloud.defaultBase", "main"),
 			"cloud.idleTimeoutMin": config.get("cloud.idleTimeoutMin", 15),

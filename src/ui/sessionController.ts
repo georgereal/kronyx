@@ -6,8 +6,9 @@ import type { PriorTranscript } from "../agent/recall";
 import type { AgentMessage } from "@cline/shared";
 import { checksOnFinish, runChecks } from "../checks";
 import { E2bSandbox, sandboxBackend, sandboxEnabled } from "../sandbox/e2b";
-import { indexFile, logEpisode } from "../agent/memory";
-import { autoApproveWrites, implementPrompt, modelPricing, promptForApiKey, providerErrorMessage, readProviderSettings, resolveProvider, writeProviderValue } from "../config";
+import { appendFact, indexFile, loadMemoryContext, logEpisode } from "../agent/memory";
+import { autoApproveWrites, implementPrompt, modelPricing, planDir, promptForApiKey, providerErrorMessage, readProviderSettings, resolveProvider, writeProviderValue } from "../config";
+import { log } from "../log";
 import type { ApiCallRow } from "../store";
 import * as git from "../git";
 import type { RunComments } from "./comments";
@@ -263,6 +264,10 @@ export class SessionController {
 					vscode.workspace.textDocuments.some((doc) => doc.isDirty && doc.uri.fsPath === abs),
 				confirmWrite: (toolName, input) => this.confirmWrite(root, toolName, input),
 				currentMode: () => this.deps.modeRef.current,
+				planDir: planDir(),
+				memoryContext: (task, s) => loadMemoryContext(root, task, s),
+				onMemoryFact: (fact) => appendFact(root, fact),
+				log: (tag, message) => log(tag, message),
 				onBeforeWrite: (abs, before) => this.deps.diffReview.record(abs, before),
 				execCommand: (command) => this.execCommand(command),
 				priorTranscripts: () => this.transcripts,

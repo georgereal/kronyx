@@ -523,8 +523,8 @@
 				},
 				"kronyx.sync.providerKeys": {
 					"type": "boolean",
-					"default": false,
-					"description": "Sync provider API keys to your Kronyx account for use on other devices. Keys are stored on our servers — enable only if you accept that."
+					"default": true,
+					"description": "Sync provider API keys to your Kronyx account for use on other devices and cloud sessions. Keys are stored on our servers — disable only if you don't accept that."
 				},
 				"kronyx.sync.endpoint": {
 					"type": "string",

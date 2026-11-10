@@ -15,6 +15,6 @@ export function useUser(): User | null | undefined {
 export async function apiFetch(path: string, user: User, init: RequestInit = {}): Promise<Response> {
 	const headers = new Headers(init.headers);
 	headers.set("Authorization", `Bearer ${await user.getIdToken()}`);
-	if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+	if (init.body && !(init.body instanceof FormData) && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
 	return fetch(path, { ...init, headers });
 }

@@ -6,7 +6,7 @@ import { Skeleton } from "@/components/Skeleton";
 import { apiFetch, useUser } from "@/lib/api";
 
 interface LiveVm { sandboxId: string; templateId?: string; state?: string; startedAt?: string }
-interface Hist { sandboxId?: string; device?: string; deviceId?: string; template?: string; repo?: string; runId?: string; event?: string; at?: string }
+interface Hist { sandboxId?: string; device?: string; deviceId?: string; template?: string; repo?: string; runId?: string; event?: string; state?: string; reason?: string; sessionId?: string; at?: string }
 
 const fmt = (v?: string) => (v ? new Date(v).toLocaleString() : "—");
 
@@ -17,6 +17,7 @@ export default function SandboxesPage() {
 	const [liveEnabled, setLiveEnabled] = useState(false);
 	const [loading, setLoading] = useState(true);
 	const [msg, setMsg] = useState("");
+	const [tab, setTab] = useState<"live" | "history">("live");
 
 	const load = async () => {
 		if (!user) return;
@@ -30,16 +31,24 @@ export default function SandboxesPage() {
 	useEffect(() => { void load(); /* eslint-disable-next-line */ }, [user]);
 
 	const stop = async (id: string) => {
-		if (!user) return;
-		setMsg(`Stopping ${id.slice(0, 8)}…`);
+		if (!user || !confirm(`Kill sandbox ${id.slice(0, 12)}?`)) return;
+		setMsg(`Killing ${id.slice(0, 8)}…`);
 		const res = await apiFetch(`/api/sandboxes/${id}`, user, { method: "DELETE" });
-		setMsg(res.ok ? "Stopped." : "Stop failed.");
+		setMsg(res.ok ? "Killed." : "Kill failed.");
+		void load();
+	};
+
+	const pause = async (id: string) => {
+		if (!user) return;
+		setMsg(`Pausing ${id.slice(0, 8)}…`);
+		const res = await apiFetch(`/api/sandboxes/${id}/pause`, user, { method: "POST" });
+		setMsg(res.ok ? "Paused." : "Pause failed.");
 		void load();
 	};
 
 	if (!user) return null;
-	const devs = new Map<string, number>();
-	for (const h of history) if (h.device) devs.set(h.device, (devs.get(h.device) ?? 0) + 1);
+	const liveRows = history.filter((h) => ["active", "running", "paused"].includes(h.state ?? ""));
+	const deadRows = history.filter((h) => !["active", "running", "paused"].includes(h.state ?? ""));
 
 	return (
 		<div className="page">
@@ -47,55 +56,64 @@ export default function SandboxesPage() {
 			<div className="stat-grid" style={{ marginBottom: 20 }}>
 				<div className="card" style={{ padding: 16 }}>
 					<div className="chart-title">Live</div>
-					<div style={{ fontSize: 28, fontWeight: 700 }}>{liveEnabled ? live.length : "—"}</div>
-					<div className="muted" style={{ fontSize: 12 }}>{liveEnabled ? `${live.filter((v) => v.state === "running").length} running` : "sync E2B key for live view"}</div>
+					<div style={{ fontSize: 28, fontWeight: 700 }}>{liveRows.length}</div>
+					<div className="muted" style={{ fontSize: 12 }}>{liveRows.filter((v) => v.state !== "paused").length} running · {liveRows.filter((v) => v.state === "paused").length} paused</div>
 				</div>
-				{[...devs.entries()].map(([d, n]) => (
-					<div key={d} className="card" style={{ padding: 16 }}>
-						<div className="chart-title">{d}</div>
-						<div style={{ fontSize: 28, fontWeight: 700 }}>{n}</div>
-						<div className="muted" style={{ fontSize: 12 }}>lifecycle events</div>
-					</div>
+				<div className="card" style={{ padding: 16 }}>
+					<div className="chart-title">History</div>
+					<div style={{ fontSize: 28, fontWeight: 700 }}>{deadRows.length}</div>
+					<div className="muted" style={{ fontSize: 12 }}>dead / replaced</div>
+				</div>
+			</div>
+
+			<div className="sess-tabs" style={{ marginBottom: 14 }}>
+				{(["live", "history"] as const).map((t) => (
+					<button key={t} className={tab === t ? "active" : ""} onClick={() => setTab(t)}>
+						{t === "live" ? `Live (${liveRows.length})` : `History (${deadRows.length})`}
+					</button>
 				))}
 			</div>
 
 			{loading && <Skeleton height={200} />}
-			{!loading && live.length === 0 && history.length === 0 && <Empty>No sandboxes yet — start a cloud run.</Empty>}
+			{!loading && live.length === 0 && history.length === 0 && <Empty>No sandboxes yet — start a cloud session.</Empty>}
 
-			{live.length > 0 && (
-				<div className="card table-card" style={{ marginBottom: 20 }}>
+			{tab === "live" && liveRows.length > 0 && (
+				<div className="card table-card">
 					<table>
-						<thead><tr><th>Sandbox</th><th>Template</th><th>State</th><th>Started</th><th></th></tr></thead>
+						<thead><tr><th>Sandbox</th><th>State</th><th>Session</th><th>Repo</th><th>Template</th><th>Last event</th><th></th></tr></thead>
 						<tbody>
-							{live.map((v) => {
-								const id = v.sandboxId ?? (v as unknown as { sandboxID?: string }).sandboxID ?? "";
-								return (
-								<tr key={id}>
-									<td className="mono">{id.slice(0, 16)}</td>
-									<td className="muted">{v.templateId || "base"}</td>
-									<td>{v.state ?? "running"}</td>
-									<td className="muted">{fmt(v.startedAt)}</td>
-									<td><button className="btn danger sm" onClick={() => void stop(id)}>Stop</button></td>
+							{liveRows.map((h, i) => (
+								<tr key={i}>
+									<td className="mono">{(h.sandboxId ?? "").slice(0, 16)}</td>
+									<td><span className={`sess-pill ${h.state === "paused" ? "completed" : "running"}`}>{h.state}</span></td>
+									<td className="muted mono">{h.sessionId ? <a href={`/sessions/${h.sessionId}`}>{h.sessionId.slice(0, 8)}</a> : "—"}</td>
+									<td className="muted">{h.repo || "—"}</td>
+									<td className="muted">{h.template || "base"}</td>
+									<td className="muted">{fmt(h.at)}</td>
+									<td style={{ whiteSpace: "nowrap" }}>
+										{h.state !== "paused" && <button className="btn ghost sm" onClick={() => void pause(h.sandboxId!)}>Pause</button>}{" "}
+										<button className="btn danger sm" onClick={() => void stop(h.sandboxId!)}>Kill</button>
+									</td>
 								</tr>
-								);
-							})}
+							))}
 						</tbody>
 					</table>
 				</div>
 			)}
+			{tab === "live" && !loading && liveRows.length === 0 && history.length > 0 && <Empty>No live sandboxes.</Empty>}
 
-			{history.length > 0 && (
+			{tab === "history" && deadRows.length > 0 && (
 				<div className="card table-card">
 					<table>
-						<thead><tr><th>Sandbox</th><th>Event</th><th>Device</th><th>Repo</th><th>Template</th><th>Time</th></tr></thead>
+						<thead><tr><th>Sandbox</th><th>State</th><th>Reason</th><th>Session</th><th>Repo</th><th>Time</th></tr></thead>
 						<tbody>
-							{history.map((h, i) => (
+							{deadRows.map((h, i) => (
 								<tr key={i}>
 									<td className="mono">{(h.sandboxId ?? "").slice(0, 16)}</td>
-									<td>{h.event}</td>
-									<td className="muted">{h.device || "—"}</td>
+									<td>{h.state ?? h.event ?? "—"}</td>
+									<td className="muted">{h.reason || "—"}</td>
+									<td className="muted mono">{h.sessionId ? <a href={`/sessions/${h.sessionId}`}>{h.sessionId.slice(0, 8)}</a> : h.device || "—"}</td>
 									<td className="muted">{h.repo || "—"}</td>
-									<td className="muted">{h.template || "base"}</td>
 									<td className="muted">{fmt(h.at)}</td>
 								</tr>
 							))}

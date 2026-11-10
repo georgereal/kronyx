@@ -4,7 +4,7 @@ import { AgentRunner, type AgentMode, type ProviderSettings } from "../agent/run
 import { providerErrorMessage, resolveProvider, writeProviderValue } from "../config";
 import { insertPr, insertSandboxEvent, kvGet, kvSet, openStore } from "../store";
 import { deviceName, getDeviceId } from "../settingsSync";
-import { E2bSandbox, openPr } from "../sandbox/e2b";
+import { E2bSandbox, e2bApiKey, openPr } from "../sandbox/e2b";
 import { createRemoteFileTools } from "../tools/remoteFileTools";
 import type { RunViewProvider, WebviewMessage } from "./runViewProvider";
 import type { SessionDeps } from "./sessionController";
@@ -14,6 +14,7 @@ import { log } from "../log";
 
 const REUSE_KEY = "kronyx.cloudState";
 const REPO_DIR = "/home/user/repo";
+const PLAN_DIR = "/home/user/.kronyx/plans";
 
 interface CloudState {
 	sandboxId?: string;
@@ -424,7 +425,7 @@ export class CloudController {
 			this.cloudStatus("Sandbox paused — resumes on next run");
 		});
 		const idle = idleTimeoutMin();
-		if (this.state.sandboxId && (await this.sandbox.connect(this.state.sandboxId))) {
+		if (this.state.sandboxId && (await this.sandbox.connect(this.state.sandboxId, await e2bApiKey(this.deps.context.secrets)))) {
 			await this.sandbox.keepalive(idle);
 			this.cloudStatus(`Reused warm sandbox ${this.state.sandboxId}`);
 			this.info(`Reused sandbox ${this.state.sandboxId}${this.state.branch ? ` on ${this.state.branch}` : ""}`);
@@ -481,10 +482,13 @@ export class CloudController {
 			isDirty: () => false,
 			confirmWrite: async () => true,
 			currentMode: (): AgentMode => (modeRef.current === "code" ? "smart" : modeRef.current),
+			planDir: PLAN_DIR,
+			environment: "an E2B cloud sandbox",
+			log: (tag, message) => log(tag, message),
 			createTools: () => {
-				const inner = (sbx as unknown as { sandbox?: import("e2b").Sandbox }).sandbox;
+				const inner = sbx.inner;
 				if (!inner) throw new Error("Sandbox not ready.");
-				return Promise.resolve(createRemoteFileTools(inner, REPO_DIR));
+				return Promise.resolve(createRemoteFileTools(inner, REPO_DIR, { planDir: PLAN_DIR }));
 			},
 			emit: (event) => {
 				this.surface.post(event);

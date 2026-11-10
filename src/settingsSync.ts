@@ -12,7 +12,7 @@ const SYNC_STAMP = "settings.syncedAt";
 const PUSH_DEBOUNCE_MS = 2_000;
 
 function providerKeysEnabled(): boolean {
-	return vscode.workspace.getConfiguration("kronyx").get<boolean>("sync.providerKeys", false);
+	return vscode.workspace.getConfiguration("kronyx").get<boolean>("sync.providerKeys", true);
 }
 
 /** Stable per-installation device id (uuid in globalState). */

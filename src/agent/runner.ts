@@ -1,9 +1,6 @@
 import { Agent } from "@cline/agents";
 import type { AgentMessage, AgentRuntimeEvent, AgentTool, AgentToolResultPart } from "@cline/shared";
 import { createFileTools, type FileChangeKind, WRITE_TOOL_NAMES } from "../tools/fileTools";
-import { planDir } from "../config";
-import { log } from "../log";
-import { loadMemoryContext } from "./memory";
 import { buildSystemPrompt } from "./systemPrompt";
 import { createPrepareTurn } from "./compaction";
 import { createRecallTool, type PriorTranscript } from "./recall";
@@ -59,6 +56,18 @@ export interface RunnerHost {
 	createTools?: () => Promise<AgentTool<any, string>[]>;
 	currentMode: () => AgentMode;
 	emit: (event: RunViewEvent) => void;
+	/** Directory for save_plan output; defaults to ".kronyx/plans" (relative to workspaceRoot for local tools, absolute for remote). */
+	planDir?: string;
+	/** Extra system-prompt context (memory recall); omit outside the extension. */
+	memoryContext?: (task: string, settings: ProviderSettings) => Promise<string>;
+	/** Environment descriptor for the system prompt, e.g. "the user's VS Code workspace". */
+	environment?: string;
+	/** Diagnostic sink; optional outside the extension. */
+	log?: (tag: string, message: string) => void;
+	/** Persist a durable fact for memory_write; omit outside the extension. */
+	onMemoryFact?: (fact: string) => Promise<void>;
+	/** Set false to omit the recall_context tool (e.g. tool-less ask runs). */
+	enableRecall?: boolean;
 	/** Persisted transcripts of earlier runs, exposed to the recall_context tool. */
 	priorTranscripts?: () => readonly PriorTranscript[];
 	/** Called after each run with the canonical transcript for cold-recall persistence. */
@@ -181,7 +190,8 @@ export class AgentRunner {
 						this.host.emit({ type: "file-changed", path: this.host.relativePath(abs), kind, ...stats }),
 					onBeforeWrite: this.host.onBeforeWrite,
 					execCommand: this.host.execCommand,
-					planDir,
+					planDir: this.host.planDir ? () => this.host.planDir! : undefined,
+					onMemoryFact: this.host.onMemoryFact,
 				});
 		return new Agent({
 			providerId: settings.providerId,
@@ -191,14 +201,18 @@ export class AgentRunner {
 			systemPrompt: buildSystemPrompt(
 				this.host.workspaceRoot,
 				this.host.currentMode(),
-				await loadMemoryContext(this.host.workspaceRoot, task, settings),
+				(await this.host.memoryContext?.(task, settings)) ?? "",
+				this.host.environment,
 			),
-			tools: [...tools, createRecallTool({ priorTranscripts: this.host.priorTranscripts })],
+			tools: [
+				...tools,
+				...(this.host.enableRecall === false ? [] : [createRecallTool({ priorTranscripts: this.host.priorTranscripts })]),
+			],
 			maxIterations: settings.maxIterations,
 			toolExecution: "sequential",
 			prepareTurn: createPrepareTurn({
 				contextWindow: settings.contextWindow,
-				onCompact: (s) => log("agent", `compaction ${JSON.stringify(s)}`),
+				onCompact: (s) => this.host.log?.("agent", `compaction ${JSON.stringify(s)}`),
 			}),
 			...(initialMessages?.length ? { initialMessages } : {}),
 			hooks: {
@@ -277,7 +291,10 @@ export class AgentRunner {
 			case "tool-finished": {
 				if (event.toolCall.toolName === "save_plan") {
 					const slug = String((event.toolCall.input as { slug?: string })?.slug || "plan").replace(/[^\w-]+/g, "-").slice(0, 60);
-					this.host.emit({ type: "plan-ready", path: `${planDir().replace(/\/+$/, "")}/${slug}.md` });
+					this.host.emit({
+						type: "plan-ready",
+						path: `${(this.host.planDir ?? ".kronyx/plans").replace(/\/+$/, "")}/${slug}.md`,
+					});
 				}
 				const result = event.message.content.find((part) => part.type === "tool-result") as
 					| AgentToolResultPart

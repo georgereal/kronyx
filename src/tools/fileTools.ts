@@ -18,6 +18,8 @@ export interface FileToolOptions {
 	execCommand?: (command: string) => Promise<string | null>;
 	planDir?: () => string;
 	maxReadLines?: number;
+	/** Persist a durable fact (memory_write). Absent outside the extension. */
+	onMemoryFact?: (fact: string) => Promise<void>;
 }
 
 export const WRITE_TOOL_NAMES = new Set([
@@ -335,8 +337,8 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 			required: ["fact"],
 		},
 		async execute(input) {
-			const { appendFact } = await import("../agent/memory");
-			await appendFact(options.root, input.fact);
+			if (!options.onMemoryFact) return "Memory is unavailable in this environment.";
+			await options.onMemoryFact(input.fact);
 			return "Fact recorded.";
 		},
 	};

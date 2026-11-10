@@ -62,6 +62,21 @@ export default function ConnectPage() {
 					!error && <p className="tagline-sub">Preparing your key…</p>
 				)}
 			</div>
+			<div className="card auth-card" style={{ marginTop: 16 }}>
+				<h1 style={{ fontSize: 15 }}>Connect your Git provider</h1>
+				<p className="tagline-sub" style={{ marginBottom: 14 }}>So cloud sessions can clone, push and open PRs.</p>
+				<a href="/settings" style={{ display: "block" }}>
+					<button className="btn w-full" style={{ justifyContent: "center", marginBottom: 8 }}>
+						Connect GitHub
+					</button>
+				</a>
+				<button className="btn ghost w-full" style={{ justifyContent: "center", marginBottom: 8 }} disabled title="Coming soon">
+					Connect GitLab
+				</button>
+				<button className="btn ghost w-full" style={{ justifyContent: "center" }} disabled title="Coming soon">
+					Connect Bitbucket
+				</button>
+			</div>
 		</main>
 	);
 }
