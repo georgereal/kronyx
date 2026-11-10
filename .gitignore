@@ -9,3 +9,8 @@ coverage/
 .kronyx/*
 !.kronyx/rules.md
 .revert-backup-*/
+
+# secrets
+.env
+.env.local
+.env.*.local
