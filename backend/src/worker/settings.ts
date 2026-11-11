@@ -12,6 +12,7 @@ interface Profile {
 	providerId?: string;
 	baseUrl?: string;
 	modelId?: string;
+	enabled?: boolean;
 }
 
 /** Read users/{uid}.settings — BYOK profiles + secrets synced from the editors/web. */
@@ -42,11 +43,13 @@ export function resolveProvider(
 	settings: UserSettings,
 	job: { profile?: string; modelId?: string },
 ): { settings?: ProviderSettings; error?: string } {
-	const profiles = (settings.data.profiles as Profile[] | undefined) ?? [];
+	const profiles = ((settings.data.profiles as Profile[] | undefined) ?? []).filter((p) => p.enabled !== false);
 	const name = job.profile ?? (settings.data.activeProfile as string | undefined) ?? profiles[0]?.name;
 	const profile = name ? profiles.find((p) => p.name === name) : undefined;
-	if (profiles.length > 0 && !profile) {
-		return { error: `No provider profile "${name}" — configure one in Settings → Provider.` };
+	const allProfiles = (settings.data.profiles as Profile[] | undefined) ?? [];
+	if (allProfiles.length > 0 && !profile) {
+		const disabled = name ? allProfiles.some((p) => p.name === name && p.enabled === false) : false;
+		return { error: disabled ? `Provider profile "${name}" is disabled — enable it in Settings.` : `No provider profile "${name}" — configure one in Settings → Provider.` };
 	}
 	const providerId = profile?.providerId ?? (settings.data.providerId as string | undefined) ?? "openai-compatible";
 	const baseUrl = profile?.baseUrl ?? (settings.data.baseUrl as string | undefined) ?? "";

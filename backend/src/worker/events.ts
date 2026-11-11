@@ -1,4 +1,5 @@
 import type { Db } from "mongodb";
+import { swallow } from "../lib/log";
 import type { RunViewEvent } from "../../../src/agent/runner";
 
 /**
@@ -100,7 +101,7 @@ export class RunSink {
 		await this.db
 			.collection("sessions")
 			.updateOne({ uid: this.uid, sessionId: this.sessionId }, { $set: { updatedAt: new Date() } })
-			.catch(() => {});
+			.catch(swallow("events", "op"));
 	}
 
 	async patchSession(patch: Record<string, unknown>): Promise<void> {

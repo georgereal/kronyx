@@ -201,7 +201,7 @@ export interface ModelOption {
 	tags?: string[];
 	modalities?: { input?: string[]; output?: string[] };
 	/** USD per token, as reported by the provider. */
-	pricing?: { input?: number; output?: number };
+	pricing?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
 	owner?: string;
 	releasedAt?: number;
 	knowledgeCutoff?: string;
@@ -210,11 +210,32 @@ export interface ModelOption {
 }
 
 /** Per-token USD pricing for a model, from the profile's cached catalog or configured models. */
-export function modelPricing(modelId: string, profile?: ProviderProfile): { input?: number; output?: number } | undefined {
+export function modelPricing(
+	modelId: string,
+	profile?: ProviderProfile,
+): { input?: number; output?: number; cacheRead?: number; cacheWrite?: number } | undefined {
 	return (
 		profile?.models?.find((m) => m.id === modelId)?.pricing ??
 		configuredModels().find((m) => m.id === modelId)?.pricing ??
 		profiles().flatMap((p) => p.models ?? []).find((m) => m.id === modelId)?.pricing
+	);
+}
+
+export type ModelPricing = NonNullable<ReturnType<typeof modelPricing>>;
+
+/** Estimated USD cost from catalog pricing (per-token). Undefined when pricing is unknown. */
+export function estimateCostUsd(
+	delta: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number },
+	pricing: ModelPricing | undefined,
+): number | undefined {
+	if (!pricing) return undefined;
+	const { input, output, cacheRead, cacheWrite } = pricing;
+	if ([input, output, cacheRead, cacheWrite].every((v) => v === undefined)) return undefined;
+	return (
+		(delta.inputTokens ?? 0) * (input ?? 0) +
+		(delta.outputTokens ?? 0) * (output ?? 0) +
+		(delta.cacheReadTokens ?? 0) * (cacheRead ?? input ?? 0) +
+		(delta.cacheWriteTokens ?? 0) * (cacheWrite ?? input ?? 0)
 	);
 }
 
@@ -247,7 +268,12 @@ function toModelOption(m: Record<string, unknown>): ModelOption | undefined {
 	opt.modalities = input || output ? { input, output } : undefined;
 	const inPrice = num(pricing?.input) ?? num(pricing?.prompt);
 	const outPrice = num(pricing?.output) ?? num(pricing?.completion);
-	opt.pricing = inPrice !== undefined || outPrice !== undefined ? { input: inPrice, output: outPrice } : undefined;
+	const cacheRead = num(pricing?.cache_read) ?? num(pricing?.input_cache_read) ?? num(pricing?.cached_input);
+	const cacheWrite = num(pricing?.cache_write) ?? num(pricing?.input_cache_write);
+	opt.pricing =
+		inPrice !== undefined || outPrice !== undefined || cacheRead !== undefined || cacheWrite !== undefined
+			? { input: inPrice, output: outPrice, cacheRead, cacheWrite }
+			: undefined;
 	opt.owner = typeof m.owned_by === "string" ? m.owned_by : undefined;
 	opt.releasedAt = num(m.released) ?? num(m.created);
 	opt.knowledgeCutoff = typeof m.knowledge === "string" ? m.knowledge : undefined;

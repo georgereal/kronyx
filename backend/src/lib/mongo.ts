@@ -35,12 +35,15 @@ export async function getDb(): Promise<Db> {
 	await db.collection("cloud_jobs").createIndex({ uid: 1, jobId: 1 }, { unique: true });
 	await db.collection("attachments").createIndex({ uid: 1, sessionId: 1 });
 	await db.collection("plans").createIndex({ uid: 1, sessionId: 1, slug: 1 }, { unique: true });
+	await db.collection("run_reports").createIndex({ uid: 1, runId: 1 }, { unique: true });
 	await db.collection("run_transcripts").createIndex({ uid: 1, runId: 1 }, { unique: true });
 	await db.collection("run_transcripts").createIndex({ uid: 1, sessionId: 1, savedAt: 1 });
 	await db.collection("memories").createIndex({ uid: 1, memoryId: 1 }, { unique: true });
 	await db.collection("memories").createIndex({ uid: 1, sessionId: 1, scope: 1, status: 1 });
 	await db.collection("sandboxes").createIndex({ uid: 1, sessionId: 1, at: 1 });
 	await db.collection("sandboxes").createIndex({ uid: 1, state: 1 });
+	await db.collection("sandbox_events").createIndex({ uid: 1, sandboxId: 1, at: -1 });
+	await db.collection("sandbox_events").createIndex({ uid: 1, at: -1 });
 	// Backfill: legacy event-log rows predate real state — they're all long dead.
 	await db
 		.collection("sandboxes")

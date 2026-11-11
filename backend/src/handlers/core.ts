@@ -1,3 +1,4 @@
+import { errlog, swallow } from "../lib/log";
 import { ObjectId } from "mongodb";
 import { getAuth } from "firebase-admin/auth";
 import { cert, getApps, initializeApp, type App } from "firebase-admin/app";
@@ -29,7 +30,7 @@ export async function me(req: Request): Promise<Response> {
 export async function createKey(req: Request): Promise<Response> {
 	const uid = await verifyRequest(req);
 	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
-	const body = (await req.json().catch(() => ({}))) as { label?: string };
+	const body = (await req.json().catch(swallow("core", "op", ({})))) as { label?: string };
 	const { key, id } = await mintApiKey(uid, String(body.label ?? "").slice(0, 80));
 	return json({ key, id });
 }
@@ -77,10 +78,10 @@ export async function getSettings(req: Request): Promise<Response> {
 export async function putSettings(req: Request): Promise<Response> {
 	const uid = await authenticate(req);
 	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
-	const body = (await req.json().catch(() => ({}))) as {
+	const body = (await req.json().catch(swallow("core", "op", ({})))) as {
 		version?: number;
 		data?: Record<string, unknown>;
-		secrets?: Record<string, string>;
+		secrets?: Record<string, string | null>;
 		device?: { id?: string; name?: string };
 	};
 	const now = new Date();
@@ -94,7 +95,18 @@ export async function putSettings(req: Request): Promise<Response> {
 		"settings.updatedBy": device?.id ?? "unknown",
 		"settings.data": body.data ?? {},
 	};
-	if (body.secrets) set["settings.secrets"] = body.secrets;
+	// Secrets merge over the stored map (clients send only changed keys; a
+	// null value explicitly deletes). Never wholesale-replace — blank form
+	// fields must not wipe synced secrets.
+	if (body.secrets) {
+		const doc = await db.collection<{ settings?: { secrets?: Record<string, string> } }>("users").findOne({ _id: uid as never });
+		const merged = { ...(doc?.settings?.secrets ?? {}) };
+		for (const [k, v] of Object.entries(body.secrets)) {
+			if (v === null) delete merged[k];
+			else if (v) merged[k] = v;
+		}
+		set["settings.secrets"] = merged;
+	}
 	if (device) set[`devices.${device.id}`] = { name: device.name, lastSyncAt: now };
 	await db.collection<{ _id: string }>("users").updateOne({ _id: uid }, { $set: set }, { upsert: true });
 	return json({ ok: true, updatedAt: now });
@@ -144,6 +156,12 @@ interface IncomingCall {
 	tokensOut?: number;
 	cacheRead?: number;
 	cacheWrite?: number;
+	reasoningTokens?: number;
+	billedCostUsd?: number;
+	iteration?: number;
+	contextMsgs?: number;
+	kind?: string;
+	op?: string;
 	costUsd?: number;
 	durationMs?: number;
 	session?: string;
@@ -156,7 +174,7 @@ interface IncomingCall {
 export async function ingest(req: Request): Promise<Response> {
 	const uid = await authenticate(req);
 	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
-	const body = (await req.json().catch(() => ({}))) as {
+	const body = (await req.json().catch(swallow("core", "op", ({})))) as {
 		calls?: IncomingCall[];
 		runs?: Record<string, unknown>[];
 		events?: { runId: string; seq: number }[];
@@ -188,6 +206,12 @@ export async function ingest(req: Request): Promise<Response> {
 			tokensOut: Number(c.tokensOut) || 0,
 			cacheRead: Number(c.cacheRead) || 0,
 			cacheWrite: Number(c.cacheWrite) || 0,
+			reasoningTokens: Number(c.reasoningTokens) || 0,
+			billedCostUsd: typeof c.billedCostUsd === "number" ? c.billedCostUsd : null,
+			iteration: typeof c.iteration === "number" ? c.iteration : null,
+			contextMsgs: typeof c.contextMsgs === "number" ? c.contextMsgs : null,
+			kind: c.kind ?? "chat",
+			op: c.op ?? "",
 			costUsd: typeof c.costUsd === "number" ? c.costUsd : null,
 			durationMs: Number(c.durationMs) || 0,
 			session: c.session ?? "",
@@ -199,7 +223,9 @@ export async function ingest(req: Request): Promise<Response> {
 	let inserted = 0;
 	if (docs.length) {
 		const result = await db.collection("usage_events").insertMany(docs, { ordered: false }).catch((e) => {
-			return (e as { result?: { nInserted?: number } }).result ?? { nInserted: 0 };
+			const r = (e as { result?: { nInserted?: number } }).result ?? { nInserted: 0 };
+			errlog("ingest", `usage_events bulk insert: ${r.nInserted ?? 0}/${docs.length} inserted`, e);
+			return r;
 		});
 		inserted = "insertedCount" in result ? result.insertedCount : result.nInserted ?? 0;
 	}
@@ -241,12 +267,9 @@ export async function ingest(req: Request): Promise<Response> {
 		);
 	}
 	if (sandboxes.length) {
-		await db
-			.collection("sandboxes")
-			.insertMany(sandboxes.map((s) => ({ uid, ...s, at: new Date(Number(s.at) || Date.now()), ingestedAt: now })), {
-				ordered: false,
-			})
-			.catch(() => {});
+		const docs = sandboxes.map((s) => ({ uid, ...s, at: new Date(Number(s.at) || Date.now()), ingestedAt: now }));
+		await db.collection("sandboxes").insertMany(docs, { ordered: false }).catch(swallow("core", "op"));
+		await db.collection("sandbox_events").insertMany(docs, { ordered: false }).catch(swallow("core", "op"));
 	}
 	return json({ inserted, runs: runs.length, events: events.length, prs: prs.length, sandboxes: sandboxes.length });
 }

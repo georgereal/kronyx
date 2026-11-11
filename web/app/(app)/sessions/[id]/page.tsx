@@ -6,11 +6,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Composer, type Mode } from "@/components/Composer";
 import { Timeline } from "@/components/Timeline";
 import { ProviderGate } from "@/components/ProviderGate";
-import { StatusPill } from "@/components/StatusPill";
 import { apiFetch, useUser } from "@/lib/api";
 import type { RunDoc, RunEvent, SessionDoc } from "@/lib/types";
 
-const ACTIVE = new Set(["queued", "running", "claimed"]);
+const ACTIVE = new Set(["queued", "running", "claimed", "stopping"]);
 
 interface SessionResponse {
 	session: SessionDoc;
@@ -30,6 +29,7 @@ export default function SessionView() {
 	const [modelId, setModelId] = useState("");
 	const [modelProfile, setModelProfile] = useState("");
 	const [prMsg, setPrMsg] = useState("");
+	const [submitted, setSubmitted] = useState<string | null>(null);
 	const [notFound, setNotFound] = useState(false);
 	const evRef = useRef<Map<string, RunEvent>>(new Map());
 	const sseRef = useRef<EventSource | null>(null);
@@ -94,7 +94,12 @@ export default function SessionView() {
 
 	useEffect(() => {
 		if (latestRun) pendingRun.current = false;
-	}, [latestRun]);
+		if (latestRun && submitted) {
+			// Clear once the run's first event arrives (or it fails).
+			const hasEvents = events.some((e) => e.runId === latestRun.runId);
+			if (hasEvents || latestRun.status === "failed" || latestRun.status === "stopped") setSubmitted(null);
+		}
+	}, [latestRun, events, submitted]);
 
 	// PlanCard implement/push queue runs without the Composer — listen and
 	// pick them up so the stream opens live.
@@ -117,7 +122,6 @@ export default function SessionView() {
 		};
 		window.addEventListener("scroll", onScroll, { passive: true });
 		return () => window.removeEventListener("scroll", onScroll);
-		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, []);
 
 	// Follow the tail on every event batch while pinned. Deferred + repeated
@@ -127,7 +131,6 @@ export default function SessionView() {
 		requestAnimationFrame(toBottom);
 		const timers = [150, 400, 900].map((ms) => setTimeout(toBottom, ms));
 		return () => timers.forEach(clearTimeout);
-		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [events]);
 
 	// Finished runs: load each newest window (last 2000) — older pages fetch on scroll-up.
@@ -229,8 +232,9 @@ export default function SessionView() {
 			method: "POST",
 			body: JSON.stringify({ task, mode, attachmentIds, modelId: modelId || undefined, profile: modelProfile || undefined }),
 		});
-		// Poll until the new run doc appears so the stream opens.
+		// Immediate feedback: show "working" until the first event/run lands.
 		pendingRun.current = true;
+		setSubmitted(task);
 		setTimeout(() => void refresh(), 500);
 	};
 
@@ -249,14 +253,22 @@ export default function SessionView() {
 
 	return (
 		<ProviderGate user={user}>
-		<div className="page" style={{ maxWidth: 860 }}>
-			<div style={{ position: "sticky", top: 0, zIndex: 10, background: "var(--bg)", paddingBottom: 8, borderBottom: "1px solid var(--border)", marginBottom: 8 }}>
-			<div className="sess-header">
-				<Link href="/sessions" className="muted" style={{ fontSize: 12 }}>← Sessions</Link>
-				<h1 style={{ flex: 1, fontSize: 15, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+		<div className="page" style={{ maxWidth: "none", padding: 0 }}>
+			<div style={{ position: "sticky", top: 0, zIndex: 10, background: "var(--bg)", paddingTop: 10, paddingBottom: 8, borderBottom: "1px solid var(--border)", marginBottom: 8 }}>
+				<div style={{ padding: "0 24px" }}>
+			<div className="sess-header" style={{ alignItems: "center" }}>
+				<Link href="/sessions" className="muted" style={{ fontSize: 16 }}>←</Link>
+				<h1 style={{ flex: 1, fontSize: 16, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
 					{session?.title ?? "Session"}
 				</h1>
-				{latestRun && <StatusPill status={latestRun.status ?? "queued"} />}
+				{latestRun && (
+					<span className="status-pill completed" style={{ textTransform: "capitalize" }}>
+						{latestRun.status === "completed" ? "✓ Completed" : latestRun.status}
+					</span>
+				)}
+				<span className="cloud-badge">☁ Cloud Run</span>
+				<button className="btn sm" style={{ padding: "2px 8px" }}>···</button>
+				<span className="avatar">{(user.email ?? "U")[0].toUpperCase()}</span>
 				{latestRun?.status === "queued" && (
 					<button className="btn sm" onClick={async () => {
 						await apiFetch(`/api/runs/${latestRun.runId}/stop`, user, { method: "POST" });
@@ -265,14 +277,17 @@ export default function SessionView() {
 				)}
 			</div>
 			<div className="sess-header" style={{ marginTop: -8 }}>
-				{session?.repo && <span className="sess-chip mono">{session.repo}</span>}
+				{session?.repo && <span className="sess-chip mono">⌘ {session.repo}</span>}
 				{session?.branch && <span className="sess-chip mono">⎇ {session.branch}</span>}
 				{session?.template && <span className="sess-chip">{session.template}</span>}
 				{session?.prUrl ? (
 					<a href={session.prUrl} target="_blank" rel="noreferrer" className="sess-chip" style={{ color: "var(--accent)" }}>
 						PR ↗
 					</a>
-				) : session?.branch && !active ? (
+				) : session?.branch ? (
+					<span className="sess-chip muted">No PR</span>
+				) : null}
+				{!session?.prUrl && session?.branch && !active && (
 					<button className="sess-chip" style={{ cursor: "pointer", color: "var(--accent)" }}
 						onClick={async () => {
 							const res = await apiFetch(`/api/sessions/${id}/pr`, user, { method: "POST" });
@@ -287,25 +302,38 @@ export default function SessionView() {
 						}}>
 						Raise PR
 					</button>
-				) : null}
+				)}
 				{prMsg && <span className="sess-chip muted">{prMsg}</span>}
 				{(tokens.in || tokens.out) > 0 && (
 					<span className="sess-chip muted">{tokens.in.toLocaleString()} in / {tokens.out.toLocaleString()} out</span>
 				)}
 			</div>
+			<div style={{ display: "flex", gap: 16, marginTop: 6, fontSize: 11 }}>
 			{preflight && (
-				<div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 6, fontSize: 11 }}>
-					{preflight.checks.map((c) => (
-						<span key={c.name} className="sess-chip muted" style={{ color: c.ok ? "var(--ok, #4ade80)" : "var(--err)" }} title={c.detail}>
-							{c.ok ? "✓" : "✗"} {c.name}: {c.detail}
+				<details style={{ flex: "0 1 auto" }}>
+					<summary className="muted" style={{ cursor: "pointer" }}>
+						<span style={{ color: preflight.ready ? "var(--ok, #4ade80)" : "var(--amber, #facc15)" }}>
+							{preflight.ready ? "●" : "●"}
+						</span>{" "}
+						Environment ({preflight.checks.filter((c) => c.ok).length}/{preflight.checks.length}) —{" "}
+						<span style={{ color: preflight.ready ? "var(--ok, #4ade80)" : "var(--err)" }}>
+							{preflight.ready ? "ready" : `${preflight.checks.filter((c) => !c.ok).map((c) => c.name).join(", ")} failing`}
 						</span>
-					))}
-					{!preflight.ready && <span className="sess-chip" style={{ color: "var(--err)" }}>fix in Settings before running</span>}
-				</div>
+					</summary>
+					<div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 4 }}>
+						{preflight.checks.map((c) => (
+							<span key={c.name} className="sess-chip muted" style={{ color: c.ok ? "var(--ok, #4ade80)" : "var(--err)" }} title={c.detail}>
+								{c.ok ? "✓" : "✗"} {c.name}: {c.detail}
+							</span>
+						))}
+						{!preflight.ready && <span className="sess-chip" style={{ color: "var(--err)" }}>fix in Settings before running</span>}
+					</div>
+				</details>
 			)}
 			{lifecycle.length > 0 && (
-				<details style={{ marginTop: 6, fontSize: 11 }} open={active}>
-					<summary className="muted" style={{ cursor: "pointer" }}>
+				<details style={{ flex: "1 1 auto", minWidth: 0 }}>
+					<summary className="muted" style={{ cursor: "pointer", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+						<span style={{ color: latestRun?.status === "failed" ? "var(--err)" : active ? "var(--amber, #facc15)" : "var(--ok, #4ade80)" }}>●</span>{" "}
 						Status log ({lifecycle.length}) — {String(lifecycle[lifecycle.length - 1].event.text ?? "")}
 					</summary>
 					<div style={{ display: "flex", flexDirection: "column", gap: 2, marginTop: 4 }}>
@@ -328,7 +356,20 @@ export default function SessionView() {
 				</details>
 			)}
 			</div>
-			<Timeline user={user} sessionId={id} events={ordered} runs={runs} />
+			</div>
+			</div>
+			<div style={{ maxWidth: 860, margin: "0 auto" }}>
+			<Timeline user={user} sessionId={id} events={ordered} runs={runs}
+				githubUrl={session?.prUrl ?? (session?.repo && session?.branch ? `https://github.com/${session.repo}/tree/${session.branch}` : undefined)} />
+			{submitted && (
+				<div className="msg-row" style={{ opacity: 0.8 }}>
+					<span className="avatar accent">K</span>
+					<div className="ev status" style={{ flex: 1 }}>
+						<span className="stream-cursor" style={{ verticalAlign: "middle", marginRight: 8 }} />
+						Working on it — <span className="muted">{submitted.slice(0, 60)}{submitted.length > 60 ? "…" : ""}</span>
+					</div>
+				</div>
+			)}
 			<div className="composer-dock">
 				<Composer
 					user={user}
@@ -337,9 +378,9 @@ export default function SessionView() {
 					onSubmit={(t, a) => void submit(t, a)}
 					onStop={() => void stop()}
 					running={active}
-					slim
 					onModel={(id, profile) => { setModelId(id); setModelProfile(profile); }}
 				/>
+			</div>
 			</div>
 		</div>
 		</ProviderGate>

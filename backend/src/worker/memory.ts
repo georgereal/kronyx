@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { AgentMessage, AgentTool } from "@cline/shared";
 import type { Db } from "mongodb";
+import { swallow } from "../lib/log";
 import type { RunDigest } from "../../../src/agent/runner";
 import type { PriorTranscript } from "../../../src/agent/recall";
 
@@ -42,7 +43,7 @@ export async function saveTranscript(
 	await db.collection("run_transcripts").updateMany(
 		{ uid, sessionId, state: { $ne: "compacted" } },
 		[{ $set: { state: "active" } }],
-	).catch(() => {});
+	).catch(swallow("memory", "op"));
 	const stale = await db
 		.collection("run_transcripts")
 		.find({ uid, sessionId, state: { $ne: "compacted" } })
@@ -81,6 +82,7 @@ interface MemoryDoc {
 	uid: string;
 	sessionId: string;
 	scope: "conversation" | "project";
+	repo?: string;
 	content: string;
 	origin: { runId: string; kind: "agent" | "user" };
 	confidence: number;
@@ -93,23 +95,48 @@ export interface EmbedProvider {
 	baseUrl: string;
 	apiKey: string;
 	embeddingModel?: string;
+	/** Called per /embeddings request for usage accounting — must not throw. */
+	onUsage?: (u: { model: string; tokensIn: number; durationMs: number; ok: boolean; error?: string; op?: string }) => void;
 }
 
 const DEFAULT_EMBED_MODEL = "openai/text-embedding-3-small";
+/** Must match the `memories_vector` Atlas index numDimensions. */
+const EMBEDDING_DIMS = 1536;
+let dimsWarned = false;
 
 /** OpenAI-compatible /embeddings call (works on AI Gateway, OpenAI, OpenRouter). */
-async function embedText(provider: EmbedProvider, text: string): Promise<number[] | undefined> {
+async function embedText(provider: EmbedProvider, text: string, op?: string): Promise<number[] | undefined> {
+	const model = provider.embeddingModel ?? DEFAULT_EMBED_MODEL;
+	const t0 = Date.now();
+	const report = (ok: boolean, tokensIn = 0, error?: string) => {
+		try {
+			provider.onUsage?.({ model, tokensIn, durationMs: Date.now() - t0, ok, error, op });
+		} catch {}
+	};
 	try {
 		const res = await fetch(`${provider.baseUrl.replace(/\/+$/, "")}/embeddings`, {
 			method: "POST",
 			headers: { "content-type": "application/json", authorization: `Bearer ${provider.apiKey}` },
-			body: JSON.stringify({ model: provider.embeddingModel ?? DEFAULT_EMBED_MODEL, input: text.slice(0, 8000) }),
+			body: JSON.stringify({ model, input: text.slice(0, 8000) }),
 			signal: AbortSignal.timeout(15_000),
 		});
-		if (!res.ok) return undefined;
-		const data = (await res.json()) as { data?: { embedding?: number[] }[] };
-		return data.data?.[0]?.embedding;
-	} catch {
+		if (!res.ok) {
+			report(false, 0, `HTTP ${res.status}`);
+			return undefined;
+		}
+		const data = (await res.json()) as {
+			data?: { embedding?: number[] }[];
+			usage?: { prompt_tokens?: number; total_tokens?: number };
+		};
+		report(true, data.usage?.prompt_tokens ?? data.usage?.total_tokens ?? Math.ceil(text.slice(0, 8000).length / 4));
+		const embedding = data.data?.[0]?.embedding;
+		if (embedding && embedding.length !== EMBEDDING_DIMS && !dimsWarned) {
+			dimsWarned = true;
+			console.warn(`[memory] ${model} returned ${embedding.length} dims — index expects ${EMBEDDING_DIMS}; vector recall will miss`);
+		}
+		return embedding;
+	} catch (err) {
+		report(false, 0, err instanceof Error ? err.message : String(err));
 		return undefined;
 	}
 }
@@ -121,24 +148,31 @@ export function memoryWriteTool(
 	sessionId: string,
 	runId: string,
 	provider?: EmbedProvider,
-): AgentTool<{ fact: string }, string> {
+	repo?: string,
+): AgentTool<{ fact: string; scope?: string }, string> {
 	return {
 		name: "memory_write",
 		description:
-			"Record a durable fact for future tasks in this session (decisions made, paths, conventions, state). Keep it concise.",
+			"Record a durable fact for future tasks (decisions made, paths, conventions, state). Keep it concise. scope=conversation recalls within this session; scope=project recalls across all sessions on this repository.",
 		inputSchema: {
 			type: "object",
-			properties: { fact: { type: "string", description: "One concise fact to remember." } },
+			properties: {
+				fact: { type: "string", description: "One concise fact to remember." },
+				scope: { type: "string", enum: ["conversation", "project"], description: "conversation (default) or project-wide." },
+			},
 			required: ["fact"],
 		},
 		async execute(input) {
 			const fact = String(input.fact ?? "").slice(0, 500);
 			if (!fact) return "Empty fact ignored.";
+			// project scope only makes sense with a repo to partition on.
+			const scope: MemoryDoc["scope"] = input.scope === "project" && repo ? "project" : "conversation";
 			const doc: MemoryDoc = {
 				memoryId: randomUUID(),
 				uid,
 				sessionId,
-				scope: "conversation",
+				scope,
+				...(repo ? { repo } : {}),
 				content: fact,
 				origin: { runId, kind: "agent" },
 				confidence: 0.8,
@@ -146,7 +180,7 @@ export function memoryWriteTool(
 				version: 1,
 				createdAt: new Date(),
 			};
-			const embedding = provider ? await embedText(provider, fact) : undefined;
+			const embedding = provider ? await embedText(provider, fact, "memory_write") : undefined;
 			await db.collection("memories").insertOne(embedding ? { ...doc, embedding } : doc);
 			const stale = await db
 				.collection("memories")
@@ -166,11 +200,13 @@ export function memoryWriteTool(
 	};
 }
 
-/** Active + candidate memories for a session (conversation scope). */
-export async function loadMemories(db: Db, uid: string, sessionId: string): Promise<MemoryDoc[]> {
+/** Active + candidate memories: this session's conversation scope + repo's project scope. */
+export async function loadMemories(db: Db, uid: string, sessionId: string, repo?: string): Promise<MemoryDoc[]> {
+	const scopeFilter: Record<string, unknown>[] = [{ scope: "conversation", sessionId }];
+	if (repo) scopeFilter.push({ scope: "project", repo });
 	return db
 		.collection("memories")
-		.find({ uid, sessionId, scope: "conversation", status: { $in: ["active", "candidate"] } })
+		.find({ uid, status: { $in: ["active", "candidate"] }, $or: scopeFilter })
 		.sort({ createdAt: 1 })
 		.limit(MAX_MEMORIES)
 		.toArray() as Promise<unknown> as Promise<MemoryDoc[]>;
@@ -186,8 +222,9 @@ export async function searchMemories(
 	sessionId: string,
 	query: string,
 	provider?: EmbedProvider,
+	repo?: string,
 ): Promise<MemoryDoc[]> {
-	const vector = provider ? await embedText(provider, query) : undefined;
+	const vector = provider ? await embedText(provider, query, "memory_recall") : undefined;
 	if (vector) {
 		const hits = await db
 			.collection("memories")
@@ -198,18 +235,31 @@ export async function searchMemories(
 						path: "embedding",
 						queryVector: vector,
 						numCandidates: 50,
-						limit: 8,
-						filter: { uid, sessionId, scope: "conversation" },
+						// Over-fetch: scope partition (session vs repo) is applied
+						// below — $vectorSearch filters can't express that OR.
+						limit: 16,
+						filter: { uid, scope: { $in: ["conversation", "project"] }, status: { $in: ["active", "candidate"] } },
 					},
 				},
 			])
 			.toArray()
-			.catch(() => []);
-		if (hits.length) return hits as unknown as MemoryDoc[];
+			.catch(swallow("memory", "op", []));
+		const eligible = (hits as unknown as MemoryDoc[]).filter((h) =>
+			h.scope === "project" ? repo !== undefined && h.repo === repo : h.sessionId === sessionId,
+		);
+		if (eligible.length) {
+			const top = eligible.slice(0, 8);
+			// Recall is the verification signal: promote candidates that made it into context.
+			void db
+				.collection("memories")
+				.updateMany({ uid, status: "candidate", memoryId: { $in: top.map((m) => m.memoryId) } }, { $set: { status: "active" } })
+				.catch(swallow("memory", "op"));
+			return top;
+		}
 	}
 	// No embeddings available (provider lacks the model) — recency is the
 	// honest degenerate, not a keyword workaround.
-	return loadMemories(db, uid, sessionId);
+	return loadMemories(db, uid, sessionId, repo);
 }
 
 /** Lightweight context manifest (ADR §9) — what actually entered this run's context. */

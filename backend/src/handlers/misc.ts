@@ -1,8 +1,11 @@
 import { randomUUID } from "node:crypto";
+import { swallow } from "../lib/log";
 import type { Db } from "mongodb";
+import { getProvider, providers, type ProviderCreds } from "../../../src/sandbox/provider";
 import { authenticate } from "../lib/apiKeys";
 import { getDb } from "../lib/mongo";
 import { fetchModels } from "../lib/models";
+import { recordSandboxEvent } from "../lib/sandboxEvents";
 import { json } from "../routes";
 
 const MAX_FILE = 4 * 1024 * 1024;
@@ -14,7 +17,7 @@ const TEXT_EXT = /\.(txt|md|markdown|ts|tsx|js|jsx|mjs|cjs|json|ya?ml|toml|py|go
 export async function attachments(req: Request): Promise<Response> {
 	const uid = await authenticate(req);
 	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
-	const form = await req.formData().catch(() => null);
+	const form = await req.formData().catch(swallow("misc", "op", null));
 	if (!form) return json({ error: "multipart body required" }, { status: 400 });
 	const sessionId = String(form.get("sessionId") ?? "");
 	const files = form.getAll("files").filter((f): f is File => f instanceof File);
@@ -56,14 +59,14 @@ export async function models(req: Request): Promise<Response> {
 		.collection<{
 			_id: string;
 			settings?: {
-				data?: { profiles?: { name?: string; baseUrl?: string }[]; activeProfile?: string; baseUrl?: string };
+				data?: { profiles?: { name?: string; baseUrl?: string; enabled?: boolean }[]; activeProfile?: string; baseUrl?: string };
 				secrets?: Record<string, string>;
 			};
 		}>("users")
 		.findOne({ _id: uid });
 	const data = doc?.settings?.data ?? {};
 	const secrets = doc?.settings?.secrets ?? {};
-	const profiles = (data.profiles ?? []).filter((p) => p.baseUrl);
+	const profiles = (data.profiles ?? []).filter((p) => p.baseUrl && p.enabled !== false);
 	const keyFor = (name?: string) =>
 		name ? (secrets[`profile.apiKey.${name}`] ?? secrets[name] ?? "") : (secrets.providerApiKey ?? "");
 	// Catalog per provider profile, in parallel. Ungrouped fallback = flat provider.*.
@@ -106,25 +109,26 @@ export async function janitor(req: Request): Promise<Response> {
 
 /** Shared janitor sweep — also run by the worker on a timer. */
 export async function runJanitorSweep(db: Db): Promise<{ users: number; killed: number; paused: number }> {
-	const users: { _id: string; settings?: { secrets?: { e2bApiKey?: string } } }[] = await db
+	const users: { _id: string; settings?: { secrets?: Record<string, string>; data?: Record<string, unknown> } }[] = await db
 		.collection("users")
-		.find({ "settings.secrets.e2bApiKey": { $exists: true, $ne: "" } })
-		.toArray() as unknown as { _id: string; settings?: { secrets?: { e2bApiKey?: string } } }[];
+		.find({ "settings.secrets": { $exists: true } })
+		.toArray() as unknown as { _id: string; settings?: { secrets?: Record<string, string>; data?: Record<string, unknown> } }[];
 	const cutoff = Date.now() - MAX_MINUTES * 60_000;
 	const SESSION_IDLE_KILL_MIN = Number(process.env.SESSION_IDLE_KILL_MINUTES || 24 * 60);
 	const PAUSED_KILL_MIN = Number(process.env.PAUSED_KILL_MINUTES || 48 * 60);
 	const idleCutoff = new Date(Date.now() - SESSION_IDLE_KILL_MIN * 60_000);
 	const pausedCutoff = new Date(Date.now() - PAUSED_KILL_MIN * 60_000);
-	const keyFor = (uid: string) =>
-		users.find((u) => u._id === uid)?.settings?.secrets?.e2bApiKey ?? process.env.E2B_API_KEY ?? "";
-	const kill = async (uid: string, id: string): Promise<boolean> => {
-		const key = keyFor(uid);
-		if (!key) return false;
-		const res = await fetch(`https://api.e2b.app/sandboxes/${encodeURIComponent(id)}`, {
-			method: "DELETE",
-			headers: { "X-API-KEY": key },
-		}).catch(() => undefined);
-		return !!res && (res.ok || res.status === 404);
+	const credsFor = (uid: string): ProviderCreds => {
+		const u = users.find((x) => x._id === uid);
+		return { secrets: u?.settings?.secrets ?? {}, data: u?.settings?.data ?? {} };
+	};
+	const providerFor = (row: Record<string, any>) => getProvider(typeof row.provider === "string" ? row.provider : "e2b");
+	const kill = async (uid: string, id: string, providerName?: string): Promise<boolean> => {
+		try {
+			return await getProvider(providerName).killById(id, credsFor(uid));
+		} catch {
+			return false;
+		}
 	};
 
 	const IDLE_PAUSE_MIN = Number(process.env.SANDBOX_IDLE_PAUSE_MINUTES || 15);
@@ -140,15 +144,17 @@ export async function runJanitorSweep(db: Db): Promise<{ users: number; killed: 
 		})
 		.toArray();
 	for (const row of idleRows) {
-		const key = keyFor(row.uid);
-		if (!key) continue;
-		// Use the SDK's betaPause — the REST /pause path doesn't pause the box.
-		const { Sandbox } = await import("e2b");
-		const ok = await Sandbox.betaPause(String(row.sandboxId), { apiKey: key }).catch(() => false);
+		const provider = providerFor(row);
+		if (!provider.capabilities.pause || !provider.pauseById) continue;
+		const ok = await provider.pauseById(String(row.sandboxId), credsFor(row.uid)).catch(swallow("misc", "op", false));
 		if (ok) {
 			await db
 				.collection("sandboxes")
 				.updateOne({ _id: row._id }, { $set: { state: "paused", reason: `idle-${IDLE_PAUSE_MIN}m`, at: new Date() } });
+			await recordSandboxEvent(db, {
+				uid: row.uid, sandboxId: String(row.sandboxId), sessionId: row.sessionId,
+				provider: provider.name, event: "pause", state: "paused", reason: `idle-${IDLE_PAUSE_MIN}m`,
+			});
 			paused++;
 		}
 	}
@@ -166,32 +172,35 @@ export async function runJanitorSweep(db: Db): Promise<{ users: number; killed: 
 		const pausedLong = row.state === "paused" && row.at && new Date(row.at) < pausedCutoff;
 		if (!row.killPending && !sessionIdle && !pausedLong) continue;
 		const reason = row.reason ?? (row.killPending ? "unreachable" : pausedLong ? "paused-48h" : "session-idle");
-		if (await kill(row.uid, String(row.sandboxId))) {
+		if (await kill(row.uid, String(row.sandboxId), typeof row.provider === "string" ? row.provider : undefined)) {
 			console.log(`[janitor] killed ${row.sandboxId} (${reason})`);
 			await db
 				.collection("sandboxes")
 				.updateOne({ _id: row._id }, { $set: { killPending: false, state: "dead", reason, deadAt: new Date() } });
+			await recordSandboxEvent(db, {
+				uid: row.uid, sandboxId: String(row.sandboxId), sessionId: row.sessionId,
+				provider: typeof row.provider === "string" ? row.provider : "e2b", event: "kill", state: "dead", reason,
+			});
 			killed++;
 		}
 	}
 	const knownIds = new Set(rows.map((r) => String(r.sandboxId)));
-	// Orphans: live E2B sandboxes we have no record of, past the base TTL.
+	// Orphans: live provider sandboxes we have no record of, past the base TTL.
 	for (const u of users) {
-		const key = u.settings?.secrets?.e2bApiKey;
-		if (!key) continue;
-		const res = await fetch("https://api.e2b.app/v2/sandboxes", {
-			headers: { "X-API-KEY": key },
-			signal: AbortSignal.timeout(15_000),
-		}).catch(() => undefined);
-		if (!res?.ok) continue;
-		const sandboxes = (await res.json()) as { sandboxID?: string; sandboxId?: string; startedAt?: string }[];
-		for (const s of sandboxes) {
-			const id = s.sandboxID ?? s.sandboxId;
-			const started = s.startedAt ? new Date(s.startedAt).getTime() : 0;
-			if (!id || knownIds.has(id) || (started && started > cutoff)) continue;
-			if (await kill(u._id, id)) {
-				console.log(`[janitor] killed orphan ${id} (orphan-ttl)`);
-				killed++;
+		const creds: ProviderCreds = { secrets: u.settings?.secrets ?? {}, data: u.settings?.data ?? {} };
+		for (const p of Object.values(providers)) {
+			if (!p.capabilities.orphanSweep || !p.listLive || p.validate(creds)) continue;
+			const sandboxes = await p.listLive(creds).catch(swallow("misc", "op", []));
+			for (const s of sandboxes) {
+				const started = s.startedAt ? new Date(s.startedAt).getTime() : 0;
+				if (knownIds.has(s.id) || (started && started > cutoff)) continue;
+				if (await p.killById(s.id, creds).catch(swallow("misc", "op", false))) {
+					console.log(`[janitor] killed orphan ${s.id} (${p.name}, orphan-ttl)`);
+					await recordSandboxEvent(db, {
+						uid: u._id, sandboxId: s.id, provider: p.name, event: "kill", state: "dead", reason: "orphan-ttl",
+					});
+					killed++;
+				}
 			}
 		}
 	}
@@ -208,7 +217,7 @@ export async function mcp(req: Request): Promise<Response> {
 		return json({ connectors: items.map((c) => ({ ...c, _id: undefined })) });
 	}
 	if (req.method === "POST") {
-		const body = (await req.json().catch(() => ({}))) as { name?: string; url?: string };
+		const body = (await req.json().catch(swallow("misc", "op", ({})))) as { name?: string; url?: string };
 		const name = String(body.name ?? "").slice(0, 80);
 		const url = String(body.url ?? "").slice(0, 300);
 		if (!name || !url) return json({ error: "name and url required" }, { status: 400 });

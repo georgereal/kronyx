@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { AgentRunner, type AgentMode, type ProviderSettings } from "../agent/runner";
-import { providerErrorMessage, resolveProvider, writeProviderValue } from "../config";
+import { estimateCostUsd, modelPricing, providerErrorMessage, resolveProvider, writeProviderValue } from "../config";
 import { insertPr, insertSandboxEvent, kvGet, kvSet, openStore } from "../store";
 import { deviceName, getDeviceId } from "../settingsSync";
 import { E2bSandbox, e2bApiKey, openPr } from "../sandbox/e2b";
 import { createRemoteFileTools } from "../tools/remoteFileTools";
+import type { SandboxHandle } from "../sandbox/provider";
 import type { RunViewProvider, WebviewMessage } from "./runViewProvider";
 import type { SessionDeps } from "./sessionController";
 import { apiKey, webAppUrl } from "../auth";
@@ -71,7 +72,7 @@ export class CloudController {
 	private runner: AgentRunner | undefined;
 	private running = false;
 	private postRunPause: ReturnType<typeof setTimeout> | undefined;
-	private lastUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+	private lastUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, totalCost: 0 };
 	private lastUsageAt = 0;
 	private runStartedAt = 0;
 	private currentTask = "";
@@ -179,18 +180,26 @@ export class CloudController {
 		}
 		if (event.type === "usage") {
 			const now = Date.now();
+			const diff = (cur: number, prev: number) => (cur >= prev ? cur - prev : cur);
 			const prev = this.lastUsage;
 			const delta = {
-				tokensIn: Math.max(0, Number(event.inputTokens ?? 0) - prev.inputTokens),
-				tokensOut: Math.max(0, Number(event.outputTokens ?? 0) - prev.outputTokens),
-				cacheRead: Math.max(0, Number(event.cacheReadTokens ?? 0) - prev.cacheReadTokens),
-				cacheWrite: Math.max(0, Number(event.cacheWriteTokens ?? 0) - prev.cacheWriteTokens),
+				tokensIn: diff(Number(event.inputTokens ?? 0), prev.inputTokens),
+				tokensOut: diff(Number(event.outputTokens ?? 0), prev.outputTokens),
+				cacheRead: diff(Number(event.cacheReadTokens ?? 0), prev.cacheReadTokens),
+				cacheWrite: diff(Number(event.cacheWriteTokens ?? 0), prev.cacheWriteTokens),
+				reasoningTokens: diff(Number(event.reasoningTokens ?? 0), prev.reasoningTokens),
 			};
+			const billedCost =
+				Number(event.totalCost ?? 0) > 0 || prev.totalCost > 0
+					? diff(Number(event.totalCost ?? 0), prev.totalCost)
+					: undefined;
 			this.lastUsage = {
 				inputTokens: Number(event.inputTokens ?? 0),
 				outputTokens: Number(event.outputTokens ?? 0),
 				cacheReadTokens: Number(event.cacheReadTokens ?? 0),
 				cacheWriteTokens: Number(event.cacheWriteTokens ?? 0),
+				reasoningTokens: Number(event.reasoningTokens ?? 0),
+				totalCost: Number(event.totalCost ?? 0),
 			};
 			const p = this.runProvider;
 			this.deps.recordApiCall?.({
@@ -198,12 +207,21 @@ export class CloudController {
 				task: this.currentTask,
 				at: now,
 				status: "ok",
+				costUsd: p
+					? estimateCostUsd(
+							{ inputTokens: delta.tokensIn, outputTokens: delta.tokensOut, cacheReadTokens: delta.cacheRead, cacheWriteTokens: delta.cacheWrite },
+							modelPricing(p.modelId, undefined),
+						)
+					: undefined,
 				provider: p?.providerId,
 				baseUrl: p?.baseUrl,
 				model: p?.modelId,
 				profile: p?.profile,
 				keyLabel: p?.profile ?? "default",
 				...delta,
+				billedCostUsd: billedCost,
+				iteration: typeof event.iteration === "number" ? event.iteration : undefined,
+				contextMsgs: typeof event.contextMsgs === "number" ? event.contextMsgs : undefined,
 				durationMs: this.lastUsageAt ? now - this.lastUsageAt : now - this.runStartedAt,
 			});
 			this.lastUsageAt = now;
@@ -425,7 +443,7 @@ export class CloudController {
 			this.cloudStatus("Sandbox paused — resumes on next run");
 		});
 		const idle = idleTimeoutMin();
-		if (this.state.sandboxId && (await this.sandbox.connect(this.state.sandboxId, await e2bApiKey(this.deps.context.secrets)))) {
+		if (this.state.sandboxId && (await this.sandbox.connectKey(this.state.sandboxId, await e2bApiKey(this.deps.context.secrets)))) {
 			await this.sandbox.keepalive(idle);
 			this.cloudStatus(`Reused warm sandbox ${this.state.sandboxId}`);
 			this.info(`Reused sandbox ${this.state.sandboxId}${this.state.branch ? ` on ${this.state.branch}` : ""}`);
@@ -486,9 +504,20 @@ export class CloudController {
 			environment: "an E2B cloud sandbox",
 			log: (tag, message) => log(tag, message),
 			createTools: () => {
-				const inner = sbx.inner;
-				if (!inner) throw new Error("Sandbox not ready.");
-				return Promise.resolve(createRemoteFileTools(inner, REPO_DIR, { planDir: PLAN_DIR }));
+				// Tools outlive any single handle (pause/resume/recreate replaces
+				// sbx.inner) — resolve it per call or they hit a ghost sandbox.
+				const live: SandboxHandle = {
+					get id() {
+						return sbx.inner?.id ?? "";
+					},
+					run: (cmd, opts) => sbx.inner!.run(cmd, opts),
+					readFile: (p) => sbx.inner!.readFile(p),
+					writeFile: async (p, c) => {
+						await sbx.inner!.writeFile(p, c);
+					},
+					setTimeout: (ms) => sbx.inner?.setTimeout?.(ms) ?? Promise.resolve(),
+				};
+				return Promise.resolve(createRemoteFileTools(live, REPO_DIR, { planDir: PLAN_DIR }));
 			},
 			emit: (event) => {
 				this.surface.post(event);

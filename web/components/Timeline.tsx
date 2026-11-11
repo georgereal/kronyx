@@ -140,7 +140,7 @@ function PlanCard({ user, sessionId, slug }: { user: User; sessionId: string; sl
 	);
 }
 
-function Event({ user, sessionId, e }: { user: User; sessionId: string; e: RunEvent }) {
+function Event({ user, sessionId, e, events, runs, githubUrl }: { user: User; sessionId: string; e: RunEvent; events: RunEvent[]; runs: RunDoc[]; githubUrl?: string }) {
 	const ev = e.event;
 	const kind = KIND[ev.type] ?? ev.type;
 	const cls =
@@ -157,10 +157,12 @@ function Event({ user, sessionId, e }: { user: User; sessionId: string; e: RunEv
 		const task = split[0];
 		const attCount = split.length > 1 ? (split[1].match(/--- attached file:/g) ?? []).length : 0;
 		return (
-			<div className="ev user-msg">
-				<div className="ev-kind">You</div>
-				<span className="stream-text">{task}</span>
-				{attCount > 0 && <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>+{attCount} attached file{attCount > 1 ? "s" : ""}</div>}
+			<div className="msg-row">
+				<span className="avatar">{(user.email ?? "U")[0].toUpperCase()}</span>
+				<div className="user-bubble" style={{ flex: 1 }}>
+					<span className="stream-text">{task}</span>
+					{attCount > 0 && <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>+{attCount} attached file{attCount > 1 ? "s" : ""}</div>}
+				</div>
 			</div>
 		);
 	}
@@ -232,10 +234,61 @@ function Event({ user, sessionId, e }: { user: User; sessionId: string; e: RunEv
 	const text =
 		(ev.text as string) || (ev.error as string) || (ev.detail as string) || (ev.command as string) ||
 		(ev.status as string) || "";
-	// run-finished carries the same reply as assistant-text — render as a slim
-	// status line so the message isn't duplicated.
+	// run-finished → "Changes pushed" result card: summary + file stats + GitHub link.
 	if (ev.type === "run-finished") {
-		return <div className="ev status" style={{ borderStyle: "dashed" }}><div className="ev-kind">Done</div></div>;
+		const files = events.filter((x) => x.runId === e.runId && x.event.type === "file-changed");
+		const added = files.reduce((a, x) => a + Number(x.event.added ?? 0), 0);
+		const removed = files.reduce((a, x) => a + Number(x.event.removed ?? 0), 0);
+		const run = runs.find((r) => r.runId === e.runId);
+		const dur = run?.durationMs ? fmtDur(run.durationMs) : "";
+		const ts = e.at ? new Date(e.at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "";
+		const summary = String(ev.text ?? ev.summary ?? "");
+		return (
+			<div className="result-card">
+				<div className="result-head">
+					<span className="avatar accent">K</span>
+					<b>Kronyx</b>
+					<span className="muted" style={{ fontSize: 12 }}>☁ Executed in cloud{dur ? ` · ${dur}` : ""}{ts ? ` · ${ts}` : ""}</span>
+				</div>
+				<div className="result-title">
+					<span className="check-circle">✓</span>
+					<span>Changes pushed to GitHub</span>
+					<span className="status-pill completed" style={{ marginLeft: "auto" }}>Completed</span>
+				</div>
+				{summary && <div className="result-summary"><Md text={summary} /></div>}
+				{files.length > 0 && (
+					<>
+						<div className="result-sub"><span className="mono" style={{ fontSize: 11 }}>{"</>"}</span> Summary of changes</div>
+						<ul className="result-files">
+							{files.map((f, i) => (
+								<li key={i}>
+									<span className="mono">{String(f.event.path)}</span>{" "}
+									<span className="muted">+{String(f.event.added ?? 0)} −{String(f.event.removed ?? 0)}</span>
+								</li>
+							))}
+						</ul>
+						<div className="result-foot">
+							<span className="muted">{files.length} file{files.length > 1 ? "s" : ""} changed</span>
+							<span style={{ color: "var(--ok, #4ade80)" }}>+{added} additions</span>
+							<span style={{ color: "var(--err)" }}>−{removed} deletions</span>
+							{githubUrl && (
+								<a href={githubUrl} target="_blank" rel="noreferrer" className="btn sm" style={{ marginLeft: "auto" }}>
+									View on GitHub ↗
+								</a>
+							)}
+						</div>
+					</>
+				)}
+				{files.length === 0 && (
+					<div className="result-foot">
+						<span className="muted">0 files changed</span>
+						{githubUrl && (
+							<a href={githubUrl} target="_blank" rel="noreferrer" className="btn sm" style={{ marginLeft: "auto" }}>View on GitHub ↗</a>
+						)}
+					</div>
+				)}
+			</div>
+		);
 	}
 	if (!text && !ev.type.startsWith("run-")) return null;
 	return (
@@ -249,8 +302,6 @@ function Event({ user, sessionId, e }: { user: User; sessionId: string; e: RunEv
 
 type Worked = { kind: "worked"; items: Item[]; runId?: string; added: number; removed: number; done: boolean; key: string };
 type Block = Item | Worked;
-
-const TOP_LEVEL = new Set(["run-started", "assistant-text", "run-finished", "run-failed", "plan-ready", "cloud-status", "mode-blocked", "loop-detected"]);
 
 /** Group folded items into blocks: activity runs → one collapsible worked card. */
 function blocks(items: Item[]): Block[] {
@@ -376,7 +427,7 @@ function WorkedCard({ block, run, children }: { block: Worked; run?: RunDoc; chi
 	);
 }
 
-export function Timeline({ user, sessionId, events, runs }: { user: User; sessionId: string; events: RunEvent[]; runs: RunDoc[] }) {
+export function Timeline({ user, sessionId, events, runs, githubUrl }: { user: User; sessionId: string; events: RunEvent[]; runs: RunDoc[]; githubUrl?: string }) {
 	const items = fold(events);
 	const byRun = new Map(runs.map((r) => [r.runId, r]));
 	const renderItem = (item: Item) => {
@@ -412,7 +463,7 @@ export function Timeline({ user, sessionId, events, runs }: { user: User; sessio
 		if (item.kind === "terminal") return <Terminal key={item.key} item={item} />;
 		if (item.kind === "event" && item.e.event.type === "file-changed" && item.e.event.diff)
 			return <FileDiff key={item.key} e={item.e} />;
-		return <Event key={item.key} user={user} sessionId={sessionId} e={item.e} />;
+		return <Event key={item.key} user={user} sessionId={sessionId} e={item.e} events={events} runs={runs} githubUrl={githubUrl} />;
 	};
 
 	const grouped = blocks(items);

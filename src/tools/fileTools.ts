@@ -90,6 +90,7 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 
 	const readFile: AgentTool<{ path: string; start_line?: number; end_line?: number }, string> = {
 		name: "read_file",
+		executionMode: "parallel",
 		description:
 			"Read a text file from the workspace. Returns lines prefixed with their line number and a '|' separator. " +
 			"The prefix is not part of the file: never include it in edit_file old_text. Use start_line/end_line for large files.",
@@ -256,6 +257,7 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 
 	const listFiles: AgentTool<{ path?: string; recursive?: boolean; max_entries?: number }, string> = {
 		name: "list_files",
+		executionMode: "parallel",
 		description: "List files and folders. Folders end with '/'. Skips .git, node_modules and build output.",
 		inputSchema: {
 			type: "object",
@@ -287,6 +289,7 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 		string
 	> = {
 		name: "search_files",
+		executionMode: "parallel",
 		description: "Search file contents. Returns matching lines as path:line: text.",
 		inputSchema: {
 			type: "object",

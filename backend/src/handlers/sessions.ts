@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
+import { errlog, swallow } from "../lib/log";
 import { authenticate } from "../lib/apiKeys";
 import { verifyIdToken } from "../lib/firebaseAdmin";
 import { getDb } from "../lib/mongo";
 import { installationRepos, installationToken, listInstallations } from "../lib/githubApp";
+import { getProvider, providers } from "../../../src/sandbox/provider";
 import { githubPat, loadUserSettings, resolveProvider } from "../worker/settings";
 import { json } from "../routes";
 
@@ -31,7 +33,7 @@ export async function listSessions(req: Request): Promise<Response> {
 export async function createSession(req: Request): Promise<Response> {
 	const uid = await authenticate(req);
 	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
-	const body = (await req.json().catch(() => ({}))) as {
+	const body = (await req.json().catch(swallow("sessions", "op", ({})))) as {
 		repo?: string;
 		base?: string;
 		mode?: string;
@@ -41,6 +43,7 @@ export async function createSession(req: Request): Promise<Response> {
 		template?: string;
 		extraRepos?: string[];
 		securityProfile?: string;
+		provider?: string;
 	};
 	const repo = String(body.repo ?? "").trim();
 	const mode = ["ask", "plan", "agent"].includes(body.mode ?? "") ? body.mode! : "agent";
@@ -62,7 +65,17 @@ export async function createSession(req: Request): Promise<Response> {
 				if (!base) base = hit.defaultBranch;
 			}
 		}
-	} catch {}
+	} catch (e) {
+		errlog("sessions", "listInstallations — repo detection skipped", e);
+	}
+	const db = await getDb();
+	const userDoc = await db
+		.collection<{ settings?: { data?: { sandboxProvider?: string; modelDefaults?: Record<string, string> } } }>("users")
+		.findOne({ _id: uid as never }, { projection: { "settings.data.sandboxProvider": 1, "settings.data.modelDefaults": 1 } })
+		.catch(swallow("sessions", "op", null));
+	const requested = String(body.provider ?? userDoc?.settings?.data?.sandboxProvider ?? "e2b");
+	const provider = requested in providers ? requested : "e2b";
+	const defaultModel = userDoc?.settings?.data?.modelDefaults?.[mode] ?? null;
 	const doc = {
 		uid,
 		sessionId,
@@ -74,16 +87,16 @@ export async function createSession(req: Request): Promise<Response> {
 		installationId: installationId ?? null,
 		extraRepos: extraRepos.map((r) => ({ repo: r, installationId: installationIds[r] ?? null })),
 		template: body.template?.slice(0, 80) || null,
+		provider,
 		securityProfile: body.securityProfile === "bypass" ? "bypass" : "agent",
 		cloned: false,
 		mode,
-		modelId: body.modelId ?? null,
+		modelId: body.modelId ?? defaultModel,
 		profile: body.profile ?? null,
 		prUrl: null,
 		createdAt: new Date(),
 		updatedAt: new Date(),
 	};
-	const db = await getDb();
 	await db.collection("sessions").insertOne(doc);
 	return json({ session: { ...doc, _id: undefined } });
 }
@@ -110,7 +123,7 @@ export async function getSession(req: Request, p: Record<string, string>): Promi
 export async function postMessage(req: Request, p: Record<string, string>): Promise<Response> {
 	const uid = await authenticate(req);
 	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
-	const body = (await req.json().catch(() => ({}))) as {
+	const body = (await req.json().catch(swallow("sessions", "op", ({})))) as {
 		task?: string;
 		mode?: string;
 		modelId?: string;
@@ -160,6 +173,12 @@ export async function postMessage(req: Request, p: Record<string, string>): Prom
 	await db
 		.collection("sessions")
 		.updateOne({ uid, sessionId: p.id }, { $set: { updatedAt: now, lastTask: task.slice(0, 120) } });
+	// First event lands immediately — the timeline shows "Queued" instead of blank.
+	await db.collection("run_events").insertOne({
+		uid, runId, sessionId: p.id, seq: 1,
+		event: { type: "cloud-status", text: "Queued — waiting for a worker" },
+		ingestedAt: now,
+	});
 	return json({ runId });
 }
 
@@ -236,18 +255,18 @@ export async function preflight(req: Request, p: Record<string, string>): Promis
 	const db = await getDb();
 	const session = await db.collection("sessions").findOne({ uid, sessionId: p.id });
 	if (!session) return json({ error: "not_found" }, { status: 404 });
-	const settings = (await loadUserSettings(db, uid).catch(() => null)) ?? { data: {}, secrets: {} };
+	const settings = (await loadUserSettings(db, uid).catch(swallow("sessions", "op", null))) ?? { data: {}, secrets: {} };
 
 	const checks: { name: string; ok: boolean; detail: string }[] = [];
 
 	// GitHub auth source
-	const token = session.installationId ? await installationToken(session.installationId).catch(() => "") : githubPat(settings);
+	const token = session.installationId ? await installationToken(session.installationId).catch(swallow("sessions", "op", "")) : githubPat(settings);
 	checks.push({ name: "GitHub auth", ok: !!token, detail: session.installationId ? `installation ${session.installationId}` : token ? "PAT" : "no token" });
 
 	// Repo access
 	if (session.repo) {
 		const res = token
-			? await fetch(`https://api.github.com/repos/${session.repo}`, { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" } }).catch(() => null)
+			? await fetch(`https://api.github.com/repos/${session.repo}`, { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" } }).catch(swallow("sessions", "op", null))
 			: null;
 		checks.push({ name: "Repo", ok: !!res && res.status === 200, detail: res?.status === 200 ? session.repo : res ? `${session.repo} — HTTP ${res.status}` : `${session.repo} — unreachable` });
 	} else {
@@ -271,9 +290,10 @@ export async function preflight(req: Request, p: Record<string, string>): Promis
 	const res = resolveProvider(settings, {});
 	checks.push({ name: "Model", ok: !res.error, detail: res.error ?? `${res.settings!.modelId} · ${res.settings!.profile ?? "default"}` });
 
-	// E2B key
-	const e2b = process.env.E2B_API_KEY ?? "";
-	checks.push({ name: "E2B", ok: !!e2b, detail: e2b ? "key set" : "E2B_API_KEY missing" });
+	// Sandbox provider credentials
+	const sbxProvider = getProvider(typeof session.provider === "string" ? session.provider : "e2b");
+	const credErr = sbxProvider.validate({ secrets: settings.secrets, data: settings.data });
+	checks.push({ name: `Sandbox (${sbxProvider.name})`, ok: !credErr, detail: credErr ?? "credentials set" });
 
 	const ready = checks.every((c) => c.ok || (c.name === "Sandbox" && !sbxRow));
 	return json({ ready, checks });

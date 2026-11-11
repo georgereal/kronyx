@@ -47,5 +47,6 @@ export interface RunDoc {
 export interface RunEvent {
 	runId?: string;
 	seq: number;
+	at?: string;
 	event: { type: string; [k: string]: unknown };
 }

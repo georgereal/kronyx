@@ -1,12 +1,17 @@
-import { Sandbox } from "e2b";
+import { getProvider, type ProviderCreds, type SandboxHandle, type SandboxProvider } from "./provider";
+import { swallow } from "../lib/errlog";
 
 /**
- * vscode-free E2B sandbox wrapper shared by the extension's cloud controller
+ * vscode-free sandbox wrapper shared by the extension's cloud controller
  * and the web worker. Credential/config resolution and prompting live in the
  * vscode-specific subclass (e2b.ts) or the worker's settings layer.
+ *
+ * Provider-agnostic: the underlying backend is selected by `provider` name
+ * ("e2b" default; see src/sandbox/provider.ts registry).
  */
 export class SandboxCore {
-	protected sandbox: Sandbox | undefined;
+	private provider: SandboxProvider = getProvider("e2b");
+	protected handle: SandboxHandle | undefined;
 	private idleTimer: ReturnType<typeof setTimeout> | undefined;
 	private onPause: (() => void) | undefined;
 	private idleMinutes = 0;
@@ -18,7 +23,7 @@ export class SandboxCore {
 		if (id) this.onLifecycle?.(event, id);
 	}
 
-	/** Called when the sandbox is about to be beta-paused (idle hot-load). */
+	/** Called when the sandbox is about to be paused (idle hot-load). */
 	setPauseHook(fn: () => void): void {
 		this.onPause = fn;
 	}
@@ -31,7 +36,7 @@ export class SandboxCore {
 
 	private armIdlePause(): void {
 		clearTimeout(this.idleTimer);
-		if (this.idleMinutes <= 0) return;
+		if (this.idleMinutes <= 0 || !this.provider.capabilities.pause) return;
 		this.idleTimer = setTimeout(() => {
 			void this.pause().then((ok) => ok && this.onPause?.());
 		}, this.idleMinutes * 60_000);
@@ -39,14 +44,14 @@ export class SandboxCore {
 
 	/** Pause the sandbox (snapshot filesystem/memory); resumes via connect(). */
 	async pause(): Promise<boolean> {
-		if (!this.sandbox) return false;
+		if (!this.handle || !this.provider.pauseById) return false;
 		const id = this.sandboxId;
 		if (!id) return false;
 		try {
-			const ok = await Sandbox.betaPause(id);
+			const ok = await this.provider.pauseById(id, this.creds);
 			if (ok) {
 				this.onLifecycle?.("pause", id);
-				this.sandbox = undefined;
+				this.handle = undefined;
 			}
 			return ok;
 		} catch {
@@ -54,39 +59,54 @@ export class SandboxCore {
 		}
 	}
 
-	/** Create a sandbox with an explicit key + options (no prompting). */
-	async create(opts: { apiKey: string; template?: string; timeoutMs?: number }): Promise<Sandbox> {
-		const sbx = opts.template
-			? await Sandbox.create(opts.template, { apiKey: opts.apiKey, timeoutMs: opts.timeoutMs })
-			: await Sandbox.create({ apiKey: opts.apiKey, timeoutMs: opts.timeoutMs });
-		this.sandbox = sbx;
+	private creds: ProviderCreds = { secrets: {}, data: {} };
+
+	/** Create a sandbox via the named provider (default e2b). */
+	async create(opts: {
+		creds: ProviderCreds;
+		provider?: string;
+		template?: string;
+		timeoutMs?: number;
+	}): Promise<SandboxHandle> {
+		this.provider = getProvider(opts.provider);
+		const err = this.provider.validate(opts.creds);
+		if (err) throw new Error(err);
+		this.creds = opts.creds;
+		this.handle = await this.provider.create(opts.creds, { template: opts.template, timeoutMs: opts.timeoutMs });
 		this.report("start");
 		this.armIdlePause();
-		return sbx;
+		return this.handle;
 	}
 
-	/** Reconnect to a running or paused sandbox by id (auto-resumes); null if gone. */
-	async connect(id: string, apiKey?: string): Promise<Sandbox | null> {
+	/** Reconnect to a running or paused sandbox by id; null if gone. */
+	async connect(id: string, creds: ProviderCreds, provider?: string): Promise<SandboxHandle | null> {
+		this.provider = getProvider(provider);
+		if (!this.provider.capabilities.reconnect) return null;
+		this.creds = creds;
 		try {
-			this.sandbox = await Sandbox.connect(id, apiKey ? { apiKey } : undefined);
-			this.report("resume");
-			this.armIdlePause();
-			return this.sandbox;
+			this.handle = (await this.provider.connect(id, creds)) ?? undefined;
 		} catch {
-			this.sandbox = undefined;
+			this.handle = undefined;
 			return null;
 		}
+		if (!this.handle) return null;
+		this.report("resume");
+		this.armIdlePause();
+		return this.handle;
 	}
 
-	/** Extend the sandbox TTL from now (idle keepalive while a run is active). */
+	get providerName(): string {
+		return this.provider.name;
+	}
+
+	/** Extend the sandbox lifetime from now (idle keepalive while a run is active). */
 	async keepalive(minutes: number): Promise<void> {
-		await this.sandbox?.setTimeout(minutes * 60_000).catch(() => {});
+		await this.handle?.setTimeout?.(minutes * 60_000).catch(swallow("sandbox", "op"));
 	}
 
 	async runIn(dir: string, command: string, timeoutMs = 120_000): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-		if (!this.sandbox) throw new Error("Sandbox not initialized.");
-		const result = await this.sandbox.commands.run(command, { cwd: dir, timeoutMs });
-		return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr };
+		if (!this.handle) throw new Error("Sandbox not initialized.");
+		return this.handle.run(command, { cwd: dir, timeoutMs });
 	}
 
 	/** Clone and return the repo's default branch ("" if undetectable). */
@@ -94,7 +114,7 @@ export class SandboxCore {
 		const authed = repoUrl.replace("https://", `https://x-access-token:${token}@`);
 		const result = await this.runIn("/home/user", `git clone ${authed} ${dest}`, 300_000);
 		if (result.exitCode !== 0) throw new Error(`git clone failed: ${result.stderr || result.stdout}`);
-		const head = await this.runIn(dest, "git symbolic-ref refs/remotes/origin/HEAD --short", 15_000).catch(() => undefined);
+		const head = await this.runIn(dest, "git symbolic-ref refs/remotes/origin/HEAD --short", 15_000).catch(swallow("sandbox", "op"));
 		return head?.exitCode === 0 ? head.stdout.trim().replace(/^origin\//, "") : "";
 	}
 
@@ -122,8 +142,8 @@ export class SandboxCore {
 
 	/** Fetch origin/<base>; returns how many commits the branch is behind (0 = up to date). */
 	async driftBehind(dir: string, base: string): Promise<number> {
-		await this.runIn(dir, `git fetch origin ${base}`).catch(() => undefined);
-		const r = await this.runIn(dir, `git rev-list --count HEAD..origin/${base}`).catch(() => undefined);
+		await this.runIn(dir, `git fetch origin ${base}`).catch(swallow("sandbox", "op"));
+		const r = await this.runIn(dir, `git rev-list --count HEAD..origin/${base}`).catch(swallow("sandbox", "op"));
 		return r && r.exitCode === 0 ? Number(r.stdout.trim()) || 0 : 0;
 	}
 
@@ -131,36 +151,37 @@ export class SandboxCore {
 	async rebaseOnto(dir: string, base: string): Promise<boolean> {
 		const r = await this.runIn(dir, `git rebase origin/${base}`, 180_000);
 		if (r.exitCode === 0) return true;
-		await this.runIn(dir, "git rebase --abort").catch(() => undefined);
+		await this.runIn(dir, "git rebase --abort").catch(swallow("sandbox", "op"));
 		return false;
 	}
 
 	/** Raw file write into the sandbox filesystem (text or binary). */
 	async writeFile(absPath: string, content: string | Uint8Array): Promise<void> {
-		if (!this.sandbox) throw new Error("Sandbox not initialized.");
-		await this.sandbox.files.write(absPath, content);
+		if (!this.handle) throw new Error("Sandbox not initialized.");
+		await this.handle.writeFile(absPath, content);
 	}
 
 	/** Raw file read; null when missing/unreadable. */
 	async readFile(absPath: string): Promise<string | null> {
-		if (!this.sandbox) return null;
-		return this.sandbox.files.read(absPath).catch(() => null);
+		if (!this.handle) return null;
+		return this.handle.readFile(absPath).catch(swallow("sandbox", "op", null));
 	}
 
 	async close(): Promise<void> {
 		clearTimeout(this.idleTimer);
 		this.report("stop");
-		await this.sandbox?.kill().catch(() => {});
-		this.sandbox = undefined;
+		const id = this.sandboxId;
+		if (id) await this.provider.killById(id, this.creds).catch(swallow("sandbox", "op"));
+		this.handle = undefined;
 	}
 
 	get sandboxId(): string | undefined {
-		return (this.sandbox as unknown as { sandboxId?: string })?.sandboxId;
+		return this.handle?.id;
 	}
 
-	/** Underlying e2b Sandbox for tool factories (e.g. createRemoteFileTools). */
-	get inner(): Sandbox | undefined {
-		return this.sandbox;
+	/** Underlying provider-agnostic handle for tool factories (e.g. createRemoteFileTools). */
+	get inner(): SandboxHandle | undefined {
+		return this.handle;
 	}
 }
 

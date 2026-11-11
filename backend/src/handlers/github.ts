@@ -2,6 +2,7 @@ import { authenticate } from "../lib/apiKeys";
 import { getDb } from "../lib/mongo";
 import { installationRepos, installationToken, listInstallations } from "../lib/githubApp";
 import { json } from "../routes";
+import { swallow } from "../lib/log";
 
 /** GET /api/github/repos */
 export async function repos(req: Request): Promise<Response> {
@@ -28,9 +29,9 @@ export async function repos(req: Request): Promise<Response> {
 export async function token(req: Request): Promise<Response> {
 	const uid = await authenticate(req);
 	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
-	const { installationId } = (await req.json().catch(() => ({}))) as { installationId?: number };
+	const { installationId } = (await req.json().catch(swallow("github", "bad json", {}))) as { installationId?: number };
 	if (!installationId) return json({ error: "installationId required" }, { status: 400 });
-	const t = await installationToken(installationId).catch(() => "");
+	const t = await installationToken(installationId).catch(swallow("github", "installationToken", ""));
 	if (!t) return json({ error: "token_failed" }, { status: 502 });
 	return json({ token: t });
 }
@@ -47,7 +48,7 @@ export function callback(req: Request): Response {
 export async function link(req: Request): Promise<Response> {
 	const uid = await authenticate(req);
 	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
-	const { installationId } = (await req.json().catch(() => ({}))) as { installationId?: number };
+	const { installationId } = (await req.json().catch(swallow("github", "bad json", {}))) as { installationId?: number };
 	if (!installationId) return json({ error: "installationId required" }, { status: 400 });
 	const db = await getDb();
 	await db.collection<{ _id: string }>("users").updateOne(

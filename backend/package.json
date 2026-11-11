@@ -15,6 +15,8 @@
 	"dependencies": {
 		"@cline/agents": "^0.2.0",
 		"@cline/shared": "^0.2.0",
+		"@kubernetes/client-node": "^2.0.2",
+		"@vercel/sandbox": "^3.9.1",
 		"diff": "9.0.0",
 		"e2b": "^2.62.0",
 		"firebase-admin": "^13.5.0",

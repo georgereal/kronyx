@@ -2,6 +2,8 @@
  * Context cache seam: in-process Map today, Redis-backed when REDIS_URL is set.
  * Swap point is `getCache()` — everything else consumes the interface.
  */
+import { swallow } from "../lib/log";
+
 export interface ContextCache {
 	get(key: string): Promise<unknown | undefined>;
 	set(key: string, value: unknown, ttlMs?: number): Promise<void>;
@@ -37,16 +39,16 @@ class RedisCache implements ContextCache {
 		return new RedisCache(new Redis(url, { lazyConnect: true, maxRetriesPerRequest: 1 }));
 	}
 	async get(key: string) {
-		const raw = await this.client.get(`kronyx:${key}`).catch(() => null);
+		const raw = await this.client.get(`kronyx:${key}`).catch(swallow("cache", `get ${key}`, null));
 		return raw ? JSON.parse(raw) : undefined;
 	}
 	async set(key: string, value: unknown, ttlMs = 60_000) {
 		await this.client
 			.set(`kronyx:${key}`, JSON.stringify(value), "PX", Math.round(ttlMs))
-			.catch(() => {});
+			.catch(swallow("cache", `set ${key}`));
 	}
 	async del(key: string) {
-		await this.client.del(`kronyx:${key}`).catch(() => {});
+		await this.client.del(`kronyx:${key}`).catch(swallow("cache", `del ${key}`));
 	}
 }
 

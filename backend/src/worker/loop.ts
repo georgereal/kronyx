@@ -1,7 +1,8 @@
 import { hostname } from "node:os";
-import { dbg } from "../lib/log";
+import { dbg, swallow } from "../lib/log";
 import { getDb } from "../lib/mongo";
 import { RunSink } from "./events";
+import { saveRunReport } from "../lib/runReport";
 import { E2bOrchestratedExecutor, type CloudJob } from "./executor";
 
 try {
@@ -99,7 +100,7 @@ async function runJob(job: CloudJob): Promise<void> {
 		void db
 			.collection("cloud_jobs")
 			.updateOne({ jobId: job.jobId }, { $set: { heartbeatAt: new Date(), leaseUntil: lease() } })
-			.catch(() => {});
+			.catch(swallow("loop", "op"));
 	}, HEARTBEAT_MS);
 
 	let stopped = false;
@@ -110,9 +111,9 @@ async function runJob(job: CloudJob): Promise<void> {
 			if (run?.control === "stop_requested" && !stopped) {
 				stopped = true;
 				log(`stop requested for ${job.runId}`);
-				executor.agentRunner?.stop();
+				executor.requestStop();
 			}
-		})().catch(() => {});
+		})().catch(swallow("loop", "op"));
 	}, STOP_CHECK_MS);
 
 	try {
@@ -125,21 +126,26 @@ async function runJob(job: CloudJob): Promise<void> {
 		await db.collection("cloud_jobs").updateOne({ jobId: job.jobId }, { $set: { status: stopped ? "stopped" : "done", finishedAt: new Date() } });
 		log(`job ${job.jobId} ${status}`);
 	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		await sink.emit({ type: "run-failed", error: message }).catch(() => {});
-		await sink.patchRun({ status: "failed", error: message, finishedAt: new Date() }).catch(() => {});
+		const message = stopped ? "Stopped by user" : error instanceof Error ? error.message : String(error);
+		await sink.emit({ type: "run-failed", error: message }).catch(swallow("loop", "op"));
+		await sink.patchRun({ status: stopped ? "stopped" : "failed", error: message, finishedAt: new Date() }).catch(swallow("loop", "op"));
 		await db
 			.collection("cloud_jobs")
-			.updateOne({ jobId: job.jobId }, { $set: { status: "failed", error: message, finishedAt: new Date() } })
-			.catch(() => {});
-		log(`job ${job.jobId} failed: ${message}`);
+			.updateOne({ jobId: job.jobId }, { $set: { status: stopped ? "stopped" : "failed", error: message, finishedAt: new Date() } })
+			.catch(swallow("loop", "op"));
+		log(`job ${job.jobId} ${stopped ? "stopped" : "failed"}: ${message}`);
 	} finally {
 		clearInterval(heartbeat);
 		clearInterval(stopCheck);
+		// Collated usage+trace report — drain first so all events have landed.
+		await sink
+			.drain()
+			.then(() => saveRunReport(db, job.uid, job.runId))
+			.catch(swallow("loop", "op"));
 		await db
 			.collection("sessions")
 			.updateOne({ uid: job.uid, sessionId: job.sessionId, activeRunId: job.runId }, { $set: { activeRunId: null } })
-			.catch(() => {});
+			.catch(swallow("loop", "op"));
 	}
 }
 
@@ -152,7 +158,7 @@ export async function startWorker(): Promise<void> {
 		void getDb()
 			.then((db) => import("../handlers/misc").then((m) => m.runJanitorSweep(db)))
 			.then((r) => r.killed + r.paused > 0 && log(`janitor: ${JSON.stringify(r)}`))
-			.catch(() => {});
+			.catch(swallow("loop", "op"));
 	}, JANITOR_MS);
 	for (;;) {
 		try {

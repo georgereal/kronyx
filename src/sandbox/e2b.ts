@@ -1,8 +1,8 @@
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { Sandbox } from "e2b";
 import { IGNORED_DIRS } from "../tools/workspace";
+import type { ProviderCreds, SandboxHandle } from "./provider";
 import { SandboxCore, openPr } from "./sandboxCore";
 
 export { openPr };
@@ -28,12 +28,16 @@ export async function e2bApiKey(secrets: vscode.SecretStorage): Promise<string |
  * input-box prompts on top of the vscode-free SandboxCore.
  */
 export class E2bSandbox extends SandboxCore {
+	private static creds(apiKey: string): ProviderCreds {
+		return { secrets: { e2bApiKey: apiKey }, data: {} };
+	}
+
 	/** E2B template override from settings; "" = base image. */
 	private template(): string {
 		return vscode.workspace.getConfiguration("kronyx").get<string>("cloud.template", "");
 	}
 
-	async ensure(secrets: vscode.SecretStorage): Promise<Sandbox> {
+	async ensure(secrets: vscode.SecretStorage): Promise<SandboxHandle> {
 		if (this.inner) {
 			this.applyIdle();
 			return this.inner;
@@ -51,15 +55,16 @@ export class E2bSandbox extends SandboxCore {
 			await secrets.store("kronyx.sandbox.e2bApiKey", key);
 		}
 		const ttlMs = vscode.workspace.getConfiguration("kronyx").get<number>("cloud.ttlMinutes", 60) * 60_000;
-		const sbx = await this.create({ apiKey: key, template: this.template() || undefined, timeoutMs: ttlMs });
+		const handle = await this.create({ creds: E2bSandbox.creds(key), template: this.template() || undefined, timeoutMs: ttlMs });
 		this.applyIdle();
-		return sbx;
+		return handle;
 	}
 
-	override async connect(id: string, apiKey?: string): Promise<Sandbox | null> {
-		const sbx = await super.connect(id, apiKey);
-		if (sbx) this.applyIdle();
-		return sbx;
+	/** Reconnect by id with an E2B api key (extension path is e2b-only). */
+	async connectKey(id: string, apiKey?: string): Promise<SandboxHandle | null> {
+		const handle = await super.connect(id, E2bSandbox.creds(apiKey ?? ""), "e2b");
+		if (handle) this.applyIdle();
+		return handle;
 	}
 
 	private applyIdle(): void {
@@ -71,7 +76,7 @@ export class E2bSandbox extends SandboxCore {
 	async syncUp(root: string): Promise<number> {
 		const sbx = this.inner;
 		if (!sbx) return 0;
-		await sbx.commands.run(`mkdir -p ${WORK_DIR}`);
+		await sbx.run(`mkdir -p ${WORK_DIR}`, { cwd: "/" });
 		let count = 0;
 		for await (const rel of walk(root, "")) {
 			if (count >= SYNC_FILE_LIMIT) break;
@@ -80,7 +85,7 @@ export class E2bSandbox extends SandboxCore {
 			if (!stat || stat.size > SYNC_BYTE_CAP) continue;
 			const buffer = await fs.readFile(abs);
 			if (buffer.includes(0)) continue;
-			await sbx.files.write(`${WORK_DIR}/${rel.split(path.sep).join("/")}`, buffer.toString("utf8"));
+			await sbx.writeFile(`${WORK_DIR}/${rel.split(path.sep).join("/")}`, buffer.toString("utf8"));
 			count++;
 		}
 		return count;
@@ -88,8 +93,7 @@ export class E2bSandbox extends SandboxCore {
 
 	async run(command: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {
 		if (!this.inner) throw new Error("Sandbox not initialized.");
-		const result = await this.inner.commands.run(command, { cwd: WORK_DIR, timeoutMs: 60_000 });
-		return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr };
+		return this.inner.run(command, { cwd: WORK_DIR, timeoutMs: 60_000 });
 	}
 }
 

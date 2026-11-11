@@ -14,8 +14,17 @@ export interface UsageCall {
 	tokensIn: number;
 	tokensOut: number;
 	cacheRead: number;
+	cacheWrite?: number;
+	reasoningTokens?: number;
+	billedCostUsd?: number | null;
+	iteration?: number | null;
+	contextMsgs?: number | null;
+	kind?: string;
+	op?: string;
 	costUsd: number | null;
 	durationMs: number;
+	runId?: string;
+	session?: string;
 }
 
 export const RANGES = [

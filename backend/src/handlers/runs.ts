@@ -1,13 +1,17 @@
+import { getProvider, providers, type ProviderCreds } from "../../../src/sandbox/provider";
+import { swallow } from "../lib/log";
 import { authenticate } from "../lib/apiKeys";
 import { getDb } from "../lib/mongo";
+import { recordSandboxEvent } from "../lib/sandboxEvents";
+import { buildRunReport } from "../lib/runReport";
 import { json } from "../routes";
 
-async function e2bKey(uid: string): Promise<string | undefined> {
+async function userCreds(uid: string): Promise<ProviderCreds> {
 	const db = await getDb();
 	const doc = await db
-		.collection<{ _id: string; settings?: { secrets?: { e2bApiKey?: string } } }>("users")
+		.collection<{ _id: string; settings?: { secrets?: Record<string, string>; data?: Record<string, unknown> } }>("users")
 		.findOne({ _id: uid });
-	return doc?.settings?.secrets?.e2bApiKey ?? process.env.E2B_API_KEY;
+	return { secrets: doc?.settings?.secrets ?? {}, data: doc?.settings?.data ?? {} };
 }
 
 /** GET /api/runs */
@@ -44,6 +48,24 @@ export async function getRun(req: Request, p: Record<string, string>): Promise<R
 	});
 }
 
+/** GET /api/runs/:id/report — collated usage+trace JSON; builds on demand when missing. */
+export async function runReport(req: Request, p: Record<string, string>): Promise<Response> {
+	const uid = await authenticate(req);
+	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
+	const db = await getDb();
+	if (new URL(req.url).searchParams.get("refresh") !== "1") {
+		const doc = await db.collection("run_reports").findOne({ uid, runId: p.id }, { projection: { _id: 0 } });
+		if (doc) return json({ report: doc });
+	}
+	const report = await buildRunReport(db, uid, p.id);
+	if (!report) return json({ error: "not_found" }, { status: 404 });
+	await db
+		.collection("run_reports")
+		.updateOne({ uid, runId: p.id }, { $set: report }, { upsert: true })
+		.catch(swallow("runs", "op"));
+	return json({ report });
+}
+
 /** POST /api/runs/:id/stop */
 export async function stopRun(req: Request, p: Record<string, string>): Promise<Response> {
 	const uid = await authenticate(req);
@@ -65,6 +87,11 @@ export async function stopRun(req: Request, p: Record<string, string>): Promise<
 		await db
 			.collection("sessions")
 			.updateOne({ uid, sessionId: run.sessionId, activeRunId: p.id }, { $set: { activeRunId: null, updatedAt: new Date() } });
+	} else {
+		// Claimed/running: worker's stopCheck reads `control` — show progress meanwhile.
+		await db
+			.collection("runs")
+			.updateOne({ uid, runId: p.id, status: { $in: ["running", "claimed"] } }, { $set: { status: "stopping", updatedAt: new Date() } });
 	}
 	return json({ ok: true });
 }
@@ -75,33 +102,42 @@ export async function listSandboxes(req: Request): Promise<Response> {
 	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
 	const db = await getDb();
 	const history = await db.collection("sandboxes").find({ uid }).sort({ at: -1 }).limit(300).toArray();
-	const key = await e2bKey(uid);
-	let live: { sandboxId: string; templateId?: string; state?: string; startedAt?: string }[] = [];
-	if (key) {
-		const res = await fetch("https://api.e2b.app/v2/sandboxes", {
-			headers: { "X-API-KEY": key },
-			signal: AbortSignal.timeout(10_000),
-		}).catch(() => undefined);
-		if (res?.ok) live = (await res.json()) as typeof live;
+	const events = await db.collection("sandbox_events").find({ uid }).sort({ at: -1 }).limit(500).toArray();
+	const creds = await userCreds(uid);
+	let live: { sandboxId: string; provider?: string; startedAt?: string }[] = [];
+	for (const p of Object.values(providers)) {
+		if (!p.listLive || p.validate(creds)) continue;
+		const items = await p.listLive(creds).catch(swallow("runs", "op", []));
+		live = live.concat(items.map((s) => ({ sandboxId: s.id, provider: p.name, startedAt: s.startedAt })));
 	}
-	return json({ live, history: history.map((h) => ({ ...h, _id: undefined })), liveEnabled: !!key });
+	return json({
+		live,
+		history: history.map((h) => ({ ...h, _id: undefined })),
+		events: events.map((e) => ({ ...e, _id: undefined })),
+		liveEnabled: true,
+	});
+}
+
+/** Provider for a sandbox row (defaults to e2b for pre-provider rows). */
+async function rowProvider(uid: string, id: string) {
+	const db = await getDb();
+	const row = await db.collection("sandboxes").findOne({ uid, sandboxId: id }, { sort: { at: -1 } });
+	return { db, provider: getProvider(typeof row?.provider === "string" ? row.provider : "e2b") };
 }
 
 /** DELETE /api/sandboxes/:id — manual kill; row marked dead, session pointer cleared. */
 export async function deleteSandbox(req: Request, p: Record<string, string>): Promise<Response> {
 	const uid = await authenticate(req);
 	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
-	const k = await e2bKey(uid);
-	if (!k) return json({ error: "no_e2b_key" }, { status: 400 });
-	const res = await fetch(`https://api.e2b.app/sandboxes/${encodeURIComponent(p.id)}`, {
-		method: "DELETE",
-		headers: { "X-API-KEY": k },
-	});
-	if (!res.ok && res.status !== 404) return json({ ok: false }, { status: 502 });
-	const db = await getDb();
+	const { db, provider } = await rowProvider(uid, p.id);
+	const creds = await userCreds(uid);
+	const err = provider.validate(creds);
+	if (err) return json({ error: "no_credentials", detail: err }, { status: 400 });
+	if (!(await provider.killById(p.id, creds).catch(swallow("runs", "op", false)))) return json({ ok: false }, { status: 502 });
 	await db
 		.collection("sandboxes")
 		.updateOne({ uid, sandboxId: p.id }, { $set: { state: "dead", reason: "manual", killPending: false, deadAt: new Date() } });
+	await recordSandboxEvent(db, { uid, sandboxId: p.id, provider: provider.name, event: "kill", state: "dead", reason: "manual" });
 	await db.collection("sessions").updateMany({ uid, sandboxId: p.id }, { $set: { sandboxId: null, cloned: false } });
 	return json({ ok: true });
 }
@@ -110,16 +146,15 @@ export async function deleteSandbox(req: Request, p: Record<string, string>): Pr
 export async function pauseSandbox(req: Request, p: Record<string, string>): Promise<Response> {
 	const uid = await authenticate(req);
 	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
-	const k = await e2bKey(uid);
-	if (!k) return json({ error: "no_e2b_key" }, { status: 400 });
-	const res = await fetch(`https://api.e2b.app/sandboxes/${encodeURIComponent(p.id)}/pause`, {
-		method: "POST",
-		headers: { "X-API-KEY": k },
-	});
-	if (!res.ok && res.status !== 404) return json({ ok: false }, { status: 502 });
-	const db = await getDb();
+	const { db, provider } = await rowProvider(uid, p.id);
+	if (!provider.capabilities.pause || !provider.pauseById) return json({ error: "pause_unsupported", provider: provider.name }, { status: 400 });
+	const creds = await userCreds(uid);
+	const err = provider.validate(creds);
+	if (err) return json({ error: "no_credentials", detail: err }, { status: 400 });
+	if (!(await provider.pauseById(p.id, creds).catch(swallow("runs", "op", false)))) return json({ ok: false }, { status: 502 });
 	await db
 		.collection("sandboxes")
 		.updateOne({ uid, sandboxId: p.id }, { $set: { state: "paused", reason: "manual", at: new Date() } });
+	await recordSandboxEvent(db, { uid, sandboxId: p.id, provider: provider.name, event: "pause", state: "paused", reason: "manual" });
 	return json({ ok: true });
 }

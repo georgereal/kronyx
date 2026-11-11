@@ -71,6 +71,7 @@ export const routes: Route[] = makeRoutes([
 	["GET", "/api/github/callback", gh.callback],
 	["POST", "/api/github/link", gh.link],
 	["GET", "/api/runs", runsH.listRuns],
+	["GET", "/api/runs/:id/report", runsH.runReport],
 	["GET", "/api/runs/:id", runsH.getRun],
 	["POST", "/api/runs/:id/stop", runsH.stopRun],
 	["GET", "/api/sandboxes", runsH.listSandboxes],

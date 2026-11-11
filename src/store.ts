@@ -88,9 +88,19 @@ export async function openStore(root: string): Promise<Store | undefined> {
 				db.exec(`ALTER TABLE runs ADD COLUMN ${col}`);
 			} catch { /* column exists */ }
 		}
-		try {
-			db.exec(`ALTER TABLE api_calls ADD COLUMN run_id TEXT`);
-		} catch { /* column exists */ }
+		for (const col of [
+			"run_id TEXT",
+			"reasoning_tokens INTEGER",
+			"billed_cost_usd REAL",
+			"iteration INTEGER",
+			"context_msgs INTEGER",
+			"kind TEXT",
+			"op TEXT",
+		]) {
+			try {
+				db.exec(`ALTER TABLE api_calls ADD COLUMN ${col}`);
+			} catch { /* column exists */ }
+		}
 		db.exec(`CREATE TABLE IF NOT EXISTS sandboxes(
 			id INTEGER PRIMARY KEY, root TEXT, sandbox_id TEXT, device TEXT, device_id TEXT,
 			template TEXT, repo TEXT, run_id TEXT, event TEXT, at INTEGER,
@@ -413,6 +423,12 @@ export interface ApiCallRow {
 	tokensOut: number;
 	cacheRead?: number;
 	cacheWrite?: number;
+	reasoningTokens?: number;
+	billedCostUsd?: number;
+	iteration?: number;
+	contextMsgs?: number;
+	kind?: string;
+	op?: string;
 	costUsd?: number;
 	durationMs?: number;
 	runId?: string;
@@ -424,13 +440,16 @@ export function insertApiCall(d: Store | undefined, call: ApiCallRow, root = "")
 		run(
 			d,
 			`INSERT INTO api_calls(root, session, task, at, status, provider, base_url, model, profile, key_label,
-				device, device_id, run_id, tokens_in, tokens_out, cache_read, cache_write, cost_usd, duration_ms)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				device, device_id, run_id, tokens_in, tokens_out, cache_read, cache_write,
+				reasoning_tokens, billed_cost_usd, iteration, context_msgs, kind, op, cost_usd, duration_ms)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			[
 				root, call.session, call.task, call.at, call.status, call.provider ?? "", call.baseUrl ?? "",
 				call.model ?? "", call.profile ?? "", call.keyLabel ?? "", call.device ?? "", call.deviceId ?? "",
 				call.runId ?? "",
 				call.tokensIn, call.tokensOut, call.cacheRead ?? 0, call.cacheWrite ?? 0,
+				call.reasoningTokens ?? 0, call.billedCostUsd ?? null, call.iteration ?? null, call.contextMsgs ?? null,
+				call.kind ?? "chat", call.op ?? "",
 				call.costUsd ?? null, call.durationMs ?? 0,
 			],
 		);

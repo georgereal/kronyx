@@ -4,7 +4,7 @@ export interface ModelOption {
 	description?: string;
 	contextWindow?: number;
 	maxTokens?: number;
-	pricing?: { input?: number; output?: number };
+	pricing?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
 	modalities?: { input?: string[]; output?: string[] };
 	tags?: string[];
 	owner?: string;
@@ -36,7 +36,12 @@ function toModelOption(m: Record<string, unknown>): ModelOption | undefined {
 	opt.owner = typeof m.owned_by === "string" ? m.owned_by : undefined;
 	const inPrice = num(pricing?.input) ?? num(pricing?.prompt);
 	const outPrice = num(pricing?.output) ?? num(pricing?.completion);
-	opt.pricing = inPrice !== undefined || outPrice !== undefined ? { input: inPrice, output: outPrice } : undefined;
+	const cacheRead = num(pricing?.cache_read) ?? num(pricing?.input_cache_read) ?? num(pricing?.cached_input);
+	const cacheWrite = num(pricing?.cache_write) ?? num(pricing?.input_cache_write);
+	opt.pricing =
+		inPrice !== undefined || outPrice !== undefined || cacheRead !== undefined || cacheWrite !== undefined
+			? { input: inPrice, output: outPrice, cacheRead, cacheWrite }
+			: undefined;
 	return opt;
 }
 

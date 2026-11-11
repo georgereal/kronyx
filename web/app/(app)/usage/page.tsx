@@ -1,11 +1,12 @@
 "use client";
 
-import { RefreshCw, Search } from "lucide-react";
+import { FileJson, RefreshCw, Search } from "lucide-react";
 import { useMemo, useState } from "react";
 import { fmtTok } from "@/components/AreaChart";
 import { Empty } from "@/components/Empty";
 import { Skeleton } from "@/components/Skeleton";
 import { StatusPill } from "@/components/StatusPill";
+import { apiFetch } from "@/lib/api";
 import { fmtCost, fmtDur, host, RangePicker, useUsageCalls } from "@/lib/usage";
 
 export default function UsagePage() {
@@ -13,8 +14,21 @@ export default function UsagePage() {
 	const [model, setModel] = useState("");
 	const [status, setStatus] = useState("");
 	const [search, setSearch] = useState("");
-	const { calls, loading, reload } = useUsageCalls(range);
+	const { calls, loading, reload, user } = useUsageCalls(range);
 	const [limit, setLimit] = useState(200);
+
+	const downloadReport = async (runId: string) => {
+		if (!user) return;
+		const res = await apiFetch(`/api/runs/${runId}/report`, user);
+		if (!res.ok) return;
+		const { report } = (await res.json()) as { report: unknown };
+		const url = URL.createObjectURL(new Blob([JSON.stringify(report, null, 2)], { type: "application/json" }));
+		const a = document.createElement("a");
+		a.href = url;
+		a.download = `run-${runId.slice(0, 12)}-report.json`;
+		a.click();
+		URL.revokeObjectURL(url);
+	};
 
 	const models = useMemo(() => [...new Set(calls.map((c) => c.model).filter(Boolean))].sort(), [calls]);
 	const filtered = useMemo(
@@ -85,10 +99,13 @@ export default function UsagePage() {
 								<th>Model</th>
 								<th>Provider</th>
 								<th className="num">Usage</th>
+								<th className="num">Turn</th>
 								<th className="num">Cost est.</th>
+								<th className="num">Billed</th>
 								<th className="num">Duration</th>
 								<th>Key</th>
 								<th>Device</th>
+								<th></th>
 							</tr>
 						</thead>
 						<tbody>
@@ -103,16 +120,36 @@ export default function UsagePage() {
 										<td>
 											<StatusPill status={c.status} />
 										</td>
-										<td className="model-cell">{c.model}</td>
+										<td className="model-cell">
+											{c.model}
+											{c.kind === "embedding" && <span className="sess-chip muted" style={{ marginLeft: 6, fontSize: 10 }}>emb{c.op ? `·${c.op.split("_")[1] ?? c.op}` : ""}</span>}
+										</td>
 										<td className="muted">{host(c.baseUrl) || c.provider}</td>
 										<td className="num">
 											{fmtTok(c.tokensIn)} in · {fmtTok(c.tokensOut)} out
 											{c.cacheRead > 0 && <span className="muted"> · {fmtTok(c.cacheRead)}↩</span>}
+											{(c.reasoningTokens ?? 0) > 0 && <span className="muted"> · {fmtTok(c.reasoningTokens!)}↯</span>}
+										</td>
+										<td className="num muted">
+											{c.iteration != null ? `#${c.iteration}` : "—"}
+											{c.contextMsgs != null && <span className="muted" title="messages in context"> · {c.contextMsgs}msg</span>}
 										</td>
 										<td className="num">{fmtCost(c.costUsd)}</td>
+										<td className="num">{fmtCost(c.billedCostUsd ?? null)}</td>
 										<td className="num">{fmtDur(c.durationMs)}</td>
 										<td className="mono muted">{c.keyLabel}</td>
 										<td className="muted">{c.device || "—"}</td>
+										<td>
+											{c.runId && (
+												<button
+													className="btn ghost sm"
+													title={`Download run report (${c.runId.slice(0, 12)})`}
+													onClick={() => void downloadReport(c.runId!)}
+												>
+													<FileJson size={13} />
+												</button>
+											)}
+										</td>
 									</tr>
 								);
 							})}

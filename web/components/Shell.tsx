@@ -88,7 +88,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
 	}
 
 	const dot = (s: SessionDoc) =>
-		s.lastStatus === "running" || s.lastStatus === "queued" ? "running"
+		s.lastStatus === "running" || s.lastStatus === "queued" || s.lastStatus === "stopping" ? "running"
 		: s.lastStatus === "completed" ? "completed"
 		: s.lastStatus === "failed" ? "failed"
 		: "";
@@ -143,10 +143,12 @@ export function Shell({ children }: { children: React.ReactNode }) {
 				</div>
 
 				<Link href="/sessions" className="btn side-new">
-					<Plus size={13} /> <span className="side-label">New session</span>
+					<Plus size={13} /> <span className="side-label" style={{ color: "#fff", fontWeight: 600 }}>New session</span>
 				</Link>
 
-				<div className="side-section" style={{ marginTop: 4, borderTop: "none" }}>
+				<Link href="/sessions" className="nav-item"><span>⌂</span> <span className="side-label">Home</span></Link>
+				<Link href="/sessions" className="nav-item"><span>▤</span> <span className="side-label">Projects</span></Link>
+				<div className="side-section" style={{ marginTop: 8, borderTop: "none" }}>
 					<div className="side-section-head side-label">Sessions</div>
 					<div className="side-sessions">
 						{sessions.length === 0 && <div className="side-empty side-label">No sessions yet</div>}
@@ -173,7 +175,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
 					</button>
 				</div>
 			</aside>}
-			<main className="container">{children}</main>
+			<main className={`container${pathname === "/settings" ? " wide" : ""}`}>{children}</main>
 		</div>
 	);
 }

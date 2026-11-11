@@ -1,0 +1,99 @@
+import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import type { ExecResult, ProviderCreds, SandboxHandle, SandboxProvider } from "../provider";
+
+/**
+ * Docker provider — runs session sandboxes as containers on the worker's
+ * Docker host (or a remote one via dockerHost / DOCKER_HOST, e.g. ssh://).
+ * Shared-host isolation — trusted workloads only.
+ */
+const DEFAULT_IMAGE = "node:22";
+
+const dockerEnv = (creds: ProviderCreds): NodeJS.ProcessEnv => ({
+	...process.env,
+	...(creds.secrets.dockerHost ? { DOCKER_HOST: creds.secrets.dockerHost } : {}),
+});
+
+function cli(
+	creds: ProviderCreds,
+	args: string[],
+	opts: { input?: string | Uint8Array; timeoutMs?: number } = {},
+): Promise<ExecResult> {
+	return new Promise((resolve) => {
+		execFile(
+			"docker",
+			args,
+			{ env: dockerEnv(creds), timeout: opts.timeoutMs ?? 120_000, maxBuffer: 16 * 1024 * 1024 },
+			(err, stdout, stderr) => {
+				resolve({ exitCode: err ? (typeof err.code === "number" ? err.code : 1) : 0, stdout: String(stdout), stderr: String(stderr) });
+			},
+		).stdin?.end(opts.input);
+	});
+}
+
+class DockerHandle implements SandboxHandle {
+	constructor(
+		private readonly creds: ProviderCreds,
+		readonly id: string,
+	) {}
+
+	async run(command: string, opts: { cwd: string; timeoutMs?: number }): Promise<ExecResult> {
+		return cli(this.creds, ["exec", "-w", opts.cwd, this.id, "sh", "-c", command], { timeoutMs: (opts.timeoutMs ?? 120_000) + 5_000 });
+	}
+
+	async readFile(path: string): Promise<string> {
+		const r = await cli(this.creds, ["exec", this.id, "sh", "-c", 'cat "$1"', "_", path]);
+		if (r.exitCode !== 0) throw new Error(`readFile failed: ${r.stderr || r.stdout}`);
+		return r.stdout;
+	}
+
+	async writeFile(path: string, content: string | Uint8Array): Promise<void> {
+		const input = typeof content === "string" ? content : Buffer.from(content).toString("base64");
+		const cmd = typeof content === "string" ? 'cat > "$1"' : 'base64 -d > "$1"';
+		const r = await cli(this.creds, ["exec", "-i", this.id, "sh", "-c", cmd, "_", path], { input });
+		if (r.exitCode !== 0) throw new Error(`writeFile failed: ${r.stderr || r.stdout}`);
+	}
+}
+
+export const dockerProvider: SandboxProvider = {
+	name: "docker",
+	capabilities: { pause: true, reconnect: true, orphanSweep: true },
+	secretKeys: ["dockerHost"],
+
+	validate() {
+		return null; // local docker socket is the default; dockerHost optional
+	},
+
+	async create(creds, opts) {
+		const image = opts.template || creds.secrets.dockerImage || DEFAULT_IMAGE;
+		const name = `kronyx-${randomUUID().slice(0, 12)}`;
+		const r = await cli(creds, ["run", "-d", "--name", name, "--label", "kronyx=1", image, "sleep", "infinity"], { timeoutMs: 300_000 });
+		if (r.exitCode !== 0) throw new Error(`docker run failed: ${r.stderr || r.stdout}`);
+		return new DockerHandle(creds, name);
+	},
+
+	async connect(id, creds) {
+		const r = await cli(creds, ["inspect", "-f", "{{.State.Running}}", id], { timeoutMs: 15_000 });
+		return r.exitCode === 0 && r.stdout.trim() === "true" ? new DockerHandle(creds, id) : null;
+	},
+
+	async pauseById(id, creds) {
+		return (await cli(creds, ["pause", id], { timeoutMs: 15_000 })).exitCode === 0;
+	},
+
+	async killById(id, creds) {
+		return (await cli(creds, ["rm", "-f", id], { timeoutMs: 30_000 })).exitCode === 0;
+	},
+
+	async listLive(creds) {
+		const r = await cli(creds, ["ps", "--filter", "label=kronyx=1", "--format", "{{.Names}} {{.CreatedAt}}"], { timeoutMs: 15_000 });
+		if (r.exitCode !== 0) return [];
+		return r.stdout
+			.split("\n")
+			.filter(Boolean)
+			.map((line) => {
+				const [id, ...rest] = line.split(" ");
+				return { id, startedAt: rest.join(" ") || undefined };
+			});
+	},
+};

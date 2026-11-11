@@ -42,7 +42,18 @@ export type RunViewEvent =
 	| { type: "permission-response"; id: string; decision: "allow" | "always" | "deny" | "alwaysTool" }
 	| { type: "loop-detected"; tool: string; count: number }
 	| { type: "mode-blocked"; mode: AgentMode }
-	| { type: "usage"; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number }
+	| {
+			type: "usage";
+			inputTokens: number;
+			outputTokens: number;
+			cacheReadTokens: number;
+			cacheWriteTokens: number;
+			reasoningTokens?: number;
+			/** Provider-reported cumulative billed cost (not all providers report). */
+			totalCost?: number;
+			iteration?: number;
+			contextMsgs?: number;
+		}
 	| { type: "run-finished"; status: string; text: string; iterations: number }
 	| { type: "run-failed"; error: string };
 
@@ -110,7 +121,10 @@ export class AgentRunner {
 		this.digests = [];
 	}
 
+	private stopRequested = false;
+
 	stop(): void {
+		this.stopRequested = true;
 		this.agent?.abort("Stopped by user");
 	}
 
@@ -148,6 +162,11 @@ export class AgentRunner {
 		this.running = true;
 		this.host.emit({ type: "run-started", task });
 		try {
+			// A stop that landed before run() (e.g. during worker sandbox setup) still halts here.
+			if (this.stopRequested) {
+				this.host.emit({ type: "run-finished", status: "stopped", text: "Stopped by user", iterations: 0 });
+				return;
+			}
 			let agent = this.agent;
 			if (agent && this.shouldHandoff(settings)) {
 				const dropped = Math.round(JSON.stringify(agent.snapshot().messages).length / CHARS_PER_TOKEN / 1000);
@@ -174,6 +193,7 @@ export class AgentRunner {
 		} catch (error) {
 			this.host.emit({ type: "run-failed", error: error instanceof Error ? error.message : String(error) });
 		} finally {
+			this.stopRequested = false;
 			this.running = false;
 		}
 	}
@@ -323,6 +343,10 @@ export class AgentRunner {
 					outputTokens: event.usage.outputTokens ?? 0,
 					cacheReadTokens: event.usage.cacheReadTokens ?? 0,
 					cacheWriteTokens: event.usage.cacheWriteTokens ?? 0,
+					reasoningTokens: event.usage.reasoningTokenCount ?? 0,
+					totalCost: event.usage.totalCost,
+					iteration: event.snapshot.iteration,
+					contextMsgs: event.snapshot.messages.length,
 				});
 				break;
 			case "status-notice":

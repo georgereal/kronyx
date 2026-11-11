@@ -7,7 +7,7 @@ import type { AgentMessage } from "@cline/shared";
 import { checksOnFinish, runChecks } from "../checks";
 import { E2bSandbox, sandboxBackend, sandboxEnabled } from "../sandbox/e2b";
 import { appendFact, indexFile, loadMemoryContext, logEpisode } from "../agent/memory";
-import { autoApproveWrites, implementPrompt, modelPricing, planDir, promptForApiKey, providerErrorMessage, readProviderSettings, resolveProvider, writeProviderValue } from "../config";
+import { autoApproveWrites, estimateCostUsd, implementPrompt, modelPricing, planDir, promptForApiKey, providerErrorMessage, readProviderSettings, resolveProvider, writeProviderValue } from "../config";
 import { log } from "../log";
 import type { ApiCallRow } from "../store";
 import * as git from "../git";
@@ -99,7 +99,7 @@ export class SessionController {
 	private runStartedAt = 0;
 	private replayed = false;
 	private runTask = "";
-	private lastUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+	private lastUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, totalCost: 0 };
 	private lastUsageAt = 0;
 	private runProvider: { providerId: string; baseUrl: string; modelId: string; profile?: string } | undefined;
 	private transcripts: PriorTranscript[] = [];
@@ -303,19 +303,26 @@ export class SessionController {
 		if (event.type === "usage") {
 			const now = Date.now();
 			// usage-updated is cumulative per run — the delta from the previous event
-			// approximates the most recent provider request.
+			// approximates the most recent provider request. Reset-safe: a counter
+			// drop (agent handoff) counts the new value, not a clamped 0.
+			const diff = (cur: number, prev: number) => (cur >= prev ? cur - prev : cur);
 			const prev = this.lastUsage;
 			const delta = {
-				inputTokens: Math.max(0, event.inputTokens - prev.inputTokens),
-				outputTokens: Math.max(0, event.outputTokens - prev.outputTokens),
-				cacheReadTokens: Math.max(0, event.cacheReadTokens - prev.cacheReadTokens),
-				cacheWriteTokens: Math.max(0, event.cacheWriteTokens - prev.cacheWriteTokens),
+				inputTokens: diff(event.inputTokens, prev.inputTokens),
+				outputTokens: diff(event.outputTokens, prev.outputTokens),
+				cacheReadTokens: diff(event.cacheReadTokens, prev.cacheReadTokens),
+				cacheWriteTokens: diff(event.cacheWriteTokens, prev.cacheWriteTokens),
+				reasoningTokens: diff(event.reasoningTokens ?? 0, prev.reasoningTokens),
 			};
+			const billedCost =
+				(event.totalCost ?? 0) > 0 || prev.totalCost > 0 ? diff(event.totalCost ?? 0, prev.totalCost) : undefined;
 			this.lastUsage = {
 				inputTokens: event.inputTokens,
 				outputTokens: event.outputTokens,
 				cacheReadTokens: event.cacheReadTokens,
 				cacheWriteTokens: event.cacheWriteTokens,
+				reasoningTokens: event.reasoningTokens ?? 0,
+				totalCost: event.totalCost ?? 0,
 			};
 			this.deps.recordUsage({
 				session: this.name,
@@ -342,7 +349,11 @@ export class SessionController {
 				tokensOut: delta.outputTokens,
 				cacheRead: delta.cacheReadTokens,
 				cacheWrite: delta.cacheWriteTokens,
-				costUsd: estimateCost(delta, pricing),
+				reasoningTokens: delta.reasoningTokens,
+				billedCostUsd: billedCost,
+				iteration: event.iteration,
+				contextMsgs: event.contextMsgs,
+				costUsd: estimateCostUsd(delta, pricing),
 				durationMs: this.lastUsageAt ? now - this.lastUsageAt : now - this.runStartedAt,
 			});
 			this.lastUsageAt = now;
@@ -665,15 +676,6 @@ function summarizePrior(events: Parameters<RunViewProvider["post"]>[0][]): strin
 		lastText?.text ? `Last summary: ${lastText.text.slice(-600)}` : "",
 	].filter(Boolean);
 	return parts.join("\n").slice(0, 1500);
-}
-
-/** Estimated USD cost from catalog pricing (per-token). Undefined when pricing is unknown. */
-function estimateCost(
-	delta: { inputTokens: number; outputTokens: number },
-	pricing: { input?: number; output?: number } | undefined,
-): number | undefined {
-	if (!pricing || (pricing.input === undefined && pricing.output === undefined)) return undefined;
-	return delta.inputTokens * (pricing.input ?? 0) + delta.outputTokens * (pricing.output ?? 0);
 }
 
 function errorMessage(error: unknown): string {

@@ -1,7 +1,7 @@
 "use client";
 
 import type { User } from "firebase/auth";
-import { ChevronDown, Cpu, GitBranch, Paperclip, Plus, SendHorizontal, Settings2, X } from "lucide-react";
+import { Cpu, GitBranch, Paperclip, Plus, SendHorizontal, Settings2, Square, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { apiFetch } from "@/lib/api";
 import type { ModelGroup, ModelOption } from "@/lib/types";
@@ -56,7 +56,6 @@ export function Composer({
 	onSubmit,
 	onStop,
 	running,
-	slim,
 	autoFocus,
 	onModel,
 }: {
@@ -68,13 +67,12 @@ export function Composer({
 	onSubmit: (task: string, attachmentIds: string[]) => void;
 	onStop?: () => void;
 	running?: boolean;
-	slim?: boolean;
 	autoFocus?: boolean;
 	onModel?: (modelId: string, profile: string) => void;
 }) {
 	const [text, setText] = useState("");
 	const [atts, setAtts] = useState<Attachment[]>([]);
-	const [menu, setMenu] = useState<"none" | "attach" | "env" | "model" | "send" | "slash" | "mode">("none");
+	const [menu, setMenu] = useState<"none" | "attach" | "env" | "model" | "slash" | "mode">("none");
 	const [repos, setRepos] = useState<Repo[]>([]);
 	const [groups, setGroups] = useState<ModelGroup[]>([]);
 	const [modelId, setModelId] = useState("");
@@ -123,7 +121,7 @@ export function Composer({
 	};
 
 	const onKey = (e: React.KeyboardEvent) => {
-		if (e.key === "Enter" && !e.shiftKey && menu !== "slash") {
+		if (e.key === "Enter" && ((!e.shiftKey && menu !== "slash") || e.metaKey || e.ctrlKey)) {
 			e.preventDefault();
 			submit();
 		}
@@ -312,11 +310,11 @@ export function Composer({
 					{env?.repo && <span className="sess-chip mono" style={{ maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis" }}>{env.repo}</span>}
 					<div className="spacer" />
 					<div className="anchor">
-						<button className="chip-btn" onClick={() => toggleMenu("mode")}>
-							{MODES.find((m) => m.id === mode)?.label ?? "Mode"}
+						<button className="chip-btn" onClick={() => toggleMenu("model")}>
+							<Cpu size={12} /> {MODES.find((m) => m.id === mode)?.label ?? "Agent"} · {modelLabel.length > 26 ? `${modelLabel.slice(0, 24)}…` : modelLabel}
 						</button>
-						{menu === "mode" && (
-							<div className="pop" style={{ left: "auto", right: 0, minWidth: 260 }} onClick={(e) => e.stopPropagation()}>
+						{menu === "model" && (
+							<div className="pop" style={{ left: "auto", right: 0, minWidth: 340 }} onClick={(e) => e.stopPropagation()}>
 								<div className="pop-title">Mode</div>
 								{MODES.map((m) => (
 									<button key={m.id} className="pop-item" onClick={() => { onMode(m.id); closeMenus(); }}>
@@ -327,15 +325,7 @@ export function Composer({
 										{mode === m.id && <span className="right">✓</span>}
 									</button>
 								))}
-							</div>
-						)}
-					</div>
-					<div className="anchor">
-						<button className="chip-btn" onClick={() => toggleMenu("model")}>
-							<Cpu size={12} /> {modelLabel.length > 26 ? `${modelLabel.slice(0, 24)}…` : modelLabel}
-						</button>
-						{menu === "model" && (
-							<div className="pop" style={{ left: "auto", right: 0, minWidth: 340 }} onClick={(e) => e.stopPropagation()}>
+								<div className="pop-sep" />
 								<input className="pop-search" placeholder="Search models" value={modelQuery} onChange={(e) => setModelQuery(e.target.value)} />
 								<div className="pop-scroll">
 									{modelFiltered.map((g) => (
@@ -361,33 +351,17 @@ export function Composer({
 						)}
 					</div>
 					{running ? (
-						<button className="chip-btn" onClick={onStop} style={{ borderColor: "var(--err)", color: "var(--err)" }}>
-							■ Stop
-						</button>
+						<span className="send-btn stop">
+							<button onClick={onStop} title="Stop">
+								<Square size={14} />
+							</button>
+						</span>
 					) : (
-						<div className="anchor">
-							<span className="send-btn">
-								<button onClick={submit} disabled={!text.trim()} title="Start session in background">
-									<SendHorizontal size={14} />
-								</button>
-								<button className="send-arrow" onClick={() => toggleMenu("send")} title="Send options">
-									<ChevronDown size={13} />
-								</button>
-							</span>
-							{menu === "send" && (
-								<div className="pop" style={{ left: "auto", right: 0, minWidth: 230 }} onClick={(e) => e.stopPropagation()}>
-									<button className="pop-item" onClick={submit}>
-										<span style={{ flex: 1 }}>Start session in background</span>
-										<span className="right">⌘⏎</span>
-									</button>
-									<div className="pop-sep" />
-									<div className="pop-item disabled">
-										<span style={{ flex: 1 }}>Start &amp; send in Slack</span>
-										<span className="right">Soon</span>
-									</div>
-								</div>
-							)}
-						</div>
+						<span className="send-btn">
+							<button onClick={submit} disabled={!text.trim()} title="Send">
+								<SendHorizontal size={14} />
+							</button>
+						</span>
 					)}
 				</div>
 			</div>

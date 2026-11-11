@@ -1,6 +1,7 @@
 import type { AgentTool } from "@cline/shared";
-import type { Sandbox } from "e2b";
+import type { SandboxHandle } from "../sandbox/provider";
 import { adaptIndentation, findMatches, mostSimilarRegion } from "./matching";
+import { swallow } from "../lib/errlog";
 
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 
@@ -16,21 +17,20 @@ export interface RemoteToolOptions {
 }
 
 /**
- * File tools that execute inside an E2B sandbox: reads/writes via the files
- * API, edits by fetching the file and applying the local matching engine.
+ * File tools that execute inside a remote sandbox: reads/writes via the
+ * provider handle, edits by fetching the file and applying the local
+ * matching engine.
  */
-export function createRemoteFileTools(sandbox: Sandbox, workdir: string, opts: RemoteToolOptions = {}): AgentTool<any, string>[] {
-	const run = async (command: string): Promise<{ exitCode: number; stdout: string; stderr: string }> => {
-		const r = await sandbox.commands.run(command, { cwd: workdir, timeoutMs: 60_000 });
-		return { exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr };
-	};
+export function createRemoteFileTools(sandbox: SandboxHandle, workdir: string, opts: RemoteToolOptions = {}): AgentTool<any, string>[] {
+	const run = (command: string): Promise<{ exitCode: number; stdout: string; stderr: string }> =>
+		sandbox.run(command, { cwd: workdir, timeoutMs: 60_000 });
 
 	// Agents sometimes pass absolute paths — resolve them instead of
 	// double-prefixing workdir ("/home/user/repo//home/user/repo/x" → 404).
 	const abs = (rel: string): string => (rel.startsWith("/") ? rel : `${workdir}/${rel}`);
 
 	const readText = async (rel: string): Promise<string> => {
-		const content = await sandbox.files.read(abs(rel)).catch(() => {
+		const content = await sandbox.readFile(abs(rel)).catch(() => {
 			throw new Error(`File not found or unreadable: ${rel}`);
 		});
 		if (content.length > MAX_FILE_BYTES) throw new Error(`${rel} is larger than 2 MB.`);
@@ -39,7 +39,7 @@ export function createRemoteFileTools(sandbox: Sandbox, workdir: string, opts: R
 
 	const writeText = async (rel: string, text: string): Promise<boolean> => {
 		const existed = await exists(rel);
-		await sandbox.files.write(abs(rel), text);
+		await sandbox.writeFile(abs(rel), text);
 		return existed;
 	};
 
@@ -50,6 +50,7 @@ export function createRemoteFileTools(sandbox: Sandbox, workdir: string, opts: R
 
 	const readFile: AgentTool<{ path: string; start_line?: number; end_line?: number }, string> = {
 		name: "read_file",
+		executionMode: "parallel",
 		description:
 			"Read a text file from the workspace. Returns lines prefixed with their line number and a '|' separator. " +
 			"The prefix is not part of the file: never include it in edit_file old_text. Use start_line/end_line for large files.",
@@ -201,6 +202,7 @@ export function createRemoteFileTools(sandbox: Sandbox, workdir: string, opts: R
 
 	const listFiles: AgentTool<{ path?: string; recursive?: boolean; max_entries?: number }, string> = {
 		name: "list_files",
+		executionMode: "parallel",
 		description: "List files and folders. Folders end with '/'. Skips .git, node_modules and build output.",
 		inputSchema: {
 			type: "object",
@@ -213,22 +215,24 @@ export function createRemoteFileTools(sandbox: Sandbox, workdir: string, opts: R
 		async execute(input) {
 			const depth = input.recursive ? "" : " -maxdepth 1";
 			const limit = input.max_entries ?? 500;
+			// One round trip: -printf marks dirs with a trailing slash.
 			const r = await run(
-				`find "${input.path ?? "."}"${depth} -not -path "*/.git*" -not -path "*/node_modules*" -not -path "*/dist*" | head -${limit}`,
+				`find "${input.path ?? "."}"${depth} \\( -name .git -o -name node_modules -o -name dist \\) -prune -o \\( -type d -printf '%p/\\n' -o -type f -print \\) | head -${limit}`,
 			);
+			if (r.exitCode !== 0 && !r.stdout.trim()) {
+				return `Error listing files: ${(r.stderr || `exit ${r.exitCode}`).slice(0, 300)}`;
+			}
 			const lines = r.stdout
 				.split("\n")
-				.filter((l) => l && l !== input.path)
+				.filter((l) => l && l !== input.path && l !== `${input.path}/`)
 				.map((l) => l.replace(/^\.\//, ""));
-			const withSlash = await Promise.all(
-				lines.slice(0, limit).map(async (l) => l + ((await run(`test -d "${l}"`)).exitCode === 0 ? "/" : "")),
-			);
-			return withSlash.join("\n") || "Empty.";
+			return lines.slice(0, limit).join("\n") || "Empty.";
 		},
 	};
 
 	const searchFiles: AgentTool<{ pattern: string; path?: string; file_glob?: string; max_results?: number }, string> = {
 		name: "search_files",
+		executionMode: "parallel",
 		description: "Search file contents. Returns matching lines as path:line: text.",
 		inputSchema: {
 			type: "object",
@@ -247,6 +251,8 @@ export function createRemoteFileTools(sandbox: Sandbox, workdir: string, opts: R
 			const r = await run(
 				`grep -rIn ${glob} --exclude-dir=.git --exclude-dir=node_modules -- ${JSON.stringify(input.pattern)} "${dir}" 2>/dev/null | head -${limit}`,
 			);
+			// grep exits 1 on no matches; >1 means a real error (missing dir, bad flags).
+			if (r.exitCode > 1) return `Error searching: ${(r.stderr || `exit ${r.exitCode}`).slice(0, 300)}`;
 			const out = r.stdout
 				.split("\n")
 				.filter(Boolean)
@@ -285,8 +291,8 @@ export function createRemoteFileTools(sandbox: Sandbox, workdir: string, opts: R
 		async execute(input) {
 			const slug = String(input.slug || "plan").replace(/[^\w-]+/g, "-").slice(0, 60) || "plan";
 			const dir = (opts.planDir ?? `${workdir}/.kronyx/plans`).replace(/\/+$/, "");
-			await sandbox.commands.run(`mkdir -p ${JSON.stringify(dir)}`);
-			await sandbox.files.write(`${dir}/${slug}.md`, input.plan);
+			await sandbox.run(`mkdir -p ${JSON.stringify(dir)}`, { cwd: workdir });
+			await sandbox.writeFile(`${dir}/${slug}.md`, input.plan);
 			return `Saved plan to ${dir}/${slug}.md — share it with the user and stop.`;
 		},
 	};
