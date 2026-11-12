@@ -19,6 +19,33 @@ const DEFAULT_CONTEXT_WINDOW = 128_000;
 const PATH_KEYS = ["path", "file", "filePath", "rel"];
 const ATTACH_RE = /^--- attached file: (.+?) ---\n[\s\S]*?--- end \1 ---$/;
 
+/** Tools whose successful call mutates a path — later writes supersede every
+ *  earlier result on that path (stale reads AND earlier write results). */
+const PATH_WRITE_TOOLS = new Set(["write_file", "edit_file", "append_file", "insert_lines"]);
+const FILE_EDITOR_WRITE_COMMANDS = new Set(["create", "str_replace", "insert", "undo_edit", "replace_function"]);
+
+const isPathWrite = (toolName: string, input: unknown): boolean => {
+	if (PATH_WRITE_TOOLS.has(toolName)) return true;
+	if (toolName !== "file_editor") return false;
+	const cmd = (input as { command?: string } | undefined)?.command;
+	return !!cmd && FILE_EDITOR_WRITE_COMMANDS.has(cmd);
+};
+
+/** Per-tool clamp policy — one size fits badly. run_command keeps the tail
+ *  (errors/build output land at the end); search/list results cap small. */
+const CLAMPS: Record<string, { max: number; head: number; tail: number }> = {
+	run_command: { max: 9_000, head: 1_500, tail: 6_000 },
+	search_files: { max: 4_000, head: 3_000, tail: 800 },
+	list_files: { max: 4_000, head: 3_000, tail: 800 },
+};
+const DEFAULT_CLAMP = { max: MAX_RESULT_CHARS, head: HEAD_CHARS, tail: TAIL_CHARS };
+
+/** Provider-specific tuning. Anthropic requires the thinking block that
+ *  precedes a tool call to stay in the transcript; other providers never
+ *  receive reasoning back, so pruning it unconditionally is free savings. */
+const isAnthropicProvider = (providerId?: string, modelId?: string): boolean =>
+	/anthropic|claude/i.test(`${providerId ?? ""} ${modelId ?? ""}`);
+
 export interface CompactStats {
 	stubbed: number;
 	clamped: number;
@@ -36,6 +63,9 @@ export interface CompactStats {
 export interface PrepareTurnOptions {
 	/** Fallback context window when the runtime's model info lacks one. */
 	contextWindow?: number;
+	/** Provider/model identity — tunes provider-specific projections (reasoning retention). */
+	providerId?: string;
+	modelId?: string;
 	/**
 	 * Optional LLM recap: called with the oldest messages when stubbing alone
 	 * can't reach the target. Returns the summary text, or undefined to skip.
@@ -58,10 +88,11 @@ function estimateTokens(messages: readonly AgentMessage[], systemPrompt?: string
 
 /** Head+tail clamp for a single oversized tool-result part. Returns the new part or undefined. */
 function clampResult(part: AgentToolResultPart): AgentToolResultPart | undefined {
+	const clamp = CLAMPS[part.toolName] ?? DEFAULT_CLAMP;
 	const text = resultText(part);
-	if (text.length <= MAX_RESULT_CHARS) return undefined;
-	const elided = text.length - HEAD_CHARS - TAIL_CHARS;
-	const trimmed = `${text.slice(0, HEAD_CHARS)}\n…[${elided} chars elided]…\n${text.slice(-TAIL_CHARS)}`;
+	if (text.length <= clamp.max) return undefined;
+	const elided = text.length - clamp.head - clamp.tail;
+	const trimmed = `${text.slice(0, clamp.head)}\n…[${elided} chars elided]…\n${text.slice(-clamp.tail)}`;
 	return { ...part, output: trimmed };
 }
 
@@ -87,6 +118,15 @@ function targetKey(toolName: string, input: unknown): string {
 		if (typeof rec[k] === "string" && rec[k]) return `${toolName}:${k}=${rec[k]}`;
 	}
 	return `${toolName}:${JSON.stringify(input ?? {})}`;
+}
+
+/** Tool-agnostic path identity — lets a write supersede reads from any tool. */
+function pathKeyOf(input: unknown): string | undefined {
+	const rec = (input ?? {}) as Record<string, unknown>;
+	for (const k of PATH_KEYS) {
+		if (typeof rec[k] === "string" && rec[k]) return rec[k];
+	}
+	return undefined;
 }
 
 /**
@@ -122,11 +162,20 @@ export function createPrepareTurn(opts: PrepareTurnOptions = {}) {
 		const mutable = messages.map((m) => ({ ...m, content: [...m.content] }));
 		const recentFloor = Math.max(0, messages.length - KEEP_RECENT_MESSAGES);
 
-		// toolCallId → supersession key (same tool+target, else exact input).
+		// toolCallId → supersession key (same tool+target, else exact input) and
+		// → path key (cross-tool: a read is stale once the file is rewritten).
 		const callKeys = new Map<string, string>();
+		const callPathKeys = new Map<string, string>();
+		const writeCalls: { pathKey: string; toolCallId: string }[] = [];
 		for (const m of messages) {
 			for (const p of m.content) {
-				if (p.type === "tool-call") callKeys.set(p.toolCallId, targetKey(p.toolName, p.input));
+				if (p.type !== "tool-call") continue;
+				callKeys.set(p.toolCallId, targetKey(p.toolName, p.input));
+				const pathKey = pathKeyOf(p.input);
+				if (pathKey) {
+					callPathKeys.set(p.toolCallId, pathKey);
+					if (isPathWrite(p.toolName, p.input)) writeCalls.push({ pathKey, toolCallId: p.toolCallId });
+				}
 			}
 		}
 
@@ -137,6 +186,21 @@ export function createPrepareTurn(opts: PrepareTurnOptions = {}) {
 				if (p.type === "tool-result") resultPositions.push({ mi, pi });
 			}),
 		);
+		const resultIndexByCallId = new Map<string, number>();
+		resultPositions.forEach((c, i) => {
+			const part = messages[c.mi].content[c.pi] as AgentToolResultPart;
+			resultIndexByCallId.set(part.toolCallId, i);
+		});
+		// path → result index of its latest SUCCESSFUL write. Failed or
+		// interrupted writes don't supersede — their old reads are still true.
+		const lastWriteResultIdx = new Map<string, number>();
+		for (const w of writeCalls) {
+			const ri = resultIndexByCallId.get(w.toolCallId);
+			if (ri === undefined) continue;
+			const res = messages[resultPositions[ri].mi].content[resultPositions[ri].pi] as AgentToolResultPart;
+			if (res.isError) continue;
+			lastWriteResultIdx.set(w.pathKey, ri);
+		}
 		const candidates = resultPositions.slice(0, Math.max(0, resultPositions.length - KEEP_RECENT_RESULTS));
 		const keyLastIndex = new Map<string, number>();
 		candidates.forEach((c, i) => {
@@ -146,6 +210,8 @@ export function createPrepareTurn(opts: PrepareTurnOptions = {}) {
 		const rank = (c: { mi: number; pi: number }, i: number): number => {
 			const part = messages[c.mi].content[c.pi] as AgentToolResultPart;
 			if (part.isError) return 0;
+			const writeIdx = lastWriteResultIdx.get(callPathKeys.get(part.toolCallId) ?? "");
+			if (writeIdx !== undefined && writeIdx > i) return 1; // superseded by a later write on this path
 			if (keyLastIndex.get(callKeys.get(part.toolCallId) ?? part.toolName) !== i) return 1;
 			return 2;
 		};
@@ -185,14 +251,15 @@ export function createPrepareTurn(opts: PrepareTurnOptions = {}) {
 		}
 
 		// Prune reasoning + inlined attachments outside the recent window.
-		// Reasoning is kept on tool-call turns (some providers require the
-		// thinking block that preceded a tool call) and on the last turn.
+		// Anthropic requires the thinking block that preceded a tool call to
+		// remain; other providers never receive reasoning back, so it can go.
+		const keepReasoningOnCalls = isAnthropicProvider(opts.providerId, opts.modelId);
 		let reasoningPruned = 0;
 		let attachmentsStubbed = 0;
 		mutable.forEach((m, mi) => {
 			if (mi >= recentFloor) return;
 			m.content = m.content.filter((p) => {
-				if (p.type === "reasoning" && !m.content.some((q) => q.type === "tool-call")) {
+				if (p.type === "reasoning" && !(keepReasoningOnCalls && m.content.some((q) => q.type === "tool-call"))) {
 					reasoningPruned++;
 					return false;
 				}

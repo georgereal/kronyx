@@ -272,6 +272,8 @@ export class AgentRunner {
 			toolExecution: "sequential",
 			prepareTurn: createPrepareTurn({
 				contextWindow: settings.contextWindow,
+				providerId: settings.providerId,
+				modelId: settings.modelId,
 				summarize: settings.baseUrl
 					? (messages) => summarizeMessages(settings, messages)
 					: undefined,

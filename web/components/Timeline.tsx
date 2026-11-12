@@ -623,6 +623,9 @@ function Event({ user, sessionId, e, events, runs, githubUrl }: { user: User; se
 			const cl = Array.isArray(ev.checks) ? (ev.checks as { ok: boolean }[]) : [];
 			const ok = cl.filter((c) => c.ok).length;
 			if (cl.length) rollup.push(`${ok}/${cl.length} checks passed`);
+			const comp = ev.compaction as { estTokensBefore?: number; estTokensAfter?: number } | undefined;
+			if (comp?.estTokensBefore && comp.estTokensAfter && comp.estTokensAfter < comp.estTokensBefore)
+				rollup.push(`context trimmed ~${Math.round(comp.estTokensBefore / 1000)}k→~${Math.round(comp.estTokensAfter / 1000)}k`);
 		}
 		return (
 			<div className={`result-card${issues ? " has-issues" : ""}`}>

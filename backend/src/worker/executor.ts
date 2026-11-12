@@ -173,6 +173,8 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	private lastPrUrl: string | undefined;
 	private lastPushed = false;
 	private readonly runChecks: { command: string; ok: boolean }[] = [];
+	/** Last context-compaction stats — folded into the run-completed rollup. */
+	private lastCompaction: { estTokensBefore?: number; estTokensAfter?: number } | undefined;
 
 	/** Extend E2B lifetime + refresh janitor activity every 10 min while a run
 	 *  is in flight — `lastActivityAt` is otherwise only stamped once at run
@@ -487,6 +489,9 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	private trackUsage(e: RunViewEvent, job: CloudJob, agentIndex = 0): void {
 		// The main agent's closing report — the run-completed card reuses it.
 		if (e.type === "run-finished" && agentIndex === 0) this.lastRunSummary = String(e.text ?? "");
+		const meta = (e as { meta?: { kind?: string } }).meta;
+		if (e.type === "info" && meta?.kind === "context_compaction")
+			this.lastCompaction = meta as { estTokensBefore?: number; estTokensAfter?: number };
 		let L = this.usageLedgers.get(agentIndex);
 		if (!L) {
 			L = {
@@ -691,6 +696,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		this.lastPrUrl = undefined;
 		this.lastPushed = false;
 		this.runChecks.length = 0;
+		this.lastCompaction = undefined;
 		try {
 			if (job.kind === "push-plan") await this.pushPlan(job, session, settings);
 			else if (job.kind === "open-pr") await this.openPrJob(job, session, settings);
@@ -705,6 +711,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				prUrl: this.lastPrUrl ?? session.prUrl,
 				pushed: this.lastPushed,
 				checks: this.runChecks,
+				compaction: this.lastCompaction,
 			});
 		} finally {
 			this.stopSandboxKeepalive();

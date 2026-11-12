@@ -175,6 +175,75 @@ describe("createPrepareTurn", () => {
 		expect(texts[3]).not.toContain("output elided"); // r2 is the newest read of a.ts — intact
 	});
 
+	it("a successful write supersedes earlier reads of the same path (cross-tool)", async () => {
+		const msgs: AgentMessage[] = [
+			call("r1", "read_file", { path: "a.ts" }),
+			result("r1", "read_file", "stale contents " + "y".repeat(500)),
+			call("w1", "edit_file", { path: "a.ts", old_str: "x", new_str: "y" }),
+			result("w1", "edit_file", "Edited a.ts."),
+		];
+		// pad so the read lands outside the keep-recent window
+		for (let i = 2; i < 9; i++) {
+			msgs.push(call(`r${i}`, "read_file", { path: `f${i}.ts` }), result(`r${i}`, "read_file", "r".repeat(300)));
+		}
+		const turn = createPrepareTurn({ contextWindow: 1_000_000 });
+		const out = (await turn(ctx(msgs, 1_000_000)))!;
+		const texts = out.messages!.map((m) => JSON.stringify(m.content));
+		expect(texts[1]).toContain("output elided by context compaction"); // stale read
+		expect(texts[3]).not.toContain("output elided"); // the edit's own result stays
+	});
+
+	it("a FAILED write does not supersede the earlier read", async () => {
+		const msgs: AgentMessage[] = [
+			call("r1", "read_file", { path: "a.ts" }),
+			result("r1", "read_file", "good contents " + "y".repeat(500)),
+			call("w1", "edit_file", { path: "a.ts", old_str: "x" }),
+			result("w1", "edit_file", "old_str not found", true),
+		];
+		for (let i = 2; i < 9; i++) {
+			msgs.push(call(`r${i}`, "read_file", { path: `f${i}.ts` }), result(`r${i}`, "read_file", "r".repeat(300)));
+		}
+		const turn = createPrepareTurn({ contextWindow: 1_000_000 });
+		const out = await turn(ctx(msgs, 1_000_000));
+		// the read may legitimately remain intact — only the failed write result
+		// is stubbable; check the read is NOT stubbed
+		const texts = (out?.messages ?? msgs).map((m) => JSON.stringify(m.content));
+		expect(texts[1]).not.toContain("output elided by context compaction");
+	});
+
+	it("file_editor view does not supersede; str_replace does", async () => {
+		const msgs: AgentMessage[] = [
+			call("r1", "read_file", { path: "a.ts" }),
+			result("r1", "read_file", "contents " + "y".repeat(500)),
+			call("v1", "file_editor", { command: "view", path: "a.ts" }),
+			result("v1", "file_editor", "numbered view"),
+			call("w1", "file_editor", { command: "str_replace", path: "a.ts" }),
+			result("w1", "file_editor", "Replaced."),
+		];
+		for (let i = 2; i < 9; i++) {
+			msgs.push(call(`r${i}`, "read_file", { path: `f${i}.ts` }), result(`r${i}`, "read_file", "r".repeat(300)));
+		}
+		const turn = createPrepareTurn({ contextWindow: 1_000_000 });
+		const out = (await turn(ctx(msgs, 1_000_000)))!;
+		const texts = out.messages!.map((m) => JSON.stringify(m.content));
+		expect(texts[1]).toContain("output elided by context compaction"); // read stale after str_replace
+		expect(texts[5]).not.toContain("output elided"); // str_replace result stays
+	});
+
+	it("clamps run_command output tail-heavy (errors land at the end)", async () => {
+		const tail = "Error: build failed at the very end";
+		const big = "h".repeat(10_000) + tail;
+		const out = (await createPrepareTurn()(ctx(
+			[call("c1", "run_command", { command: "npm test" }), result("c1", "run_command", big)],
+			1_000_000,
+		)))!;
+		const part = (out.messages![1].content[0] as { output: string }).output;
+		expect(part).toContain("chars elided");
+		expect(part).toContain(tail); // tail survives
+		expect(part.startsWith("h".repeat(1_500))).toBeTruthy();
+		expect(part.length).toBeLessThan(big.length);
+	});
+
 	it("uses real BPE token counts — token-dense text triggers where chars/4 would not", async () => {
 		// 6000 chars of pseudo-random alnum ≈ 2833 BPE tokens but only 1500
 		// under chars/4. Window 5000: real count lands in the soft band
