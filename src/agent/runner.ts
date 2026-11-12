@@ -62,7 +62,12 @@ export type RunViewEvent =
 			contextPct?: number;
 		}
 	| { type: "run-finished"; status: string; text: string; iterations: number }
-	| { type: "run-failed"; error: string };
+	| { type: "run-failed"; error: string }
+	// Multi-agent orchestration events (emitted by the executor, not the runner).
+	| { type: "fanout"; slices: { index: number; title: string; owns: string[] }[] }
+	| { type: "fanin"; results: { index: number; title: string; status: "merged" | "resolved" | "failed"; detail?: string }[] }
+	| { type: "fanin-conflict"; index: number; files: string[] }
+	| { type: "slice-status"; index: number; title: string; status: "running" | "done" | "failed" | "stopped"; summary?: string };
 
 export interface RunnerHost {
 	workspaceRoot: string;

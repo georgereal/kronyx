@@ -1,5 +1,6 @@
 import type { AgentTool } from "@cline/shared";
 import type { SandboxHandle } from "../sandbox/provider";
+import { isSharedManifest, ownsMatch } from "../agent/decompose";
 import { adaptIndentation, findMatches, mostSimilarRegion } from "./matching";
 
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
@@ -23,6 +24,13 @@ export interface RemoteToolOptions {
 	planDir?: string;
 	/** Live stdout/stderr chunks from the run_command tool (UI streaming). */
 	onCommandOutput?: (chunk: string) => void;
+	/**
+	 * Multi-agent slice boundary: path globs (workdir-relative) the agent may
+	 * write to. Set → mutating file tools refuse paths outside the set; root
+	 * shared manifests (package.json, lockfiles, …) are always refused since
+	 * the coordinator owns them.
+	 */
+	allowedPaths?: string[];
 }
 
 /**
@@ -55,6 +63,16 @@ export function createRemoteFileTools(sandbox: SandboxHandle, workdir: string, o
 	const exists = async (rel: string): Promise<boolean> => {
 		const r = await run(`test -e "${abs(rel)}"`);
 		return r.exitCode === 0;
+	};
+
+	/** Slice boundary enforcement — throws on writes outside `allowedPaths`
+	 *  or to coordinator-owned root manifests. No-op when unset. */
+	const guardWrite = (rel: string): void => {
+		if (!opts.allowedPaths) return;
+		if (isSharedManifest(rel))
+			throw new Error(`Refused: "${rel}" is a shared root manifest owned by the coordinator — note the needed change in your final summary instead of editing it.`);
+		if (!ownsMatch(opts.allowedPaths, rel))
+			throw new Error(`Refused: "${rel}" is outside this slice's boundary (${opts.allowedPaths.join(", ")}). Write only inside your owned paths.`);
 	};
 
 	const readFile: AgentTool<{ path: string; start_line?: number; end_line?: number }, string> = {
@@ -103,6 +121,7 @@ export function createRemoteFileTools(sandbox: SandboxHandle, workdir: string, o
 			required: ["path", "content"],
 		},
 		async execute(input) {
+			guardWrite(input.path);
 			const existed = await writeText(input.path, input.content);
 			return `${existed ? "Overwrote" : "Created"} ${input.path} (${input.content.split("\n").length} lines).`;
 		},
@@ -135,6 +154,7 @@ export function createRemoteFileTools(sandbox: SandboxHandle, workdir: string, o
 			required: ["path", "edits"],
 		},
 		async execute(input) {
+			guardWrite(input.path);
 			const original = await readText(input.path);
 			const eol = original.includes("\r\n") ? "\r\n" : "\n";
 			let text = original.replace(/\r\n/g, "\n");
@@ -179,6 +199,7 @@ export function createRemoteFileTools(sandbox: SandboxHandle, workdir: string, o
 			required: ["path", "content"],
 		},
 		async execute(input) {
+			guardWrite(input.path);
 			const current = (await exists(input.path)) ? await readText(input.path) : "";
 			const sep = current.length > 0 && !current.endsWith("\n") ? "\n" : "";
 			await writeText(input.path, current + sep + input.content);
@@ -199,6 +220,7 @@ export function createRemoteFileTools(sandbox: SandboxHandle, workdir: string, o
 			required: ["path", "line", "content"],
 		},
 		async execute(input) {
+			guardWrite(input.path);
 			const original = await readText(input.path);
 			const lines = original.split("\n");
 			const trailing = lines.length > 1 && lines[lines.length - 1] === "";

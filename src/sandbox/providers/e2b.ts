@@ -12,23 +12,35 @@ class E2bHandle implements SandboxHandle {
 		return (this.sbx as unknown as { sandboxId: string }).sandboxId;
 	}
 
+	/** Background handles for in-flight commands — interrupt() SIGKILLs them. */
+	private activeCmds = new Set<{ pid: number }>();
+
 	async run(command: string, opts: { cwd: string; timeoutMs?: number; onOutput?: (chunk: string) => void }): Promise<ExecResult> {
+		const handle = await this.sbx.commands.run(command, {
+			cwd: opts.cwd,
+			timeoutMs: opts.timeoutMs,
+			background: true,
+			onStdout: opts.onOutput,
+			onStderr: opts.onOutput,
+		});
+		this.activeCmds.add(handle);
 		try {
-			const r = await this.sbx.commands.run(command, {
-				cwd: opts.cwd,
-				timeoutMs: opts.timeoutMs,
-				onStdout: opts.onOutput,
-				onStderr: opts.onOutput,
-			});
+			const r = await handle.wait();
 			return { exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr };
 		} catch (err) {
-			// commands.run throws CommandExitError on nonzero exit — other
-			// providers return ExecResult, and callers rely on exitCode +
+			// wait() throws CommandExitError on nonzero exit (and on kill) —
+			// other providers return ExecResult, and callers rely on exitCode +
 			// stderr (e.g. grep's exit 1 on no matches). Normalize.
 			const e = err as { exitCode?: number; stdout?: string; stderr?: string };
 			if (typeof e?.exitCode === "number") return { exitCode: e.exitCode, stdout: e.stdout ?? "", stderr: e.stderr ?? "" };
 			throw err;
+		} finally {
+			this.activeCmds.delete(handle);
 		}
+	}
+
+	async interrupt(): Promise<void> {
+		await Promise.all([...this.activeCmds].map((h) => this.sbx.commands.kill(h.pid).catch(() => false)));
 	}
 
 	readFile(path: string): Promise<string> {

@@ -3,7 +3,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { AgentRunner, type AgentMode, type RunDigest } from "../agent/runner";
 import { evaluate, parsePermissionsText, ruleFor, type PermissionLayers, type PermissionRules } from "../agent/permissions";
-import { readGlobalPermissions } from "../permStore";
+import { readGlobalModePermissions, readGlobalPermissions } from "../permStore";
 import type { PriorTranscript } from "../agent/recall";
 import type { AgentMessage } from "@cline/shared";
 import { checksOnFinish, runChecks } from "../checks";
@@ -109,6 +109,7 @@ export class SessionController {
 		global: { allow: [], ask: [], deny: [] },
 		project: { allow: [], ask: [], deny: [] },
 		local: { allow: [], ask: [], deny: [] },
+		modes: {},
 	};
 	private sandbox: E2bSandbox | undefined;
 	private sandboxSynced = false;
@@ -271,7 +272,7 @@ export class SessionController {
 				isDirty: (abs) =>
 					vscode.workspace.textDocuments.some((doc) => doc.isDirty && doc.uri.fsPath === abs),
 				confirmWrite: (toolName, input) => this.confirmWrite(root, toolName, input),
-				checkPermission: async (toolName, input) => evaluate(this.permLayers, toolName, input),
+				checkPermission: async (toolName, input) => evaluate(this.permLayers, toolName, input, this.deps.modeRef.current),
 				currentMode: () => this.deps.modeRef.current,
 				planDir: planDir(),
 				memoryContext: (task, s) => loadMemoryContext(root, task, s),
@@ -563,6 +564,7 @@ export class SessionController {
 			global: await readGlobalPermissions(),
 			project: await read(path.join(root, ".kronyx", "permissions.json")),
 			local: await read(path.join(root, ".kronyx", "permissions.local.json")),
+			modes: await readGlobalModePermissions(),
 		};
 	}
 

@@ -42,11 +42,18 @@ export interface RunDoc {
 	tokensOut?: number;
 	createdAt?: string;
 	finishedAt?: string;
+	/** Multi-agent mode: per-slice status for the fan-out card. */
+	slices?: { index: number; title: string; status: string; summary?: string }[];
+	/** Sub-run linkage: set on multi-agent slice/coordinator docs. */
+	parentRunId?: string;
+	kind?: string;
+	agentIndex?: number;
+	summary?: string;
 }
 
 export interface RunEvent {
 	runId?: string;
 	seq: number;
 	at?: string;
-	event: { type: string; [k: string]: unknown };
+	event: { type: string; agentIndex?: number; [k: string]: unknown };
 }

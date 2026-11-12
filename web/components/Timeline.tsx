@@ -1,7 +1,7 @@
 "use client";
 
 import type { User } from "firebase/auth";
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { marked } from "marked";
 import { apiFetch } from "@/lib/api";
 import type { RunDoc, RunEvent } from "@/lib/types";
@@ -21,6 +21,7 @@ const KIND: Record<string, string> = {
 	"ui-screenshot": "Screenshot",
 	"mode-blocked": "Mode",
 	"loop-detected": "Stopped",
+	"run-stopping": "Stopping",
 	"run-finished": "Done",
 	"run-failed": "Failed",
 };
@@ -28,7 +29,7 @@ const KIND: Record<string, string> = {
 const WRITE_TOOLS = new Set(["file_editor", "write_file", "edit_file", "append_file", "insert_lines"]);
 
 type Item =
-	| { kind: "stream"; streamKind: "reasoning" | "assistant"; text: string; done: boolean; key: string; runId?: string; at?: string }
+	| { kind: "stream"; streamKind: "reasoning" | "assistant"; text: string; done: boolean; key: string; runId?: string; at?: string; seq?: number; agentIndex?: number }
 	| {
 			kind: "action";
 			name: string;
@@ -44,8 +45,10 @@ type Item =
 			liveOutput?: string;
 			key: string;
 			runId?: string;
+			seq?: number;
+			agentIndex?: number;
 	  }
-	| { kind: "perm"; permId: string; tool: string; path: string; command: string; input: unknown; decision?: string; key: string; runId?: string }
+	| { kind: "perm"; permId: string; tool: string; path: string; command: string; input: unknown; decision?: string; key: string; runId?: string; seq?: number; agentIndex?: number }
 	| { kind: "event"; e: RunEvent; key: string };
 
 /**
@@ -55,54 +58,67 @@ type Item =
  */
 function fold(events: RunEvent[]): Item[] {
 	const items: Item[] = [];
-	let openReasoning: Extract<Item, { kind: "stream" }> | null = null;
-	let openAssistant: Extract<Item, { kind: "stream" }> | null = null;
-	// assistant-text is the final copy of the last delta stream — merge it in,
-	// never render it as a separate card (that's the visible duplicate).
-	let lastAssistant: (Extract<Item, { kind: "stream" }> & { absorbed?: boolean }) | null = null;
+	type StreamItem = Extract<Item, { kind: "stream" }>;
+	// Multi-agent runs interleave deltas from parallel agents — keep each
+	// agent's open streams separate so they fold into per-agent cards.
+	interface Lane {
+		openReasoning: StreamItem | null;
+		openAssistant: StreamItem | null;
+		// assistant-text is the final copy of the last delta stream — merge it
+		// in, never render it as a separate card (that's the visible duplicate).
+		lastAssistant: (StreamItem & { absorbed?: boolean }) | null;
+	}
+	const lanes = new Map<number, Lane>();
+	const lane = (ai: number): Lane => {
+		let l = lanes.get(ai);
+		if (!l) lanes.set(ai, (l = { openReasoning: null, openAssistant: null, lastAssistant: null }));
+		return l;
+	};
 	for (const e of events) {
+		const ai = e.event.agentIndex ?? 0;
+		const l = lane(ai);
 		const t = e.event.type;
 		if (t === "reasoning-delta" || t === "assistant-delta") {
 			const isR = t === "reasoning-delta";
-			let s: Extract<Item, { kind: "stream" }> | null = isR ? openReasoning : openAssistant;
-			if (!s || s.done || (!isR && lastAssistant?.absorbed)) {
-				s = { kind: "stream", streamKind: isR ? "reasoning" : "assistant", text: "", done: false, key: `s${e.runId}-${e.seq}`, runId: e.runId, at: e.at };
+			let s: StreamItem | null = isR ? l.openReasoning : l.openAssistant;
+			if (!s || s.done || (!isR && l.lastAssistant?.absorbed)) {
+				s = { kind: "stream", streamKind: isR ? "reasoning" : "assistant", text: "", done: false, key: `s${e.runId}-${e.seq}`, runId: e.runId, at: e.at, seq: e.seq, agentIndex: ai };
 				items.push(s);
-				if (isR) openReasoning = s;
+				if (isR) l.openReasoning = s;
 				else {
-					openAssistant = s;
-					lastAssistant = s;
+					l.openAssistant = s;
+					l.lastAssistant = s;
 				}
 			}
 			s.text += String(e.event.text ?? "");
 			continue;
 		}
 		if (t === "reasoning") {
-			if (openReasoning && !openReasoning.done) {
-				openReasoning.text = String(e.event.text ?? openReasoning.text);
-				openReasoning.done = true;
-				openReasoning = null;
+			if (l.openReasoning && !l.openReasoning.done) {
+				l.openReasoning.text = String(e.event.text ?? l.openReasoning.text);
+				l.openReasoning.done = true;
+				l.openReasoning = null;
 				continue;
 			}
 		}
 		if (t === "assistant-text") {
 			// Merge into this iteration's stream regardless of intervening events
 			// (usage/reasoning close the delta but shouldn't spawn a second card).
-			if (lastAssistant && !lastAssistant.absorbed) {
-				lastAssistant.text = String(e.event.text ?? lastAssistant.text);
-				lastAssistant.done = true;
-				lastAssistant.absorbed = true;
+			if (l.lastAssistant && !l.lastAssistant.absorbed) {
+				l.lastAssistant.text = String(e.event.text ?? l.lastAssistant.text);
+				l.lastAssistant.done = true;
+				l.lastAssistant.absorbed = true;
 				continue;
 			}
 		}
 		// Close any dangling streams on non-stream events (tools, finish, etc.).
-		if (openReasoning && t !== "reasoning-delta") {
-			openReasoning.done = true;
-			openReasoning = null;
+		if (l.openReasoning && t !== "reasoning-delta") {
+			l.openReasoning.done = true;
+			l.openReasoning = null;
 		}
-		if (openAssistant && t !== "assistant-delta") {
-			openAssistant.done = true;
-			openAssistant = null;
+		if (l.openAssistant && t !== "assistant-delta") {
+			l.openAssistant.done = true;
+			l.openAssistant = null;
 		}
 		items.push({ kind: "event", e, key: `e${e.runId}-${e.seq}` });
 	}
@@ -124,6 +140,7 @@ function pair(items: Item[]): Item[] {
 			continue;
 		}
 		const ev = item.e.event;
+		const ai = ev.agentIndex ?? 0;
 		if (ev.type === "tool-started") {
 			const inp = (ev.input ?? {}) as Record<string, unknown>;
 			const a: Extract<Item, { kind: "action" }> = {
@@ -134,13 +151,16 @@ function pair(items: Item[]): Item[] {
 				path: inp.path ? String(inp.path) : inp.file ? String(inp.file) : undefined,
 				key: item.key,
 				runId: item.e.runId,
+				seq: item.e.seq,
+				agentIndex: ai,
 			};
-			if (a.toolId) actions.set(a.toolId, a);
+			// Tool ids are per-runner — parallel agents reuse them, so key by lane.
+			if (a.toolId) actions.set(`${ai}:${a.toolId}`, a);
 			out.push(a);
 			continue;
 		}
 		if (ev.type === "tool-finished") {
-			const a = actions.get(String(ev.id ?? ""));
+			const a = actions.get(`${ai}:${String(ev.id ?? "")}`);
 			if (a) {
 				a.output = String(ev.output ?? "");
 				a.ok = ev.ok !== false;
@@ -150,8 +170,8 @@ function pair(items: Item[]): Item[] {
 		}
 		if (ev.type === "file-changed") {
 			const path = String(ev.path ?? "");
-			// Attach to the most recent edit action for the same path.
-			const a = [...actions.values()].reverse().find((x) => x.path === path && !x.diff);
+			// Attach to the most recent edit action for the same path, same agent.
+			const a = [...actions.values()].reverse().find((x) => x.agentIndex === ai && x.path === path && !x.diff);
 			if (a) {
 				a.diff = String(ev.diff ?? "");
 				a.added = Number(ev.added ?? 0);
@@ -164,7 +184,7 @@ function pair(items: Item[]): Item[] {
 		if (ev.type === "tool-output-delta") {
 			// Attach live output to the open run_command card (only one streams
 			// at a time); orphan deltas are dropped.
-			const a = [...actions.values()].reverse().find((x) => x.name === "run_command" && x.output === undefined);
+			const a = [...actions.values()].reverse().find((x) => x.agentIndex === ai && x.name === "run_command" && x.output === undefined);
 			if (a) a.liveOutput = (a.liveOutput ?? "") + String(ev.text ?? "");
 			continue;
 		}
@@ -178,13 +198,15 @@ function pair(items: Item[]): Item[] {
 				input: ev.input,
 				key: item.key,
 				runId: item.e.runId,
+				seq: item.e.seq,
+				agentIndex: ai,
 			};
-			perms.set(p.permId, p);
+			perms.set(`${ai}:${p.permId}`, p);
 			out.push(p);
 			continue;
 		}
 		if (ev.type === "permission-resolved" || ev.type === "permission-response") {
-			const p = perms.get(String(ev.id ?? ev.permId ?? ""));
+			const p = perms.get(`${ai}:${String(ev.id ?? ev.permId ?? "")}`);
 			if (p) {
 				p.decision = String(ev.decision ?? "");
 				continue;
@@ -640,13 +662,36 @@ function Event({ user, sessionId, e, events, runs, githubUrl }: { user: User; se
 	);
 }
 
-export function Timeline({ user, sessionId, events, runs, githubUrl, active }: { user: User; sessionId: string; events: RunEvent[]; runs: RunDoc[]; githubUrl?: string; active?: boolean }) {
+export function Timeline({
+	user,
+	sessionId,
+	events,
+	runs,
+	githubUrl,
+	active,
+	lateAfter,
+}: {
+	user: User;
+	sessionId: string;
+	events: RunEvent[];
+	runs: RunDoc[];
+	githubUrl?: string;
+	active?: boolean;
+	/** Events in lateAfter.runId with seq > lateAfter.seq render demoted behind a "stopping" divider. */
+	lateAfter?: { runId: string; seq: number; halted: boolean };
+}) {
 	const items = pair(fold(events));
-	const renderItem = (item: Item) => {
+	const seqOf = (item: Item): number => (item.kind === "event" ? item.e.seq : (item.seq ?? 0));
+	const runIdOf = (item: Item): string | undefined => (item.kind === "event" ? item.e.runId : item.runId);
+	const isLate = (item: Item): boolean =>
+		!!lateAfter && runIdOf(item) === lateAfter.runId && seqOf(item) > lateAfter.seq;
+
+	const renderItem = (item: Item, frozen = false) => {
 		if (item.kind === "stream") {
+			const done = item.done || frozen;
 			if (item.streamKind === "reasoning") {
 				// Thought stream: grey surface while live, collapses once done.
-				return item.done ? (
+				return done ? (
 					<details key={item.key} className="ev thinking">
 						<summary>Thinking</summary>
 						<Md text={item.text} />
@@ -664,7 +709,7 @@ export function Timeline({ user, sessionId, events, runs, githubUrl, active }: {
 				<div key={item.key} className="msg-row">
 					<span className="avatar accent">K</span>
 					<div className="k-bubble" style={{ flex: 1 }}>
-						{item.done ? <Md text={item.text} /> : (
+						{done ? <Md text={item.text} /> : (
 							<>
 								<span className="stream-text">{item.text}</span>
 								<span className="stream-cursor" />
@@ -678,9 +723,53 @@ export function Timeline({ user, sessionId, events, runs, githubUrl, active }: {
 		if (item.kind === "action") {
 			const isWrite = WRITE_TOOLS.has(item.name) || !!item.path;
 			if (isWrite) return <EditCard key={item.key} item={item} />;
-			return <Terminal key={item.key} item={item} />;
+			return <Terminal key={item.key} item={frozen && item.output === undefined ? { ...item, output: item.liveOutput ?? "" } : item} />;
 		}
-		if (item.kind === "perm") return <PermissionCard key={item.key} user={user} item={item} active={!!active} />;
+		if (item.kind === "perm") return <PermissionCard key={item.key} user={user} item={item} active={!!active && !lateAfter} />;
+		// Multi-agent orchestration events → dedicated cards.
+		const et = item.e.event.type;
+		if (et === "slice-status") return null;
+		if (et === "fanout") {
+			const slices = (item.e.event.slices as { index: number; title: string; owns: string[] }[]) ?? [];
+			return (
+				<div key={item.key} className="fanout-card">
+					<div className="fanout-head">Fanned out into {slices.length} parallel agents</div>
+					{slices.map((s) => (
+						<div key={s.index} className="fanout-row">
+							<span className="fanout-idx">#{s.index}</span>
+							<span className="fanout-title">{s.title}</span>
+							<span className="muted fanout-owns">{s.owns.slice(0, 3).join(", ")}{s.owns.length > 3 ? ` +${s.owns.length - 3}` : ""}</span>
+							<SlicePill i={s.index} runId={item.e.runId} />
+						</div>
+					))}
+				</div>
+			);
+		}
+		if (et === "fanin") {
+			const results = (item.e.event.results as { index: number; title: string; status: string; detail?: string }[]) ?? [];
+			const icon = (s: string) => (s === "merged" ? "✓" : s === "resolved" ? "⚠" : "✗");
+			return (
+				<div key={item.key} className="fanin-card">
+					<div className="fanout-head">Merge results</div>
+					{results.map((r) => (
+						<div key={r.index} className="fanout-row">
+							<span className={`fanin-icon ${r.status}`}>{icon(r.status)}</span>
+							<span className="fanout-title">{r.title}</span>
+							<span className="muted fanout-owns">{r.status}{r.detail ? ` — ${r.detail}` : ""}</span>
+						</div>
+					))}
+				</div>
+			);
+		}
+		if (et === "fanin-conflict") {
+			const files = (item.e.event.files as string[]) ?? [];
+			return (
+				<div key={item.key} className="ev-line">
+					<span className="dot amber" />
+					<span>Merge conflict in slice {String(item.e.event.index)} — coordinator resolving ({files.slice(0, 3).join(", ")}{files.length > 3 ? ` +${files.length - 3}` : ""})</span>
+				</div>
+			);
+		}
 		return <Event key={item.key} user={user} sessionId={sessionId} e={item.e} events={events} runs={runs} githubUrl={githubUrl} />;
 	};
 
@@ -699,10 +788,139 @@ export function Timeline({ user, sessionId, events, runs, githubUrl, active }: {
 		seenSigs.add(sig);
 		seen.push(b);
 	}
+	// Multi-agent helpers: slice titles come from that run's fanout event; live
+	// status from the run doc's slices[] (falling back to slice-status events).
+	const fanoutEvFor = (runId?: string) =>
+		seen.find((i) => i.kind === "event" && i.e.event.type === "fanout" && i.e.runId === runId) ??
+		seen.find((i) => i.kind === "event" && i.e.event.type === "fanout");
+	const sliceTitle = (i: number, runId?: string): string => {
+		const fe = fanoutEvFor(runId);
+		const s = (fe?.kind === "event" ? (fe.e.event.slices as { index: number; title: string }[] | undefined) : undefined)?.find(
+			(x) => x.index === i,
+		);
+		return s?.title ?? `Slice ${i}`;
+	};
+	const sliceStatus = (i: number, runId?: string): string => {
+		const fromRun = runs?.find((r) => r.runId === runId)?.slices?.find((s) => s.index === i)?.status;
+		if (fromRun) return fromRun;
+		for (let k = events.length - 1; k >= 0; k--) {
+			const e = events[k];
+			const ev = e.event;
+			if (ev.type === "slice-status" && ev.index === i && (!runId || e.runId === runId)) return String(ev.status);
+		}
+		return "queued";
+	};
+	const SlicePill = ({ i, runId }: { i: number; runId?: string }) => <span className={`slice-pill ${sliceStatus(i, runId)}`}>{sliceStatus(i, runId)}</span>;
+
+	const lateItems = lateAfter ? seen.filter(isLate) : [];
+	const normalItems = lateAfter ? seen.filter((i) => !isLate(i)) : seen;
+	// Multi-agent lanes: items tagged agentIndex>0 render grouped under the
+	// fanout card instead of interleaved with coordinator/main-lane events.
+	// Lanes keyed `${runId}:${agentIndex}` — a second multi run in the same
+	// session must group under its own fanout card, not bleed into the first.
+	const laneKeyOf = (item: Item): { runId: string; ai: number } => {
+		if (item.kind === "event") return { runId: item.e.runId ?? "", ai: item.e.event.agentIndex ?? 0 };
+		return { runId: item.runId ?? "", ai: item.agentIndex ?? 0 };
+	};
+	const laneItems = new Map<string, Item[]>();
+	const mainItems: Item[] = [];
+	for (const i of normalItems) {
+		const { runId, ai } = laneKeyOf(i);
+		if (ai > 0) {
+			const k = `${runId}:${ai}`;
+			const l = laneItems.get(k) ?? [];
+			l.push(i);
+			laneItems.set(k, l);
+		} else {
+			mainItems.push(i);
+		}
+	}
+	// Lane open state: default by status, but a manual toggle sticks across re-renders.
+	const [laneToggles, setLaneToggles] = useState<Map<string, boolean>>(new Map());
+	const lanesBlock = (runId: string | undefined) =>
+		laneItems.size > 0 && (
+			<div className="slice-lanes">
+				{[...laneItems.entries()]
+					.filter(([k]) => k.startsWith(`${runId ?? ""}:`))
+					.map(([k, litems]) => {
+						const i = Number(k.split(":").pop());
+						const st = sliceStatus(i, runId);
+						const open = laneToggles.get(k) ?? (st === "running" || st === "queued");
+						return (
+							<details
+								key={k}
+								className={`slice-lane ${st}`}
+								open={open}
+								onToggle={(e) => {
+									const el = e.currentTarget;
+									if (el.open !== open)
+										setLaneToggles((prev) => {
+											const next = new Map(prev);
+											next.set(k, el.open);
+											return next;
+										});
+								}}
+							>
+								<summary>
+									<span className="fanout-idx">#{i}</span> {sliceTitle(i, runId)} <SlicePill i={i} runId={runId} />
+									<span className="muted" style={{ marginLeft: "auto" }}>{litems.length} events</span>
+								</summary>
+								<div className="slice-lane-body">{litems.map((item) => renderItem(item, !!lateAfter))}</div>
+							</details>
+						);
+					})}
+			</div>
+		);
 	return (
 		<div className="timeline">
 			{items.length === 0 && <div className="muted" style={{ padding: 20 }}>Waiting for events…</div>}
-			{seen.map(renderItem)}
+			{mainItems.map((item) => (
+				<Fragment key={item.key}>
+					{renderItem(item, !!lateAfter)}
+					{item.kind === "event" && item.e.event.type === "fanout" ? lanesBlock(item.e.runId) : null}
+				</Fragment>
+			))}
+			{/* Orphan lanes: agentIndex-tagged items whose run emitted no fanout
+			    event (lost/failed fanout) must still be visible somewhere. */}
+			{(() => {
+				const fanoutRunIds = new Set(
+					mainItems.filter((i) => i.kind === "event" && i.e.event.type === "fanout").map((i) => (i.kind === "event" ? i.e.runId : "")),
+				);
+				const orphans = [...laneItems.keys()].filter((k) => !fanoutRunIds.has(k.split(":")[0]));
+				if (!orphans.length) return null;
+				return (
+					<div className="slice-lanes">
+						{orphans.map((k) => {
+							const i = Number(k.split(":").pop());
+							const litems = laneItems.get(k)!;
+							return (
+								<details key={k} className="slice-lane">
+									<summary>
+										<span className="fanout-idx">#{i}</span> Agent {i} events <span className="muted">(no fan-out card)</span>
+										<span className="muted" style={{ marginLeft: "auto" }}>{litems.length} events</span>
+									</summary>
+									<div className="slice-lane-body">{litems.map((item) => renderItem(item, !!lateAfter))}</div>
+								</details>
+							);
+						})}
+					</div>
+				);
+			})()}
+			{lateAfter && (
+				<div className={`stop-banner${lateAfter.halted ? " halted" : ""}`}>
+					{lateAfter.halted ? "⏸ Stopped" : "⏸ Stopping — waiting for the run to halt…"}
+				</div>
+			)}
+			{lateItems.length > 0 && (
+				<details className="late-events">
+					<summary className="muted">
+						{lateItems.length} late event{lateItems.length === 1 ? "" : "s"} — arrived {lateAfter?.halted ? "after stop" : "while stopping"}
+					</summary>
+					{lateItems.map((item) => (
+						<div key={item.key} className="tl-late">{renderItem(item)}</div>
+					))}
+				</details>
+			)}
 		</div>
 	);
 }

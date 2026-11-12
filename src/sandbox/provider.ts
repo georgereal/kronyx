@@ -34,6 +34,12 @@ export interface SandboxHandle {
 	writeFile(path: string, content: string | Uint8Array): Promise<void>;
 	/** Extend/override lifetime from now; unsupported on some providers. */
 	setTimeout?(timeoutMs: number): Promise<void>;
+	/**
+	 * Best-effort interrupt: kill the currently running foreground command(s)
+	 * so an in-flight run() resolves promptly (exitCode 130). Optional —
+	 * providers without process control leave it undefined.
+	 */
+	interrupt?(): Promise<void>;
 }
 
 /** Credentials + settings data handed to providers (mirrors worker UserSettings). */

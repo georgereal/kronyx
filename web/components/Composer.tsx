@@ -6,7 +6,7 @@ import { useEffect, useRef, useState } from "react";
 import { apiFetch } from "@/lib/api";
 import type { ModelGroup, ModelOption } from "@/lib/types";
 
-export type Mode = "ask" | "plan" | "agent";
+export type Mode = "ask" | "plan" | "agent" | "multi";
 
 export interface Attachment {
 	attachmentId: string;
@@ -31,6 +31,7 @@ export const emptyEnv: EnvState = { repo: "", base: "", startRef: "", prLabel: "
 
 const MODES: { id: Mode; label: string; desc: string }[] = [
 	{ id: "agent", label: "Agent", desc: "Full writes — branch, verify, push & open a PR" },
+	{ id: "multi", label: "Multi", desc: "Parallel agents — task is split, merged into one PR" },
 	{ id: "plan", label: "Plan", desc: "Read-only exploration, saves a plan to implement" },
 	{ id: "ask", label: "Ask", desc: "Chat only — no sandbox, no repo needed" },
 ];
@@ -39,6 +40,7 @@ const SLASH_COMMANDS: { name: string; desc: string; action: "mode" | "prompt"; m
 	{ name: "ask", desc: "Switch to Ask mode", action: "mode", mode: "ask" },
 	{ name: "plan", desc: "Switch to Plan mode", action: "mode", mode: "plan" },
 	{ name: "agent", desc: "Switch to Agent mode", action: "mode", mode: "agent" },
+	{ name: "multi", desc: "Switch to Multi-agent mode", action: "mode", mode: "multi" },
 	{ name: "implement", desc: "Saved prompt — implement a described change", action: "prompt", text: "Implement the following change, following existing code conventions: " },
 	{ name: "bug-catcher", desc: "Saved prompt — find and fix a bug", action: "prompt", text: "Find and fix the bug described below. First reproduce it or identify the root cause, then make a minimal fix: " },
 	{ name: "review", desc: "Saved prompt — review recent changes", action: "prompt", text: "Review the recent changes on this branch for correctness, edge cases and style. Report findings by severity: " },
@@ -61,6 +63,7 @@ export function Composer({
 	onSubmit,
 	onStop,
 	running,
+	stopping,
 	autoFocus,
 	onModel,
 }: {
@@ -72,6 +75,8 @@ export function Composer({
 	onSubmit: (task: string, attachmentIds: string[]) => void;
 	onStop?: () => void;
 	running?: boolean;
+	/** Run is halting — show a disabled "stopping" state instead of a stop button. */
+	stopping?: boolean;
 	autoFocus?: boolean;
 	onModel?: (modelId: string, profile: string) => void;
 }) {
@@ -391,11 +396,17 @@ export function Composer({
 							)}
 						</div>
 					)}
-					{env?.repo && (
+					{env?.repo ? (
 						<span className="sess-chip mono" style={{ maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis" }}>
 							{env.repo}
 							{env.prLabel ? ` ${env.prLabel}` : env.startRef && env.startRef !== env.base ? ` @${env.startRef}` : ""}
 						</span>
+					) : (
+						env && onEnv && mode !== "ask" && (
+							<button className="chip-btn" onClick={() => toggleMenu("env")}>
+								<GitBranch size={12} /> Select repository
+							</button>
+						)
 					)}
 					<div className="spacer" />
 					<div className="anchor">
@@ -447,9 +458,9 @@ export function Composer({
 							</div>
 						)}
 					</div>
-					{running ? (
+					{running || stopping ? (
 						<span className="send-btn stop">
-							<button onClick={onStop} title="Stop">
+							<button onClick={onStop} disabled={stopping} title={stopping ? "Stopping…" : "Stop"}>
 								<Square size={14} />
 							</button>
 						</span>

@@ -70,6 +70,8 @@ export const routes: Route[] = makeRoutes([
 	["GET", "/api/github/branches", gh.branches],
 	["GET", "/api/github/prs", gh.prs],
 	["POST", "/api/github/token", gh.token],
+	["POST", "/api/github/create-repo", gh.createRepo],
+	["POST", "/api/github/resolve", gh.resolve],
 	["GET", "/api/github/callback", gh.callback],
 	["POST", "/api/github/link", gh.link],
 	["GET", "/api/runs", runsH.listRuns],

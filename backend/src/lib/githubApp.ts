@@ -36,6 +36,42 @@ export async function listInstallations(): Promise<Installation[]> {
 	return Array.isArray(data) ? data : [];
 }
 
+/** Single installation's account info (app JWT). */
+export async function getInstallation(installationId: number): Promise<Installation | null> {
+	const res = await gh(`/app/installations/${installationId}`);
+	if (!res.ok) return null;
+	return (await res.json()) as Installation;
+}
+
+/**
+ * Create a repo in an organization — installation token needs the app's
+ * Administration (write) org permission. User-account repos can't be created
+ * via installation tokens.
+ */
+export async function createOrgRepo(
+	installationId: number,
+	org: string,
+	name: string,
+	isPrivate: boolean,
+): Promise<{ fullName: string; defaultBranch: string }> {
+	const res = await gh(`/orgs/${org}/repos`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ name, private: isPrivate, auto_init: true }),
+	}, await installationToken(installationId));
+	const data = (await res.json().catch(() => ({}))) as { full_name?: string; default_branch?: string; message?: string };
+	if (!res.ok || !data.full_name) throw new Error(data.message ?? `create repo failed: ${res.status}`);
+	return { fullName: data.full_name, defaultBranch: data.default_branch ?? "main" };
+}
+
+/** GitHub account id for a login (user or org) — used to preselect the install target. */
+export async function lookupAccountId(login: string): Promise<number | null> {
+	const res = await gh(`/users/${encodeURIComponent(login)}`);
+	if (!res.ok) return null;
+	const data = (await res.json().catch(() => ({}))) as { id?: number };
+	return data.id ?? null;
+}
+
 /** Repos visible to an installation. */
 export async function installationRepos(installationId: number): Promise<{ fullName: string; defaultBranch: string }[]> {
 	const res = await gh(`/installation/repositories?per_page=100`, {}, await installationToken(installationId));

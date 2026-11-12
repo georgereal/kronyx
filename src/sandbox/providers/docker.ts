@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -20,17 +20,19 @@ const dockerEnv = (creds: ProviderCreds): NodeJS.ProcessEnv => ({
 function cli(
 	creds: ProviderCreds,
 	args: string[],
-	opts: { input?: string | Uint8Array; timeoutMs?: number } = {},
+	opts: { input?: string | Uint8Array; timeoutMs?: number; onChild?: (c: ChildProcess) => void } = {},
 ): Promise<ExecResult> {
 	return new Promise((resolve) => {
-		execFile(
+		const child = execFile(
 			"docker",
 			args,
 			{ env: dockerEnv(creds), timeout: opts.timeoutMs ?? 120_000, maxBuffer: 16 * 1024 * 1024 },
 			(err, stdout, stderr) => {
 				resolve({ exitCode: err ? (typeof err.code === "number" ? err.code : 1) : 0, stdout: String(stdout), stderr: String(stderr) });
 			},
-		).stdin?.end(opts.input);
+		);
+		opts.onChild?.(child);
+		child.stdin?.end(opts.input);
 	});
 }
 
@@ -40,8 +42,26 @@ class DockerHandle implements SandboxHandle {
 		readonly id: string,
 	) {}
 
+	private activeCmds = new Set<ChildProcess>();
+
 	async run(command: string, opts: { cwd: string; timeoutMs?: number }): Promise<ExecResult> {
-		return cli(this.creds, ["exec", "-w", opts.cwd, this.id, "sh", "-c", command], { timeoutMs: (opts.timeoutMs ?? 120_000) + 5_000 });
+		let child: ChildProcess | undefined;
+		const r = await cli(this.creds, ["exec", "-w", opts.cwd, this.id, "sh", "-c", command], {
+			timeoutMs: (opts.timeoutMs ?? 120_000) + 5_000,
+			onChild: (c) => {
+				child = c;
+				this.activeCmds.add(c);
+			},
+		});
+		if (child) this.activeCmds.delete(child);
+		return r;
+	}
+
+	async interrupt(): Promise<void> {
+		for (const c of this.activeCmds) c.kill("SIGKILL");
+		// The exec'd process inside the container runs as `sh` — kill it too
+		// (the container's only other process is `sleep infinity`).
+		void cli(this.creds, ["exec", this.id, "pkill", "-9", "sh"], { timeoutMs: 10_000 }).catch(() => {});
 	}
 
 	async readFile(path: string): Promise<string> {

@@ -26,6 +26,8 @@ export interface PermissionLayers {
 	global: PermissionRules;
 	project: PermissionRules;
 	local: PermissionRules;
+	/** Optional per-mode global overrides keyed by "ask" | "plan" | "agent". */
+	modes?: Record<string, PermissionRules>;
 }
 
 const EMPTY: PermissionRules = { allow: [], ask: [], deny: [] };
@@ -50,6 +52,31 @@ export function parsePermissionsText(text: string): PermissionRules {
 	} catch {
 		return { ...EMPTY };
 	}
+}
+
+/** Parse the optional `permissions.modes` map — per-mode global overrides. */
+export function parseModePermissions(json: unknown): Record<string, PermissionRules> {
+	if (typeof json === "string") {
+		try {
+			return parseModePermissions(JSON.parse(json));
+		} catch {
+			return {};
+		}
+	}
+	const p = (json as { permissions?: Record<string, unknown> } | null)?.permissions ?? json;
+	const modes = (p as Record<string, unknown> | null)?.modes;
+	if (!modes || typeof modes !== "object") return {};
+	const out: Record<string, PermissionRules> = {};
+	for (const [mode, rules] of Object.entries(modes as Record<string, unknown>)) {
+		const parsed = parsePermissions(rules);
+		if (parsed.allow.length || parsed.ask.length || parsed.deny.length) out[mode] = parsed;
+	}
+	return out;
+}
+
+/** Map any runtime mode onto the rule-bucket keys the web UI exposes. */
+export function modeKey(mode: string | undefined): string {
+	return mode === "ask" || mode === "plan" ? mode : "agent";
 }
 
 /** The value a `tool(glob)` rule matches against per tool. */
@@ -83,7 +110,7 @@ const PATH_TOOLS = new Set([
 ]);
 
 /** `*` (segment-limited for paths, anything for commands) and `**` (anything). */
-function globToRe(glob: string, isPath: boolean): RegExp {
+export function globToRe(glob: string, isPath: boolean): RegExp {
 	const esc = glob.replace(/[.+^${}()|[\]\\]/g, "\\$&");
 	const re = esc
 		.replace(/\*\*/g, "\uE000")
@@ -116,11 +143,16 @@ const matchLayer = (rules: PermissionRules, toolName: string, target: string): P
  * then local, then project, then global allow/ask. Returns undefined when no
  * rule matches (caller falls back to mode defaults).
  */
-export function evaluate(layers: PermissionLayers, toolName: string, input: unknown): PermissionDecision {
+export function evaluate(layers: PermissionLayers, toolName: string, input: unknown, mode?: string): PermissionDecision {
 	const target = ruleTarget(toolName, input);
 	if (matchList(layers.global.deny, toolName, target)) return "deny";
 	for (const rules of [layers.local, layers.project]) {
 		const d = matchLayer(rules, toolName, target);
+		if (d !== undefined) return d;
+	}
+	const modeRules = mode ? layers.modes?.[modeKey(mode)] : undefined;
+	if (modeRules) {
+		const d = matchLayer(modeRules, toolName, target);
 		if (d !== undefined) return d;
 	}
 	if (matchList(layers.global.allow, toolName, target)) return "allow";

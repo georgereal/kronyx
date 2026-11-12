@@ -43,9 +43,10 @@ export class RunSink {
 	private pumping = false;
 	private readonly MAX_QUEUE = 10_000;
 
-	/** Buffered emit: never throws; drains via pump with retry/backoff. */
-	async emit(event: RunViewEvent | Record<string, unknown>): Promise<void> {
-		this.queue.push(this.scrub(event));
+	/** Buffered emit: never throws; drains via pump with retry/backoff.
+	 *  `extra` lands as top-level fields on the run_events doc (e.g. agentIndex). */
+	async emit(event: RunViewEvent | Record<string, unknown>, extra?: { agentIndex?: number }): Promise<void> {
+		this.queue.push({ ...this.scrub(event), ...extra });
 		// Cap: drop oldest token deltas only — tool/status/finish events must land.
 		while (this.queue.length > this.MAX_QUEUE) {
 			const i = this.queue.findIndex((e) => e.type === "reasoning-delta" || e.type === "assistant-delta");

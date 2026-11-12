@@ -12,7 +12,7 @@ try {
 const WORKER_ID = `${hostname()}-${process.pid}`;
 const POLL_MS = 2_000;
 const HEARTBEAT_MS = 15_000;
-const STOP_CHECK_MS = 3_000;
+const STOP_CHECK_MS = 1_000;
 const LEASE_MS = 10 * 60_000;
 
 const log = (msg: string) => console.log(`[worker ${WORKER_ID}] ${msg}`);

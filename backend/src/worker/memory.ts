@@ -8,6 +8,8 @@ import type { RunDigest } from "../../../src/agent/runner";
 import type { PriorTranscript, RecallScorer } from "../../../src/agent/recall";
 
 const MAX_TRANSCRIPTS = 5;
+/** Slice transcripts are debug-only — keep a much shorter tail. */
+const MAX_SLICE_TRANSCRIPTS = 3;
 const MAX_TRANSCRIPT_BYTES = 512 * 1024;
 const MAX_DIGESTS = 3;
 const MAX_MEMORIES = 50;
@@ -16,7 +18,10 @@ const MAX_MEMORIES = 50;
 export async function loadTranscripts(db: Db, uid: string, sessionId: string): Promise<PriorTranscript[]> {
 	const docs = await db
 		.collection("run_transcripts")
-		.find({ uid, sessionId, state: { $ne: "compacted" } })
+		// agentIndex>0 docs are multi-agent slice transcripts — stored for
+		// debugging but excluded from recall (the merged run's transcript and
+		// digests carry the outcome; slices would bloat context N×).
+		.find({ uid, sessionId, state: { $ne: "compacted" }, agentIndex: { $in: [0, null] } })
 		.sort({ savedAt: 1 })
 		.limit(MAX_TRANSCRIPTS)
 		.toArray();
@@ -47,6 +52,7 @@ export async function saveTranscript(
 	sessionId: string,
 	runId: string,
 	messages: readonly AgentMessage[],
+	agentIndex = 0,
 ): Promise<void> {
 	let payload = messages as unknown[];
 	if (JSON.stringify(payload).length > MAX_TRANSCRIPT_BYTES) {
@@ -54,9 +60,18 @@ export async function saveTranscript(
 	}
 	const packed = gzipSync(JSON.stringify(payload));
 	await db.collection("run_transcripts").updateOne(
-		{ uid, runId },
+		{ uid, runId, agentIndex },
 		{
-			$set: { uid, sessionId, runId, label: `run ${runId.slice(0, 8)}`, data: packed, encoding: "gzip", savedAt: new Date() },
+			$set: {
+				uid,
+				sessionId,
+				runId,
+				agentIndex,
+				label: `run ${runId.slice(0, 8)}${agentIndex ? ` slice ${agentIndex}` : ""}`,
+				data: packed,
+				encoding: "gzip",
+				savedAt: new Date(),
+			},
 			$unset: { messages: "" },
 		},
 		{ upsert: true },
@@ -67,24 +82,31 @@ export async function saveTranscript(
 		{ uid, sessionId, state: { $ne: "compacted" } },
 		[{ $set: { state: "active" } }],
 	).catch(swallow("memory", "op"));
-	const stale = await db
+	// Eviction: run transcripts and slice transcripts have separate caps —
+	// slice chatter must not push real runs into compaction, and eviction is
+	// keyed by {runId, agentIndex} (a runId alone no longer identifies one doc).
+	const active = await db
 		.collection("run_transcripts")
 		.find({ uid, sessionId, state: { $ne: "compacted" } })
 		.sort({ savedAt: -1 })
-		.skip(MAX_TRANSCRIPTS)
-		.project({ runId: 1 })
+		.project({ runId: 1, agentIndex: 1 })
 		.toArray();
-	if (stale.length) {
-		await db.collection("run_transcripts").updateMany(
-			{ uid, runId: { $in: stale.map((d) => d.runId) } },
-			{ $set: { state: "compacted", compactedAt: new Date() } },
-		);
+	const main = active.filter((d) => !d.agentIndex);
+	const slices = active.filter((d) => d.agentIndex);
+	const evict = [...main.slice(MAX_TRANSCRIPTS), ...slices.slice(MAX_SLICE_TRANSCRIPTS)];
+	for (const d of evict) {
+		await db
+			.collection("run_transcripts")
+			.updateOne({ uid, runId: d.runId, agentIndex: d.agentIndex ?? 0 }, { $set: { state: "compacted", compactedAt: new Date() } })
+			.catch(swallow("memory", "op"));
 	}
 }
 
 export interface ProvenDigest extends RunDigest {
 	runId: string;
 	toSeq?: number;
+	/** 0 = main/coordinator, 1..N = multi-agent slice that produced it. */
+	agentIndex?: number;
 }
 
 /** Store digests with provenance (source run + event range) on the session doc. */
@@ -93,11 +115,13 @@ export async function recordDigests(
 	uid: string,
 	sessionId: string,
 	digests: readonly ProvenDigest[],
+	/** Multi-agent runs produce one digest set per agent — let the caller raise the cap. */
+	max = MAX_DIGESTS,
 ): Promise<void> {
 	if (!digests.length) return;
 	await db
 		.collection("sessions")
-		.updateOne({ uid, sessionId }, { $set: { digests: digests.slice(-MAX_DIGESTS), updatedAt: new Date() } });
+		.updateOne({ uid, sessionId }, { $set: { digests: digests.slice(-max), updatedAt: new Date() } });
 }
 
 interface MemoryDoc {

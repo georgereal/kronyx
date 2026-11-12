@@ -32,6 +32,7 @@ export default function SessionView() {
 	const [prMsg, setPrMsg] = useState("");
 	const [submitted, setSubmitted] = useState<string | null>(null);
 	const [notFound, setNotFound] = useState(false);
+	const [stopPressed, setStopPressed] = useState<{ runId: string; seq: number } | null>(null);
 	const evRef = useRef<Map<string, RunEvent>>(new Map());
 	const sseRef = useRef<EventSource | null>(null);
 	// Bottom-pin: window scrollbar follows new events unless the user scrolls up.
@@ -41,6 +42,18 @@ export default function SessionView() {
 	const runOrder = new Map(runs.map((r, i) => [r.runId, i]));
 	const ordered = [...events].sort((a, b) => (runOrder.get(a.runId ?? "") ?? 0) - (runOrder.get(b.runId ?? "") ?? 0) || a.seq - b.seq);
 	const active = !!latestRun && ACTIVE.has(latestRun.status ?? "");
+	const halted = latestRun?.status === "stopped" || latestRun?.status === "failed" || latestRun?.status === "completed";
+	const stopping = (!!latestRun && latestRun.status === "stopping") || (!!stopPressed && !halted && stopPressed?.runId === latestRun?.runId);
+	// Boundary seq for demoting stragglers: the worker's run-stopping event, or
+	// the seq we froze at when Stop was pressed — whichever lands first.
+	const lateAfter = (() => {
+		if (!latestRun || !stopping) return undefined;
+		const evSeq = events.find((e) => e.runId === latestRun.runId && e.event.type === "run-stopping")?.seq;
+		const seqs = [evSeq, stopPressed?.runId === latestRun.runId ? stopPressed.seq : undefined].filter(
+			(x): x is number => x !== undefined,
+		);
+		return seqs.length ? { runId: latestRun.runId, seq: Math.min(...seqs), halted } : undefined;
+	})();
 	// Latest run's setup/lifecycle events — surfaced as a top strip so clone,
 	// credential refresh, branch sync, push, and PR steps are always visible.
 	const lifecycle = events
@@ -240,7 +253,10 @@ export default function SessionView() {
 	};
 
 	const stop = async () => {
-		if (!user || !latestRun) return;
+		if (!user || !latestRun || stopping) return;
+		// Freeze the timeline at the last known seq — the brake is visual first.
+		const seq = events.filter((e) => e.runId === latestRun.runId).reduce((m, e) => Math.max(m, e.seq), 0);
+		setStopPressed({ runId: latestRun.runId, seq });
 		await apiFetch(`/api/runs/${latestRun.runId}/stop`, user, { method: "POST" });
 	};
 
@@ -360,7 +376,7 @@ export default function SessionView() {
 			</div>
 			</div>
 			<div style={{ maxWidth: 860, margin: "0 auto" }}>
-			<Timeline user={user} sessionId={id} events={ordered} runs={runs} active={active}
+			<Timeline user={user} sessionId={id} events={ordered} runs={runs} active={active} lateAfter={lateAfter}
 				githubUrl={session?.prUrl ?? (session?.repo && session?.branch ? `https://github.com/${session.repo}/tree/${session.branch}` : undefined)} />
 			{submitted && (
 				<div className="msg-row" style={{ opacity: 0.8 }}>
@@ -379,7 +395,8 @@ export default function SessionView() {
 					onMode={setMode}
 					onSubmit={(t, a) => void submit(t, a)}
 					onStop={() => void stop()}
-					running={active}
+					running={active && !stopping}
+					stopping={stopping && !halted}
 					onModel={(id, profile) => { setModelId(id); setModelProfile(profile); }}
 				/>
 			</div>

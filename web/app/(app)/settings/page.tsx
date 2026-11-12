@@ -3,6 +3,7 @@
 import { Bot, Box, Check, ChevronDown, Copy, GitBranch, KeyRound, MoreHorizontal, Pencil, Plus, ShieldCheck, SlidersHorizontal, Trash2, X } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { apiFetch, useUser } from "@/lib/api";
+import { CopyButton } from "@/components/CopyButton";
 import { Modal } from "@/components/Modal";
 import type { ModelGroup, ModelOption } from "@/lib/types";
 
@@ -78,7 +79,7 @@ interface SettingsDoc {
 		e2bTemplate?: string;
 		sandboxAutoSwitch?: boolean;
 		modelDefaults?: Record<string, string>;
-		permissions?: { allow?: string[]; ask?: string[]; deny?: string[] };
+		permissions?: { allow?: string[]; ask?: string[]; deny?: string[]; modes?: Record<string, { allow?: string[]; ask?: string[]; deny?: string[] }> };
 		profiles?: { name?: string; providerId?: string; baseUrl?: string; modelId?: string; enabled?: boolean }[];
 	};
 	secrets?: Record<string, string>;
@@ -128,9 +129,52 @@ export default function SettingsPage() {
 	const [e2bTemplate, setE2bTemplate] = useState("");
 	const [sandboxAutoSwitch, setSandboxAutoSwitch] = useState(true);
 	const [modelDefaults, setModelDefaults] = useState<Record<string, string>>({});
-	const [permAllow, setPermAllow] = useState("");
-	const [permAsk, setPermAsk] = useState("");
-	const [permDeny, setPermDeny] = useState("");
+	type PermScope = "global" | "ask" | "plan" | "agent";
+	const emptyPermText = () => ({ allow: "", ask: "", deny: "" });
+	const [permText, setPermText] = useState<Record<PermScope, { allow: string; ask: string; deny: string }>>({
+		global: emptyPermText(),
+		ask: emptyPermText(),
+		plan: emptyPermText(),
+		agent: emptyPermText(),
+	});
+	const [permScope, setPermScope] = useState<PermScope>("global");
+	const SUGGESTED_PERMS: Record<PermScope, { allow: string[]; ask: string[]; deny: string[] }> = {
+		global: {
+			allow: ["read_file(**)", "list_files(**)", "search_files(**)", "run_command(git status)", "run_command(git diff *)", "run_command(git log *)", "run_command(git show *)", "run_command(git branch *)", "run_command(ls *)", "run_command(pwd)", "run_command(which *)"],
+			ask: ["run_command(git push *)", "run_command(git commit *)", "run_command(sudo *)", "browser_use", "switch_environment"],
+			deny: ["run_command(rm -rf *)", "run_command(git push --force*)", "run_command(git reset --hard*)", "write_file(.env)", "write_file(**/.env)", "read_file(**/secrets*)", "read_file(**/*.pem)", "read_file(**/id_rsa*)"],
+		},
+		ask: {
+			allow: ["read_file(**)", "list_files(**)", "search_files(**)"],
+			ask: [],
+			deny: [],
+		},
+		plan: {
+			allow: ["save_plan", "read_file(**)", "list_files(**)", "search_files(**)", "run_command(git diff *)", "run_command(git log *)"],
+			ask: [],
+			deny: [],
+		},
+		agent: {
+			allow: ["run_command(git checkout *)", "run_command(git switch *)", "run_command(git stash *)", "run_command(git merge *)"],
+			ask: ["run_command(git rebase *)", "run_command(git clean *)"],
+			deny: [],
+		},
+	};
+	const loadSuggestedPerms = () =>
+		setPermText((pt) => {
+			const merge = (cur: string, extra: string[]) =>
+				[...new Set([...cur.split("\n").map((s) => s.trim()).filter(Boolean), ...extra])].join("\n");
+			return Object.fromEntries(
+				(["global", "ask", "plan", "agent"] as PermScope[]).map((scope) => [
+					scope,
+					{
+						allow: merge(pt[scope].allow, SUGGESTED_PERMS[scope].allow),
+						ask: merge(pt[scope].ask, SUGGESTED_PERMS[scope].ask),
+						deny: merge(pt[scope].deny, SUGGESTED_PERMS[scope].deny),
+					},
+				]),
+			) as typeof pt;
+		});
 	const [dataExtras, setDataExtras] = useState<Record<string, unknown>>({});
 	const [groups, setGroups] = useState<ModelGroup[]>([]);
 	const [usage, setUsage] = useState<UsageEvent[]>([]);
@@ -146,6 +190,8 @@ export default function SettingsPage() {
 	const [descOpen, setDescOpen] = useState<Set<string>>(new Set());
 	const [sortCost, setSortCost] = useState<"asc" | "desc" | null>(null);
 	const [editing, setEditing] = useState<{ index: number | null; draft: Profile } | null>(null);
+	const [newSecretOpen, setNewSecretOpen] = useState(false);
+	const [newSecretKey, setNewSecretKey] = useState("");
 	const [msg, setMsg] = useState("");
 
 	useEffect(() => {
@@ -170,9 +216,18 @@ export default function SettingsPage() {
 				setE2bTemplate(settings?.data?.e2bTemplate ?? "");
 				setSandboxAutoSwitch(settings?.data?.sandboxAutoSwitch !== false);
 				setModelDefaults(settings?.data?.modelDefaults ?? {});
-				setPermAllow((settings?.data?.permissions?.allow ?? []).join("\n"));
-				setPermAsk((settings?.data?.permissions?.ask ?? []).join("\n"));
-				setPermDeny((settings?.data?.permissions?.deny ?? []).join("\n"));
+				const toText = (r?: { allow?: string[]; ask?: string[]; deny?: string[] }) => ({
+					allow: (r?.allow ?? []).join("\n"),
+					ask: (r?.ask ?? []).join("\n"),
+					deny: (r?.deny ?? []).join("\n"),
+				});
+				const perms = settings?.data?.permissions;
+				setPermText({
+					global: toText(perms),
+					ask: toText(perms?.modes?.ask),
+					plan: toText(perms?.modes?.plan),
+					agent: toText(perms?.modes?.agent),
+				});
 				// PUT replaces settings.data wholesale — retain keys this page doesn't own
 				// (providerId/baseUrl/modelId synced by the extension) so saving here
 				// doesn't wipe them.
@@ -193,12 +248,25 @@ export default function SettingsPage() {
 			})();
 		}
 		void apiFetch("/api/github/repos", user).then(async (r) => {
-			if (r.ok) setGithubLinked((((await r.json()) as { repos?: unknown[] }).repos ?? []).length > 0);
+			if (!r.ok) return;
+			const body = (await r.json()) as {
+				repos?: { repo: string; defaultBranch: string; installationId: number }[];
+				installations?: { id: number; account: string; type: string }[];
+			};
+			const list = body.repos ?? [];
+			setGithubLinked(list.length > 0);
+			setGhRepos(list);
+			setGhInstallations(body.installations ?? []);
 		});
 	}, [user]);
 
 	const [githubLinked, setGithubLinked] = useState(false);
-	const appSlug = process.env.NEXT_PUBLIC_GITHUB_APP_SLUG || "kronyx";
+	const [ghRepos, setGhRepos] = useState<{ repo: string; defaultBranch: string; installationId: number }[]>([]);
+	const [ghInstallations, setGhInstallations] = useState<{ id: number; account: string; type: string }[]>([]);
+	const appSlug = (process.env.NEXT_PUBLIC_GITHUB_APP_SLUG || "kronyx")
+		.replace(/^https?:\/\/github\.com\/apps\//, "")
+		.replace(/\/.*/, "");
+	const installUrl = `https://github.com/apps/${appSlug}/installations/new`;
 
 	const setProfile = (i: number, patch: Partial<Profile>) => setProfiles((ps) => ps.map((p, j) => (j === i ? { ...p, ...patch } : p)));
 
@@ -272,11 +340,19 @@ export default function SettingsPage() {
 					e2bTemplate: e2bTemplate || undefined,
 					sandboxAutoSwitch,
 					modelDefaults,
-					permissions: {
-						allow: permAllow.split("\n").map((s) => s.trim()).filter(Boolean),
-						ask: permAsk.split("\n").map((s) => s.trim()).filter(Boolean),
-						deny: permDeny.split("\n").map((s) => s.trim()).filter(Boolean),
-					},
+					permissions: (() => {
+						const toList = (t: { allow: string; ask: string; deny: string }) => ({
+							allow: t.allow.split("\n").map((s) => s.trim()).filter(Boolean),
+							ask: t.ask.split("\n").map((s) => s.trim()).filter(Boolean),
+							deny: t.deny.split("\n").map((s) => s.trim()).filter(Boolean),
+						});
+						const modes = Object.fromEntries(
+							(["ask", "plan", "agent"] as const)
+								.map((m) => [m, toList(permText[m])])
+								.filter(([, r]) => (r as { allow: string[] }).allow.length + (r as { ask: string[] }).ask.length + (r as { deny: string[] }).deny.length > 0),
+						);
+						return { ...toList(permText.global), modes };
+					})(),
 					profiles: profiles.map(({ name, providerId, baseUrl, modelId, enabled }) => ({ name, providerId, baseUrl, modelId, enabled })),
 				},
 				secrets: secretPatch,
@@ -557,7 +633,7 @@ export default function SettingsPage() {
 					<p className="muted" style={{ fontSize: 12 }}>Default model per session mode — overridden by the composer picker.</p>
 				</div>
 			</div>
-			{(["agent", "plan", "ask"] as const).map((mode) => (
+			{(["agent", "multi", "plan", "ask"] as const).map((mode) => (
 				<Field key={mode} label={`${mode[0].toUpperCase() + mode.slice(1)} mode`}>
 					<select className="input" value={modelDefaults[mode] ?? ""} onChange={(e) => setModelDefaults({ ...modelDefaults, [mode]: e.target.value })}>
 						<option value="">(provider default)</option>
@@ -586,15 +662,82 @@ export default function SettingsPage() {
 				One rule per line — <code className="mono">tool</code> or <code className="mono">tool(glob)</code>, e.g.{" "}
 				<code className="mono">run_command(npm run test:*)</code>, <code className="mono">write_file(src/**)</code>.
 			</p>
-			<Field label="Allow" hint="auto-approve matching tools">
-				<textarea className="input mono" rows={4} value={permAllow} onChange={(e) => setPermAllow(e.target.value)} placeholder={"run_command(npm run build)\nread_file(**)"} />
-			</Field>
-			<Field label="Ask" hint="always prompt, even in auto modes">
-				<textarea className="input mono" rows={3} value={permAsk} onChange={(e) => setPermAsk(e.target.value)} placeholder={"browser_use\nrun_command(git push *)"} />
-			</Field>
-			<Field label="Deny" hint="never run — cannot be overridden by lower layers">
-				<textarea className="input mono" rows={4} value={permDeny} onChange={(e) => setPermDeny(e.target.value)} placeholder={"run_command(rm -rf *)\nwrite_file(.env)"} />
-			</Field>
+			<div style={{ display: "flex", gap: 6, margin: "10px 0 14px", flexWrap: "wrap" }}>
+				{(
+					[
+						["global", "All modes"],
+						["ask", "Ask"],
+						["plan", "Plan"],
+						["agent", "Agent"],
+					] as [PermScope, string][]
+				).map(([id, label]) => (
+					<button
+						key={id}
+						className={`chip-btn${permScope === id ? " active" : ""}`}
+						style={permScope === id ? { borderColor: "var(--accent)", color: "var(--accent)" } : undefined}
+						onClick={() => setPermScope(id)}
+					>
+						{label}
+					</button>
+				))}
+				<span style={{ flex: 1 }} />
+				<button className="btn ghost sm" onClick={loadSuggestedPerms} title="Fill all mode lists with a sensible starter set">
+					Load suggested defaults
+				</button>
+			</div>
+			<p className="muted" style={{ fontSize: 11, marginTop: -6 }}>
+				{permScope === "global"
+					? "Baseline rules for every mode. Deny here can never be overridden."
+					: permScope === "agent"
+						? "Extra rules for write-capable modes (Agent/code/smart). Checked after repo rules, before the All-modes lists."
+						: `Extra rules only when the session runs in ${permScope === "ask" ? "Ask" : "Plan"} mode. Checked after repo rules, before the All-modes lists.`}
+			</p>
+			{permScope !== "global" && (
+				<div className="card" style={{ padding: "10px 14px", marginBottom: 14, background: "var(--bg)" }}>
+					<div className="muted" style={{ fontSize: 10.5, textTransform: "uppercase", letterSpacing: 0.6, marginBottom: 6 }}>
+						Built-in for {permScope === "ask" ? "Ask" : permScope === "plan" ? "Plan" : "Agent"} — always enforced
+					</div>
+					{(permScope === "agent"
+						? [
+								"Multi-agent runs share the Agent rules (each slice evaluates as agent)",
+								"Write tools allowed — confirmation depends on the run's security profile",
+								"browser_use + switch_environment available",
+								"Identical repeated actions auto-skipped (dedup guard)",
+							]
+						: [
+								"Write tools not exposed to the model: write_file, edit_file, append_file, insert_lines, file_editor",
+								"run_command, browser_use, switch_environment not exposed",
+								permScope === "plan" ? "save_plan is the single write permitted (plan mode only)" : "No write tools at all — chat only",
+								"Sequential tool calls; stray writes hard-blocked",
+							]
+					).map((r) => (
+						<div key={r} className="mono" style={{ fontSize: 11, color: "var(--muted)", padding: "2px 0" }}>
+							• {r}
+						</div>
+					))}
+				</div>
+			)}
+			{(["allow", "ask", "deny"] as const).map((kind) => (
+				<Field
+					key={kind}
+					label={kind === "allow" ? "Allow" : kind === "ask" ? "Ask" : "Deny"}
+					hint={kind === "allow" ? "auto-approve matching tools" : kind === "ask" ? "always prompt, even in auto modes" : "never run — cannot be overridden by lower layers"}
+				>
+					<textarea
+						className="input mono"
+						rows={kind === "ask" ? 3 : 4}
+						value={permText[permScope][kind]}
+						onChange={(e) => setPermText((pt) => ({ ...pt, [permScope]: { ...pt[permScope], [kind]: e.target.value } }))}
+						placeholder={
+							kind === "allow"
+								? "run_command(npm run build)\nread_file(**)"
+								: kind === "ask"
+									? "browser_use\nrun_command(git push *)"
+									: "run_command(rm -rf *)\nwrite_file(.env)"
+						}
+					/>
+				</Field>
+			))}
 		</>
 	);
 
@@ -607,26 +750,143 @@ export default function SettingsPage() {
 					: "Install the Kronyx GitHub App on your repos so cloud runs can work on them (scoped, revocable)."}
 			</p>
 			{githubLinked ? (
-				<span style={{ color: "var(--ok)", fontSize: 13 }}>✓ Enabled</span>
+				<>
+					<div style={{ color: "var(--ok)", fontSize: 13, marginBottom: 10 }}>
+						✓ Enabled — {ghRepos.length} repo{ghRepos.length === 1 ? "" : "s"} across {ghInstallations.length || 1} installation{(ghInstallations.length || 1) === 1 ? "" : "s"}
+					</div>
+					{ghInstallations.length === 0 && (
+						<div className="pop-scroll" style={{ maxHeight: 160, marginBottom: 12 }}>
+							{ghRepos.map((r) => (
+								<div key={r.repo} className="pop-item" style={{ cursor: "default", padding: "4px 12px" }}>
+									<GitBranch size={12} />
+									<span className="mono" style={{ flex: 1, fontSize: 12 }}>{r.repo}</span>
+									<span className="right">{r.defaultBranch}</span>
+								</div>
+							))}
+						</div>
+					)}
+					{ghInstallations.map((inst) => {
+						const mine = ghRepos.filter((r) => r.installationId === inst.id);
+						return (
+							<div key={inst.id} style={{ marginBottom: 12 }}>
+								<div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, marginBottom: 4 }}>
+									<span style={{ fontWeight: 600 }}>{inst.account || `Installation ${inst.id}`}</span>
+									<span className="muted">{inst.type}</span>
+									<a
+										href={`https://github.com/apps/${appSlug}/installations/${inst.id}`}
+										target="_blank"
+										rel="noreferrer"
+										className="muted"
+										style={{ fontSize: 11 }}
+									>
+										manage ↗
+									</a>
+								</div>
+								<div className="pop-scroll" style={{ maxHeight: 160 }}>
+									{mine.map((r) => (
+										<div key={r.repo} className="pop-item" style={{ cursor: "default", padding: "4px 12px" }}>
+											<GitBranch size={12} />
+											<span className="mono" style={{ flex: 1, fontSize: 12 }}>{r.repo}</span>
+											<span className="right">{r.defaultBranch}</span>
+										</div>
+									))}
+								</div>
+							</div>
+						);
+					})}
+					<div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+						<a className="btn ghost sm" href={installUrl} target="_blank" rel="noreferrer">
+							+ Add another account / repos
+						</a>
+						<CopyButton text={installUrl} label="Copy install link" />
+					</div>
+					<p className="muted" style={{ fontSize: 11, marginTop: 10, maxWidth: 420 }}>
+						To install on a different GitHub account or org: open an incognito window, sign in to GitHub as that user, and
+						paste the copied install link — then pick the account and repos to grant.
+					</p>
+				</>
 			) : (
-				<a className="btn ghost" href={`https://github.com/apps/${appSlug}/installations/new`} target="_blank" rel="noreferrer">
-					Enable GitHub access
-				</a>
+				<>
+					<a className="btn ghost" href={installUrl} target="_blank" rel="noreferrer">
+						Enable GitHub access
+					</a>
+					<p className="muted" style={{ fontSize: 11, marginTop: 10, maxWidth: 420 }}>
+						Installing for a different GitHub account? Open an incognito window, sign in to GitHub as that user, and open:
+					</p>
+					<div className="key-reveal mono" style={{ fontSize: 11, wordBreak: "break-all" }}>{installUrl}</div>
+					<CopyButton text={installUrl} label="Copy install link" />
+				</>
 			)}
 		</div>
 	);
 
-	const secretsSection = (
-		<div className="card" style={{ padding: 20 }}>
-			<div className="chart-title" style={{ marginBottom: 4 }}>Shared secrets</div>
-			<p className="muted" style={{ fontSize: 12, marginBottom: 14 }}>Stored server-side (opt-in). Blank keeps the synced value.</p>
-			{SHARED_SECRET_FIELDS.map((f) => (
-				<Field key={f.key} label={f.label} hint={f.hint}>
-					{secretInput(f.key)}
-				</Field>
-			))}
-		</div>
-	);
+	const secretLabel = (key: string): { label: string; hint: string } => {
+		if (key === "githubToken") return { label: "GitHub token", hint: "fallback when no app installation" };
+		if (key === "e2bApiKey") return { label: "E2B API key", hint: "cloud sandboxes — overrides worker env" };
+		if (key === "providerApiKey") return { label: "LLM API key", hint: "fallback when no profile key" };
+		if (key.startsWith("profile.apiKey.")) return { label: `Profile key — ${key.slice("profile.apiKey.".length)}`, hint: "LLM key for that provider profile" };
+		const prof = profiles.find((p) => p.name === key);
+		if (prof) return { label: `Profile key — ${key}`, hint: "LLM key for that provider profile" };
+		return { label: key, hint: "custom" };
+	};
+
+	const secretsSection = (() => {
+		const known = SHARED_SECRET_FIELDS.map((f) => f.key);
+		const keys = [
+			...new Set([
+				...known,
+				...Object.keys(secrets).filter((k) => !deleted.has(k)),
+				...[...syncedKeys],
+			]),
+		];
+		return (
+			<div className="card" style={{ padding: 20 }}>
+				<div className="chart-title" style={{ marginBottom: 4 }}>Shared secrets</div>
+				<p className="muted" style={{ fontSize: 12, marginBottom: 14 }}>
+					Credentials shared between your editors and cloud runs — LLM keys, sandbox keys, git tokens. Stored
+					server-side per account (opt-in): the extension pulls them into its secret store and pushes local ones up,
+					and the worker injects them into sandbox runs. Blank keeps the synced value; ✕ clears it.
+				</p>
+				{keys.map((k) => {
+					const l = secretLabel(k);
+					return (
+						<Field key={k} label={l.label} hint={l.hint}>
+							{secretInput(k)}
+						</Field>
+					);
+				})}
+				{keys.length === 0 && <div className="muted" style={{ fontSize: 12 }}>No secrets yet.</div>}
+				{newSecretOpen ? (
+					<div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+						<input
+							className="input mono"
+							style={{ width: 220 }}
+							placeholder="secret name (e.g. npmToken)"
+							value={newSecretKey}
+							onChange={(e) => setNewSecretKey(e.target.value)}
+							autoFocus
+						/>
+						<button
+							className="btn sm"
+							disabled={!/^[\w.-]+$/.test(newSecretKey.trim())}
+							onClick={() => {
+								setSecrets((s) => ({ ...s, [newSecretKey.trim()]: "" }));
+								setNewSecretKey("");
+								setNewSecretOpen(false);
+							}}
+						>
+							Add
+						</button>
+						<button className="btn ghost sm" onClick={() => setNewSecretOpen(false)}>Cancel</button>
+					</div>
+				) : (
+					<button className="btn ghost sm" style={{ marginTop: 10 }} onClick={() => setNewSecretOpen(true)}>
+						+ Add a secret
+					</button>
+				)}
+			</div>
+		);
+	})();
 
 	if (!user) return null;
 	return (

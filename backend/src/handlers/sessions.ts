@@ -47,7 +47,7 @@ export async function createSession(req: Request): Promise<Response> {
 		startRef?: string;
 	};
 	const repo = String(body.repo ?? "").trim();
-	const mode = ["ask", "plan", "agent"].includes(body.mode ?? "") ? body.mode! : "agent";
+	const mode = ["ask", "plan", "agent", "multi"].includes(body.mode ?? "") ? body.mode! : "agent";
 	if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) {
 		if (mode !== "ask") return json({ error: "repo must be owner/name" }, { status: 400 });
 	}
@@ -79,7 +79,7 @@ export async function createSession(req: Request): Promise<Response> {
 	// Composer template wins; otherwise the user's default applies. When both
 	// are unset the worker's LLM pick chooses from the live E2B template list.
 	const template = body.template?.slice(0, 80) || userDoc?.settings?.data?.e2bTemplate?.slice(0, 80) || null;
-	const defaultModel = userDoc?.settings?.data?.modelDefaults?.[mode] ?? null;
+	const defaultModel = userDoc?.settings?.data?.modelDefaults?.[mode] ?? userDoc?.settings?.data?.modelDefaults?.agent ?? null;
 	// startRef: the ref to check out at clone time (feature branch or
 	// pull/<n>/head); base stays the rebase/PR target.
 	const startRef = /^[\w./-]{1,200}$/.test(String(body.startRef ?? "")) ? String(body.startRef) : "";
@@ -144,7 +144,7 @@ export async function postMessage(req: Request, p: Record<string, string>): Prom
 	const db = await getDb();
 	const session = await db.collection("sessions").findOne({ uid, sessionId: p.id });
 	if (!session) return json({ error: "not_found" }, { status: 404 });
-	const mode = ["ask", "plan", "agent"].includes(body.mode ?? "") ? body.mode! : (session.mode ?? "agent");
+	const mode = ["ask", "plan", "agent", "multi"].includes(body.mode ?? "") ? body.mode! : (session.mode ?? "agent");
 	const runId = `web-${randomUUID()}`;
 	const now = new Date();
 	const doc = {
