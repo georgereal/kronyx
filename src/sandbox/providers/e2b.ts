@@ -1,5 +1,6 @@
 import { Sandbox } from "e2b";
 import type { ExecResult, ProviderCreds, SandboxHandle, SandboxProvider } from "../provider";
+import { PUBLIC_E2B_TEMPLATES } from "../templateCatalog";
 import { swallow } from "../../lib/errlog";
 
 const apiKey = (creds: ProviderCreds): string => creds.secrets.e2bApiKey ?? process.env.E2B_API_KEY ?? "";
@@ -11,9 +12,14 @@ class E2bHandle implements SandboxHandle {
 		return (this.sbx as unknown as { sandboxId: string }).sandboxId;
 	}
 
-	async run(command: string, opts: { cwd: string; timeoutMs?: number }): Promise<ExecResult> {
+	async run(command: string, opts: { cwd: string; timeoutMs?: number; onOutput?: (chunk: string) => void }): Promise<ExecResult> {
 		try {
-			const r = await this.sbx.commands.run(command, { cwd: opts.cwd, timeoutMs: opts.timeoutMs });
+			const r = await this.sbx.commands.run(command, {
+				cwd: opts.cwd,
+				timeoutMs: opts.timeoutMs,
+				onStdout: opts.onOutput,
+				onStderr: opts.onOutput,
+			});
 			return { exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr };
 		} catch (err) {
 			// commands.run throws CommandExitError on nonzero exit — other
@@ -64,7 +70,16 @@ export const e2bProvider: SandboxProvider = {
 	},
 
 	async pauseById(id, creds) {
-		return Sandbox.betaPause(id, { apiKey: apiKey(creds) }).catch(swallow("e2b", "op", false));
+		try {
+			await Sandbox.betaPause(id, { apiKey: apiKey(creds) });
+			return true;
+		} catch (err) {
+			// Already paused or gone is the goal state — returning false would
+			// leave the row "active" and the janitor retries every sweep.
+			if (err instanceof Error && /not found/i.test(err.message)) return true;
+			swallow("e2b", "op")(err);
+			return false;
+		}
 	},
 
 	async killById(id, creds) {
@@ -84,5 +99,20 @@ export const e2bProvider: SandboxProvider = {
 		if (!res?.ok) return [];
 		const list = (await res.json()) as { sandboxID?: string; sandboxId?: string; startedAt?: string }[];
 		return list.map((s) => ({ id: s.sandboxID ?? s.sandboxId ?? "", startedAt: s.startedAt })).filter((s) => s.id);
+	},
+
+	async listTemplates(creds) {
+		const res = await fetch("https://api.e2b.app/templates", {
+			headers: { "X-API-KEY": apiKey(creds) },
+			signal: AbortSignal.timeout(15_000),
+		}).catch(swallow("e2b", "op"));
+		const list = res?.ok ? ((await res.json().catch(swallow("e2b", "op", []))) as { templateID?: string; names?: string[]; public?: boolean }[]) : [];
+		const account = (Array.isArray(list) ? list : [])
+			.map((t) => ({ id: String(t.templateID ?? ""), names: t.names ?? [], public: !!t.public }))
+			.filter((t) => t.id);
+		// Public fleet isn't returned by the API but is creatable by name —
+		// merge it in; account builds with the same slug win.
+		const slugs = new Set(account.flatMap((t) => t.names.map((n) => n.split(":")[0])));
+		return [...account, ...PUBLIC_E2B_TEMPLATES.filter((t) => !slugs.has(t.id))];
 	},
 };

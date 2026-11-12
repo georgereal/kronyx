@@ -25,6 +25,7 @@ export interface UsageCall {
 	durationMs: number;
 	runId?: string;
 	session?: string;
+	uid?: string;
 }
 
 export const RANGES = [
@@ -46,26 +47,39 @@ export const host = (u: string) => {
 	}
 };
 
-export function useUsageCalls(sinceMs: number) {
+export function useUsageCalls(sinceMs: number, allUsers = false) {
 	const user = useUser();
 	const [calls, setCalls] = useState<UsageCall[]>([]);
 	const [loading, setLoading] = useState(true);
+	const [forbidden, setForbidden] = useState(false);
+	const [userNames, setUserNames] = useState<Record<string, { name: string | null; email: string | null }>>({});
 
 	const load = useCallback(async () => {
 		if (!user) return;
 		setLoading(true);
 		const params = new URLSearchParams({ limit: "2000" });
 		if (sinceMs > 0) params.set("since", String(Date.now() - sinceMs));
+		if (allUsers) params.set("all", "1");
 		const res = await apiFetch(`/api/usage?${params}`, user);
-		if (res.ok) setCalls(((await res.json()) as { calls: UsageCall[] }).calls);
+		if (res.status === 403) {
+			setForbidden(true);
+			setCalls([]);
+		} else {
+			setForbidden(false);
+			if (res.ok) {
+				const b = (await res.json()) as { calls: UsageCall[]; users?: Record<string, { name: string | null; email: string | null }> };
+				setCalls(b.calls);
+				setUserNames(b.users ?? {});
+			}
+		}
 		setLoading(false);
-	}, [user, sinceMs]);
+	}, [user, sinceMs, allUsers]);
 
 	useEffect(() => {
 		void load();
 	}, [load]);
 
-	return { calls, loading, user, reload: load };
+	return { calls, loading, user, forbidden, userNames, reload: load };
 }
 
 export function RangePicker({ value, onChange }: { value: number; onChange: (ms: number) => void }) {

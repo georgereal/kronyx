@@ -36,6 +36,56 @@ export async function token(req: Request): Promise<Response> {
 	return json({ token: t });
 }
 
+/** GET /api/github/branches?installationId=&repo= — branch names for the start-point picker. */
+export async function branches(req: Request): Promise<Response> {
+	const uid = await authenticate(req);
+	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
+	const url = new URL(req.url);
+	const inst = Number(url.searchParams.get("installationId"));
+	const repo = url.searchParams.get("repo") ?? "";
+	if (!inst || !/^[\w.-]+\/[\w.-]+$/.test(repo)) return json({ error: "installationId and repo required" }, { status: 400 });
+	const token = await installationToken(inst).catch(swallow("github", "installationToken", ""));
+	if (!token) return json({ error: "token_failed" }, { status: 502 });
+	const res = await fetch(`https://api.github.com/repos/${repo}/branches?per_page=100`, {
+		headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" },
+	}).catch(swallow("github", "branches", null));
+	if (!res?.ok) return json({ branches: [] });
+	const list = (await res.json()) as { name: string }[];
+	return json({ branches: (Array.isArray(list) ? list : []).map((b) => b.name) });
+}
+
+/** GET /api/github/prs?installationId=&repo= — open PRs for the start-point picker. */
+export async function prs(req: Request): Promise<Response> {
+	const uid = await authenticate(req);
+	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
+	const url = new URL(req.url);
+	const inst = Number(url.searchParams.get("installationId"));
+	const repo = url.searchParams.get("repo") ?? "";
+	if (!inst || !/^[\w.-]+\/[\w.-]+$/.test(repo)) return json({ error: "installationId and repo required" }, { status: 400 });
+	const token = await installationToken(inst).catch(swallow("github", "installationToken", ""));
+	if (!token) return json({ error: "token_failed" }, { status: 502 });
+	const res = await fetch(`https://api.github.com/repos/${repo}/pulls?state=open&per_page=50&sort=updated`, {
+		headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" },
+	}).catch(swallow("github", "prs", null));
+	if (!res?.ok) return json({ prs: [] });
+	const list = (await res.json()) as {
+		number: number;
+		title: string;
+		head: { ref: string; repo?: { full_name: string } | null; user?: { login: string } };
+		base: { ref: string };
+	}[];
+	return json({
+		prs: (Array.isArray(list) ? list : []).map((p) => ({
+			number: p.number,
+			title: p.title,
+			headRef: p.head.ref,
+			headRepo: p.head.repo?.full_name ?? null,
+			baseRef: p.base.ref,
+			user: p.head.user?.login ?? "",
+		})),
+	});
+}
+
 /** GET /api/github/callback — GitHub redirects here after install; forward into the web app. */
 export function callback(req: Request): Response {
 	const url = new URL(req.url);

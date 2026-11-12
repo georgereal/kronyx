@@ -1,8 +1,5 @@
 import { Writable } from "node:stream";
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import type { ExecResult, ProviderCreds, SandboxHandle, SandboxProvider } from "../provider";
 import { swallow } from "../../lib/errlog";
 
@@ -18,7 +15,6 @@ const DEFAULT_IMAGE = "node:22";
 type K8sCtx = { api: any; exec: any; ns: string };
 
 async function k8sCtx(creds: ProviderCreds): Promise<K8sCtx> {
-	// eslint-disable-next-line @typescript-eslint/no-implied-eval
 	const mod: any = await import(K8S_PKG);
 	const kc = new mod.KubeConfig();
 	if (creds.secrets.kubeconfig) kc.loadFromString(creds.secrets.kubeconfig);
@@ -98,11 +94,10 @@ export const kubernetesProvider: SandboxProvider = {
 	secretKeys: ["kubeconfig"],
 
 	validate(creds) {
-		// Configured via secret, KUBECONFIG, or ~/.kube/config — otherwise skip
-		// entirely so listLive doesn't hammer a nonexistent cluster every poll.
-		if (creds.secrets.kubeconfig) return null;
-		if (process.env.KUBECONFIG || existsSync(join(homedir(), ".kube", "config"))) return null;
-		return "No kubeconfig — set it in Settings → Secrets.";
+		// Explicitly configured only — a stray ~/.kube/config pointing at a dead
+		// cluster must not count as "enabled".
+		if (creds.secrets.kubeconfig || process.env.KUBECONFIG) return null;
+		return "Kubernetes not configured — set kubeconfig in Settings → Secrets.";
 	},
 
 	async create(creds, opts) {

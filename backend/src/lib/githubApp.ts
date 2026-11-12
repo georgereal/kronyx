@@ -44,9 +44,27 @@ export async function installationRepos(installationId: number): Promise<{ fullN
 	return (data.repositories ?? []).map((r) => ({ fullName: r.full_name, defaultBranch: r.default_branch }));
 }
 
+// Installation tokens last ~1h — mint at most once per ~50min per installation.
+const tokenCache = new Map<number, { token: string; at: number; inflight?: Promise<string> }>();
+const TOKEN_TTL_MS = 50 * 60_000;
+
 /** Short-lived installation access token — scoped to the installed repos only. */
 export async function installationToken(installationId: number): Promise<string> {
-	const res = await gh(`/app/installations/${installationId}/access_tokens`, { method: "POST" });
-	if (!res.ok) throw new Error(`installation token failed: ${res.status}`);
-	return ((await res.json()) as { token: string }).token;
+	const hit = tokenCache.get(installationId);
+	if (hit?.inflight) return hit.inflight;
+	if (hit && Date.now() - hit.at < TOKEN_TTL_MS) return hit.token;
+	const inflight = (async () => {
+		const res = await gh(`/app/installations/${installationId}/access_tokens`, { method: "POST" });
+		if (!res.ok) throw new Error(`installation token failed: ${res.status}`);
+		return ((await res.json()) as { token: string }).token;
+	})();
+	tokenCache.set(installationId, { token: "", at: 0, inflight });
+	try {
+		const token = await inflight;
+		tokenCache.set(installationId, { token, at: Date.now() });
+		return token;
+	} finally {
+		const cur = tokenCache.get(installationId);
+		if (cur?.inflight === inflight) cur.inflight = undefined;
+	}
 }

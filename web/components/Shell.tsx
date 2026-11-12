@@ -175,7 +175,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
 					</button>
 				</div>
 			</aside>}
-			<main className={`container${pathname === "/settings" ? " wide" : ""}`}>{children}</main>
+			<main className={`container${["/settings", "/usage", "/sandboxes", "/runs"].includes(pathname) ? " wide" : ""}`}>{children}</main>
 		</div>
 	);
 }

@@ -28,4 +28,8 @@ Env: backend reads `backend/.env` (copy of `web/.env.local` — MONGODB_URI, FIR
 
 `POST /api/sessions` → `POST /api/sessions/:id/messages` enqueues `cloud_jobs` → worker claims → E2B sandbox (clone, attachments, branch `kronyx/<slug>-<id>` at first agent run, drift rebase, verify, push, `openPr`) → `run_events` → UI polls (3s) or SSE `?stream=1&token=<idToken>`.
 
-Modes: `ask` = no sandbox (chat only); `plan` = read-only sandbox + `save_plan` → `plans` collection (UI card: Implement / Push to branch); `agent` = full writes → PR. Attachments: ≤20KB text inlined, all files land in `.kronyx/attachments/` (excluded from commits).
+Modes: `ask` = no sandbox (chat only); `plan` = read-only sandbox + `save_plan` → `plans` collection (UI card: Implement / Push to branch); `agent` = full writes → PR. Attachments: ≤20KB text inlined, all files land in `.kronyx/attachments/` (excluded from commits, along with `.kronyx/shots/` browser screenshots).
+
+Browser/GUI: agent mode adds a `browser_use` tool (`src/tools/browserTools.ts` — browser-use + Playwright inside the sandbox, LLM creds via a 0600 env file). Post-run verify screenshots the booted app into `runs.screenshot` + a `ui-screenshot` event. Both need the custom E2B template in `backend/e2b-template/` (Chromium, browser-use, Qt libs like libgl1/xvfb for PyQt5); set it via the Composer template field. Stock template: tool reports "not installed", screenshot step skips. Qt tests: `QT_QPA_PLATFORM=offscreen`.
+
+Templates: the worker lists the account's usable E2B templates (`listTemplates` → public fleet + `e2b template build` customs) and the model picks one at cold start (`backend/src/worker/pickTemplate.ts`); priority = Composer field > LLM pick > `e2bTemplate` settings default > `base`. `switch_environment` (agent tool, `src/tools/envTools.ts`) swaps VM images mid-run — interim commit+push → recreate → reclone branch → continue (≤2/run); disabled via Settings → `sandboxAutoSwitch`.

@@ -50,6 +50,7 @@ export class SandboxCore {
 		try {
 			const ok = await this.provider.pauseById(id, this.creds);
 			if (ok) {
+				clearTimeout(this.idleTimer);
 				this.onLifecycle?.("pause", id);
 				this.handle = undefined;
 			}
@@ -112,7 +113,12 @@ export class SandboxCore {
 	/** Clone and return the repo's default branch ("" if undetectable). */
 	async cloneRepo(repoUrl: string, token: string, dest: string): Promise<string> {
 		const authed = repoUrl.replace("https://", `https://x-access-token:${token}@`);
-		const result = await this.runIn("/home/user", `git clone ${authed} ${dest}`, 300_000);
+		// Partial clone first (big repos fetch blobs on demand); full fallback.
+		let result = await this.runIn("/home/user", `git clone --filter=blob:none ${authed} ${dest}`, 300_000);
+		if (result.exitCode !== 0) {
+			await this.runIn("/home/user", `rm -rf ${dest}`, 30_000).catch(swallow("sandbox", "op"));
+			result = await this.runIn("/home/user", `git clone ${authed} ${dest}`, 300_000);
+		}
 		if (result.exitCode !== 0) throw new Error(`git clone failed: ${result.stderr || result.stdout}`);
 		const head = await this.runIn(dest, "git symbolic-ref refs/remotes/origin/HEAD --short", 15_000).catch(swallow("sandbox", "op"));
 		return head?.exitCode === 0 ? head.stdout.trim().replace(/^origin\//, "") : "";

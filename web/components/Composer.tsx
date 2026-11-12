@@ -17,13 +17,17 @@ export interface Attachment {
 export interface EnvState {
 	repo: string;
 	base: string;
+	/** Ref to check out at clone time: branch name or pull/<n>/head. Defaults to base. */
+	startRef: string;
+	/** Display label when the start point came from a PR pick, e.g. "#42". */
+	prLabel: string;
 	installationId: number | null;
 	extraRepos: string[];
 	template: string;
-	securityProfile: "agent" | "bypass";
+	securityProfile: "agent" | "bypass" | "controlled";
 }
 
-export const emptyEnv: EnvState = { repo: "", base: "", installationId: null, extraRepos: [], template: "", securityProfile: "agent" };
+export const emptyEnv: EnvState = { repo: "", base: "", startRef: "", prLabel: "", installationId: null, extraRepos: [], template: "", securityProfile: "agent" };
 
 const MODES: { id: Mode; label: string; desc: string }[] = [
 	{ id: "agent", label: "Agent", desc: "Full writes — branch, verify, push & open a PR" },
@@ -42,6 +46,7 @@ const SLASH_COMMANDS: { name: string; desc: string; action: "mode" | "prompt"; m
 ];
 
 interface Repo { repo: string; defaultBranch: string; installationId: number; }
+interface Pr { number: number; title: string; headRef: string; headRepo: string | null; baseRef: string; user: string; }
 
 function fmtSize(n: number): string {
 	return n > 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`;
@@ -79,6 +84,8 @@ export function Composer({
 	const [modelProfile, setModelProfile] = useState("");
 	const [repoQuery, setRepoQuery] = useState("");
 	const [modelQuery, setModelQuery] = useState("");
+	const [branches, setBranches] = useState<string[]>([]);
+	const [prs, setPrs] = useState<Pr[]>([]);
 	const taRef = useRef<HTMLTextAreaElement>(null);
 	const fileRef = useRef<HTMLInputElement>(null);
 
@@ -102,6 +109,22 @@ export function Composer({
 	}, [user]);
 
 	useEffect(() => onModel?.(modelId, modelProfile), [modelId, modelProfile, onModel]);
+
+	// Branch + open-PR lists for the start-point picker — lazy per repo.
+	useEffect(() => {
+		if (!env?.repo || !env.installationId || menu !== "env") return;
+		const repo = env.repo;
+		const inst = env.installationId;
+		setBranches([]);
+		setPrs([]);
+		const q = `?installationId=${inst}&repo=${encodeURIComponent(repo)}`;
+		void apiFetch(`/api/github/branches${q}`, user)
+			.then(async (r) => (r.ok ? setBranches(((await r.json()) as { branches: string[] }).branches ?? []) : undefined))
+			.catch(() => {});
+		void apiFetch(`/api/github/prs${q}`, user)
+			.then(async (r) => (r.ok ? setPrs(((await r.json()) as { prs: Pr[] }).prs ?? []) : undefined))
+			.catch(() => {});
+	}, [env?.repo, env?.installationId, menu, user]);
 
 	useEffect(() => {
 		if (autoFocus) taRef.current?.focus();
@@ -239,7 +262,7 @@ export function Composer({
 												className="pop-item"
 												onClick={() => {
 													if (env.repo === r.repo) return;
-													onEnv({ ...env, repo: r.repo, base: r.defaultBranch, installationId: r.installationId });
+													onEnv({ ...env, repo: r.repo, base: r.defaultBranch, startRef: "", prLabel: "", installationId: r.installationId });
 												}}
 											>
 												<GitBranch size={13} />
@@ -257,6 +280,59 @@ export function Composer({
 									</div>
 									{env.repo && (
 										<>
+											<div className="pop-sep" />
+											<div className="pop-title">Start from</div>
+											<div className="pop-scroll" style={{ maxHeight: 180 }}>
+												{branches.slice(0, 40).map((b) => {
+													const sel = !env.prLabel && (env.startRef || env.base) === b;
+													return (
+														<button
+															key={b}
+															className="pop-item"
+															onClick={() => onEnv({ ...env, base: b, startRef: b, prLabel: "" })}
+														>
+															<GitBranch size={13} />
+															<span className="mono" style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis" }}>{b}</span>
+															{sel && <span className="right">✓</span>}
+														</button>
+													);
+												})}
+												{branches.length === 0 && <div className="pop-item disabled">Loading branches…</div>}
+											</div>
+											{prs.length > 0 && (
+												<>
+													<div className="pop-title">Open PRs</div>
+													<div className="pop-scroll" style={{ maxHeight: 160 }}>
+														{prs.map((p) => {
+															const sel = env.prLabel === `#${p.number}`;
+															return (
+																<button
+																	key={p.number}
+																	className="pop-item"
+																	onClick={() =>
+																		onEnv({
+																			...env,
+																			base: p.baseRef,
+																			startRef: p.headRepo === env.repo ? p.headRef : `pull/${p.number}/head`,
+																			prLabel: `#${p.number}`,
+																		})
+																	}
+																>
+																	<span style={{ flex: 1, minWidth: 0 }}>
+																		<span style={{ display: "block", fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+																			#{p.number} {p.title}
+																		</span>
+																		<span className="muted mono" style={{ display: "block", fontSize: 10.5 }}>
+																			{p.headRef} → {p.baseRef}
+																		</span>
+																	</span>
+																	{sel && <span className="right">✓</span>}
+																</button>
+															);
+														})}
+													</div>
+												</>
+											)}
 											<div className="pop-sep" />
 											<div className="pop-title">Extra repos (read-only context)</div>
 											<div className="pop-scroll" style={{ maxHeight: 140 }}>
@@ -294,10 +370,18 @@ export function Composer({
 									</div>
 									<button
 										className="pop-item"
-										onClick={() => onEnv({ ...env, securityProfile: env.securityProfile === "agent" ? "bypass" : "agent" })}
+										onClick={() =>
+											onEnv({
+												...env,
+												securityProfile:
+													env.securityProfile === "agent" ? "controlled" : env.securityProfile === "controlled" ? "bypass" : "agent",
+											})
+										}
 									>
 										<span style={{ flex: 1 }}>Security profile</span>
-										<span className="right">{env.securityProfile === "bypass" ? "Bypass approvals" : "Agent (default)"}</span>
+										<span className="right">
+											{env.securityProfile === "bypass" ? "Bypass approvals" : env.securityProfile === "controlled" ? "Approve each change" : "Agent (default)"}
+										</span>
 									</button>
 									<div className="pop-item disabled">
 										<span style={{ flex: 1 }}>MCP connectors</span>
@@ -307,14 +391,19 @@ export function Composer({
 							)}
 						</div>
 					)}
-					{env?.repo && <span className="sess-chip mono" style={{ maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis" }}>{env.repo}</span>}
+					{env?.repo && (
+						<span className="sess-chip mono" style={{ maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis" }}>
+							{env.repo}
+							{env.prLabel ? ` ${env.prLabel}` : env.startRef && env.startRef !== env.base ? ` @${env.startRef}` : ""}
+						</span>
+					)}
 					<div className="spacer" />
 					<div className="anchor">
-						<button className="chip-btn" onClick={() => toggleMenu("model")}>
-							<Cpu size={12} /> {MODES.find((m) => m.id === mode)?.label ?? "Agent"} · {modelLabel.length > 26 ? `${modelLabel.slice(0, 24)}…` : modelLabel}
+						<button className="chip-btn" onClick={() => toggleMenu("mode")}>
+							{MODES.find((m) => m.id === mode)?.label ?? "Agent"}
 						</button>
-						{menu === "model" && (
-							<div className="pop" style={{ left: "auto", right: 0, minWidth: 340 }} onClick={(e) => e.stopPropagation()}>
+						{menu === "mode" && (
+							<div className="pop" style={{ left: "auto", right: 0, minWidth: 260 }} onClick={(e) => e.stopPropagation()}>
 								<div className="pop-title">Mode</div>
 								{MODES.map((m) => (
 									<button key={m.id} className="pop-item" onClick={() => { onMode(m.id); closeMenus(); }}>
@@ -325,7 +414,15 @@ export function Composer({
 										{mode === m.id && <span className="right">✓</span>}
 									</button>
 								))}
-								<div className="pop-sep" />
+							</div>
+						)}
+					</div>
+					<div className="anchor">
+						<button className="chip-btn" onClick={() => toggleMenu("model")}>
+							<Cpu size={12} /> {modelLabel.length > 26 ? `${modelLabel.slice(0, 24)}…` : modelLabel}
+						</button>
+						{menu === "model" && (
+							<div className="pop" style={{ left: "auto", right: 0, minWidth: 340 }} onClick={(e) => e.stopPropagation()}>
 								<input className="pop-search" placeholder="Search models" value={modelQuery} onChange={(e) => setModelQuery(e.target.value)} />
 								<div className="pop-scroll">
 									{modelFiltered.map((g) => (

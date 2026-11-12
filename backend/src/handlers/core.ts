@@ -18,11 +18,12 @@ function adminApp(): App {
 export async function me(req: Request): Promise<Response> {
 	const uid = await authenticate(req);
 	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
+	const role = await userRole(uid);
 	try {
 		const user = await getAuth(adminApp()).getUser(uid);
-		return json({ uid, email: user.email ?? null, name: user.displayName ?? null });
+		return json({ uid, email: user.email ?? null, name: user.displayName ?? null, role });
 	} catch {
-		return json({ uid });
+		return json({ uid, role });
 	}
 }
 
@@ -112,12 +113,21 @@ export async function putSettings(req: Request): Promise<Response> {
 	return json({ ok: true, updatedAt: now });
 }
 
-/** GET /api/usage */
+/** RBAC seed: role lives on the users doc ("admin" gates cross-user views). */
+async function userRole(uid: string): Promise<string> {
+	const db = await getDb();
+	const doc = await db.collection("users").findOne({ _id: uid as never }, { projection: { role: 1 } });
+	return typeof doc?.role === "string" ? doc.role : "user";
+}
+
+/** GET /api/usage — caller's rows; ?all=1 aggregates across users (admin only). */
 export async function usage(req: Request): Promise<Response> {
 	const uid = await authenticate(req);
 	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
 	const url = new URL(req.url);
-	const filter: Record<string, unknown> = { uid };
+	const all = url.searchParams.get("all") === "1";
+	if (all && (await userRole(uid)) !== "admin") return json({ error: "forbidden" }, { status: 403 });
+	const filter: Record<string, unknown> = all ? {} : { uid };
 	const since = Number(url.searchParams.get("since"));
 	const until = Number(url.searchParams.get("until"));
 	if (since || until) {
@@ -136,9 +146,17 @@ export async function usage(req: Request): Promise<Response> {
 		.find(filter)
 		.sort({ at: -1 })
 		.limit(limit)
-		.project({ _id: 0, uid: 0 })
+		.project(all ? { _id: 0 } : { _id: 0, uid: 0 })
 		.toArray();
-	return json({ calls });
+	if (!all) return json({ calls });
+	// Admin view: resolve uids → display names so the UI can show people, not ids.
+	const users: Record<string, { name: string | null; email: string | null }> = {};
+	const auth = getAuth(adminApp());
+	for (const u of [...new Set(calls.map((c) => String(c.uid)).filter(Boolean))]) {
+		const rec = await auth.getUser(u).catch(swallow("core", "op", null));
+		users[u] = { name: rec?.displayName ?? null, email: rec?.email ?? null };
+	}
+	return json({ calls, users });
 }
 
 interface IncomingCall {

@@ -3,7 +3,7 @@
 import { ArrowDownToLine, ArrowUpFromLine, DollarSign, Zap } from "lucide-react";
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import { AreaChart, bucketize, fmtTok } from "@/components/AreaChart";
+import { bucketizeSeries, fmtTok, MultiLineChart } from "@/components/AreaChart";
 import { Empty } from "@/components/Empty";
 import { Skeleton } from "@/components/Skeleton";
 import { Stat } from "@/components/Stat";
@@ -39,9 +39,23 @@ export default function Overview() {
 
 	const tin = calls.reduce((s, c) => s + c.tokensIn, 0);
 	const tout = calls.reduce((s, c) => s + c.tokensOut, 0);
+	const cr = calls.reduce((s, c) => s + c.cacheRead, 0);
+	const cw = calls.reduce((s, c) => s + (c.cacheWrite ?? 0), 0);
+	const rt = calls.reduce((s, c) => s + (c.reasoningTokens ?? 0), 0);
 	const costKnown = calls.filter((c) => c.costUsd !== null);
 	const cost = costKnown.reduce((s, c) => s + (c.costUsd ?? 0), 0);
-	const buckets = bucketize(calls, (c) => new Date(c.at).getTime(), (c) => c.tokensIn + c.tokensOut);
+	const [inB, outB, crB, cwB, rtB] = bucketizeSeries(
+		calls,
+		(c) => new Date(c.at).getTime(),
+		[(c) => c.tokensIn, (c) => c.tokensOut, (c) => c.cacheRead, (c) => c.cacheWrite ?? 0, (c) => c.reasoningTokens ?? 0],
+	);
+	const series = [
+		{ label: "in", color: "#5b8cff", buckets: inB, total: tin },
+		{ label: "out", color: "#3ecf8e", buckets: outB, total: tout },
+		{ label: "cache↩", color: "#a78bfa", buckets: crB, total: cr },
+		{ label: "cache✎", color: "#f5a97f", buckets: cwB, total: cw },
+		{ label: "↯", color: "#f38ba8", buckets: rtB, total: rt, thin: true },
+	].filter((s) => s.total > 0);
 
 	const byModel = new Map<string, { tokens: number; calls: number }>();
 	for (const c of calls) {
@@ -77,8 +91,17 @@ export default function Overview() {
 			)}
 
 			<div className="card chart-wrap">
-				<div className="chart-title">Token volume</div>
-				<AreaChart buckets={buckets} />
+				<div className="chart-title" style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+					Token volume
+					<span style={{ flex: 1 }} />
+					{series.map((s) => (
+						<span key={s.label} className="muted" style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 10.5, textTransform: "none", letterSpacing: 0 }}>
+							<span style={{ width: 8, height: 8, borderRadius: 2, background: s.color, display: "inline-block" }} />
+							{s.label} {fmtTok(s.total)}
+						</span>
+					))}
+				</div>
+				<MultiLineChart series={series} />
 			</div>
 
 			<div className="stat-grid" style={{ gridTemplateColumns: "1fr 2fr", gap: 12 }}>

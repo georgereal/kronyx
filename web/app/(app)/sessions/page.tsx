@@ -31,6 +31,7 @@ export default function SessionsLanding() {
 			body: JSON.stringify({
 				repo: env.repo,
 				base: env.base,
+				startRef: env.startRef || env.base,
 				mode,
 				modelId: modelId || undefined,
 				profile: modelProfile || undefined,

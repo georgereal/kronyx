@@ -13,7 +13,9 @@ import {
 	writeProviderValue,
 	type ModelOption,
 } from "../config";
-import { saveUserConfig, userConfig } from "../userConfig";
+import { onUserConfigSaved, saveUserConfig, userConfig } from "../userConfig";
+import { globalPermissionsPath, readGlobalPermissions, writeGlobalPermissions } from "../permStore";
+import type { PermissionRules } from "../agent/permissions";
 import { currentUser, signIn, signOut, webAppUrl } from "../auth";
 import { log } from "../log";
 
@@ -98,6 +100,9 @@ async function collectValues(context: vscode.ExtensionContext): Promise<Record<s
 			"memory.topK": config.get("memory.topK", 5),
 			"eval.suite": config.get("eval.suite", ".kronyx/evals.json"),
 			"eval.gateOnModelChange": config.get("eval.gateOnModelChange", "prompt"),
+			"permissions.allow": (await readGlobalPermissions()).allow.join("\n"),
+			"permissions.ask": (await readGlobalPermissions()).ask.join("\n"),
+			"permissions.deny": (await readGlobalPermissions()).deny.join("\n"),
 		},
 		profileNames: profiles()
 			.map((p) => p.name)
@@ -105,10 +110,20 @@ async function collectValues(context: vscode.ExtensionContext): Promise<Record<s
 		profileKeys: await profileKeyStatus(context),
 		account: await currentUser(context).then((u) => u?.email ?? u?.name ?? null).catch(() => null),
 		dashboardUrl: webAppUrl(),
+		permissionsPath: globalPermissionsPath(),
 	};
 }
 
 async function setKey(key: string, value: unknown): Promise<void> {
+	// Permission rule lists live in ~/.kronyx/permissions.json, not VS Code settings.
+	if (key.startsWith("permissions.")) {
+		const field = key.slice("permissions.".length) as keyof PermissionRules;
+		const rules = await readGlobalPermissions();
+		rules[field] = Array.isArray(value) ? value.map((v) => String(v).trim()).filter(Boolean) : [];
+		await writeGlobalPermissions(rules);
+		onUserConfigSaved?.();
+		return;
+	}
 	// Provider config lives in the shared user-level file; everything else stays in VS Code settings.
 	if (await writeProviderValue(key, value)) {
 		onProviderSaved?.();
@@ -301,6 +316,7 @@ const NAV = [
 	["provider", "Provider"],
 	["agent", "Agent"],
 	["checks", "Checks"],
+	["permissions", "Permissions"],
 	["memory", "Memory &amp; Evals"],
 	["sandbox", "Sandbox / Cloud"],
 	["git", "Git"],
@@ -383,6 +399,26 @@ const SECTIONS = `
   <label>Check commands (JSON array of shell commands)
     <textarea data-key="checks.commands" data-kind="json" rows="3" placeholder='["npm run typecheck", "npm run test"]'></textarea>
   </label>
+</section>
+
+<section id="sec-permissions" class="page">
+  <h2>Permissions</h2>
+  <p class="note">
+    Global rules apply to every workspace — one rule per line.
+    Syntax: <code>tool</code>, <code>tool(glob)</code> — e.g. <code>run_command(npm run test:*)</code>, <code>write_file(src/**)</code>.
+    Repo rules (<code>.kronyx/permissions.json</code>) and local rules (<code>.kronyx/permissions.local.json</code>)
+    can override allow/ask below; <strong>global deny is never overridden</strong>.
+  </p>
+  <label>Allow — auto-approve matching tools
+    <textarea data-key="permissions.allow" data-kind="lines" rows="4" placeholder="run_command(npm run build)&#10;read_file(**)"></textarea>
+  </label>
+  <label>Ask — always prompt, even in auto modes
+    <textarea data-key="permissions.ask" data-kind="lines" rows="3" placeholder="browser_use&#10;run_command(git push *)"></textarea>
+  </label>
+  <label>Deny — never run, in every mode
+    <textarea data-key="permissions.deny" data-kind="lines" rows="4" placeholder="run_command(rm -rf *)&#10;write_file(.env)"></textarea>
+  </label>
+  <p class="note" id="permissions-path"></p>
 </section>
 
 <section id="sec-memory" class="page">
@@ -506,6 +542,7 @@ function settingsJs(httpMode: boolean): string {
 		const kind = el.dataset.kind;
 		if (kind === "bool") return el.checked;
 		if (kind === "number") return Number(el.value);
+		if (kind === "lines") return el.value.split("\n").map((s) => s.trim()).filter(Boolean);
 		if (kind === "json") { try { return JSON.parse(el.value || "[]"); } catch { return undefined; } }
 		return el.value;
 	};
@@ -555,6 +592,8 @@ function settingsJs(httpMode: boolean): string {
 			else el.value = value;
 		}
 		apiKeyStatus.textContent = msg.apiKeySet ? "— set" : "— not set";
+		const permPath = document.getElementById("permissions-path");
+		if (permPath && msg.permissionsPath) permPath.textContent = "Saved to " + msg.permissionsPath + " — synced to cloud runs when settings sync is on.";
 		const acct = document.getElementById("account-status");
 		if (acct) acct.textContent = msg.account ? "Signed in as " + msg.account : "Not signed in — usage and settings stay local only.";
 		renderProfiles(msg);

@@ -9,7 +9,7 @@ import type { ExecResult, ProviderCreds, SandboxHandle, SandboxProvider } from "
  */
 const PKG = "@vercel/sandbox";
 
-async function sdk(creds: ProviderCreds): Promise<any> {
+async function sdk(_creds: ProviderCreds): Promise<any> {
 	const mod: any = await import(PKG);
 	return mod.Sandbox;
 }

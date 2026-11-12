@@ -32,6 +32,14 @@ export const WRITE_TOOL_NAMES = new Set([
 ]);
 
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
+const CMD_HEAD_CHARS = 2_000;
+const CMD_TAIL_CHARS = 5_000;
+
+/** Errors live at the tail: keep head for context, tail for the failure. */
+const clampCmdOut = (out: string): string =>
+	out.length <= CMD_HEAD_CHARS + CMD_TAIL_CHARS
+		? out
+		: `${out.slice(0, CMD_HEAD_CHARS)}\n…[${out.length - CMD_HEAD_CHARS - CMD_TAIL_CHARS} chars elided]…\n${out.slice(-CMD_TAIL_CHARS)}`;
 
 interface EditInput {
 	old_text: string;
@@ -110,7 +118,9 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 			if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
 			const start = Math.max(1, input.start_line ?? 1);
 			const requestedEnd = Math.min(lines.length, input.end_line ?? lines.length);
-			const end = Math.min(requestedEnd, start + maxReadLines - 1);
+			// Unbounded reads page at 400 lines; explicit ranges get maxReadLines.
+			const page = input.end_line === undefined ? Math.min(maxReadLines, 400) : maxReadLines;
+			const end = Math.min(requestedEnd, start + page - 1);
 			const width = String(end).length;
 			const body = lines
 				.slice(start - 1, end)
@@ -330,6 +340,7 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 
 	const memoryWrite: AgentTool<{ fact: string }, string> = {
 		name: "memory_write",
+		executionMode: "parallel",
 		description:
 			"Record a durable fact about this project for future runs (build/test commands, conventions, gotchas). Appends to .kronyx/memory/facts.md.",
 		inputSchema: {
@@ -346,14 +357,22 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 		},
 	};
 
-	const runCommand: AgentTool<{ command: string }, string> = {
+	const runCommand: AgentTool<{ command: string; timeout_seconds?: number }, string> = {
 		name: "run_command",
 		description:
-			"Run a shell command (build, test, install, etc). Executes in the configured sandbox when enabled, else in the workspace root. Returns exit code and output.",
+			"Run a shell command (build, test, install, etc). Executes in the configured sandbox when enabled, else in the workspace root. Returns exit code and output. " +
+			"Set timeout_seconds generously for slow work — package installs, builds, test suites can take 5–20 minutes. Do NOT give up on a command just because it is slow.",
 		inputSchema: {
 			type: "object",
 			properties: {
 				command: { type: "string", description: "Shell command to run." },
+				timeout_seconds: {
+					type: "integer",
+					minimum: 1,
+					maximum: 1800,
+					description:
+						"Max seconds to wait (default 300, max 1800). Use a higher value for installs/builds (e.g. 600–1200), a lower one for quick checks.",
+				},
 			},
 			required: ["command"],
 		},
@@ -362,11 +381,12 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 				const out = await options.execCommand(input.command);
 				if (out !== null) return out;
 			}
+			const timeout = Math.min(Math.max(input.timeout_seconds ?? 300, 1), 1800) * 1000;
 			const { exec } = await import("node:child_process");
 			return new Promise((resolve) => {
-				exec(input.command, { cwd: options.root, timeout: 60_000 }, (error, stdout, stderr) => {
+				exec(input.command, { cwd: options.root, timeout }, (error, stdout, stderr) => {
 					const out = `${stdout}${stderr}`.trim();
-					resolve(`exit ${error ? 1 : 0}\n${out.length > 8000 ? `${out.slice(0, 8000)}\n... (truncated)` : out}`);
+					resolve(`exit ${error ? 1 : 0}\n${clampCmdOut(out)}`);
 				});
 			});
 		},

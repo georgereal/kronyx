@@ -10,6 +10,7 @@
 		const kind = el.dataset.kind;
 		if (kind === "bool") return el.checked;
 		if (kind === "number") return Number(el.value);
+		if (kind === "lines") return el.value.split("\n").map((s) => s.trim()).filter(Boolean);
 		if (kind === "json") {
 			try {
 				return JSON.parse(el.value || "[]");
@@ -614,6 +615,8 @@
 				else el.value = value;
 			}
 			apiKeyStatus.textContent = msg.apiKeySet ? "— set" : "— not set";
+			const permPath = document.getElementById("permissions-path");
+			if (permPath && msg.permissionsPath) permPath.textContent = "Saved to " + msg.permissionsPath + " — synced to cloud runs when settings sync is on.";
 			renderProfiles(msg);
 		}
 		if (msg.type === "modelsResult") modelsResult.textContent = msg.text;

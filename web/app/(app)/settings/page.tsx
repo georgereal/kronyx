@@ -1,6 +1,6 @@
 "use client";
 
-import { Bot, Box, Check, ChevronDown, Copy, GitBranch, KeyRound, MoreHorizontal, Pencil, Plus, SlidersHorizontal, Trash2, X } from "lucide-react";
+import { Bot, Box, Check, ChevronDown, Copy, GitBranch, KeyRound, MoreHorizontal, Pencil, Plus, ShieldCheck, SlidersHorizontal, Trash2, X } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { apiFetch, useUser } from "@/lib/api";
 import { Modal } from "@/components/Modal";
@@ -47,6 +47,7 @@ const SECTIONS = [
 	{ id: "llm", label: "LLM Providers", icon: <Bot size={14} /> },
 	{ id: "sandbox", label: "Sandbox Providers", icon: <Box size={14} /> },
 	{ id: "defaults", label: "Model Defaults", icon: <SlidersHorizontal size={14} /> },
+	{ id: "permissions", label: "Permissions", icon: <ShieldCheck size={14} /> },
 	{ id: "github", label: "GitHub Access", icon: <GitBranch size={14} /> },
 	{ id: "secrets", label: "Shared Secrets", icon: <KeyRound size={14} /> },
 ] as const;
@@ -74,7 +75,10 @@ interface SettingsDoc {
 	data?: {
 		activeProfile?: string;
 		sandboxProvider?: string;
+		e2bTemplate?: string;
+		sandboxAutoSwitch?: boolean;
 		modelDefaults?: Record<string, string>;
+		permissions?: { allow?: string[]; ask?: string[]; deny?: string[] };
 		profiles?: { name?: string; providerId?: string; baseUrl?: string; modelId?: string; enabled?: boolean }[];
 	};
 	secrets?: Record<string, string>;
@@ -121,7 +125,13 @@ export default function SettingsPage() {
 	const [profiles, setProfiles] = useState<Profile[]>([]);
 	const [activeProfile, setActiveProfile] = useState("");
 	const [sandboxProvider, setSandboxProvider] = useState("e2b");
+	const [e2bTemplate, setE2bTemplate] = useState("");
+	const [sandboxAutoSwitch, setSandboxAutoSwitch] = useState(true);
 	const [modelDefaults, setModelDefaults] = useState<Record<string, string>>({});
+	const [permAllow, setPermAllow] = useState("");
+	const [permAsk, setPermAsk] = useState("");
+	const [permDeny, setPermDeny] = useState("");
+	const [dataExtras, setDataExtras] = useState<Record<string, unknown>>({});
 	const [groups, setGroups] = useState<ModelGroup[]>([]);
 	const [usage, setUsage] = useState<UsageEvent[]>([]);
 	const [secrets, setSecrets] = useState<Record<string, string>>({});
@@ -157,7 +167,18 @@ export default function SettingsPage() {
 				);
 				setActiveProfile(settings?.data?.activeProfile ?? "");
 				setSandboxProvider(settings?.data?.sandboxProvider ?? "e2b");
+				setE2bTemplate(settings?.data?.e2bTemplate ?? "");
+				setSandboxAutoSwitch(settings?.data?.sandboxAutoSwitch !== false);
 				setModelDefaults(settings?.data?.modelDefaults ?? {});
+				setPermAllow((settings?.data?.permissions?.allow ?? []).join("\n"));
+				setPermAsk((settings?.data?.permissions?.ask ?? []).join("\n"));
+				setPermDeny((settings?.data?.permissions?.deny ?? []).join("\n"));
+				// PUT replaces settings.data wholesale — retain keys this page doesn't own
+				// (providerId/baseUrl/modelId synced by the extension) so saving here
+				// doesn't wipe them.
+				const { activeProfile: _a, sandboxProvider: _s, e2bTemplate: _t, sandboxAutoSwitch: _sw, modelDefaults: _m, permissions: _p, profiles: _pr, ...rest } =
+					(settings?.data ?? {}) as Record<string, unknown>;
+				setDataExtras(rest);
 			}
 			const [mr, ur] = await Promise.all([apiFetch("/api/models", user), apiFetch("/api/usage?limit=500", user)]);
 			if (mr.ok) setGroups(((await mr.json()) as { groups: ModelGroup[] }).groups ?? []);
@@ -245,9 +266,17 @@ export default function SettingsPage() {
 			body: JSON.stringify({
 				version: 1,
 				data: {
+					...dataExtras,
 					activeProfile,
 					sandboxProvider,
+					e2bTemplate: e2bTemplate || undefined,
+					sandboxAutoSwitch,
 					modelDefaults,
+					permissions: {
+						allow: permAllow.split("\n").map((s) => s.trim()).filter(Boolean),
+						ask: permAsk.split("\n").map((s) => s.trim()).filter(Boolean),
+						deny: permDeny.split("\n").map((s) => s.trim()).filter(Boolean),
+					},
 					profiles: profiles.map(({ name, providerId, baseUrl, modelId, enabled }) => ({ name, providerId, baseUrl, modelId, enabled })),
 				},
 				secrets: secretPatch,
@@ -490,6 +519,28 @@ export default function SettingsPage() {
 										{secretInput(f.key, f.textarea)}
 									</Field>
 								))}
+								{p.id === "e2b" && (
+									<>
+										<Field label="Default template" hint="e2b template build — blank lets the model pick">
+											<input
+												className="input mono"
+												value={e2bTemplate}
+												onChange={(e) => setE2bTemplate(e.target.value)}
+												placeholder="kronyx-browser"
+											/>
+										</Field>
+										<Field label="Auto template switch" hint="agent may swap VM images mid-run">
+											<label className="radio-row">
+												<input
+													type="checkbox"
+													checked={sandboxAutoSwitch}
+													onChange={(e) => setSandboxAutoSwitch(e.target.checked)}
+												/>
+												Allow switch_environment
+											</label>
+										</Field>
+									</>
+								)}
 							</div>
 						)}
 					</div>
@@ -516,6 +567,34 @@ export default function SettingsPage() {
 					</select>
 				</Field>
 			))}
+		</>
+	);
+
+	const permissionsSection = (
+		<>
+			<div className="settings-head">
+				<div>
+					<div className="chart-title">Global Permission Rules</div>
+					<p className="muted" style={{ fontSize: 12 }}>
+						Apply to every repo, in local and cloud runs — synced via <code>~/.kronyx/permissions.json</code>.
+						Repo (<code>.kronyx/permissions.json</code>) and local (<code>.kronyx/permissions.local.json</code>) rules
+						can override allow/ask; <strong>global deny is never overridden</strong>.
+					</p>
+				</div>
+			</div>
+			<p className="muted" style={{ fontSize: 11 }}>
+				One rule per line — <code className="mono">tool</code> or <code className="mono">tool(glob)</code>, e.g.{" "}
+				<code className="mono">run_command(npm run test:*)</code>, <code className="mono">write_file(src/**)</code>.
+			</p>
+			<Field label="Allow" hint="auto-approve matching tools">
+				<textarea className="input mono" rows={4} value={permAllow} onChange={(e) => setPermAllow(e.target.value)} placeholder={"run_command(npm run build)\nread_file(**)"} />
+			</Field>
+			<Field label="Ask" hint="always prompt, even in auto modes">
+				<textarea className="input mono" rows={3} value={permAsk} onChange={(e) => setPermAsk(e.target.value)} placeholder={"browser_use\nrun_command(git push *)"} />
+			</Field>
+			<Field label="Deny" hint="never run — cannot be overridden by lower layers">
+				<textarea className="input mono" rows={4} value={permDeny} onChange={(e) => setPermDeny(e.target.value)} placeholder={"run_command(rm -rf *)\nwrite_file(.env)"} />
+			</Field>
 		</>
 	);
 
@@ -571,6 +650,7 @@ export default function SettingsPage() {
 					{section === "llm" && llmSection}
 					{section === "sandbox" && sandboxSection}
 					{section === "defaults" && defaultsSection}
+					{section === "permissions" && permissionsSection}
 					{section === "github" && githubSection}
 					{section === "secrets" && secretsSection}
 				</div>

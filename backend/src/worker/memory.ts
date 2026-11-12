@@ -1,9 +1,11 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { gunzipSync, gzipSync } from "node:zlib";
 import type { AgentMessage, AgentTool } from "@cline/shared";
 import type { Db } from "mongodb";
 import { swallow } from "../lib/log";
+import { getCache } from "./cache";
 import type { RunDigest } from "../../../src/agent/runner";
-import type { PriorTranscript } from "../../../src/agent/recall";
+import type { PriorTranscript, RecallScorer } from "../../../src/agent/recall";
 
 const MAX_TRANSCRIPTS = 5;
 const MAX_TRANSCRIPT_BYTES = 512 * 1024;
@@ -18,7 +20,24 @@ export async function loadTranscripts(db: Db, uid: string, sessionId: string): P
 		.sort({ savedAt: 1 })
 		.limit(MAX_TRANSCRIPTS)
 		.toArray();
-	return docs.map((d) => ({ label: String(d.label ?? d.runId), messages: (d.messages ?? []) as AgentMessage[] }));
+	return docs.map((d) => ({
+		label: String(d.label ?? d.runId),
+		messages: decodeTranscript(d) as AgentMessage[],
+	}));
+}
+
+/** Read both shapes: gzipped `data` (new) and raw `messages` (legacy). */
+function decodeTranscript(d: Record<string, unknown>): unknown[] {
+	const bin = d.data as { buffer?: Buffer } | Buffer | undefined;
+	if (bin) {
+		try {
+			const buf = Buffer.isBuffer(bin) ? bin : (bin.buffer as Buffer);
+			return JSON.parse(gunzipSync(buf).toString("utf8")) as unknown[];
+		} catch {
+			return [];
+		}
+	}
+	return (d.messages ?? []) as unknown[];
 }
 
 /** Save the canonical transcript for a finished run (upsert per runId, cap history). */
@@ -33,9 +52,13 @@ export async function saveTranscript(
 	if (JSON.stringify(payload).length > MAX_TRANSCRIPT_BYTES) {
 		payload = payload.slice(-Math.floor(payload.length * 0.6));
 	}
+	const packed = gzipSync(JSON.stringify(payload));
 	await db.collection("run_transcripts").updateOne(
 		{ uid, runId },
-		{ $set: { uid, sessionId, runId, label: `run ${runId.slice(0, 8)}`, messages: payload, savedAt: new Date() } },
+		{
+			$set: { uid, sessionId, runId, label: `run ${runId.slice(0, 8)}`, data: packed, encoding: "gzip", savedAt: new Date() },
+			$unset: { messages: "" },
+		},
 		{ upsert: true },
 	);
 	// Retention tiers: past the active window, transcripts are marked compacted
@@ -141,6 +164,67 @@ async function embedText(provider: EmbedProvider, text: string, op?: string): Pr
 	}
 }
 
+const RECALL_CHUNK_CHARS = 1500;
+const RECALL_MIN_CHUNK_CHARS = 40;
+const RECALL_MAX_EMBEDS = 40;
+const RECALL_VEC_CACHE_MAX = 4000;
+const RECALL_MIN_SCORE = 0.2;
+
+/**
+ * In-process chunk-vector cache, keyed by content hash so identical messages
+ * (e.g. a transcript re-searched across runs) embed once per worker lifetime.
+ * Transcript messages are immutable, so stale entries can't occur; Redis would
+ * only add per-chunk round-trips for no durability benefit worth paying here.
+ */
+const recallVecCache = new Map<string, number[]>();
+
+function cosine(a: number[], b: number[]): number {
+	let dot = 0;
+	let na = 0;
+	let nb = 0;
+	for (let i = 0; i < a.length && i < b.length; i++) {
+		dot += a[i] * b[i];
+		na += a[i] * a[i];
+		nb += b[i] * b[i];
+	}
+	return na && nb ? dot / (Math.sqrt(na) * Math.sqrt(nb)) : 0;
+}
+
+/**
+ * Semantic ranker for recall_context: embeds the query plus up to
+ * RECALL_MAX_EMBEDS not-yet-cached transcript chunks per call and returns
+ * cosine-similar hits. Returns undefined when the provider can't embed at all
+ * (tool falls back to keyword search).
+ */
+export function createRecallScorer(provider: EmbedProvider): RecallScorer {
+	return async (query, chunks) => {
+		const qVec = await embedText(provider, query, "recall_context");
+		if (!qVec) return undefined;
+		let embedded = 0;
+		const scored: { idx: number; score: number }[] = [];
+		for (const c of chunks) {
+			const text = c.text.slice(0, RECALL_CHUNK_CHARS);
+			if (text.length < RECALL_MIN_CHUNK_CHARS) continue;
+			const key = createHash("sha256").update(text).digest("hex").slice(0, 24);
+			let v = recallVecCache.get(key);
+			if (!v && embedded < RECALL_MAX_EMBEDS) {
+				v = await embedText(provider, text, "recall_context");
+				embedded++;
+				if (v) {
+					if (recallVecCache.size >= RECALL_VEC_CACHE_MAX) {
+						const oldest = recallVecCache.keys().next().value;
+						if (oldest !== undefined) recallVecCache.delete(oldest);
+					}
+					recallVecCache.set(key, v);
+				}
+			}
+			const score = v ? cosine(qVec, v) : 0;
+			if (score >= RECALL_MIN_SCORE) scored.push({ idx: c.idx, score });
+		}
+		return scored.sort((a, b) => b.score - a.score).slice(0, 8);
+	};
+}
+
 /** memory_write tool: provenance-carrying candidate in the `memories` collection. */
 export function memoryWriteTool(
 	db: Db,
@@ -224,7 +308,18 @@ export async function searchMemories(
 	provider?: EmbedProvider,
 	repo?: string,
 ): Promise<MemoryDoc[]> {
-	const vector = provider ? await embedText(provider, query, "memory_recall") : undefined;
+	// Repeated runs often recall with the same task text — cache the query
+	// embedding briefly (5min) instead of re-billing an /embeddings call.
+	let vector: number[] | undefined;
+	if (provider) {
+		const cache = await getCache().catch(() => undefined);
+		const key = `embed:${createHash("sha256").update(query.slice(0, 8000)).digest("hex").slice(0, 32)}`;
+		vector = (await cache?.get(key).catch(() => undefined)) as number[] | undefined;
+		if (!vector) {
+			vector = await embedText(provider, query, "memory_recall");
+			if (vector) void cache?.set(key, vector, 5 * 60_000).catch(() => {});
+		}
+	}
 	if (vector) {
 		const hits = await db
 			.collection("memories")

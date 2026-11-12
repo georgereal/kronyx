@@ -6,7 +6,7 @@ import { fmtTok } from "@/components/AreaChart";
 import { Empty } from "@/components/Empty";
 import { Skeleton } from "@/components/Skeleton";
 import { StatusPill } from "@/components/StatusPill";
-import { apiFetch } from "@/lib/api";
+import { apiFetch, useRole } from "@/lib/api";
 import { fmtCost, fmtDur, host, RangePicker, useUsageCalls } from "@/lib/usage";
 
 export default function UsagePage() {
@@ -14,7 +14,10 @@ export default function UsagePage() {
 	const [model, setModel] = useState("");
 	const [status, setStatus] = useState("");
 	const [search, setSearch] = useState("");
-	const { calls, loading, reload, user } = useUsageCalls(range);
+	const [allUsers, setAllUsers] = useState(false);
+	const { calls, loading, reload, user, userNames } = useUsageCalls(range, allUsers);
+	const role = useRole(user);
+	const isAdmin = role === "admin";
 	const [limit, setLimit] = useState(200);
 
 	const downloadReport = async (runId: string) => {
@@ -75,6 +78,16 @@ export default function UsagePage() {
 					<option value="failed">failed</option>
 				</select>
 				<span className="spacer" />
+				{isAdmin && (
+					<label
+						className="muted"
+						style={{ fontSize: 11.5, display: "flex", alignItems: "center", gap: 5, cursor: "pointer" }}
+						title="Aggregate usage across all users"
+					>
+						<input type="checkbox" checked={allUsers} onChange={(e) => setAllUsers(e.target.checked)} />
+						All users
+					</label>
+				)}
 				<span className="muted" style={{ fontSize: 11.5 }}>
 					{filtered.length} request{filtered.length === 1 ? "" : "s"}
 				</span>
@@ -98,13 +111,15 @@ export default function UsagePage() {
 								<th>Status</th>
 								<th>Model</th>
 								<th>Provider</th>
-								<th className="num">Usage</th>
-								<th className="num">Turn</th>
-								<th className="num">Cost est.</th>
-								<th className="num">Billed</th>
-								<th className="num">Duration</th>
+								<th>Usage</th>
+								<th>Cached</th>
+								<th>Turn</th>
+								<th>Cost est.</th>
+								<th>Billed</th>
+								<th>Duration</th>
 								<th>Key</th>
 								<th>Device</th>
+								{allUsers && <th>User</th>}
 								<th></th>
 							</tr>
 						</thead>
@@ -125,20 +140,36 @@ export default function UsagePage() {
 											{c.kind === "embedding" && <span className="sess-chip muted" style={{ marginLeft: 6, fontSize: 10 }}>emb{c.op ? `·${c.op.split("_")[1] ?? c.op}` : ""}</span>}
 										</td>
 										<td className="muted">{host(c.baseUrl) || c.provider}</td>
-										<td className="num">
+										<td>
 											{fmtTok(c.tokensIn)} in · {fmtTok(c.tokensOut)} out
-											{c.cacheRead > 0 && <span className="muted"> · {fmtTok(c.cacheRead)}↩</span>}
-											{(c.reasoningTokens ?? 0) > 0 && <span className="muted"> · {fmtTok(c.reasoningTokens!)}↯</span>}
+											{(c.reasoningTokens ?? 0) > 0 && (
+												<span className="muted" title="reasoning tokens — the model's internal chain-of-thought (billed as output)">
+													{" "}· {fmtTok(c.reasoningTokens!)}↯
+												</span>
+											)}
 										</td>
-										<td className="num muted">
+										<td className="muted" title="prompt-cache read / write tokens">
+											{c.cacheRead > 0 || (c.cacheWrite ?? 0) > 0 ? (
+												<>
+													{c.cacheRead > 0 && <>{fmtTok(c.cacheRead)}↩</>}
+													{(c.cacheWrite ?? 0) > 0 && <span> +{fmtTok(c.cacheWrite!)}w</span>}
+												</>
+											) : "—"}
+										</td>
+										<td className="muted">
 											{c.iteration != null ? `#${c.iteration}` : "—"}
 											{c.contextMsgs != null && <span className="muted" title="messages in context"> · {c.contextMsgs}msg</span>}
 										</td>
-										<td className="num">{fmtCost(c.costUsd)}</td>
-										<td className="num">{fmtCost(c.billedCostUsd ?? null)}</td>
-										<td className="num">{fmtDur(c.durationMs)}</td>
+										<td>{fmtCost(c.costUsd)}</td>
+										<td>{fmtCost(c.billedCostUsd ?? null)}</td>
+										<td>{fmtDur(c.durationMs)}</td>
 										<td className="mono muted">{c.keyLabel}</td>
 										<td className="muted">{c.device || "—"}</td>
+										{allUsers && (
+											<td className="muted" title={c.uid}>
+												{(c.uid && (userNames[c.uid]?.name ?? userNames[c.uid]?.email)) ?? (c.uid ? c.uid.slice(0, 8) : "—")}
+											</td>
+										)}
 										<td>
 											{c.runId && (
 												<button

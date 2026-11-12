@@ -2,17 +2,24 @@ import { randomUUID } from "node:crypto";
 import type { Db } from "mongodb";
 import { dbg, swallow } from "../lib/log";
 import { AgentRunner, type AgentMode, type ProviderSettings, type RunViewEvent } from "../../../src/agent/runner";
-import { getProvider, type ProviderCreds, type SandboxHandle } from "../../../src/sandbox/provider";
+import { getProvider, type ProviderCreds, type SandboxHandle, type SandboxProvider } from "../../../src/sandbox/provider";
 import { SandboxCore, openPr } from "../../../src/sandbox/sandboxCore";
 import { createRemoteFileTools } from "../../../src/tools/remoteFileTools";
+import { BROWSER_DRIVER, BROWSER_DRIVER_PATH, SCREENSHOT_PATH, createBrowserTools } from "../../../src/tools/browserTools";
+import { createEnvTools } from "../../../src/tools/envTools";
+import { isAgentCliTemplate, resolveTemplateName, type TemplateInfo } from "../../../src/sandbox/templateCatalog";
+import { pickTemplate } from "./pickTemplate";
 import { installationToken } from "../lib/githubApp";
-import { fetchModels } from "../lib/models";
+import { fetchModels, type ModelOption } from "../lib/models";
+import { getCache } from "./cache";
 import { recordSandboxEvent } from "../lib/sandboxEvents";
 import { githubPat, loadUserSettings, resolveProvider, type UserSettings } from "./settings";
 import type { RunSink } from "./events";
 import type { AgentMessage } from "@cline/shared";
 import type { PriorTranscript } from "../../../src/agent/recall";
+import { evaluate, parsePermissions, parsePermissionsText, type PermissionLayers } from "../../../src/agent/permissions";
 import {
+	createRecallScorer,
 	loadTranscripts,
 	memoryWriteTool,
 	recordDigests,
@@ -26,6 +33,8 @@ import {
 const REPO_DIR = "/home/user/repo";
 const PLAN_DIR = "/home/user/.kronyx/plans";
 const ATTACH_DIR = ".kronyx/attachments";
+const SHOTS_DIR = ".kronyx/shots";
+const COMMIT_EXCLUDES = [ATTACH_DIR, SHOTS_DIR, ".kronyx/permissions.local.json"];
 const INLINE_TEXT_LIMIT = 20 * 1024;
 const TEXT_EXT = /\.(txt|md|markdown|ts|tsx|js|jsx|mjs|cjs|json|ya?ml|toml|py|go|rs|java|c|cc|cpp|h|hpp|cs|rb|php|sh|css|html|xml|sql|env|ini|cfg|log)$/i;
 
@@ -47,6 +56,8 @@ interface SessionDoc {
 	sessionId: string;
 	repo?: string;
 	base?: string;
+	/** Ref to check out at clone time — feature branch or pull/<n>/head. */
+	startRef?: string;
 	branch?: string;
 	sandboxId?: string;
 	installationId?: number;
@@ -80,6 +91,14 @@ interface RunnerRoute {
  */
 interface LiveSlot {
 	handle?: SandboxHandle;
+	/** Rebound per run — browser screenshots emit on the current run's sink. */
+	onScreenshot?: (dataUrl: string, label?: string) => void;
+	/** Set by the switch_environment tool while a swap is in flight (dedup). */
+	templateRequest?: { template: string; reason: string; evidence: string };
+	/** Rebound per run — performs the VM swap synchronously inside the tool call. */
+	performSwitch?: (req: { template: string; reason: string; evidence: string }) => Promise<string>;
+	/** Rebound per run — the account's usable E2B templates for switch validation. */
+	templates?: TemplateInfo[];
 }
 
 const delegatingHandle = (live: LiveSlot): SandboxHandle => ({
@@ -100,32 +119,42 @@ const delegatingHandle = (live: LiveSlot): SandboxHandle => ({
 export class E2bOrchestratedExecutor implements RunExecutor {
 	private runner: AgentRunner | undefined;
 	/** Warm per-session runners: the same AgentRunner serves all runs in a session. */
-	private static runnerCache = new Map<string, { runner: AgentRunner; route: RunnerRoute; live: LiveSlot }>();
+	private static runnerCache = new Map<string, { runner: AgentRunner; route: RunnerRoute; live: LiveSlot; lastUsedAt: number }>();
 	private static readonly MAX_CACHED = 20;
+	/** Idle runners hold tools + transcripts — evict after this much quiet time. */
+	private static readonly RUNNER_TTL_MS = 30 * 60_000;
 	private pendingSave: Promise<void> | undefined;
 	private embedProvider: EmbedProvider | undefined;
 	/** Per-run usage ledger for usage_events rows (web runs bypass /api/ingest). */
 	private runProvider: ProviderSettings | undefined;
 	private modelPricing: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number } | undefined;
+	/** Catalog entry for the run's model — contextWindow/maxTokens/pricing. */
+	private modelMeta: ModelOption | undefined;
 	private lastUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, totalCost: 0 };
 	private lastUsageAt = 0;
 	private runStartedAt = 0;
-	/** process-wide: `${baseUrl}|${modelId}` → per-token pricing (null = unknown) */
-	private static pricingCache = new Map<
-		string,
-		{ input?: number; output?: number; cacheRead?: number; cacheWrite?: number } | null
-	>();
+	/** process-wide: `${baseUrl}|${modelId}` → catalog entry (null = unknown) */
+	private static modelMetaCache = new Map<string, ModelOption | null>();
 
 	private async loadPricing(p: ProviderSettings): Promise<void> {
 		const key = `${p.baseUrl}|${p.modelId}`;
-		if (E2bOrchestratedExecutor.pricingCache.has(key)) {
-			this.modelPricing = E2bOrchestratedExecutor.pricingCache.get(key) ?? undefined;
-			return;
+		let meta = E2bOrchestratedExecutor.modelMetaCache.get(key);
+		if (meta === undefined) {
+			// Cross-worker cache first — a miss hits the provider's /models once.
+			const cache = await getCache().catch(swallow("executor", "op", undefined));
+			meta = ((await cache?.get(`modelmeta:${key}`).catch(() => undefined)) ?? undefined) as ModelOption | undefined;
+			if (meta === undefined) {
+				const models = await fetchModels(p.baseUrl, p.apiKey).catch(swallow("executor", "op", []));
+				meta = models.find((m) => m.id === p.modelId) ?? null;
+				void cache?.set(`modelmeta:${key}`, meta ?? null, 24 * 60 * 60_000).catch(() => {});
+			}
+			E2bOrchestratedExecutor.modelMetaCache.set(key, meta);
 		}
-		const models = await fetchModels(p.baseUrl, p.apiKey).catch(swallow("executor", "op", []));
-		const pricing = models.find((m) => m.id === p.modelId)?.pricing ?? null;
-		E2bOrchestratedExecutor.pricingCache.set(key, pricing);
-		this.modelPricing = pricing ?? undefined;
+		this.modelMeta = meta ?? undefined;
+		this.modelPricing = meta?.pricing ?? undefined;
+		// Real catalog limits — compaction/handoff thresholds and output cap.
+		if (meta?.contextWindow) p.contextWindow = meta.contextWindow;
+		if (meta?.maxTokens) p.maxTokens = meta.maxTokens;
 	}
 
 	constructor(
@@ -138,6 +167,8 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	}
 
 	private stopRequested = false;
+	/** Mid-run VM swaps this job has already used (cap: 2). */
+	private switchCount = 0;
 
 	/** Stop at the next safe point: aborts a live agent AND gates setup/run phases. */
 	requestStop(): void {
@@ -149,6 +180,75 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		if (this.stopRequested) throw new Error("Stopped by user");
 	}
 
+	/**
+	 * Live terminal streaming: sandbox onOutput chunks are bursty — batch into
+	 * 400ms tool-output-delta events instead of one row per chunk.
+	 */
+	private outBuf = "";
+	private outTimer: ReturnType<typeof setTimeout> | null = null;
+	private queueToolOutput(chunk: string): void {
+		this.outBuf += chunk;
+		if (this.outTimer) return;
+		this.outTimer = setTimeout(() => this.flushToolOutput(), 400);
+	}
+	private flushToolOutput(): void {
+		if (this.outTimer) {
+			clearTimeout(this.outTimer);
+			this.outTimer = null;
+		}
+		if (!this.outBuf) return;
+		const text = this.outBuf;
+		this.outBuf = "";
+		void this.sink.emit({ type: "tool-output-delta", text }).catch(swallow("executor", "op"));
+	}
+
+	/**
+	 * Interactive approvals ("controlled" securityProfile): emit a
+	 * permission-request event, record a pending entry on the run doc, and
+	 * poll for the decision the UI posts via POST /api/runs/:id/permissions/:permId.
+	 * Denies on stop or after a 10-minute timeout.
+	 */
+	private async awaitPermission(job: CloudJob, toolName: string, input: unknown): Promise<boolean> {
+		const permId = randomUUID();
+		const inp = (input ?? {}) as Record<string, unknown>;
+		const path = String(inp.path ?? inp.file ?? "");
+		const command = String(inp.command ?? inp.cmd ?? "");
+		await this.sink
+			.emit({ type: "permission-request", id: permId, tool: toolName, path, command, input })
+			.catch(swallow("executor", "op"));
+		await this.db
+			.collection("runs")
+			.updateOne(
+				{ uid: job.uid, runId: job.runId },
+				{ $set: { [`permissions.${permId}`]: { tool: toolName, status: "pending", at: new Date() } } },
+			)
+			.catch(swallow("executor", "op"));
+		const resolve = async (decision: "allow" | "deny" | "stopped" | "timeout", allowed: boolean): Promise<boolean> => {
+			await this.sink
+				.emit({ type: "permission-response", id: permId, decision })
+				.catch(swallow("executor", "op"));
+			return allowed;
+		};
+		const deadline = Date.now() + 10 * 60_000;
+		while (Date.now() < deadline) {
+			if (this.stopRequested) return resolve("stopped", false);
+			const run = await this.db
+				.collection("runs")
+				.findOne(
+					{ uid: job.uid, runId: job.runId },
+					{ projection: { [`permissions.${permId}`]: 1, control: 1 } },
+				)
+				.catch(swallow("executor", "op", null));
+			if (run?.control === "stop_requested") return resolve("stopped", false);
+			const decision = String(
+				((run as { permissions?: Record<string, { decision?: string }> } | null)?.permissions?.[permId]?.decision) ?? "",
+			);
+			if (decision === "allow" || decision === "deny") return resolve(decision, decision === "allow");
+			await new Promise((r) => setTimeout(r, 1500));
+		}
+		return resolve("timeout", false);
+	}
+
 	/** Session-scoped runner: warm hit returns the live agent; cold start rehydrates transcripts + digests. */
 	private async ensureRunner(
 		job: CloudJob,
@@ -156,16 +256,32 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		kind: "ask" | "sandboxed",
 		mode: AgentMode,
 		makeTools: () => Promise<import("@cline/shared").AgentTool<any, string>[]>,
+		sandbox?: SandboxCore,
 	): Promise<{ runner: AgentRunner; live: LiveSlot }> {
-		const key = `${job.sessionId}:${kind}`;
+		// Provider fingerprint in the key: switching model/profile mid-session
+		// rebuilds the agent instead of reusing one bound to stale credentials.
+		const p = this.runProvider;
+		const fp = p ? `${p.providerId}|${p.modelId}|${p.baseUrl}` : "none";
+		const key = `${job.sessionId}:${kind}:${fp}`;
+		const now = Date.now();
+		for (const [k, e] of E2bOrchestratedExecutor.runnerCache) {
+			if (!e.runner.isRunning && now - e.lastUsedAt > E2bOrchestratedExecutor.RUNNER_TTL_MS) {
+				e.runner.stop();
+				E2bOrchestratedExecutor.runnerCache.delete(k);
+			}
+		}
 		const cached = E2bOrchestratedExecutor.runnerCache.get(key);
 		if (cached) {
+			cached.lastUsedAt = now;
 			cached.route.job = job;
 			cached.route.sink = this.sink;
 			cached.route.track = (e) => this.trackUsage(e, job);
 			return { runner: (this.runner = cached.runner), live: cached.live };
 		}
 		const transcripts: PriorTranscript[] = await loadTranscripts(this.db, job.uid, job.sessionId).catch(swallow("executor", "op", []));
+		// Reloaded lazily (60s) — runs finished during this warm session must be
+		// visible to recall_context's runIndex, not just cold-start transcripts.
+		const transcriptBox = { list: transcripts, at: now };
 		const planDocs = await this.db
 			.collection("plans")
 			.find({ uid: job.uid, sessionId: job.sessionId })
@@ -187,15 +303,24 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		};
 		await this.sink.patchRun({ contextManifest: manifest }).catch(swallow("executor", "op"));
 		const route: RunnerRoute = { job, sink: this.sink, track: (e) => this.trackUsage(e, job) };
+		let permLayers: PermissionLayers | undefined;
 		const runner = new AgentRunner({
 			workspaceRoot: kind === "ask" ? "(none)" : REPO_DIR,
 			relativePath: (abs) => abs.replace(`${REPO_DIR}/`, ""),
 			isDirty: () => false,
-			confirmWrite: async () => kind !== "ask",
+			confirmWrite: async (toolName, input) => {
+				if (kind === "ask") return false;
+				if (session.securityProfile !== "controlled") return true;
+				return this.awaitPermission(job, toolName, input);
+			},
 			currentMode: () => mode,
 			planDir: kind === "ask" ? undefined : PLAN_DIR,
 			memoryContext: async (task) => {
-				const fresh = await this.db.collection("sessions").findOne({ uid: job.uid, sessionId: job.sessionId });
+				const sessCache = await getCache().catch(() => undefined);
+				const sessKey = `sessiondoc:${job.sessionId}`;
+				const fresh = ((await sessCache?.get(sessKey).catch(() => undefined)) ??
+					(await this.db.collection("sessions").findOne({ uid: job.uid, sessionId: job.sessionId }))) as SessionDoc | null;
+				if (fresh) void sessCache?.set(sessKey, fresh, 5_000).catch(() => {});
 				// Cold-start already searched for this exact task — reuse it.
 				const mem =
 					task === job.task
@@ -205,9 +330,36 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 							);
 				return sessionMemoryContext({ ...session, ...fresh } as SessionDoc, planSlugs, mem);
 			},
-			priorTranscripts: () => transcripts,
+			recallScorer: embed ? createRecallScorer(embed) : undefined,
+			checkPermission: async (toolName, input) => {
+				// Lazy-load once per runner: global rules from the user's synced
+				// settings (data.permissions object or permissionsJson string);
+				// project rules from the repo's own clone.
+				if (!permLayers) {
+					const settings = await loadUserSettings(this.db, job.uid).catch(() => undefined);
+					const raw = settings?.data.permissions ?? settings?.data.permissionsJson;
+					const global = typeof raw === "string" ? parsePermissionsText(raw) : parsePermissions(raw);
+					const project = sandbox
+						? parsePermissionsText((await sandbox.readFile(`${REPO_DIR}/.kronyx/permissions.json`).catch(() => null)) ?? "")
+						: { allow: [] as string[], ask: [] as string[], deny: [] as string[] };
+					permLayers = { global, project, local: { allow: [], ask: [], deny: [] } };
+				}
+				return evaluate(permLayers, toolName, input);
+			},
+			priorTranscripts: () => {
+				if (Date.now() - transcriptBox.at > 60_000) {
+					transcriptBox.at = Date.now();
+					void loadTranscripts(this.db, job.uid, job.sessionId)
+						.then((t) => {
+							transcriptBox.list = t;
+						})
+						.catch(swallow("executor", "op"));
+				}
+				return transcriptBox.list;
+			},
 			saveTranscript: (messages: readonly AgentMessage[]) => {
 				const j = route.job ?? job;
+				transcriptBox.at = 0; // next recall reloads — this run just landed in the store
 				this.pendingSave = saveTranscript(this.db, j.uid, j.sessionId, j.runId, messages).catch(swallow("executor", "op"));
 			},
 			environment:
@@ -225,10 +377,20 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		const sessionDoc = session as SessionDoc & { digests?: import("../../../src/agent/runner").RunDigest[] };
 		if (sessionDoc.digests?.length) runner.setRunDigests(sessionDoc.digests);
 		if (E2bOrchestratedExecutor.runnerCache.size >= E2bOrchestratedExecutor.MAX_CACHED) {
-			const oldest = E2bOrchestratedExecutor.runnerCache.keys().next().value;
-			if (oldest) E2bOrchestratedExecutor.runnerCache.delete(oldest);
+			let oldestKey: string | undefined;
+			let oldestAt = Infinity;
+			for (const [k, e] of E2bOrchestratedExecutor.runnerCache) {
+				if (e.lastUsedAt < oldestAt) {
+					oldestAt = e.lastUsedAt;
+					oldestKey = k;
+				}
+			}
+			if (oldestKey) {
+				E2bOrchestratedExecutor.runnerCache.get(oldestKey)?.runner.stop();
+				E2bOrchestratedExecutor.runnerCache.delete(oldestKey);
+			}
 		}
-		E2bOrchestratedExecutor.runnerCache.set(key, { runner, route, live: {} });
+		E2bOrchestratedExecutor.runnerCache.set(key, { runner, route, live: {}, lastUsedAt: now });
 		return { runner: (this.runner = runner), live: E2bOrchestratedExecutor.runnerCache.get(key)!.live };
 	}
 
@@ -286,6 +448,15 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				billedCost: Number(ev.totalCost) > 0 || this.lastUsage.totalCost > 0 ? diff(cur.totalCost, this.lastUsage.totalCost) : null,
 			};
 			this.lastUsage = cur;
+			// Stamp context-fill fields onto the event — the UI's meter reads
+			// requestTokens/contextWindow directly, no client-side diffing.
+			const win = this.modelMeta?.contextWindow ?? p?.contextWindow;
+			const stamped = e as { requestTokens?: number; contextWindow?: number; contextPct?: number };
+			stamped.requestTokens = delta.tokensIn;
+			if (win) {
+				stamped.contextWindow = win;
+				stamped.contextPct = Math.min(100, Math.round((delta.tokensIn / win) * 100));
+			}
 			void record("ok", delta, this.lastUsageAt ? now - this.lastUsageAt : now - this.runStartedAt, {
 				iteration: ev.iteration,
 				contextMsgs: ev.contextMsgs,
@@ -362,6 +533,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				billedCostUsd: delta.billedCost ?? null,
 				iteration: fields.iteration ?? null,
 				contextMsgs: fields.contextMsgs ?? null,
+				contextWindow: this.modelMeta?.contextWindow ?? this.runProvider?.contextWindow ?? null,
 				costUsd: this.modelPricing
 					? delta.tokensIn * (this.modelPricing.input ?? 0) +
 						delta.tokensOut * (this.modelPricing.output ?? 0) +
@@ -381,6 +553,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	/** Persist transcript + digests after a run. */
 	private async afterRun(job: CloudJob): Promise<void> {
 		await this.pendingSave?.catch(swallow("executor", "op"));
+		this.flushToolOutput();
 		// Events must land before terminal status — SSE reads run status to close.
 		await this.sink.drain().catch(swallow("executor", "op"));
 		if (this.runner?.runDigests.length) {
@@ -450,7 +623,36 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		await this.afterRun(job);
 	}
 
-	private async ensureSandbox(session: SessionDoc, settings: UserSettings): Promise<SandboxCore> {
+	/** Live template catalog per account, cached 10 min (public + account-built). */
+	private static templateCache = new Map<string, { at: number; list: TemplateInfo[] }>();
+	private templates: TemplateInfo[] = [];
+
+	private async liveTemplates(provider: SandboxProvider, creds: ProviderCreds): Promise<TemplateInfo[]> {
+		if (!provider.listTemplates) return [];
+		const key = String(creds.secrets.e2bApiKey ?? "").slice(-12) || provider.name;
+		const hit = E2bOrchestratedExecutor.templateCache.get(key);
+		if (hit && Date.now() - hit.at < 10 * 60_000) return hit.list;
+		// Shared cache — template catalogs rarely change; other workers hit this.
+		const cache = await getCache().catch(swallow("executor", "op", undefined));
+		const shared = (await cache?.get(`templates:${key}`).catch(() => undefined)) as TemplateInfo[] | undefined;
+		if (shared?.length) {
+			E2bOrchestratedExecutor.templateCache.set(key, { at: Date.now(), list: shared });
+			return shared;
+		}
+		const list = await provider.listTemplates(creds).catch(swallow("executor", "op", []));
+		dbg("executor", "liveTemplates", { provider: provider.name, count: list.length });
+		if (list.length) {
+			E2bOrchestratedExecutor.templateCache.set(key, { at: Date.now(), list });
+			void cache?.set(`templates:${key}`, list, 10 * 60_000).catch(() => {});
+		}
+		return list;
+	}
+
+	private async ensureSandbox(
+		session: SessionDoc,
+		settings: UserSettings,
+		opts: { template?: string; llm?: ProviderSettings; task?: string } = {},
+	): Promise<SandboxCore> {
 		const providerName = session.provider ?? String(settings.data.sandboxProvider ?? "e2b");
 		const provider = getProvider(providerName);
 		const creds: ProviderCreds = { secrets: settings.secrets, data: settings.data };
@@ -460,6 +662,9 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			const v = settings.secrets[k];
 			if (v) this.sink.mask(v);
 		}
+		// Template catalog is needed by switch_environment validation too —
+		// cached 10 min, so this is usually a map read.
+		this.templates = await this.liveTemplates(provider, creds);
 		const sbx = new SandboxCore();
 		sbx.onLifecycle = (event, sandboxId) => {
 			const state = event === "pause" ? "paused" : event === "start" ? "running" : event === "resume" ? "running" : undefined;
@@ -503,8 +708,22 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			}
 			dbg("sandbox", "unreachable after retries", { sandboxId: oldId });
 		}
+		// Template resolution (only when a VM is actually created — warm
+		// reconnects above never reach this): switch override > session
+		// template > LLM pick > user's e2bTemplate default > stock base.
+		let template = opts.template ?? session.template ?? undefined;
+		if (!template && this.templates.length && opts.llm && opts.task) {
+			const picked = await pickTemplate(opts.llm, opts.task, this.templates);
+			if (picked) {
+				template = picked;
+				await this.sink.patchSession({ template: picked });
+				await this.sink.emit({ type: "info", text: `Picked sandbox template "${picked}" for this task` });
+			}
+		}
+		template ??= String(settings.data.e2bTemplate ?? "") || undefined;
+		session.template = template ?? session.template;
 		try {
-			await sbx.create({ creds, provider: providerName, template: session.template ?? undefined, timeoutMs: 60 * 60_000 });
+			await sbx.create({ creds, provider: providerName, template, timeoutMs: 60 * 60_000 });
 		} catch (createErr) {
 			// E2B quota hit safety valve: kill our oldest paused sandbox and retry once.
 			if (provider.name !== "e2b") throw createErr;
@@ -521,7 +740,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				{ $set: { killPending: true, reason: "quota-fallback" } },
 			).catch(swallow("executor", "op"));
 			await provider.killById(pausedId, creds).catch(swallow("executor", "op"));
-			await sbx.create({ creds, provider: providerName, template: session.template ?? undefined, timeoutMs: 60 * 60_000 });
+			await sbx.create({ creds, provider: providerName, template, timeoutMs: 60 * 60_000 });
 		}
 		await sbx.keepalive(60);
 		const newId = sbx.sandboxId;
@@ -574,7 +793,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		const mode: AgentMode =
 			job.mode === "plan" ? "plan" : session.securityProfile === "bypass" ? "bypass" : "smart";
 		await this.sink.emit({ type: "cloud-status", text: "Starting sandbox…" });
-		const sbx = await this.ensureSandbox(session, settings);
+		let sbx = await this.ensureSandbox(session, settings, { llm: provider, task: job.task });
 		this.throwIfStopped();
 		const token = await this.githubToken(session, settings);
 		this.sink.mask(token);
@@ -616,10 +835,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		if (!session.cloned) {
 			if (!session.repo || !token) throw new Error("No repository or GitHub credential on this session.");
 			await this.sink.emit({ type: "cloud-status", text: `Cloning ${session.repo}…` });
-			const defaultBranch = await sbx.cloneRepo(`https://github.com/${session.repo}`, token, REPO_DIR);
-			await this.sink.patchSession({ cloned: true, ...(defaultBranch ? { base: defaultBranch } : {}) });
-			session.cloned = true;
-			if (defaultBranch) session.base = defaultBranch;
+			await this.cloneStart(session, sbx, token);
 		}
 
 		const atts = await this.attachments(job);
@@ -653,12 +869,74 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		this.throwIfStopped();
 		const { runner, live } = await this.ensureRunner(job, session, "sandboxed", mode, () =>
 			Promise.resolve([
-				...createRemoteFileTools(delegatingHandle(live), REPO_DIR, { planDir: PLAN_DIR }),
+				...createRemoteFileTools(delegatingHandle(live), REPO_DIR, {
+					planDir: PLAN_DIR,
+					onCommandOutput: (chunk) => this.queueToolOutput(chunk),
+				}),
 				memoryWriteTool(this.db, job.uid, job.sessionId, job.runId, this.embedProvider, session.repo ?? undefined),
+				// browser_use drives a UI sub-agent; skip in plan mode (read-only).
+				...(mode === "plan"
+					? []
+					: createBrowserTools(delegatingHandle(live), REPO_DIR, {
+							apiKey: provider.apiKey,
+							baseUrl: provider.baseUrl,
+							modelId: provider.modelId,
+							onScreenshot: (dataUrl, label) => live.onScreenshot?.(dataUrl, label),
+						})),
+				// switch_environment: mid-run VM image swap. Disabled by the
+				// sandboxAutoSwitch setting — the agent reports missing tooling instead.
+				...(settings.data.sandboxAutoSwitch === false
+					? []
+					: createEnvTools({
+							requestSwitch: async (template, reason, evidence) => {
+								const live_ = live.templates ?? this.templates;
+								if (!live_.length) return "Template switching isn't available for this sandbox provider.";
+								if (live.templateRequest) return `A switch to "${live.templateRequest.template}" is already in progress.`;
+								if (this.switchCount >= 2) return "Refused: this run already used its VM-switch budget (2). Work around the missing tooling instead.";
+								const name = resolveTemplateName(template, live_);
+								if (!name) {
+									const avail = live_.map((t) => t.names[0]?.split(":")[0] ?? t.id).join(", ");
+									return `Unknown template "${template}". Available: ${avail}`;
+								}
+								if (name === session.template) return `Already running on "${name}".`;
+								if (isAgentCliTemplate(name)) {
+									return `Refused: "${name}" is a CLI-agent image — Kronyx's own agent loop runs in the VM, these images add nothing for it. Pick an environment image (e.g. desktop, code-interpreter-v1, or an account template).`;
+								}
+								const req = { template: name, reason, evidence };
+								live.templateRequest = req;
+								try {
+									return (await live.performSwitch?.(req)) ?? "Switching is unavailable right now — no active VM swap handler.";
+								} catch (err) {
+									return `Switch to "${name}" failed: ${String(err).slice(0, 300)} — staying on the current environment.`;
+								} finally {
+									live.templateRequest = undefined;
+								}
+							},
+						})),
 			]),
+			sbx,
 		);
 		// Rebind the handle AFTER runner selection — cached agents call through it.
 		live.handle = sbx.inner!;
+		live.onScreenshot = (dataUrl, label) => {
+			void this.sink.emit({ type: "ui-screenshot", url: label ?? "", dataUrl });
+		};
+		live.templates = this.templates;
+		// switch_environment blocks inside its tool call until the new VM is
+		// live — subsequent tool calls route through the rebound handle.
+		live.performSwitch = (req) =>
+			this.performTemplateSwitch(
+				job,
+				session,
+				settings,
+				() => sbx,
+				(next) => {
+					sbx = next;
+				},
+				live,
+				token,
+				req,
+			);
 		// Installation tokens expire in ~1h — re-mint + rewrite the remote URL
 		// periodically so the agent's own git commands don't hit a dead token.
 		const tokenRefresh =
@@ -686,6 +964,34 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		}
 		await this.verify(sbx);
 		await this.pushAndPr(job, session, settings, sbx, token);
+	}
+
+	/**
+	 * Fresh clone honoring the session's start point: lands the worktree on
+	 * `startRef` (feature branch or pull/<n>/head) before the kronyx branch
+	 * forks in ensureBranch. `base` is only healed to the detected default
+	 * when it was never meaningfully set — a chosen feature branch stays.
+	 */
+	private async cloneStart(session: SessionDoc, sbx: SandboxCore, token: string): Promise<void> {
+		const defaultBranch = await sbx.cloneRepo(`https://github.com/${session.repo}`, token, REPO_DIR);
+		if (!session.base || (session.base === "main" && defaultBranch && defaultBranch !== "main")) {
+			session.base = defaultBranch || session.base;
+			await this.sink.patchSession({ base: session.base });
+		}
+		await this.sink.patchSession({ cloned: true });
+		session.cloned = true;
+		const startRef = String(session.startRef ?? session.base ?? "");
+		if (!startRef || startRef === (defaultBranch || "main")) return;
+		const r = await sbx
+			.runIn(REPO_DIR, `git fetch origin ${JSON.stringify(startRef)} && git checkout -B .kronyx-start FETCH_HEAD`, 120_000)
+			.catch(swallow("executor", "op", { exitCode: 1, stdout: "", stderr: "" }));
+		await this.sink.emit({
+			type: "info",
+			text:
+				r?.exitCode === 0
+					? `Starting from ${startRef}`
+					: `Could not fetch ${startRef} — starting from ${defaultBranch || "the default branch"}`,
+		});
 	}
 
 	private async ensureBranch(job: CloudJob, session: SessionDoc, sbx: SandboxCore, token: string): Promise<void> {
@@ -794,6 +1100,64 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		await this.sink.emit({ type: "cloud-status", text: `Rebased ${ahead} commit(s) onto origin/${branch}.` });
 	}
 
+	/**
+	 * Synchronous environment swap executed inside the switch_environment tool
+	 * call: interim-commit → create the new VM FIRST (old stays usable on
+	 * failure) → detach old → reclone + checkout the branch → rebind handles.
+	 */
+	private async performTemplateSwitch(
+		job: CloudJob,
+		session: SessionDoc,
+		settings: UserSettings,
+		getSbx: () => SandboxCore,
+		setSbx: (next: SandboxCore) => void,
+		live: LiveSlot,
+		token: string,
+		req: { template: string; reason: string; evidence: string },
+	): Promise<string> {
+		this.switchCount++;
+		await this.sink.emit({
+			type: "cloud-status",
+			text: `Switching VM to template "${req.template}" — ${req.reason.slice(0, 160)}`,
+		});
+		await this.sink.emit({ type: "info", text: `Switch evidence: ${req.evidence.slice(0, 200)}` });
+		const old = getSbx();
+		// Interim commit so the new VM resumes from real pushed work (plan mode
+		// is read-only — nothing to commit, branch may not exist yet).
+		if (job.mode !== "plan" && session.branch && session.repo && token) {
+			await this.sink.emit({ type: "info", text: "Committing work-in-progress before the switch…" });
+			await old
+				.commitAndPush(REPO_DIR, session.branch, "kronyx: interim commit before template switch", COMMIT_EXCLUDES)
+				.catch((e) => this.sink.emit({ type: "info", text: `Interim commit skipped (${String(e).slice(0, 120)}) — continuing anyway` }));
+		}
+		// Detach the old sandbox BEFORE creating — ensureSandbox would otherwise
+		// "reconnect" to it and return the same VM.
+		session.sandboxId = undefined;
+		session.cloned = false;
+		await this.sink.patchSession({ sandboxId: null, cloned: false, template: req.template });
+		const next = await this.ensureSandbox(session, settings, { template: req.template });
+		if (session.repo && token) {
+			const defaultBranch = await next.cloneRepo(`https://github.com/${session.repo}`, token, REPO_DIR);
+			await this.sink.patchSession({ cloned: true, ...(defaultBranch ? { base: defaultBranch } : {}) });
+			session.cloned = true;
+			if (defaultBranch) session.base = defaultBranch;
+			if (session.branch) {
+				await next
+					.runIn(REPO_DIR, `git fetch origin ${session.branch} && git checkout ${session.branch}`, 60_000)
+					.catch(swallow("executor", "op"));
+			}
+		}
+		setSbx(next);
+		live.handle = next.inner!;
+		await old.close().catch(swallow("executor", "op"));
+		await this.sink.emit({ type: "cloud-status", text: `Switched to "${req.template}" — resuming on the new VM` });
+		return (
+			`Switched to "${req.template}". You are now on a fresh VM: the repo is recloned at ${REPO_DIR} ` +
+				`on branch ${session.branch ?? session.base}, and your pushed work is there. ` +
+				`Confirm the capability you needed is present, then continue the task.`
+		);
+	}
+
 	private async capturePlan(job: CloudJob, sbx: SandboxCore): Promise<void> {
 		const r = await sbx.runIn(PLAN_DIR, "ls -t *.md 2>/dev/null | head -1").catch(swallow("executor", "op"));
 		const name = r?.stdout.trim();
@@ -868,7 +1232,24 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		const code = resp?.stdout.trim() ?? "000";
 		const ok = code.startsWith("2") || code.startsWith("3");
 		await this.sink.emit({ type: "check", command: `boot: ${start} (port ${port}, HTTP ${code})`, ok, durationMs: 0, output: "" });
+		await this.captureScreenshot(sbx, `http://localhost:${port}`);
 		return `boot → ${ok ? "passed" : "failed"} (:${port} → ${code})`;
+	}
+
+	/** Tier-2 verify: Playwright screenshot of the booted app → run doc + timeline event. */
+	private async captureScreenshot(sbx: SandboxCore, url: string): Promise<void> {
+		const probe = await sbx.runIn("/", `python3 -c "import playwright" 2>/dev/null`, 15_000).catch(swallow("executor", "op"));
+		if (!probe || probe.exitCode !== 0) return; // stock template — no browser tooling
+		await sbx.writeFile(BROWSER_DRIVER_PATH, BROWSER_DRIVER);
+		const r = await sbx
+			.runIn(REPO_DIR, `python3 ${BROWSER_DRIVER_PATH} --shot ${JSON.stringify(url)} --out ${SCREENSHOT_PATH}`, 60_000)
+			.catch(swallow("executor", "op"));
+		const b64 = r?.stdout.split("\n").find((l) => l.startsWith("KRONYX_SHOT:"))?.slice("KRONYX_SHOT:".length);
+		// Keep Mongo docs modest — skip pathological captures.
+		if (!b64 || b64.length > 800_000) return;
+		const dataUrl = `data:image/png;base64,${b64}`;
+		await this.sink.emit({ type: "ui-screenshot", url, dataUrl });
+		await this.sink.patchRun({ screenshot: dataUrl }).catch(swallow("executor", "op"));
 	}
 
 	private async pushAndPr(
@@ -890,12 +1271,25 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			await this.sink.emit({ type: "info", text: "No changes to push." });
 			return;
 		}
+		// Clean tree on a PR run: only open one when the branch actually has
+		// commits over base — an agent that changed nothing must not produce
+		// an empty PR (e.g. it reported an environment limitation).
+		if (!dirty && session.branch && session.base) {
+			const ahead = await sbx
+				.runIn(REPO_DIR, `git rev-list --count origin/${session.base}..HEAD 2>/dev/null || git rev-list --count ${session.base}..HEAD`, 30_000)
+				.catch(swallow("executor", "op"));
+			const commits = Number(ahead?.stdout.trim()) || 0;
+			if (commits === 0) {
+				await this.sink.emit({ type: "info", text: "No changes on the branch — skipping PR." });
+				return;
+			}
+		}
 		// Emit per-file diffs so the timeline shows editor-style change cards —
 		// covers writes made via shell (cat >), which bypass fs-tool events.
 		for (const line of status.stdout.split("\n").filter((l) => l.trim())) {
 			const kind = line.slice(0, 2).trim();
 			const rel = line.slice(3).trim().replace(/^"|"$/g, "");
-			if (!rel || rel.startsWith(ATTACH_DIR)) continue;
+			if (!rel || COMMIT_EXCLUDES.some((d) => rel.startsWith(d))) continue;
 			const isNew = kind.includes("?");
 			const diff = await sbx
 				.runIn(REPO_DIR, isNew ? `git diff --no-index /dev/null "${rel}"` : `git diff HEAD -- "${rel}"`, 30_000)
@@ -926,7 +1320,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		dbg("run", "pushAndPr", { runId: job.runId, wantPr, branch: session.branch, base: session.base });
 		await this.sink.emit({ type: "cloud-status", text: wantPr ? "Pushing branch and opening PR…" : `Pushing commits to ${session.branch}…` });
 		try {
-			await sbx.commitAndPush(REPO_DIR, session.branch, `kronyx: ${job.task.slice(0, 60)}`, [ATTACH_DIR]);
+			await sbx.commitAndPush(REPO_DIR, session.branch, `kronyx: ${job.task.slice(0, 60)}`, COMMIT_EXCLUDES);
 		} catch (err) {
 			// Remote moved since run start — try fetch + rebase, then one retry.
 			const msg = err instanceof Error ? err.message : String(err);
@@ -938,7 +1332,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 						"Resolve the conflict in the sandbox or start a new session branch.",
 				);
 			}
-			await sbx.commitAndPush(REPO_DIR, session.branch, `kronyx: ${job.task.slice(0, 60)}`, [ATTACH_DIR]);
+			await sbx.commitAndPush(REPO_DIR, session.branch, `kronyx: ${job.task.slice(0, 60)}`, COMMIT_EXCLUDES);
 		}
 		if (!wantPr) {
 			await this.sink.emit({ type: "cloud-status", text: `Pushed to ${session.branch}.` });
@@ -1019,15 +1413,12 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		this.sink.mask(token);
 		if (!session.cloned) {
 			if (!session.repo || !token) throw new Error("No repository or GitHub credential on this session.");
-			const defaultBranch = await sbx.cloneRepo(`https://github.com/${session.repo}`, token, REPO_DIR);
-			await this.sink.patchSession({ cloned: true, ...(defaultBranch ? { base: defaultBranch } : {}) });
-			session.cloned = true;
-			if (defaultBranch) session.base = defaultBranch;
+			await this.cloneStart(session, sbx, token);
 		}
 		await this.ensureBranch(job, session, sbx, token);
 		await sbx.writeFile(`${REPO_DIR}/.kronyx/plans/${job.planSlug}.md`, String(plan.markdown));
 		await sbx.runIn(REPO_DIR, "mkdir -p .kronyx/plans").catch(swallow("executor", "op"));
-		await sbx.commitAndPush(REPO_DIR, session.branch!, `kronyx: plan ${job.planSlug}`, [ATTACH_DIR]);
+		await sbx.commitAndPush(REPO_DIR, session.branch!, `kronyx: plan ${job.planSlug}`, COMMIT_EXCLUDES);
 		await this.sink.emit({ type: "info", text: `Pushed .kronyx/plans/${job.planSlug}.md to ${session.branch}` });
 	}
 }

@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Composer, type Mode } from "@/components/Composer";
+import { ContextMeter } from "@/components/ContextMeter";
 import { Timeline } from "@/components/Timeline";
 import { ProviderGate } from "@/components/ProviderGate";
 import { apiFetch, useUser } from "@/lib/api";
@@ -359,7 +360,7 @@ export default function SessionView() {
 			</div>
 			</div>
 			<div style={{ maxWidth: 860, margin: "0 auto" }}>
-			<Timeline user={user} sessionId={id} events={ordered} runs={runs}
+			<Timeline user={user} sessionId={id} events={ordered} runs={runs} active={active}
 				githubUrl={session?.prUrl ?? (session?.repo && session?.branch ? `https://github.com/${session.repo}/tree/${session.branch}` : undefined)} />
 			{submitted && (
 				<div className="msg-row" style={{ opacity: 0.8 }}>
@@ -371,6 +372,7 @@ export default function SessionView() {
 				</div>
 			)}
 			<div className="composer-dock">
+				<ContextMeter user={user} sessionId={id} events={events} />
 				<Composer
 					user={user}
 					mode={mode}

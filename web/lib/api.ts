@@ -11,6 +11,19 @@ export function useUser(): User | null | undefined {
 	return user;
 }
 
+/** RBAC role from /api/me — gates admin-only UI. */
+export function useRole(user: User | null | undefined): string {
+	const [role, setRole] = useState("");
+	useEffect(() => {
+		if (!user) return setRole("");
+		void apiFetch("/api/me", user)
+			.then((r) => (r.ok ? r.json() : {}))
+			.then((b) => setRole(typeof (b as { role?: string }).role === "string" ? (b as { role: string }).role : "user"))
+			.catch(() => setRole("user"));
+	}, [user]);
+	return role;
+}
+
 /** fetch with the user's Firebase ID token attached. */
 export async function apiFetch(path: string, user: User, init: RequestInit = {}): Promise<Response> {
 	const headers = new Headers(init.headers);

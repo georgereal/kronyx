@@ -1,15 +1,15 @@
 {
 	"name": "kronyx",
 	"displayName": "Kronyx",
-	"description": "Agentic coding in VS Code on the Cline SDK, with a run-oriented UI and Kronyx-owned file tools.",
+	"description": "Agentic coding in VS Code and the cloud — a run-oriented agent that works locally or in sandboxes and comes back with a PR.",
 	"version": "0.0.1",
 	"publisher": "kronyx",
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/kronyx/kronyx"
+		"url": "https://github.com/georgereal/kronyx"
 	},
 	"private": true,
-	"license": "UNLICENSED",
+	"license": "Apache-2.0",
 	"engines": {
 		"vscode": "^1.105.0",
 		"node": ">=22"
@@ -346,7 +346,7 @@
 				"kronyx.sandbox.enabled": {
 					"type": "boolean",
 					"default": false,
-					"description": "Run the agent inside a sandbox. Planned — not yet enforced."
+					"description": "Run the agent inside a sandbox. Planned \u2014 not yet enforced."
 				},
 				"kronyx.sandbox.backend": {
 					"type": "string",
@@ -358,34 +358,34 @@
 						"firecracker"
 					],
 					"default": "local",
-					"description": "Sandbox backend. Planned — not yet enforced."
+					"description": "Sandbox backend. Planned \u2014 not yet enforced."
 				},
 				"kronyx.sandbox.image": {
 					"type": "string",
 					"default": "",
-					"description": "Sandbox image or snapshot to boot. Planned — not yet enforced."
+					"description": "Sandbox image or snapshot to boot. Planned \u2014 not yet enforced."
 				},
 				"kronyx.sandbox.cpus": {
 					"type": "number",
 					"default": 2,
 					"minimum": 1,
-					"description": "vCPUs for the sandbox. Planned — not yet enforced."
+					"description": "vCPUs for the sandbox. Planned \u2014 not yet enforced."
 				},
 				"kronyx.sandbox.memoryMb": {
 					"type": "number",
 					"default": 4096,
 					"minimum": 256,
-					"description": "Memory in MB for the sandbox. Planned — not yet enforced."
+					"description": "Memory in MB for the sandbox. Planned \u2014 not yet enforced."
 				},
 				"kronyx.sandbox.host": {
 					"type": "string",
 					"default": "",
-					"description": "Remote runner service URL for microVM backends (Firecracker needs Linux/KVM). Planned — not yet enforced."
+					"description": "Remote runner service URL for microVM backends (Firecracker needs Linux/KVM). Planned \u2014 not yet enforced."
 				},
 				"kronyx.sandbox.vendor": {
 					"type": "string",
 					"default": "",
-					"description": "MicroVM vendor/provider identifier for the remote runner. Planned — not yet enforced."
+					"description": "MicroVM vendor/provider identifier for the remote runner. Planned \u2014 not yet enforced."
 				},
 				"kronyx.cloud.pauseAfterRunMin": {
 					"type": "number",
@@ -524,7 +524,7 @@
 				"kronyx.sync.providerKeys": {
 					"type": "boolean",
 					"default": true,
-					"description": "Sync provider API keys to your Kronyx account for use on other devices and cloud sessions. Keys are stored on our servers — disable only if you don't accept that."
+					"description": "Sync provider API keys to your Kronyx account for use on other devices and cloud sessions. Keys are stored on our servers \u2014 disable only if you don't accept that."
 				},
 				"kronyx.sync.endpoint": {
 					"type": "string",
@@ -564,6 +564,21 @@
 		"better-sqlite3": "^13.0.3",
 		"diff": "9.0.0",
 		"e2b": "^2.62.0",
+		"gpt-tokenizer": "4.1.0",
 		"sql.js": "^1.15.2"
-	}
+	},
+	"keywords": [
+		"ai",
+		"agent",
+		"coding-assistant",
+		"vscode-extension",
+		"llm",
+		"byok",
+		"cloud-agent",
+		"cline"
+	],
+	"bugs": {
+		"url": "https://github.com/georgereal/kronyx/issues"
+	},
+	"homepage": "https://github.com/georgereal/kronyx#readme"
 }

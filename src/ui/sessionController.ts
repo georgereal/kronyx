@@ -2,6 +2,8 @@ import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { AgentRunner, type AgentMode, type RunDigest } from "../agent/runner";
+import { evaluate, parsePermissionsText, ruleFor, type PermissionLayers, type PermissionRules } from "../agent/permissions";
+import { readGlobalPermissions } from "../permStore";
 import type { PriorTranscript } from "../agent/recall";
 import type { AgentMessage } from "@cline/shared";
 import { checksOnFinish, runChecks } from "../checks";
@@ -103,6 +105,11 @@ export class SessionController {
 	private lastUsageAt = 0;
 	private runProvider: { providerId: string; baseUrl: string; modelId: string; profile?: string } | undefined;
 	private transcripts: PriorTranscript[] = [];
+	private permLayers: PermissionLayers = {
+		global: { allow: [], ask: [], deny: [] },
+		project: { allow: [], ask: [], deny: [] },
+		local: { allow: [], ask: [], deny: [] },
+	};
 	private sandbox: E2bSandbox | undefined;
 	private sandboxSynced = false;
 
@@ -137,14 +144,14 @@ export class SessionController {
 				break;
 			case "stop":
 				this.runner?.stop();
-				for (const resolve of this.pendingPermissions.values()) resolve("deny");
+				for (const p of this.pendingPermissions.values()) p.resolve("deny");
 				this.pendingPermissions.clear();
 				break;
 			case "permissionResponse": {
-				const resolve = this.pendingPermissions.get(message.id);
-				if (resolve) {
+				const p = this.pendingPermissions.get(message.id);
+				if (p) {
 					this.pendingPermissions.delete(message.id);
-					resolve(message.decision);
+					p.resolve(message.decision);
 				}
 				break;
 			}
@@ -248,7 +255,7 @@ export class SessionController {
 		}
 	}
 
-	private getRunner(): AgentRunner | undefined {
+	private async getRunner(): Promise<AgentRunner | undefined> {
 		const folder = vscode.workspace.workspaceFolders?.[0];
 		if (!folder) {
 			void vscode.window.showErrorMessage("Kronyx: open a folder first.");
@@ -257,12 +264,14 @@ export class SessionController {
 		const root = folder.uri.fsPath;
 		if (!this.runner || this.runnerRoot !== root) {
 			this.runnerRoot = root;
+			this.permLayers = await this.loadPermissionLayers(root);
 			this.runner = new AgentRunner({
 				workspaceRoot: root,
 				relativePath: (abs) => path.relative(root, abs).split(path.sep).join("/"),
 				isDirty: (abs) =>
 					vscode.workspace.textDocuments.some((doc) => doc.isDirty && doc.uri.fsPath === abs),
 				confirmWrite: (toolName, input) => this.confirmWrite(root, toolName, input),
+				checkPermission: async (toolName, input) => evaluate(this.permLayers, toolName, input),
 				currentMode: () => this.deps.modeRef.current,
 				planDir: planDir(),
 				memoryContext: (task, s) => loadMemoryContext(root, task, s),
@@ -423,7 +432,7 @@ export class SessionController {
 
 	private async startRun(task: string, mode?: AgentMode): Promise<void> {
 		const freshRunner = this.runner === undefined;
-		const active = this.getRunner();
+		const active = await this.getRunner();
 		if (!active) return;
 		if (!this.deps.runLock.tryAcquire(this.name)) {
 			this.surface.post({
@@ -540,8 +549,44 @@ export class SessionController {
 		return abs.startsWith(this.runnerRoot + path.sep) || abs === this.runnerRoot ? abs : undefined;
 	}
 
-	private pendingPermissions = new Map<string, (decision: "allow" | "always" | "deny" | "alwaysTool") => void>();
+	private pendingPermissions = new Map<
+		string,
+		{ toolName: string; input: unknown; resolve: (decision: "allow" | "always" | "deny" | "alwaysTool" | "alwaysRule") => void }
+	>();
 	private permittedTools = new Set<string>();
+
+	/** Layered rule files: ~/.kronyx global, <root>/.kronyx project + local. */
+	private async loadPermissionLayers(root: string): Promise<PermissionLayers> {
+		const read = async (p: string): Promise<PermissionRules> =>
+			parsePermissionsText(await fs.readFile(p, "utf8").catch(() => ""));
+		return {
+			global: await readGlobalPermissions(),
+			project: await read(path.join(root, ".kronyx", "permissions.json")),
+			local: await read(path.join(root, ".kronyx", "permissions.local.json")),
+		};
+	}
+
+	/** Persist an "always allow this" decision as a narrow rule in the repo-local file. */
+	private async appendLocalRule(root: string, rule: string): Promise<void> {
+		const file = path.join(root, ".kronyx", "permissions.local.json");
+		let doc: { permissions?: Record<string, unknown> } = {};
+		try {
+			doc = JSON.parse(await fs.readFile(file, "utf8")) as typeof doc;
+		} catch {}
+		doc.permissions ??= {};
+		const allow = Array.isArray(doc.permissions.allow) ? (doc.permissions.allow as unknown[]) : [];
+		if (!allow.includes(rule)) allow.push(rule);
+		doc.permissions.allow = allow;
+		await fs.mkdir(path.dirname(file), { recursive: true });
+		await fs.writeFile(file, JSON.stringify(doc, null, 2) + "\n");
+		// Keep the personal layer out of commits: .kronyx/.gitignore covers it.
+		const gi = path.join(root, ".kronyx", ".gitignore");
+		const giText = await fs.readFile(gi, "utf8").catch(() => "");
+		if (!giText.includes("permissions.local.json")) {
+			await fs.writeFile(gi, `${giText}${giText && !giText.endsWith("\n") ? "\n" : ""}permissions.local.json\n`);
+		}
+		this.permLayers.local = parsePermissionsText(JSON.stringify(doc));
+	}
 
 	/** Compute a preview diff for the permission card — real hunks for write_file, pseudo-diff from edits otherwise. */
 	private async pendingDiff(root: string, file: string, toolName: string, input: unknown): Promise<string | undefined> {
@@ -589,8 +634,8 @@ export class SessionController {
 		this.surface.post(event);
 		this.deps.persistEvent(this.name, event);
 		void root;
-		const decision = await new Promise<"allow" | "always" | "deny" | "alwaysTool">((resolve) => {
-			this.pendingPermissions.set(id, resolve);
+		const decision = await new Promise<"allow" | "always" | "deny" | "alwaysTool" | "alwaysRule">((resolve) => {
+			this.pendingPermissions.set(id, { toolName, input, resolve });
 		});
 		const response = { type: "permission-response" as const, id, decision };
 		this.surface.post(response);
@@ -598,6 +643,13 @@ export class SessionController {
 		void logEpisode(root, { kind: "permission", path: file, task: this.runTask, tool: toolName, decision });
 		if (decision === "always") this.approveAll = true;
 		if (decision === "alwaysTool") this.permittedTools.add(toolName);
+		if (decision === "alwaysRule") {
+			const rule = ruleFor(toolName, input);
+			await this.appendLocalRule(root, rule).catch((e) => {
+				log("permissions", `failed to persist rule: ${e}`);
+			});
+			this.surface.post({ type: "info", text: `Rule saved: allow ${rule} (.kronyx/permissions.local.json)` });
+		}
 		return decision !== "deny";
 	}
 

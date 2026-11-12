@@ -251,6 +251,9 @@
 			if (statusText.startsWith("Running")) {
 				setStatus("Running...");
 				updateGroupTitle("Working for");
+				// Tick live elapsed labels on running action cards.
+				const secs = startedAt ? Math.round((Date.now() - startedAt) / 1000) : 0;
+				for (const n of timeline.querySelectorAll(".live-elapsed")) n.textContent = `${fmtDur(secs)}`;
 			}
 		}, 1000);
 	};
@@ -271,6 +274,58 @@
 		if (name === "edit_file" && Array.isArray(input.edits)) return `${p} (${input.edits.length} edit(s))`;
 		return String(p);
 	};
+
+	/** Unwrap {"error": "…"} JSON envelopes so failures read as text. */
+	const prettyOut = (raw) => {
+		const t = String(raw || "").trim();
+		if (t.startsWith("{")) {
+			try {
+				const j = JSON.parse(t);
+				const msg = j.error ?? j.message;
+				if (typeof msg === "string") return msg;
+			} catch { /* not JSON */ }
+		}
+		return raw;
+	};
+
+	/** Numbered unified-diff rows: new-file numbers for +/ctx, old for −. */
+	const diffRows = (diff, cap = 300) => {
+		const rows = [];
+		let oldN = 0, newN = 0, truncated = false;
+		for (const l of String(diff).split("\n")) {
+			const h = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(l);
+			const hOld = /^@@ -(\d+)/.exec(l);
+			if (h) {
+				newN = Number(h[1]);
+				oldN = hOld ? Number(hOld[1]) : newN;
+				rows.push({ num: 0, cls: "fd-l-hunk", text: l });
+				continue;
+			}
+			if (l.startsWith("+++") || l.startsWith("---") || l.startsWith("diff ") || l.startsWith("index ")) continue;
+			if (rows.length >= cap) { truncated = true; break; }
+			if (l.startsWith("+")) rows.push({ num: newN++, cls: "fd-l-add", text: l });
+			else if (l.startsWith("-")) rows.push({ num: oldN++, cls: "fd-l-del", text: l });
+			else rows.push({ num: newN++, cls: "fd-l-ctx", text: l });
+		}
+		return { rows, truncated };
+	};
+
+	const renderDiff = (diff) => {
+		const { rows, truncated } = diffRows(diff);
+		const pre = el("pre", "diff-body fd-body");
+		for (const r of rows) {
+			const row = el("div", `fd-row ${r.cls}`);
+			row.appendChild(el("span", "fd-num", r.num ? String(r.num) : ""));
+			row.appendChild(el("span", "fd-code", r.text));
+			pre.appendChild(row);
+		}
+		if (truncated) pre.appendChild(el("div", "fd-trunc", "…truncated…"));
+		return pre;
+	};
+
+	/** Per-run counters for the summary card — reset on run-started. */
+	let runStats = { toolsFailed: 0, checksPassed: 0, checksFailed: 0, files: new Map() };
+	const resetRunStats = () => { runStats = { toolsFailed: 0, checksPassed: 0, checksFailed: 0, files: new Map() }; };
 
 	const TOOL_STYLE = {
 		read_file: ["📄", "Read"],
@@ -642,7 +697,11 @@
 				bubble.appendChild(el("div", "bubble-label", "You"));
 				bubble.appendChild(el("div", "bubble-text", msg.task));
 				card.appendChild(bubble);
+				card.appendChild(
+					el("span", "msg-time", new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })),
+				);
 				add(card);
+				resetRunStats();
 				setRunning(true);
 				setStatus("Running...");
 				break;
@@ -672,6 +731,10 @@
 				streamMsg = null;
 				streamText = "";
 				const card = el("div", "step assistant");
+				card.appendChild(el("span", "k-avatar", "K"));
+				const body = el("div", "k-body");
+				for (const n of narrationNodes(msg.text)) body.appendChild(n);
+				card.appendChild(body);
 				card.appendChild(
 					el(
 						"span",
@@ -679,7 +742,6 @@
 						new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }),
 					),
 				);
-				for (const n of narrationNodes(msg.text)) card.appendChild(n);
 				add(card);
 				break;
 			}
@@ -687,14 +749,15 @@
 				if (!streamMsg) {
 					closeGroup("Worked for");
 					streamMsg = el("div", "step assistant");
-					streamMsg.appendChild(renderMd(""));
+					streamMsg.appendChild(el("span", "k-avatar", "K"));
+					streamMsg.appendChild(el("div", "k-body"));
 					add(streamMsg);
 				}
 				streamText += msg.text;
 				clearTimeout(mdTimer);
 				mdTimer = setTimeout(() => {
 					if (!streamMsg) return;
-					streamMsg.replaceChildren(...narrationNodes(streamText + "▍"));
+					streamMsg.querySelector(".k-body")?.replaceChildren(...narrationNodes(streamText + "▍"));
 				}, 60);
 				scrollMaybe();
 				break;
@@ -710,7 +773,10 @@
 				summary.appendChild(el("span", "tool-icon", icon));
 				summary.appendChild(el("span", "tool-name", verb));
 				summary.appendChild(el("span", "tool-arg", describeInput(msg.name, msg.input)));
-				summary.appendChild(el("span", "tool-status", "…"));
+				const stat = el("span", "tool-status");
+				stat.appendChild(el("span", "live-elapsed muted", "0s"));
+				stat.appendChild(el("span", "act-pill run", "Running"));
+				summary.appendChild(stat);
 				card.appendChild(summary);
 				const input = el("details", "tool-input");
 				input.appendChild(el("summary", "", "Input"));
@@ -735,11 +801,17 @@
 				// Consolidate to a single line: icon verb arg ✓/✗ duration
 				const summary = card.querySelector("summary");
 				const stat = card.querySelector(".tool-status");
-				if (stat) stat.textContent = `${msg.ok ? "✓" : "✗"} ${msg.durationMs}ms`;
+				if (stat) {
+					stat.textContent = "";
+					stat.appendChild(el("span", "muted", `${msg.durationMs}ms`));
+					stat.appendChild(el("span", `act-pill ${msg.ok ? "ok" : "err"}`, msg.ok ? "Completed" : "Failed"));
+				}
+				if (!msg.ok) runStats.toolsFailed++;
 				card.classList.add("done-line");
-				card.open = false;
+				card.open = !msg.ok;
 				if (openToolCard === card) openToolCard = null;
-				if (summary) {
+				// Failed cards keep their output expanded; successes collapse to a line.
+				if (summary && msg.ok) {
 					card.innerHTML = "";
 					card.appendChild(summary);
 				}
@@ -755,7 +827,7 @@
 					cmdDet.appendChild(runBtn);
 					card.appendChild(cmdDet);
 				}
-				const cleanOutput = String(msg.output || "").replace(/\x1b\[[0-9;]*m/g, "").trim();
+				const cleanOutput = prettyOut(String(msg.output || "")).replace(/\x1b\[[0-9;]*m/g, "").trim();
 				if (cleanOutput) card.appendChild(el("pre", `io${msg.ok ? "" : " io-err"}`, cleanOutput));
 				lastVerb = "";
 				break;
@@ -790,6 +862,7 @@
 				ensureSegment();
 				groupStats.added += msg.added || 0;
 				groupStats.removed += msg.removed || 0;
+				runStats.files.set(msg.path, { added: msg.added || 0, removed: msg.removed || 0 });
 				updateGroupTitle("Working for");
 				const row = el("div", "step file");
 				row.appendChild(el("span", "file-name", `${msg.kind === "created" ? "✚" : "✎"} ${msg.path}`));
@@ -815,24 +888,24 @@
 					const det = el("details", "diff-detail");
 					det.open = startedAt > 0;
 					det.appendChild(el("summary", "", "Changes"));
-					const pre = el("pre", "diff-body");
-					for (const line of String(msg.diff).split("\n")) {
-						const cls = line.startsWith("+") ? "dl add" : line.startsWith("-") ? "dl del" : line.startsWith("@@") ? "dl head" : "dl sep";
-						pre.appendChild(el("span", cls, line + "\n"));
-					}
-					det.appendChild(pre);
+					det.appendChild(renderDiff(msg.diff));
 					add(det);
 				}
 				break;
 			}
 			case "check": {
 				ensureSegment();
+				if (msg.ok) runStats.checksPassed++;
+				else runStats.checksFailed++;
 				const card = el("details", `step tool ${msg.ok ? "ok" : "error"}`);
+				card.open = !msg.ok;
 				const summary = el("summary");
 				summary.appendChild(el("span", "twisty", "›"));
 				summary.appendChild(el("span", "tool-name", "check"));
 				summary.appendChild(el("span", "tool-arg", msg.command));
-				summary.appendChild(el("span", "tool-status", `${msg.ok ? "✓" : "✗"} ${msg.durationMs}ms`));
+				const cstat = el("span", "tool-status");
+				cstat.appendChild(el("span", `act-pill ${msg.ok ? "ok" : "err"}`, msg.ok ? "Passed" : "Failed"));
+				summary.appendChild(cstat);
 				card.appendChild(summary);
 				if (msg.output) card.appendChild(el("pre", "io", msg.output));
 				add(card);
@@ -847,14 +920,7 @@
 				const card = el("div", "perm-card");
 				card.appendChild(el("div", "perm-label", msg.tool === "run_command" ? "Command" : msg.tool === "memory_write" ? "Fact" : "Path"));
 				card.appendChild(el("code", "perm-body", msg.path));
-				if (msg.diff) {
-					const pre = el("pre", "diff-body");
-					for (const line of String(msg.diff).split("\n")) {
-						const cls = line.startsWith("+") ? "dl add" : line.startsWith("-") ? "dl del" : line.startsWith("@@") ? "dl head" : "dl sep";
-						pre.appendChild(el("span", cls, line + "\n"));
-					}
-					card.appendChild(pre);
-				}
+				if (msg.diff) card.appendChild(renderDiff(msg.diff));
 				row.appendChild(card);
 				const btns = el("div", "perm-btns");
 				const resolve = (decision, label) => {
@@ -870,6 +936,7 @@
 				menu.hidden = true;
 				for (const [d, label] of [
 					["alwaysTool", "Always allow this tool"],
+					["alwaysRule", "Always allow this (saved)"],
 					["always", "Allow all this session"],
 				]) {
 					const item = el("button", "perm-menu-item", label);
@@ -933,10 +1000,44 @@
 				setStatus("Running...");
 				break;
 			case "run-finished": {
-				const secs = ((Date.now() - startedAt) / 1000).toFixed(1);
-				const card = el("div", `step done final-answer ${msg.status}`);
-				card.appendChild(el("div", "label", `Finished (${msg.status}) · ${secs}s · ${msg.iterations} step(s)`));
-				if (msg.text) card.appendChild(renderMd(msg.text));
+				const secs = ((Date.now() - startedAt) / 1000).toFixed(0);
+				const issues = runStats.toolsFailed + runStats.checksFailed;
+				// Zero-diff churn (binary/.pyc) isn't a meaningful change.
+				const files = [...runStats.files.values()].filter((f) => f.added + f.removed > 0);
+				const added = files.reduce((a, f) => a + f.added, 0);
+				const removed = files.reduce((a, f) => a + f.removed, 0);
+				const card = el("div", `step done result-card${issues ? " has-issues" : ""}`);
+				const title = el("div", "result-title");
+				title.appendChild(el("span", "check-circle", "✓"));
+				title.appendChild(el("span", "", msg.status === "completed" || msg.status === "success" ? "Task completed" : `Finished (${msg.status})`));
+				const pill = issues
+					? el("span", "status-pill warn", `${issues} issue${issues > 1 ? "s" : ""}`)
+					: el("span", "status-pill completed", "Completed");
+				pill.style.marginLeft = "auto";
+				title.appendChild(pill);
+				card.appendChild(title);
+				if (issues) card.appendChild(el("div", "result-issues", `${issues} command${issues > 1 ? "s" : ""} or check${issues > 1 ? "s" : ""} failed during this run — expand the cards above to inspect.`));
+				if (msg.text) {
+					const rs = el("div", "result-summary");
+					rs.appendChild(renderMd(msg.text));
+					card.appendChild(rs);
+				}
+				const stats = el("div", "result-stats");
+				const stat = (val, cls, label) => {
+					const d = el("div", "result-stat");
+					d.appendChild(el("b", cls, String(val)));
+					d.appendChild(el("span", "muted", label));
+					return d;
+				};
+				if (files.length) stats.appendChild(stat(files.length, "", `File${files.length > 1 ? "s" : ""} changed`));
+				stats.appendChild(stat(`+${added}`, "stat-add", "Lines added"));
+				stats.appendChild(stat(`−${removed}`, "stat-del", "Lines removed"));
+				if (runStats.checksPassed) stats.appendChild(stat(runStats.checksPassed, "", "Checks passed"));
+				if (issues) stats.appendChild(stat(issues, "stat-del", "Failed"));
+				card.appendChild(stats);
+				const foot = el("div", "result-foot muted");
+				foot.textContent = `${secs}s · ${msg.iterations} step(s)`;
+				card.appendChild(foot);
 				add(card);
 				setRunning(false);
 				stopTimer();

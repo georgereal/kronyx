@@ -22,8 +22,13 @@ export interface ExecResult {
 
 export interface SandboxHandle {
 	readonly id: string;
-	/** Run a shell command; resolves with exit code + captured output. */
-	run(command: string, opts: { cwd: string; timeoutMs?: number }): Promise<ExecResult>;
+	/**
+	 * Run a shell command; resolves with exit code + captured output.
+	 * `onOutput` streams stdout/stderr chunks live where the backend supports
+	 * it (e2b); other providers may ignore it — the result still carries all
+	 * output at completion.
+	 */
+	run(command: string, opts: { cwd: string; timeoutMs?: number; onOutput?: (chunk: string) => void }): Promise<ExecResult>;
 	/** Read a text file; rejects when missing/unreadable. */
 	readFile(path: string): Promise<string>;
 	writeFile(path: string, content: string | Uint8Array): Promise<void>;
@@ -58,6 +63,8 @@ export interface SandboxProvider {
 	pauseById?(id: string, creds: ProviderCreds): Promise<boolean>;
 	killById(id: string, creds: ProviderCreds): Promise<boolean>;
 	listLive?(creds: ProviderCreds): Promise<{ id: string; startedAt?: string }[]>;
+	/** Templates usable with this account — public fleet plus account-built images. */
+	listTemplates?(creds: ProviderCreds): Promise<{ id: string; names: string[]; public: boolean }[]>;
 }
 
 export const providers: Record<string, SandboxProvider> = {

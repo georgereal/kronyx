@@ -96,6 +96,29 @@ export async function stopRun(req: Request, p: Record<string, string>): Promise<
 	return json({ ok: true });
 }
 
+/** POST /api/runs/:id/permissions/:permId — resolves a pending worker approval. */
+export async function decidePermission(req: Request, p: Record<string, string>): Promise<Response> {
+	const uid = await authenticate(req);
+	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
+	const body = (await req.json().catch(() => ({}))) as { decision?: string };
+	const decision = body.decision === "allow" ? "allow" : "deny";
+	const db = await getDb();
+	const res = await db
+		.collection("runs")
+		.updateOne(
+			{ uid, runId: p.id, [`permissions.${p.permId}.status`]: "pending" },
+			{
+				$set: {
+					[`permissions.${p.permId}.decision`]: decision,
+					[`permissions.${p.permId}.status`]: "decided",
+					[`permissions.${p.permId}.decidedAt`]: new Date(),
+				},
+			},
+		);
+	if (!res.matchedCount) return json({ error: "not_found" }, { status: 404 });
+	return json({ ok: true, decision });
+}
+
 /** GET /api/sandboxes */
 export async function listSandboxes(req: Request): Promise<Response> {
 	const uid = await authenticate(req);
@@ -104,6 +127,12 @@ export async function listSandboxes(req: Request): Promise<Response> {
 	const history = await db.collection("sandboxes").find({ uid }).sort({ at: -1 }).limit(300).toArray();
 	const events = await db.collection("sandbox_events").find({ uid }).sort({ at: -1 }).limit(500).toArray();
 	const creds = await userCreds(uid);
+	// Per-provider config status — the UI shows "not configured" and
+	// unconfigured providers are never probed.
+	const providerStatus = Object.values(providers).map((p) => {
+		const err = p.validate(creds);
+		return err ? { name: p.name, configured: false, reason: err } : { name: p.name, configured: true };
+	});
 	let live: { sandboxId: string; provider?: string; startedAt?: string }[] = [];
 	for (const p of Object.values(providers)) {
 		if (!p.listLive || p.validate(creds)) continue;
@@ -112,6 +141,7 @@ export async function listSandboxes(req: Request): Promise<Response> {
 	}
 	return json({
 		live,
+		providers: providerStatus,
 		history: history.map((h) => ({ ...h, _id: undefined })),
 		events: events.map((e) => ({ ...e, _id: undefined })),
 		liveEnabled: true,

@@ -1,4 +1,4 @@
-import type { AgentMessage, AgentTool, AgentToolResultPart } from "@cline/shared";
+import type { AgentMessage, AgentTool, AgentToolCallPart, AgentToolResultPart } from "@cline/shared";
 
 const MAX_OUTPUT_CHARS = 8_000;
 const SNIPPET_RADIUS = 200;
@@ -15,9 +15,28 @@ export interface PriorTranscript {
 	messages: readonly AgentMessage[];
 }
 
+/** One transcript chunk handed to the semantic ranker. */
+export interface RecallChunk {
+	idx: number;
+	role: string;
+	text: string;
+}
+
+/**
+ * Embedding-backed ranker for recall_context queries. Returns hit indexes +
+ * similarity scores (best first), or undefined when embeddings are unavailable
+ * — the tool then falls back to keyword search.
+ */
+export type RecallScorer = (
+	query: string,
+	chunks: readonly RecallChunk[],
+) => Promise<{ idx: number; score: number }[] | undefined>;
+
 export interface RecallOptions {
 	/** Persisted prior-run transcripts (e.g. from the store), oldest → newest. */
 	priorTranscripts?: () => readonly PriorTranscript[];
+	/** Optional semantic ranker; keyword search is the fallback. */
+	scorer?: RecallScorer;
 }
 
 const cap = (text: string): string =>
@@ -29,6 +48,15 @@ function findToolResult(messages: readonly AgentMessage[], toolCallId: string): 
 	for (const m of messages) {
 		for (const p of m.content) {
 			if (p.type === "tool-result" && p.toolCallId === toolCallId) return p;
+		}
+	}
+	return undefined;
+}
+
+function findToolCall(messages: readonly AgentMessage[], toolCallId: string): AgentToolCallPart | undefined {
+	for (const m of messages) {
+		for (const p of m.content) {
+			if (p.type === "tool-call" && p.toolCallId === toolCallId) return p;
 		}
 	}
 	return undefined;
@@ -60,9 +88,10 @@ function search(messages: readonly AgentMessage[], terms: string[]): string {
 export function createRecallTool(opts: RecallOptions = {}): AgentTool<RecallInput, string> {
 	return {
 		name: "recall_context",
+		executionMode: "parallel",
 		description:
 			"Retrieve context elided by compaction or from earlier tasks in this session. " +
-			"Use toolCallId to fetch a stubbed tool result's full output, or query to keyword-search the transcript. " +
+			"Use toolCallId to fetch a stubbed tool result's full output, or query to search the transcript semantically. " +
 			"runIndex selects a prior task's transcript (0 = oldest).",
 		inputSchema: {
 			type: "object",
@@ -83,15 +112,36 @@ export function createRecallTool(opts: RecallOptions = {}): AgentTool<RecallInpu
 			}
 			if (input.toolCallId) {
 				const part = findToolResult(messages, input.toolCallId);
-				if (!part) return `No tool result with toolCallId "${input.toolCallId}" in this transcript.`;
+				const call = findToolCall(messages, input.toolCallId);
+				if (!part && !call) return `No tool call or result with toolCallId "${input.toolCallId}" in this transcript.`;
+				const callText = call ? `call ${call.toolName} input: ${JSON.stringify(call.input)}\n` : "";
+				if (!part) return cap(`${callText}(no result recorded)`);
 				const out = typeof part.output === "string" ? part.output : JSON.stringify(part.output ?? "");
-				return cap(`tool-result ${part.toolName} (${input.toolCallId}):\n${out}`);
+				return cap(`${callText}tool-result ${part.toolName} (${input.toolCallId}):\n${out}`);
 			}
 			if (input.query?.trim()) {
+				if (opts.scorer) {
+					const chunks: RecallChunk[] = messages.map((m, idx) => ({ idx, role: m.role, text: messageText(m) }));
+					const ranked = await opts.scorer(input.query, chunks).catch(() => undefined);
+					if (ranked?.length) {
+						return cap(
+							ranked
+								.filter((h) => chunks[h.idx] !== undefined)
+								.slice(0, MAX_HITS)
+								.map(
+									(h) =>
+										`--- message #${h.idx} (${chunks[h.idx].role}, score ${h.score.toFixed(2)}) ---\n` +
+										`${chunks[h.idx].text.slice(0, 2 * SNIPPET_RADIUS + 800)}`,
+								)
+								.join("\n"),
+						);
+					}
+					// Empty/undefined → keyword fallback still gets a shot.
+				}
 				const terms = input.query.toLowerCase().split(/\s+/).filter(Boolean);
 				return cap(search(messages, terms));
 			}
-			return "Provide toolCallId (exact fetch) or query (keyword search).";
+			return "Provide toolCallId (exact fetch) or query (semantic search).";
 		},
 	};
 }

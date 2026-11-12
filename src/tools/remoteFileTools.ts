@@ -1,9 +1,16 @@
 import type { AgentTool } from "@cline/shared";
 import type { SandboxHandle } from "../sandbox/provider";
 import { adaptIndentation, findMatches, mostSimilarRegion } from "./matching";
-import { swallow } from "../lib/errlog";
 
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
+const CMD_HEAD_CHARS = 2_000;
+const CMD_TAIL_CHARS = 5_000;
+
+/** Errors live at the tail: keep head for context, tail for the failure. */
+const clampCmdOut = (out: string): string =>
+	out.length <= CMD_HEAD_CHARS + CMD_TAIL_CHARS
+		? out
+		: `${out.slice(0, CMD_HEAD_CHARS)}\n…[${out.length - CMD_HEAD_CHARS - CMD_TAIL_CHARS} chars elided]…\n${out.slice(-CMD_TAIL_CHARS)}`;
 
 interface EditInput {
 	old_text: string;
@@ -14,6 +21,8 @@ interface EditInput {
 export interface RemoteToolOptions {
 	/** Absolute directory for save_plan output; defaults to "<workdir>/.kronyx/plans". */
 	planDir?: string;
+	/** Live stdout/stderr chunks from the run_command tool (UI streaming). */
+	onCommandOutput?: (chunk: string) => void;
 }
 
 /**
@@ -68,7 +77,9 @@ export function createRemoteFileTools(sandbox: SandboxHandle, workdir: string, o
 			if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
 			const start = Math.max(1, input.start_line ?? 1);
 			const requestedEnd = Math.min(lines.length, input.end_line ?? lines.length);
-			const end = Math.min(requestedEnd, start + 1999);
+			// Unbounded reads page at 400 lines; explicit ranges get up to 2000.
+			const page = input.end_line === undefined ? 399 : 1999;
+			const end = Math.min(requestedEnd, start + page);
 			const width = String(end).length;
 			const body = lines
 				.slice(start - 1, end)
@@ -261,18 +272,74 @@ export function createRemoteFileTools(sandbox: SandboxHandle, workdir: string, o
 		},
 	};
 
-	const runCommand: AgentTool<{ command: string }, string> = {
+	const runCommand: AgentTool<{ command: string; timeout_seconds?: number }, string> = {
 		name: "run_command",
-		description: "Run a shell command in the cloud workspace (build, test, install, git). Returns exit code and output.",
+		description:
+			"Run a shell command in the cloud workspace (build, test, install, git). Returns exit code and output. " +
+			"The command keeps running while the tool polls it — set timeout_seconds generously for installs/builds/test suites (they can take 5–30 minutes). Do NOT give up on a command just because it is slow.",
 		inputSchema: {
 			type: "object",
-			properties: { command: { type: "string", description: "Shell command to run." } },
+			properties: {
+				command: { type: "string", description: "Shell command to run." },
+				timeout_seconds: {
+					type: "integer",
+					minimum: 1,
+					maximum: 3600,
+					description:
+						"Total seconds to wait before killing the command (default 1800, max 3600). Short for quick checks, 600–1800 for installs/builds.",
+				},
+			},
 			required: ["command"],
 		},
 		async execute(input) {
-			const r = await run(input.command);
-			const out = `${r.stdout}${r.stderr}`.trim();
-			return `exit ${r.exitCode}\n${out.length > 8000 ? `${out.slice(0, 8000)}\n... (truncated)` : out}`;
+			// Detached execution + polling: a single blocking run() hits the
+			// provider's request deadline on long commands. The command runs in
+			// its own session writing to a log + exit file; we poll every 10s,
+			// stream new output live, and only kill at the real deadline.
+			const stamp = `${Date.now().toString(36)}${Math.floor(Math.random() * 1e4).toString(36)}`;
+			const base = `/tmp/kronyx-cmd-${stamp}`;
+			const script = `${base}.sh`, logF = `${base}.log`, exitF = `${base}.exit`, pidF = `${base}.pid`;
+			await sandbox.writeFile(
+				script,
+				`#!/bin/bash\necho $$ > ${JSON.stringify(pidF)}\ncd ${JSON.stringify(workdir)}\n{ ${input.command}\n} > ${JSON.stringify(logF)} 2>&1\necho $? > ${JSON.stringify(exitF)}\n`,
+			);
+			await sandbox.run(`setsid bash ${JSON.stringify(script)} >/dev/null 2>&1 < /dev/null &`, { cwd: "/", timeoutMs: 15_000 });
+			const budgetMs = Math.min(Math.max(input.timeout_seconds ?? 1800, 1), 3600) * 1000;
+			const deadline = Date.now() + budgetMs;
+			const poll = (cmd: string) => sandbox.run(cmd, { cwd: "/", timeoutMs: 15_000 }).catch(() => null);
+			// Tail-biased fetch for oversized logs — the failure is at the end.
+			const fetchLog = async (size: number): Promise<string> => {
+				if (size <= 16_000) return (await poll(`head -c 16000 ${JSON.stringify(logF)}`))?.stdout ?? "";
+				const [head, tail] = await Promise.all([
+					poll(`head -c 2000 ${JSON.stringify(logF)}`),
+					poll(`tail -c 14000 ${JSON.stringify(logF)}`),
+				]);
+				return `${head?.stdout ?? ""}\n…[log truncated]…\n${tail?.stdout ?? ""}`;
+			};
+			let offset = 0;
+			for (;;) {
+				await new Promise((r) => setTimeout(r, 10_000));
+				const state = await poll(`cat ${JSON.stringify(exitF)} 2>/dev/null; echo __SIZE__; stat -c %s ${JSON.stringify(logF)} 2>/dev/null || echo 0`);
+				const [exitCode = "", , sizeS = "0"] = (state?.stdout ?? "\n__SIZE__\n0").split("\n");
+				const size = Number(sizeS) || 0;
+				if (size > offset) {
+					const chunk = await poll(`tail -c +${offset + 1} ${JSON.stringify(logF)} | head -c 20000`);
+					if (chunk?.stdout) opts.onCommandOutput?.(chunk.stdout);
+					offset = size;
+				}
+				if (exitCode.trim() !== "") {
+					const log = await fetchLog(size);
+					await poll(`rm -f ${JSON.stringify(base)}.*`);
+					return `exit ${exitCode.trim()}\n${clampCmdOut(log.trim())}`;
+				}
+				if (Date.now() > deadline) {
+					// setsid made the script a process-group leader — kill the group.
+					await poll(`kill -TERM -- -$(cat ${JSON.stringify(pidF)} 2>/dev/null) 2>/dev/null; sleep 1; kill -KILL -- -$(cat ${JSON.stringify(pidF)} 2>/dev/null) 2>/dev/null`);
+					const log = await fetchLog(size);
+					await poll(`rm -f ${JSON.stringify(base)}.*`);
+					return `timeout after ${Math.round(budgetMs / 1000)}s (killed)\n${clampCmdOut(log.trim())}`;
+				}
+			}
 		},
 	};
 

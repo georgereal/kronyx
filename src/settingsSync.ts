@@ -6,6 +6,8 @@ import { profiles, profileApiKey } from "./config";
 import { refreshUserConfig, saveUserConfig, userConfig } from "./userConfig";
 import { kvGet, kvSet, openStore } from "./store";
 import { log } from "./log";
+import { readGlobalPermissions, writeGlobalPermissions } from "./permStore";
+import { parsePermissionsText } from "./agent/permissions";
 
 const DEVICE_KEY = "kronyx.deviceId";
 const SYNC_STAMP = "settings.syncedAt";
@@ -85,6 +87,7 @@ export class SettingsSync implements vscode.Disposable {
 						modelId: uc.modelId,
 						profiles: uc.profiles,
 						activeProfile: uc.activeProfile,
+						permissions: await readGlobalPermissions(),
 					},
 					...(Object.keys(p.secrets as object).length ? { secrets: p.secrets } : {}),
 					device: { id: await getDeviceId(this.context), name: deviceName() },
@@ -127,6 +130,13 @@ export class SettingsSync implements vscode.Disposable {
 				) as Parameters<typeof saveUserConfig>[0],
 			);
 			await refreshUserConfig();
+			// Global permission rules travel in settings.data.permissions — apply them
+			// to ~/.kronyx/permissions.json so local runs match cloud behavior.
+			if (settings.data.permissions) {
+				await writeGlobalPermissions(
+					parsePermissionsText(JSON.stringify(settings.data.permissions)),
+				).catch(() => {});
+			}
 			// Secrets set on the web are user-explicit — always apply on pull
 			// (the providerKeys opt-in only gates the push direction).
 			if (settings.secrets) {

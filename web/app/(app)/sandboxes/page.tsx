@@ -8,6 +8,7 @@ import { apiFetch, useUser } from "@/lib/api";
 interface LiveVm { sandboxId: string; templateId?: string; state?: string; startedAt?: string }
 interface Hist { sandboxId?: string; device?: string; deviceId?: string; template?: string; repo?: string; runId?: string; event?: string; state?: string; reason?: string; sessionId?: string; at?: string }
 interface SbxEvent { sandboxId?: string; sessionId?: string; provider?: string; event?: string; state?: string; reason?: string; device?: string; runId?: string; at?: string }
+interface ProviderStatus { name: string; configured: boolean; reason?: string }
 
 const fmt = (v?: string) => (v ? new Date(v).toLocaleString() : "—");
 
@@ -16,6 +17,7 @@ export default function SandboxesPage() {
 	const [live, setLive] = useState<LiveVm[]>([]);
 	const [history, setHistory] = useState<Hist[]>([]);
 	const [events, setEvents] = useState<SbxEvent[]>([]);
+	const [providers, setProviders] = useState<ProviderStatus[]>([]);
 	const [expanded, setExpanded] = useState<string | null>(null);
 	const [, setLiveEnabled] = useState(false);
 	const [loading, setLoading] = useState(true);
@@ -26,8 +28,8 @@ export default function SandboxesPage() {
 		if (!user) return;
 		const res = await apiFetch("/api/sandboxes", user);
 		if (res.ok) {
-			const b = (await res.json()) as { live: LiveVm[]; history: Hist[]; events?: SbxEvent[]; liveEnabled: boolean };
-			setLive(b.live); setHistory(b.history); setEvents(b.events ?? []); setLiveEnabled(b.liveEnabled);
+			const b = (await res.json()) as { live: LiveVm[]; history: Hist[]; events?: SbxEvent[]; providers?: ProviderStatus[]; liveEnabled: boolean };
+			setLive(b.live); setHistory(b.history); setEvents(b.events ?? []); setProviders(b.providers ?? []); setLiveEnabled(b.liveEnabled);
 		}
 		setLoading(false);
 	};
@@ -76,6 +78,20 @@ export default function SandboxesPage() {
 	return (
 		<div className="page">
 			<h1>Sandboxes</h1>
+			{providers.length > 0 && (
+				<div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 14 }}>
+					{providers.map((p) => (
+						<span
+							key={p.name}
+							className="sess-chip"
+							title={p.configured ? `${p.name} enabled` : p.reason}
+							style={{ fontSize: 11, opacity: p.configured ? 1 : 0.6 }}
+						>
+							{p.name} · {p.configured ? "enabled" : "not configured"}
+						</span>
+					))}
+				</div>
+			)}
 			<div className="stat-grid" style={{ marginBottom: 20 }}>
 				<div className="card" style={{ padding: 16 }}>
 					<div className="chart-title">Live</div>

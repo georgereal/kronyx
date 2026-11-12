@@ -3,7 +3,8 @@ import type { AgentMessage, AgentRuntimeEvent, AgentTool, AgentToolResultPart } 
 import { createFileTools, type FileChangeKind, WRITE_TOOL_NAMES } from "../tools/fileTools";
 import { buildSystemPrompt } from "./systemPrompt";
 import { createPrepareTurn } from "./compaction";
-import { createRecallTool, type PriorTranscript } from "./recall";
+import { createRecallTool, type PriorTranscript, type RecallScorer } from "./recall";
+import { countTokens } from "./tokenize";
 
 export interface ProviderSettings {
 	providerId: string;
@@ -13,6 +14,7 @@ export interface ProviderSettings {
 	maxIterations: number;
 	profile?: string;
 	contextWindow?: number;
+	maxTokens?: number;
 }
 
 /** What a finished run hands to the next task: summary + the files it touched. */
@@ -35,11 +37,12 @@ export type RunViewEvent =
 	| { type: "file-changed"; path: string; kind: FileChangeKind; added?: number; removed?: number; diff?: string }
 	| { type: "assistant-delta"; text: string }
 	| { type: "reasoning-delta"; text: string }
-	| { type: "info"; text: string }
+	| { type: "tool-output-delta"; text: string }
+	| { type: "info"; text: string; meta?: Record<string, unknown> }
 	| { type: "check"; command: string; ok: boolean; durationMs: number; output: string }
 	| { type: "plan-ready"; path: string }
-	| { type: "permission-request"; id: string; tool: string; path: string; diff?: string }
-	| { type: "permission-response"; id: string; decision: "allow" | "always" | "deny" | "alwaysTool" }
+	| { type: "permission-request"; id: string; tool: string; path: string; command?: string; input?: unknown; diff?: string }
+	| { type: "permission-response"; id: string; decision: "allow" | "always" | "deny" | "alwaysTool" | "alwaysRule" | "stopped" | "timeout" }
 	| { type: "loop-detected"; tool: string; count: number }
 	| { type: "mode-blocked"; mode: AgentMode }
 	| {
@@ -53,6 +56,10 @@ export type RunViewEvent =
 			totalCost?: number;
 			iteration?: number;
 			contextMsgs?: number;
+			/** Input size of the request this event covers — ≈ current context fill. */
+			requestTokens?: number;
+			contextWindow?: number;
+			contextPct?: number;
 		}
 	| { type: "run-finished"; status: string; text: string; iterations: number }
 	| { type: "run-failed"; error: string };
@@ -79,8 +86,13 @@ export interface RunnerHost {
 	onMemoryFact?: (fact: string) => Promise<void>;
 	/** Set false to omit the recall_context tool (e.g. tool-less ask runs). */
 	enableRecall?: boolean;
+	/** Rule-file permission check (see agent/permissions.ts). Runs before mode defaults:
+	 *  "deny" skips the call, "allow" bypasses prompting, "ask"/undefined → normal flow. */
+	checkPermission?: (toolName: string, input: unknown) => Promise<"allow" | "ask" | "deny" | undefined>;
 	/** Persisted transcripts of earlier runs, exposed to the recall_context tool. */
 	priorTranscripts?: () => readonly PriorTranscript[];
+	/** Semantic ranker for recall_context queries (embeddings); keyword search is the fallback. */
+	recallScorer?: RecallScorer;
 	/** Called after each run with the canonical transcript for cold-recall persistence. */
 	saveTranscript?: (messages: readonly AgentMessage[]) => void;
 }
@@ -88,7 +100,16 @@ export interface RunnerHost {
 const HANDOFF_FRACTION = 0.4;
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const MAX_DIGESTS = 3;
-const CHARS_PER_TOKEN = 4;
+const READ_ONLY_HIDDEN = new Set([
+	"write_file",
+	"edit_file",
+	"append_file",
+	"insert_lines",
+	"file_editor",
+	"run_command",
+	"browser_use",
+	"switch_environment",
+]);
 
 export class AgentRunner {
 	private agent: Agent | undefined;
@@ -132,8 +153,7 @@ export class AgentRunner {
 	private shouldHandoff(settings: ProviderSettings): boolean {
 		if (!this.agent || this.digests.length === 0) return false;
 		const window = settings.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
-		const chars = JSON.stringify(this.agent.snapshot().messages).length;
-		return chars / CHARS_PER_TOKEN > window * HANDOFF_FRACTION;
+		return countTokens(JSON.stringify(this.agent.snapshot().messages)) > window * HANDOFF_FRACTION;
 	}
 
 	private seedMessages(): AgentMessage[] | undefined {
@@ -169,7 +189,7 @@ export class AgentRunner {
 			}
 			let agent = this.agent;
 			if (agent && this.shouldHandoff(settings)) {
-				const dropped = Math.round(JSON.stringify(agent.snapshot().messages).length / CHARS_PER_TOKEN / 1000);
+				const dropped = Math.round(countTokens(JSON.stringify(agent.snapshot().messages)) / 1000);
 				this.host.emit({
 					type: "info",
 					text: `New task — carried ${this.digests.length} run summar${this.digests.length === 1 ? "y" : "ies"} forward (~${dropped}k tokens dropped from context)`,
@@ -213,6 +233,18 @@ export class AgentRunner {
 					planDir: this.host.planDir ? () => this.host.planDir! : undefined,
 					onMemoryFact: this.host.onMemoryFact,
 				});
+		const mode = this.host.currentMode();
+		// Per-tool executionMode markers are honored only in write modes; ask/plan
+		// runs strip them to sequential so every call is an ordered boundary.
+		const allowParallel = mode !== "ask" && mode !== "plan";
+		// Read-only modes don't ship the write/env tool schemas — the hook would
+		// deny them anyway, and each schema costs tokens on every request.
+		const visible =
+			mode === "ask" || mode === "plan"
+				? tools.filter((t) => !READ_ONLY_HIDDEN.has(t.name) && (mode === "plan" || t.name !== "save_plan"))
+				: tools;
+		const execTools = (list: AgentTool<any, string>[]) =>
+			allowParallel ? list : list.map((t) => (t.executionMode === "parallel" ? { ...t, executionMode: "sequential" as const } : t));
 		return new Agent({
 			providerId: settings.providerId,
 			modelId: settings.modelId,
@@ -220,18 +252,24 @@ export class AgentRunner {
 			baseUrl: settings.baseUrl || undefined,
 			systemPrompt: buildSystemPrompt(
 				this.host.workspaceRoot,
-				this.host.currentMode(),
+				mode,
 				(await this.host.memoryContext?.(task, settings)) ?? "",
 				this.host.environment,
 			),
 			tools: [
-				...tools,
-				...(this.host.enableRecall === false ? [] : [createRecallTool({ priorTranscripts: this.host.priorTranscripts })]),
+				...execTools(visible),
+				...(this.host.enableRecall === false
+					? []
+					: execTools([createRecallTool({ priorTranscripts: this.host.priorTranscripts, scorer: this.host.recallScorer })])),
 			],
 			maxIterations: settings.maxIterations,
+			...(settings.maxTokens ? { modelOptions: { maxTokens: settings.maxTokens } } : {}),
 			toolExecution: "sequential",
 			prepareTurn: createPrepareTurn({
 				contextWindow: settings.contextWindow,
+				summarize: settings.baseUrl
+					? (messages) => summarizeMessages(settings, messages)
+					: undefined,
 				onCompact: (s) => this.host.log?.("agent", `compaction ${JSON.stringify(s)}`),
 			}),
 			...(initialMessages?.length ? { initialMessages } : {}),
@@ -258,6 +296,12 @@ export class AgentRunner {
 					if (tool.name === "save_plan") {
 						return mode === "plan" ? undefined : { skip: true, reason: "Plans are saved in Plan mode only." };
 					}
+					// Rule-file permissions: deny short-circuits, allow bypasses the prompt.
+					const rule = await this.host.checkPermission?.(tool.name, input);
+					if (rule === "deny") {
+						return { skip: true, reason: `Denied by permissions rules — ${tool.name} is not allowed here. Choose a different approach.` };
+					}
+					if (rule === "allow") return undefined;
 					// file_editor's read commands never need write permission.
 					if (tool.name === "file_editor") {
 						const cmd = (input as { command?: string })?.command;
@@ -350,10 +394,48 @@ export class AgentRunner {
 				});
 				break;
 			case "status-notice":
-				this.host.emit({ type: "info", text: event.message });
+				this.host.emit({ type: "info", text: event.message, meta: event.metadata });
 				break;
 		}
 	}
+}
+
+const SUMMARY_INPUT_CAP = 60_000;
+const SUMMARY_MAX_TOKENS = 1200;
+
+/**
+ * Hard-compaction recap: one OpenAI-compatible /chat/completions call that
+ * condenses the oldest turns. Best-effort — callers fall back to mechanical
+ * stubbing when the endpoint rejects or the shape differs.
+ */
+async function summarizeMessages(settings: ProviderSettings, messages: readonly AgentMessage[]): Promise<string | undefined> {
+	const transcript = messages
+		.map((m) => `${m.role}: ${JSON.stringify(m.content).slice(0, 4000)}`)
+		.join("\n")
+		.slice(0, SUMMARY_INPUT_CAP);
+	if (!transcript.trim()) return undefined;
+	const res = await fetch(`${settings.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
+		method: "POST",
+		headers: { "content-type": "application/json", authorization: `Bearer ${settings.apiKey}` },
+		body: JSON.stringify({
+			model: settings.modelId,
+			max_tokens: SUMMARY_MAX_TOKENS,
+			messages: [
+				{
+					role: "user",
+					content:
+						"Summarize this coding-agent transcript prefix in <=300 words for the SAME agent continuing the task. " +
+						"Keep: goal, decisions made, files changed (paths), errors hit and how they were resolved, current state, next step. " +
+						"Plain compact prose, no headers.\n\n" + transcript,
+				},
+			],
+		}),
+		signal: AbortSignal.timeout(60_000),
+	});
+	if (!res.ok) return undefined;
+	const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+	const text = data.choices?.[0]?.message?.content;
+	return typeof text === "string" && text.trim() ? text.trim() : undefined;
 }
 
 function stringify(value: unknown): string {

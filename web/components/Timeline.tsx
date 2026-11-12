@@ -18,15 +18,34 @@ const KIND: Record<string, string> = {
 	info: "Info",
 	setup: "Setup",
 	"plan-ready": "Plan",
+	"ui-screenshot": "Screenshot",
 	"mode-blocked": "Mode",
 	"loop-detected": "Stopped",
 	"run-finished": "Done",
 	"run-failed": "Failed",
 };
 
+const WRITE_TOOLS = new Set(["file_editor", "write_file", "edit_file", "append_file", "insert_lines"]);
+
 type Item =
-	| { kind: "stream"; streamKind: "reasoning" | "assistant"; text: string; done: boolean; key: string; runId?: string }
-	| { kind: "terminal"; name: string; input: unknown; output?: string; ok?: boolean; durationMs?: number; toolId?: string; key: string; runId?: string }
+	| { kind: "stream"; streamKind: "reasoning" | "assistant"; text: string; done: boolean; key: string; runId?: string; at?: string }
+	| {
+			kind: "action";
+			name: string;
+			input: unknown;
+			output?: string;
+			ok?: boolean;
+			durationMs?: number;
+			toolId?: string;
+			path?: string;
+			diff?: string;
+			added?: number;
+			removed?: number;
+			liveOutput?: string;
+			key: string;
+			runId?: string;
+	  }
+	| { kind: "perm"; permId: string; tool: string; path: string; command: string; input: unknown; decision?: string; key: string; runId?: string }
 	| { kind: "event"; e: RunEvent; key: string };
 
 /**
@@ -47,7 +66,7 @@ function fold(events: RunEvent[]): Item[] {
 			const isR = t === "reasoning-delta";
 			let s: Extract<Item, { kind: "stream" }> | null = isR ? openReasoning : openAssistant;
 			if (!s || s.done || (!isR && lastAssistant?.absorbed)) {
-				s = { kind: "stream", streamKind: isR ? "reasoning" : "assistant", text: "", done: false, key: `s${e.runId}-${e.seq}`, runId: e.runId };
+				s = { kind: "stream", streamKind: isR ? "reasoning" : "assistant", text: "", done: false, key: `s${e.runId}-${e.seq}`, runId: e.runId, at: e.at };
 				items.push(s);
 				if (isR) openReasoning = s;
 				else {
@@ -90,6 +109,92 @@ function fold(events: RunEvent[]): Item[] {
 	return items;
 }
 
+/**
+ * Pair raw events into action items: tool-started + tool-finished → one
+ * action card; file-changed attaches to the matching edit action by path;
+ * permission-request + permission-resolved → one approval card.
+ */
+function pair(items: Item[]): Item[] {
+	const out: Item[] = [];
+	const actions = new Map<string, Extract<Item, { kind: "action" }>>();
+	const perms = new Map<string, Extract<Item, { kind: "perm" }>>();
+	for (const item of items) {
+		if (item.kind !== "event") {
+			out.push(item);
+			continue;
+		}
+		const ev = item.e.event;
+		if (ev.type === "tool-started") {
+			const inp = (ev.input ?? {}) as Record<string, unknown>;
+			const a: Extract<Item, { kind: "action" }> = {
+				kind: "action",
+				name: String(ev.name),
+				input: ev.input,
+				toolId: String(ev.id ?? ""),
+				path: inp.path ? String(inp.path) : inp.file ? String(inp.file) : undefined,
+				key: item.key,
+				runId: item.e.runId,
+			};
+			if (a.toolId) actions.set(a.toolId, a);
+			out.push(a);
+			continue;
+		}
+		if (ev.type === "tool-finished") {
+			const a = actions.get(String(ev.id ?? ""));
+			if (a) {
+				a.output = String(ev.output ?? "");
+				a.ok = ev.ok !== false;
+				a.durationMs = Number(ev.durationMs ?? 0);
+				continue;
+			}
+		}
+		if (ev.type === "file-changed") {
+			const path = String(ev.path ?? "");
+			// Attach to the most recent edit action for the same path.
+			const a = [...actions.values()].reverse().find((x) => x.path === path && !x.diff);
+			if (a) {
+				a.diff = String(ev.diff ?? "");
+				a.added = Number(ev.added ?? 0);
+				a.removed = Number(ev.removed ?? 0);
+				continue;
+			}
+			// Zero-diff churn (binary/.pyc artifacts) — no signal, drop the card.
+			if (Number(ev.added ?? 0) + Number(ev.removed ?? 0) === 0) continue;
+		}
+		if (ev.type === "tool-output-delta") {
+			// Attach live output to the open run_command card (only one streams
+			// at a time); orphan deltas are dropped.
+			const a = [...actions.values()].reverse().find((x) => x.name === "run_command" && x.output === undefined);
+			if (a) a.liveOutput = (a.liveOutput ?? "") + String(ev.text ?? "");
+			continue;
+		}
+		if (ev.type === "permission-request") {
+			const p: Extract<Item, { kind: "perm" }> = {
+				kind: "perm",
+				permId: String(ev.id ?? ev.permId ?? ""),
+				tool: String(ev.tool ?? ""),
+				path: String(ev.path ?? ""),
+				command: String(ev.command ?? ""),
+				input: ev.input,
+				key: item.key,
+				runId: item.e.runId,
+			};
+			perms.set(p.permId, p);
+			out.push(p);
+			continue;
+		}
+		if (ev.type === "permission-resolved" || ev.type === "permission-response") {
+			const p = perms.get(String(ev.id ?? ev.permId ?? ""));
+			if (p) {
+				p.decision = String(ev.decision ?? "");
+				continue;
+			}
+		}
+		out.push(item);
+	}
+	return out;
+}
+
 function Md({ text }: { text: string }) {
 	return <div className="md" dangerouslySetInnerHTML={{ __html: marked.parse(text) as string }} />;
 }
@@ -98,6 +203,212 @@ function toolInput(input: unknown): string {
 	if (input == null) return "";
 	const s = typeof input === "string" ? input : JSON.stringify(input);
 	return s.length > 140 ? `${s.slice(0, 140)}…` : s;
+}
+
+function fmtDur(ms: number): string {
+	const s = Math.max(1, Math.round(ms / 1000));
+	return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+}
+
+function fmtTime(at?: string): string {
+	return at ? new Date(at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "";
+}
+
+/** Live elapsed ticker for running action cards ("Working for 38s"). */
+function Elapsed() {
+	const [s, setS] = useState(0);
+	useEffect(() => {
+		const t = setInterval(() => setS((v) => v + 1), 1000);
+		return () => clearInterval(t);
+	}, []);
+	return <span className="muted act-stat">Working for {fmtDur(s * 1000)}</span>;
+}
+
+interface DiffLine { num?: number; cls: string; text: string }
+
+/** Numbered unified-diff lines: new-file numbers for +/ctx, old for −. */
+function diffLines(diff: string, cap = 300): { rows: DiffLine[]; truncated: boolean } {
+	const rows: DiffLine[] = [];
+	let oldN = 0, newN = 0, truncated = false;
+	for (const l of diff.split("\n")) {
+		const h = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(l);
+		const hOld = /^@@ -(\d+)/.exec(l);
+		if (h) {
+			newN = Number(h[1]);
+			oldN = hOld ? Number(hOld[1]) : newN;
+			rows.push({ cls: "fd-l-hunk", text: l });
+			continue;
+		}
+		if (l.startsWith("+++") || l.startsWith("---") || l.startsWith("diff ") || l.startsWith("index ")) continue;
+		if (rows.length >= cap) { truncated = true; break; }
+		if (l.startsWith("+")) rows.push({ num: newN++, cls: "fd-l-add", text: l });
+		else if (l.startsWith("-")) rows.push({ num: oldN++, cls: "fd-l-del", text: l });
+		else rows.push({ num: newN++, cls: "fd-l-ctx", text: l });
+	}
+	return { rows, truncated };
+}
+
+function DiffBody({ diff }: { diff: string }) {
+	const { rows, truncated } = diffLines(diff);
+	return (
+		<div className="fd-body">
+			{rows.map((r, i) => (
+				<div key={i} className={`fd-row ${r.cls}`}>
+					<span className="fd-num">{r.num ?? ""}</span>
+					<span className="fd-code">{r.text}</span>
+				</div>
+			))}
+			{truncated && <div className="muted act-stat">…truncated…</div>}
+		</div>
+	);
+}
+
+/** Shared single-line collapsed row + expandable body for action cards. */
+function ActionCard({
+	icon,
+	title,
+	stats,
+	status,
+	children,
+	done,
+	failed,
+	keepOpen,
+}: {
+	icon: React.ReactNode;
+	title: React.ReactNode;
+	stats?: React.ReactNode;
+	status?: React.ReactNode;
+	children?: React.ReactNode;
+	done: boolean;
+	failed?: boolean;
+	keepOpen?: boolean;
+}) {
+	const live = !done;
+	const [open, setOpen] = useState(live || !!failed);
+	useEffect(() => setOpen(live || !!failed || !!keepOpen), [live, failed, keepOpen]);
+	return (
+		<div className={`act ${failed ? "failed" : ""}`}>
+			<button className="act-head" onClick={() => setOpen((v) => !v)}>
+				<span className="caret">{open ? "▾" : "▸"}</span>
+				<span className="act-icon">{icon}</span>
+				<span className="act-title">{title}</span>
+				{stats}
+				{status}
+			</button>
+			{open && children && <div className="act-body">{children}</div>}
+		</div>
+	);
+}
+
+/** Unwrap JSON error envelopes ({"error": "…"}) so failures read as text. */
+function prettyOut(raw: string): string {
+	const t = raw.trim();
+	if (t.startsWith("{")) {
+		try {
+			const j = JSON.parse(t) as { error?: unknown; message?: unknown };
+			const msg = j.error ?? j.message;
+			if (typeof msg === "string") return msg;
+		} catch { /* not JSON */ }
+	}
+	return raw;
+}
+
+/** Terminal execution card — command header, streamed/final output, status. */
+function Terminal({ item }: { item: Extract<Item, { kind: "action" }> }) {
+	const inp = item.input as Record<string, unknown> | undefined;
+	const cmd = item.name === "run_command" ? String(inp?.command ?? "") : `${item.name} ${toolInput(item.input)}`;
+	const done = item.output !== undefined;
+	const failed = done && item.ok === false;
+	return (
+		<ActionCard
+			icon="▶"
+			title={<span className="mono">{item.name === "run_command" ? "Running" : item.name} <span className="muted">{cmd.length > 120 ? `${cmd.slice(0, 120)}…` : cmd}</span></span>}
+			stats={
+				done
+					? item.durationMs !== undefined && <span className="muted act-stat">{fmtDur(item.durationMs)}</span>
+					: <Elapsed />
+			}
+			status={
+				done ? (
+					failed ? <span className="act-pill err">Failed</span> : <span className="act-pill ok">Completed</span>
+				) : (
+					<span className="act-pill run">Running</span>
+				)
+			}
+			done={done}
+			failed={failed}
+		>
+			<pre className="act-out">{prettyOut(item.output ?? item.liveOutput ?? "").slice(0, 4000) || "…"}</pre>
+		</ActionCard>
+	);
+}
+
+/** Code edit card — ⚙ filename + stat chip header, numbered colored diff. */
+function EditCard({ item }: { item: Extract<Item, { kind: "action" }> }) {
+	const diff = item.diff ?? "";
+	const done = item.output !== undefined;
+	const file = item.path ? item.path.split("/").pop() : "file";
+	const stats =
+		item.added != null || item.removed != null ? (
+			<span className="act-stat fd-chip">
+				{item.added != null && <span className="fd-add">+{item.added}</span>}
+				{item.removed != null && <span className="fd-del"> −{item.removed}</span>}
+			</span>
+		) : null;
+	return (
+		<ActionCard
+			icon="⚙"
+			title={<span className="mono">{file}</span>}
+			stats={stats}
+			status={done ? null : <span className="act-pill run">Editing</span>}
+			done={done}
+		>
+			{diff ? <DiffBody diff={diff} /> : <pre className="act-out">{toolInput(item.input)}</pre>}
+		</ActionCard>
+	);
+}
+
+/** Inline approval card — exact action + Allow/Deny; posts decision to the run. */
+function PermissionCard({ user, item, active }: { user: User; item: Extract<Item, { kind: "perm" }>; active: boolean }) {
+	const [decision, setDecision] = useState(item.decision ?? "");
+	const [busy, setBusy] = useState(false);
+	useEffect(() => setDecision(item.decision ?? ""), [item.decision]);
+	const decided = !!decision || !active;
+	const detail = item.command || item.path || toolInput(item.input);
+	const decide = async (d: "allow" | "deny") => {
+		if (!item.runId || busy) return;
+		setBusy(true);
+		const res = await apiFetch(`/api/runs/${item.runId}/permissions/${item.permId}`, user, {
+			method: "POST",
+			body: JSON.stringify({ decision: d }),
+		});
+		setBusy(false);
+		setDecision(res.ok ? d : "error");
+	};
+	return (
+		<div className="perm-card">
+			<div className="perm-head">
+				<span className="perm-shield">🛡</span>
+				<div style={{ flex: 1, minWidth: 0 }}>
+					<div className="perm-title">Permission required</div>
+					<div className="muted" style={{ fontSize: 12 }}>
+						Allow Kronyx to run <span className="mono">{item.tool}</span>?
+					</div>
+					{detail && <div className="perm-cmd mono">{detail.length > 160 ? `${detail.slice(0, 160)}…` : detail}</div>}
+				</div>
+				{decided ? (
+					<span className={`act-pill ${decision === "allow" ? "ok" : "err"}`} style={{ alignSelf: "center" }}>
+						{decision === "allow" ? "Allowed" : decision ? `Denied${decision === "deny" ? "" : ` (${decision})`}` : "Expired"}
+					</span>
+				) : (
+					<div className="perm-actions">
+						<button className="btn sm ghost" disabled={busy} onClick={() => void decide("deny")}>Deny</button>
+						<button className="btn sm" disabled={busy} onClick={() => void decide("allow")}>Allow</button>
+					</div>
+				)}
+			</div>
+		</div>
+	);
 }
 
 function PlanCard({ user, sessionId, slug }: { user: User; sessionId: string; slug: string }) {
@@ -140,12 +451,28 @@ function PlanCard({ user, sessionId, slug }: { user: User; sessionId: string; sl
 	);
 }
 
+/** Small check row — `✓ pytest` collapsed, expandable to output. */
+function CheckRow({ e }: { e: RunEvent }) {
+	const ev = e.event;
+	const ok = ev.ok !== false;
+	return (
+		<ActionCard
+			icon={<span style={{ color: ok ? "var(--ok)" : "var(--err)" }}>{ok ? "✓" : "✗"}</span>}
+			title={<span className="mono muted">{String(ev.command ?? "check")}</span>}
+			status={<span className={`act-pill ${ok ? "ok" : "err"}`}>{ok ? "Passed" : "Failed"}</span>}
+			done
+			failed={!ok}
+		>
+			{ev.output ? <pre className="act-out">{String(ev.output)}</pre> : null}
+		</ActionCard>
+	);
+}
+
 function Event({ user, sessionId, e, events, runs, githubUrl }: { user: User; sessionId: string; e: RunEvent; events: RunEvent[]; runs: RunDoc[]; githubUrl?: string }) {
 	const ev = e.event;
 	const kind = KIND[ev.type] ?? ev.type;
 	const cls =
 		ev.type === "run-failed" ? "failed"
-		: ev.type === "run-finished" ? "assistant"
 		: ev.type === "cloud-status" || ev.type === "info" || ev.type === "setup" ? "status"
 		: "";
 
@@ -163,6 +490,7 @@ function Event({ user, sessionId, e, events, runs, githubUrl }: { user: User; se
 					<span className="stream-text">{task}</span>
 					{attCount > 0 && <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>+{attCount} attached file{attCount > 1 ? "s" : ""}</div>}
 				</div>
+				<span className="msg-time">{fmtTime(e.at)}</span>
 			</div>
 		);
 	}
@@ -191,252 +519,136 @@ function Event({ user, sessionId, e, events, runs, githubUrl }: { user: User; se
 			</div>
 		);
 	}
+	if (ev.type === "ui-screenshot") {
+		const dataUrl = String(ev.dataUrl ?? "");
+		if (!dataUrl) return null;
+		return (
+			<div className="ev">
+				<div className="ev-kind">Screenshot · {String(ev.url ?? "")}</div>
+				<img src={dataUrl} alt="App screenshot" style={{ maxWidth: "100%", borderRadius: 6, border: "1px solid var(--border)" }} />
+			</div>
+		);
+	}
 	if (ev.type === "plan-ready") {
 		const path = String(ev.path ?? "");
 		const slug = path.split("/").pop()?.replace(/\.md$/, "") ?? "plan";
 		return <PlanCard user={user} sessionId={sessionId} slug={slug} />;
 	}
-	if (ev.type === "tool-started") {
-		return (
-			<div className={`ev ${cls}`}>
-				<details>
-					<summary>
-						<span className="mono" style={{ color: "var(--accent)" }}>{String(ev.name)}</span>{" "}
-						<span className="muted">{toolInput(ev.input)}</span>
-					</summary>
-					<pre className="tool-out">{JSON.stringify(ev.input, null, 2)}</pre>
-				</details>
-			</div>
-		);
-	}
+	if (ev.type === "check") return <CheckRow e={e} />;
 	if (ev.type === "tool-finished") {
 		const out = String(ev.output ?? "");
 		if (!out.trim()) return null;
 		return (
-			<div className={`ev ${cls}`}>
+			<div className="ev">
 				<details>
-					<summary>
-						Result {ev.ok === false && <span style={{ color: "var(--err)" }}>(error)</span>}
-					</summary>
+					<summary>Result {ev.ok === false && <span style={{ color: "var(--err)" }}>(error)</span>}</summary>
 					<pre className="tool-out">{out.slice(0, 4000)}</pre>
 				</details>
 			</div>
 		);
 	}
 	if (ev.type === "file-changed") {
+		// Standalone file change (e.g. shell writes) — compact diff card.
+		const diff = String(ev.diff ?? "");
 		return (
-			<div className={`ev ${cls}`}>
-				<div className="file-row">± {String(ev.path)} {ev.added != null && <span className="muted">+{String(ev.added)} −{String(ev.removed ?? 0)}</span>}</div>
-				{ev.diff ? <pre className="diff">{String(ev.diff).slice(0, 8000)}</pre> : null}
-			</div>
+			<ActionCard
+				icon="⚙"
+				title={<span className="mono">{String(ev.path).split("/").pop()}</span>}
+				stats={
+					ev.added != null && (
+						<span className="act-stat"><span className="fd-add">+{String(ev.added)}</span> <span className="fd-del">−{String(ev.removed ?? 0)}</span></span>
+					)
+				}
+				done
+			>
+				{diff ? <DiffBody diff={diff} /> : null}
+			</ActionCard>
 		);
 	}
 	const text =
 		(ev.text as string) || (ev.error as string) || (ev.detail as string) || (ev.command as string) ||
 		(ev.status as string) || "";
-	// run-finished → "Changes pushed" result card: summary + file stats + GitHub link.
+	// run-finished → "Task completed" summary card: stats + GitHub link.
 	if (ev.type === "run-finished") {
-		const files = events.filter((x) => x.runId === e.runId && x.event.type === "file-changed");
+		// Skip zero-diff churn (binary/.pyc artifacts) — not meaningful changes.
+		const files = events.filter(
+			(x) => x.runId === e.runId && x.event.type === "file-changed" && Number(x.event.added ?? 0) + Number(x.event.removed ?? 0) > 0,
+		);
+		const checks = events.filter((x) => x.runId === e.runId && x.event.type === "check" && x.event.ok === true);
+		// Bubble up problems: failed tool calls + failed checks shouldn't hide
+		// behind a "Task completed" banner.
+		const issues =
+			events.filter((x) => x.runId === e.runId && x.event.type === "tool-finished" && x.event.ok === false).length +
+			events.filter((x) => x.runId === e.runId && x.event.type === "check" && x.event.ok === false).length;
 		const added = files.reduce((a, x) => a + Number(x.event.added ?? 0), 0);
 		const removed = files.reduce((a, x) => a + Number(x.event.removed ?? 0), 0);
 		const run = runs.find((r) => r.runId === e.runId);
 		const dur = run?.durationMs ? fmtDur(run.durationMs) : "";
-		const ts = e.at ? new Date(e.at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "";
+		const ts = fmtTime(e.at);
 		const summary = String(ev.text ?? ev.summary ?? "");
 		return (
-			<div className="result-card">
-				<div className="result-head">
-					<span className="avatar accent">K</span>
-					<b>Kronyx</b>
-					<span className="muted" style={{ fontSize: 12 }}>☁ Executed in cloud{dur ? ` · ${dur}` : ""}{ts ? ` · ${ts}` : ""}</span>
-				</div>
+			<div className={`result-card${issues ? " has-issues" : ""}`}>
 				<div className="result-title">
 					<span className="check-circle">✓</span>
-					<span>Changes pushed to GitHub</span>
-					<span className="status-pill completed" style={{ marginLeft: "auto" }}>Completed</span>
+					<span>Task completed</span>
+					{issues > 0 ? (
+						<span className="status-pill warn" style={{ marginLeft: "auto" }}>{issues} issue{issues > 1 ? "s" : ""}</span>
+					) : (
+						<span className="status-pill completed" style={{ marginLeft: "auto" }}>Completed</span>
+					)}
 				</div>
-				{summary && <div className="result-summary"><Md text={summary} /></div>}
-				{files.length > 0 && (
-					<>
-						<div className="result-sub"><span className="mono" style={{ fontSize: 11 }}>{"</>"}</span> Summary of changes</div>
-						<ul className="result-files">
-							{files.map((f, i) => (
-								<li key={i}>
-									<span className="mono">{String(f.event.path)}</span>{" "}
-									<span className="muted">+{String(f.event.added ?? 0)} −{String(f.event.removed ?? 0)}</span>
-								</li>
-							))}
-						</ul>
-						<div className="result-foot">
-							<span className="muted">{files.length} file{files.length > 1 ? "s" : ""} changed</span>
-							<span style={{ color: "var(--ok, #4ade80)" }}>+{added} additions</span>
-							<span style={{ color: "var(--err)" }}>−{removed} deletions</span>
-							{githubUrl && (
-								<a href={githubUrl} target="_blank" rel="noreferrer" className="btn sm" style={{ marginLeft: "auto" }}>
-									View on GitHub ↗
-								</a>
-							)}
-						</div>
-					</>
-				)}
-				{files.length === 0 && (
-					<div className="result-foot">
-						<span className="muted">0 files changed</span>
-						{githubUrl && (
-							<a href={githubUrl} target="_blank" rel="noreferrer" className="btn sm" style={{ marginLeft: "auto" }}>View on GitHub ↗</a>
-						)}
+				{issues > 0 && (
+					<div className="result-issues muted">
+						{issues} command{issues > 1 ? "s" : ""} or check{issues > 1 ? "s" : ""} failed during this run — expand the cards above to inspect.
 					</div>
 				)}
+				{summary && <div className="result-summary"><Md text={summary} /></div>}
+				<div className="result-stats">
+					{files.length > 0 && <div className="result-stat"><b>{files.length}</b><span className="muted">Files changed</span></div>}
+					<div className="result-stat"><b className="fd-add">+{added}</b><span className="muted">Lines added</span></div>
+					<div className="result-stat"><b className="fd-del">−{removed}</b><span className="muted">Lines removed</span></div>
+					{checks.length > 0 && <div className="result-stat"><b>{checks.length}</b><span className="muted">Checks passed</span></div>}
+					{issues > 0 && <div className="result-stat"><b className="fd-del">{issues}</b><span className="muted">Failed</span></div>}
+				</div>
+				<div className="result-foot">
+					<span className="muted">☁ Executed in cloud{dur ? ` · ${dur}` : ""}{ts ? ` · ${ts}` : ""}</span>
+					{githubUrl && (
+						<a href={githubUrl} target="_blank" rel="noreferrer" className="btn sm" style={{ marginLeft: "auto" }}>
+							View on GitHub ↗
+						</a>
+					)}
+				</div>
 			</div>
 		);
 	}
 	if (!text && !ev.type.startsWith("run-")) return null;
-	return (
-		<div className={`ev ${cls}`}>
-			<div className="ev-kind">{kind}{ev.type === "check" && <span style={{ color: ev.ok ? "var(--ok)" : "var(--err)" }}> · {String(ev.ok ? "passed" : "failed")}</span>}</div>
-			<span>{text}</span>
-			{ev.type === "check" && ev.output ? <pre className="tool-out">{String(ev.output)}</pre> : null}
-		</div>
-	);
-}
-
-type Worked = { kind: "worked"; items: Item[]; runId?: string; added: number; removed: number; done: boolean; key: string };
-type Block = Item | Worked;
-
-/** Group folded items into blocks: activity runs → one collapsible worked card. */
-function blocks(items: Item[]): Block[] {
-	const out: Block[] = [];
-	let cur: Worked | null = null;
-	const flush = () => { if (cur) { out.push(cur); cur = null; } };
-	for (const item of items) {
-		const isUserMsg = item.kind === "event" && item.e.event.type === "run-started";
-		const isTerminal = item.kind === "event" && (item.e.event.type === "run-finished" || item.e.event.type === "run-failed" || item.e.event.type === "plan-ready");
-		// A completed assistant message ends the current worked segment and
-		// renders top-level — each iteration is msg → worked → msg → worked.
-		const isMsg =
-			(item.kind === "stream" && item.streamKind === "assistant" && item.done) ||
-			(item.kind === "event" && item.e.event.type === "assistant-text");
-
-		if (isUserMsg || isTerminal || isMsg) {
-			if (item.kind === "event" && item.e.event.type === "run-finished" && cur) cur.done = true;
-			flush();
-			out.push(item);
-			continue;
-		}
-		// Activity → accumulate into worked card.
-		if (!cur) {
-			cur = { kind: "worked", items: [], runId: item.kind === "event" ? item.e.runId : item.runId, added: 0, removed: 0, done: false, key: `w-${item.key}` };
-		}
-		if (item.kind === "event" && item.e.event.type === "tool-started") {
-			cur.items.push({ kind: "terminal", name: String(item.e.event.name), input: item.e.event.input, toolId: String(item.e.event.id ?? ""), key: item.key, runId: item.e.runId });
-			continue;
-		}
-		if (item.kind === "event" && item.e.event.type === "tool-finished") {
-			// Pair with its started terminal card.
-			const t = [...cur.items].reverse().find((x) => x.kind === "terminal" && x.toolId === String(item.e.event.id ?? ""));
-			if (t && t.kind === "terminal") {
-				t.output = String(item.e.event.output ?? "");
-				t.ok = item.e.event.ok !== false;
-				t.durationMs = Number(item.e.event.durationMs ?? 0);
-			}
-			continue;
-		}
-		if (item.kind === "event" && item.e.event.type === "file-changed") {
-			cur.added += Number(item.e.event.added ?? 0);
-			cur.removed += Number(item.e.event.removed ?? 0);
-		}
-		cur.items.push(item);
-	}
-	flush();
-	return out;
-}
-
-/** Terminal-style tool card: `$ command` header, output body, duration + status. */
-function Terminal({ item }: { item: Extract<Item, { kind: "terminal" }> }) {
-	const inp = item.input as Record<string, unknown> | undefined;
-	const cmd = item.name === "run_command" ? String(inp?.command ?? "") : `${item.name} ${toolInput(item.input)}`;
-	const [open, setOpen] = useState(item.output === undefined);
-	return (
-		<div className="term">
-			<button className="term-head" onClick={() => setOpen((v) => !v)}>
-				<span className="caret">{open ? "▾" : "▸"}</span>
-				<span className="term-cmd mono">${cmd.length > 120 ? `${cmd.slice(0, 120)}…` : cmd}</span>
-				<span className="term-meta">
-					{item.output !== undefined && (item.ok === false ? <span className="term-err">err</span> : null)}
-					{item.durationMs !== undefined && <span className="muted">{fmtDur(item.durationMs)}</span>}
-				</span>
-			</button>
-			{open && <pre className="term-out">{(item.output ?? "").slice(0, 4000) || "…"}</pre>}
-		</div>
-	);
-}
-
-/** Editor-style diff card: filename header + colored added/removed lines. */
-function FileDiff({ e }: { e: RunEvent }) {
-	const ev = e.event;
-	const diff = String(ev.diff ?? "");
-	const lines = diff.split("\n").slice(0, 200);
-	return (
-		<div className="filediff">
-			<div className="filediff-head mono">
-				± {String(ev.path)}
-				<span className="fd-stats">
-					{ev.added != null && <span className="fd-add">+{String(ev.added)}</span>}
-					{ev.removed != null && <span className="fd-del">−{String(ev.removed)}</span>}
-				</span>
+	// Context compaction — distinct marker, not a generic info line.
+	if (ev.type === "info" && (ev.meta as { kind?: string } | undefined)?.kind === "context_compaction") {
+		return (
+			<div className="ev-line muted">
+				<span className="dot" style={{ background: "var(--amber, #facc15)" }} />
+				<span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>◈ {text}</span>
 			</div>
-			{diff && (
-				<pre className="fd-body">
-					{lines.map((l, i) => (
-						<div key={i} className={l.startsWith("+") ? "fd-l-add" : l.startsWith("-") ? "fd-l-del" : "fd-l-ctx"}>{l}</div>
-					))}
-					{diff.split("\n").length > 200 && <div className="muted">…truncated…</div>}
-				</pre>
-			)}
-		</div>
-	);
-}
-
-function fmtDur(ms: number): string {
-	const s = Math.max(1, Math.round(ms / 1000));
-	return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
-}
-
-function WorkedCard({ block, run, children }: { block: Worked; run?: RunDoc; children: React.ReactNode }) {
-	const live = !block.done && run && ["running", "queued"].includes(run.status ?? "");
-	const dur =
-		run?.durationMs ??
-		(run?.createdAt && run?.finishedAt
-			? new Date(run.finishedAt).getTime() - new Date(run.createdAt).getTime()
-			: run?.createdAt
-				? Date.now() - new Date(run.createdAt).getTime()
-				: 0);
-	const [open, setOpen] = useState(!!live);
-	useEffect(() => setOpen(!!live), [live]);
+		);
+	}
+	// Lifecycle / status events — quiet single-line muted rows.
 	return (
-		<div className="worked">
-			<button className="worked-head" onClick={() => setOpen((v) => !v)}>
-				<span className="caret">{open ? "▾" : "▸"}</span>
-				Worked{block.done && dur > 0 ? ` for ${fmtDur(dur)}` : ""}
-				{(block.added > 0 || block.removed > 0) && (
-					<span className="worked-diff"> +{block.added} −{block.removed}</span>
-				)}
-			</button>
-			{open && <div className="worked-body">{children}</div>}
+		<div className={`ev-line muted ${cls}`}>
+			<span className="dot" style={{ background: ev.type === "run-failed" ? "var(--err)" : "var(--accent)" }} />
+			<span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{text || kind}</span>
 		</div>
 	);
 }
 
-export function Timeline({ user, sessionId, events, runs, githubUrl }: { user: User; sessionId: string; events: RunEvent[]; runs: RunDoc[]; githubUrl?: string }) {
-	const items = fold(events);
-	const byRun = new Map(runs.map((r) => [r.runId, r]));
+export function Timeline({ user, sessionId, events, runs, githubUrl, active }: { user: User; sessionId: string; events: RunEvent[]; runs: RunDoc[]; githubUrl?: string; active?: boolean }) {
+	const items = pair(fold(events));
 	const renderItem = (item: Item) => {
 		if (item.kind === "stream") {
 			if (item.streamKind === "reasoning") {
-				// Thought stream: dim small text while live, collapses once done.
+				// Thought stream: grey surface while live, collapses once done.
 				return item.done ? (
 					<details key={item.key} className="ev thinking">
-						<summary>Thought process</summary>
+						<summary>Thinking</summary>
 						<Md text={item.text} />
 					</details>
 				) : (
@@ -447,40 +659,42 @@ export function Timeline({ user, sessionId, events, runs, githubUrl }: { user: U
 					</div>
 				);
 			}
-			return item.done ? (
-				<div key={item.key} className="ev assistant">
-					<div className="ev-kind">Kronyx</div>
-					<Md text={item.text} />
-				</div>
-			) : (
-				<div key={item.key} className="ev assistant streaming">
-					<div className="ev-kind">Kronyx</div>
-					<span className="stream-text">{item.text}</span>
-					<span className="stream-cursor" />
+			// Conversational agent update — K avatar + plain bubble, no card.
+			return (
+				<div key={item.key} className="msg-row">
+					<span className="avatar accent">K</span>
+					<div className="k-bubble" style={{ flex: 1 }}>
+						{item.done ? <Md text={item.text} /> : (
+							<>
+								<span className="stream-text">{item.text}</span>
+								<span className="stream-cursor" />
+							</>
+						)}
+					</div>
+					<span className="msg-time">{fmtTime(item.at)}</span>
 				</div>
 			);
 		}
-		if (item.kind === "terminal") return <Terminal key={item.key} item={item} />;
-		if (item.kind === "event" && item.e.event.type === "file-changed" && item.e.event.diff)
-			return <FileDiff key={item.key} e={item.e} />;
+		if (item.kind === "action") {
+			const isWrite = WRITE_TOOLS.has(item.name) || !!item.path;
+			if (isWrite) return <EditCard key={item.key} item={item} />;
+			return <Terminal key={item.key} item={item} />;
+		}
+		if (item.kind === "perm") return <PermissionCard key={item.key} user={user} item={item} active={!!active} />;
 		return <Event key={item.key} user={user} sessionId={sessionId} e={item.e} events={events} runs={runs} githubUrl={githubUrl} />;
 	};
 
-	const grouped = blocks(items);
-	// Dedupe display-level repeats: retry runs often replay identical replies /
-	// empty worked cards — collapse consecutive identical blocks.
-	const seen: Block[] = [];
+	// Dedupe display-level repeats: retry runs often replay identical replies —
+	// collapse identical non-event items anywhere in the feed.
+	const seen: Item[] = [];
 	const seenSigs = new Set<string>();
-	for (const b of grouped) {
+	for (const b of items) {
 		const sig =
-			b.kind === "worked"
-				? `w:${b.items.length}:${b.added}:${b.removed}:${b.items.map((i) => (i.kind === "event" ? i.e.seq : i.key)).join(",")}`
-				: b.kind === "stream"
-					? `s:${b.streamKind}:${b.text.slice(0, 120)}`
-					: b.kind === "event"
-						? `e:${b.e.runId}:${b.e.seq}`
-						: `t:${b.key}`;
-		// Dedupe identical content anywhere (retries replay same reply/work).
+			b.kind === "stream"
+				? `s:${b.streamKind}:${b.text.slice(0, 120)}`
+				: b.kind === "event"
+					? `e:${b.e.runId}:${b.e.seq}`
+					: `${b.kind}:${b.key}`;
 		if (b.kind !== "event" && seenSigs.has(sig)) continue;
 		seenSigs.add(sig);
 		seen.push(b);
@@ -488,15 +702,7 @@ export function Timeline({ user, sessionId, events, runs, githubUrl }: { user: U
 	return (
 		<div className="timeline">
 			{items.length === 0 && <div className="muted" style={{ padding: 20 }}>Waiting for events…</div>}
-			{seen.map((b) =>
-				b.kind === "worked" ? (
-					<WorkedCard key={b.key} block={b} run={b.runId ? byRun.get(b.runId) : undefined}>
-						{b.items.map(renderItem)}
-					</WorkedCard>
-				) : (
-					renderItem(b)
-				),
-			)}
+			{seen.map(renderItem)}
 		</div>
 	);
 }

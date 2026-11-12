@@ -1,5 +1,8 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { ExecResult, ProviderCreds, SandboxHandle, SandboxProvider } from "../provider";
 
 /**
@@ -60,8 +63,14 @@ export const dockerProvider: SandboxProvider = {
 	capabilities: { pause: true, reconnect: true, orphanSweep: true },
 	secretKeys: ["dockerHost"],
 
-	validate() {
-		return null; // local docker socket is the default; dockerHost optional
+	validate(creds) {
+		// Configured = explicit host, or a reachable local socket. Otherwise the
+		// provider is off — no docker CLI calls on machines without Docker.
+		if (creds.secrets.dockerHost || process.env.DOCKER_HOST) return null;
+		for (const sock of ["/var/run/docker.sock", join(homedir(), ".docker", "run", "docker.sock")]) {
+			if (existsSync(sock)) return null;
+		}
+		return "Docker not configured — no socket, DOCKER_HOST, or dockerHost secret.";
 	},
 
 	async create(creds, opts) {

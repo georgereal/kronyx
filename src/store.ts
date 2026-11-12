@@ -7,14 +7,14 @@ export type Store = Database;
 let db: Store | undefined;
 let tried = false;
 let storageDir = "";
-let wasmDir = "";
+let _wasmDir = "";
 let dbFile = "";
 
 /** Directory containing sql-wasm.wasm (the extension's dist/). */
 export function setWasmDir(dir: string): void {
-	wasmDir = dir;
+	_wasmDir = dir;
 }
-let saveTimer: ReturnType<typeof setTimeout> | undefined;
+let _saveTimer: ReturnType<typeof setTimeout> | undefined;
 let lastError = "";
 /** No-op kept for call sites — better-sqlite3 reads the shared WAL file
  *  directly, so cross-process rows are always current. */

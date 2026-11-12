@@ -44,6 +44,7 @@ export async function createSession(req: Request): Promise<Response> {
 		extraRepos?: string[];
 		securityProfile?: string;
 		provider?: string;
+		startRef?: string;
 	};
 	const repo = String(body.repo ?? "").trim();
 	const mode = ["ask", "plan", "agent"].includes(body.mode ?? "") ? body.mode! : "agent";
@@ -70,25 +71,32 @@ export async function createSession(req: Request): Promise<Response> {
 	}
 	const db = await getDb();
 	const userDoc = await db
-		.collection<{ settings?: { data?: { sandboxProvider?: string; modelDefaults?: Record<string, string> } } }>("users")
-		.findOne({ _id: uid as never }, { projection: { "settings.data.sandboxProvider": 1, "settings.data.modelDefaults": 1 } })
+		.collection<{ settings?: { data?: { sandboxProvider?: string; e2bTemplate?: string; modelDefaults?: Record<string, string> } } }>("users")
+		.findOne({ _id: uid as never }, { projection: { "settings.data.sandboxProvider": 1, "settings.data.e2bTemplate": 1, "settings.data.modelDefaults": 1 } })
 		.catch(swallow("sessions", "op", null));
 	const requested = String(body.provider ?? userDoc?.settings?.data?.sandboxProvider ?? "e2b");
 	const provider = requested in providers ? requested : "e2b";
+	// Composer template wins; otherwise the user's default applies. When both
+	// are unset the worker's LLM pick chooses from the live E2B template list.
+	const template = body.template?.slice(0, 80) || userDoc?.settings?.data?.e2bTemplate?.slice(0, 80) || null;
 	const defaultModel = userDoc?.settings?.data?.modelDefaults?.[mode] ?? null;
+	// startRef: the ref to check out at clone time (feature branch or
+	// pull/<n>/head); base stays the rebase/PR target.
+	const startRef = /^[\w./-]{1,200}$/.test(String(body.startRef ?? "")) ? String(body.startRef) : "";
 	const doc = {
 		uid,
 		sessionId,
 		title: body.title?.slice(0, 120) || repo || "New session",
 		repo: repo || null,
 		base: base || "main",
+		startRef: startRef || base || "main",
 		branch: null,
 		sandboxId: null,
 		installationId: installationId ?? null,
 		extraRepos: extraRepos.map((r) => ({ repo: r, installationId: installationIds[r] ?? null })),
-		template: body.template?.slice(0, 80) || null,
+		template,
 		provider,
-		securityProfile: body.securityProfile === "bypass" ? "bypass" : "agent",
+		securityProfile: body.securityProfile === "bypass" ? "bypass" : body.securityProfile === "controlled" ? "controlled" : "agent",
 		cloned: false,
 		mode,
 		modelId: body.modelId ?? defaultModel,
@@ -246,6 +254,74 @@ export async function openSessionPr(req: Request, p: Record<string, string>): Pr
 		ingestedAt: now,
 	});
 	return json({ runId });
+}
+
+/**
+ * GET /api/sessions/:id/usage — session-scoped usage aggregate for the
+ * context meter + history modal: per-request points per run, compaction /
+ * handoff markers from run_events, session totals, context window.
+ */
+export async function sessionUsage(req: Request, p: Record<string, string>): Promise<Response> {
+	const uid = await authenticate(req);
+	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
+	const db = await getDb();
+	const rows = await db
+		.collection("usage_events")
+		.find({ uid, session: p.id, kind: "chat" })
+		.sort({ at: 1 })
+		.project({ runId: 1, task: 1, model: 1, tokensIn: 1, tokensOut: 1, cacheRead: 1, cacheWrite: 1, reasoningTokens: 1, costUsd: 1, billedCostUsd: 1, iteration: 1, contextMsgs: 1, contextWindow: 1, at: 1 })
+		.limit(20_000)
+		.toArray();
+	const compaction = await db
+		.collection("run_events")
+		.find({ uid, sessionId: p.id, "event.meta.kind": "context_compaction" })
+		.sort({ seq: 1 })
+		.project({ runId: 1, seq: 1, "event.text": 1, "event.meta": 1, ingestedAt: 1 })
+		.limit(500)
+		.toArray();
+	const handoffs = await db
+		.collection("run_events")
+		.find({ uid, sessionId: p.id, "event.type": "info", "event.text": /^New task — carried/ })
+		.sort({ seq: 1 })
+		.project({ runId: 1, "event.text": 1, ingestedAt: 1 })
+		.limit(200)
+		.toArray();
+
+	const runMap = new Map<string, { runId: string; task: string; model: string; points: unknown[] }>();
+	let contextWindow = 0;
+	const totals = { tokensIn: 0, tokensOut: 0, cacheRead: 0, cacheWrite: 0, reasoningTokens: 0, costUsd: 0 };
+	for (const r of rows) {
+		const runId = String(r.runId ?? "");
+		let run = runMap.get(runId);
+		if (!run) runMap.set(runId, (run = { runId, task: String(r.task ?? ""), model: String(r.model ?? ""), points: [] }));
+		if (r.task && !run.task) run.task = String(r.task);
+		if (r.model && !run.model) run.model = String(r.model);
+		contextWindow = Number(r.contextWindow) || contextWindow;
+		run.points.push({
+			iteration: r.iteration ?? null,
+			requestTokens: r.tokensIn ?? 0,
+			tokensOut: r.tokensOut ?? 0,
+			contextMsgs: r.contextMsgs ?? null,
+			cacheRead: r.cacheRead ?? 0,
+			cacheWrite: r.cacheWrite ?? 0,
+			reasoningTokens: r.reasoningTokens ?? 0,
+			costUsd: r.billedCostUsd ?? r.costUsd ?? null,
+			at: r.at,
+		});
+		totals.tokensIn += Number(r.tokensIn ?? 0);
+		totals.tokensOut += Number(r.tokensOut ?? 0);
+		totals.cacheRead += Number(r.cacheRead ?? 0);
+		totals.cacheWrite += Number(r.cacheWrite ?? 0);
+		totals.reasoningTokens += Number(r.reasoningTokens ?? 0);
+		totals.costUsd += Number(r.billedCostUsd ?? r.costUsd ?? 0);
+	}
+	return json({
+		contextWindow: contextWindow || null,
+		runs: [...runMap.values()],
+		compactions: compaction.map((c) => ({ runId: c.runId, text: c.event?.text ?? "", meta: c.event?.meta ?? {}, at: c.ingestedAt })),
+		handoffs: handoffs.map((h) => ({ runId: h.runId, text: h.event?.text ?? "", at: h.ingestedAt })),
+		totals,
+	});
 }
 
 /** POST /api/sessions/:id/preflight — readiness checks for the session header. */

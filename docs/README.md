@@ -1,6 +1,6 @@
 # Kronyx project docs
 
-Kronyx is a VS Code extension that uses custom AI APIs to read, edit, verify and learn from code changes.
+Kronyx is an agentic coding platform: a VS Code extension for interactive runs and a cloud agent that works tasks to pull requests in isolated sandboxes — sharing one agent core.
 
 | Folder | Contents |
 |---|---|
