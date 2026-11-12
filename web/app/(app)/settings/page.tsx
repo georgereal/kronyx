@@ -78,6 +78,7 @@ interface SettingsDoc {
 		sandboxProvider?: string;
 		e2bTemplate?: string;
 		sandboxAutoSwitch?: boolean;
+		postRunChecks?: boolean;
 		modelDefaults?: Record<string, string>;
 		permissions?: { allow?: string[]; ask?: string[]; deny?: string[]; modes?: Record<string, { allow?: string[]; ask?: string[]; deny?: string[] }> };
 		profiles?: { name?: string; providerId?: string; baseUrl?: string; modelId?: string; enabled?: boolean }[];
@@ -128,6 +129,7 @@ export default function SettingsPage() {
 	const [sandboxProvider, setSandboxProvider] = useState("e2b");
 	const [e2bTemplate, setE2bTemplate] = useState("");
 	const [sandboxAutoSwitch, setSandboxAutoSwitch] = useState(true);
+	const [postRunChecks, setPostRunChecks] = useState(true);
 	const [modelDefaults, setModelDefaults] = useState<Record<string, string>>({});
 	type PermScope = "global" | "ask" | "plan" | "agent";
 	const emptyPermText = () => ({ allow: "", ask: "", deny: "" });
@@ -215,6 +217,7 @@ export default function SettingsPage() {
 				setSandboxProvider(settings?.data?.sandboxProvider ?? "e2b");
 				setE2bTemplate(settings?.data?.e2bTemplate ?? "");
 				setSandboxAutoSwitch(settings?.data?.sandboxAutoSwitch !== false);
+				setPostRunChecks(settings?.data?.postRunChecks !== false);
 				setModelDefaults(settings?.data?.modelDefaults ?? {});
 				const toText = (r?: { allow?: string[]; ask?: string[]; deny?: string[] }) => ({
 					allow: (r?.allow ?? []).join("\n"),
@@ -231,7 +234,7 @@ export default function SettingsPage() {
 				// PUT replaces settings.data wholesale — retain keys this page doesn't own
 				// (providerId/baseUrl/modelId synced by the extension) so saving here
 				// doesn't wipe them.
-				const { activeProfile: _a, sandboxProvider: _s, e2bTemplate: _t, sandboxAutoSwitch: _sw, modelDefaults: _m, permissions: _p, profiles: _pr, ...rest } =
+				const { activeProfile: _a, sandboxProvider: _s, e2bTemplate: _t, sandboxAutoSwitch: _sw, postRunChecks: _pc, modelDefaults: _m, permissions: _p, profiles: _pr, ...rest } =
 					(settings?.data ?? {}) as Record<string, unknown>;
 				setDataExtras(rest);
 			}
@@ -339,6 +342,7 @@ export default function SettingsPage() {
 					sandboxProvider,
 					e2bTemplate: e2bTemplate || undefined,
 					sandboxAutoSwitch,
+					postRunChecks,
 					modelDefaults,
 					permissions: (() => {
 						const toList = (t: { allow: string; ask: string; deny: string }) => ({
@@ -622,6 +626,12 @@ export default function SettingsPage() {
 					</div>
 				);
 			})}
+			<Field label="Post-run checks" hint="after the agent finishes: push, open the PR, then run tests + boot smoke">
+				<label className="radio-row">
+					<input type="checkbox" checked={postRunChecks} onChange={(e) => setPostRunChecks(e.target.checked)} />
+					Run verification (npm test / app boot) after cloud runs
+				</label>
+			</Field>
 		</>
 	);
 

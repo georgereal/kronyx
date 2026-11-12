@@ -81,6 +81,12 @@ export interface RunExecutor {
 const slugify = (s: string) =>
 	s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 32) || "run";
 
+/** The VM is gone (EOL/killed) — distinct from a task error; the tail retries on a fresh VM. */
+const isSandboxDeath = (err: unknown): boolean => {
+	const m = err instanceof Error ? err.message : String(err);
+	return /sandbox (was )?not found|connection to sandbox|killed or reached its|sandbox died/i.test(m);
+};
+
 /** Executor that orchestrates the agent loop on the worker with remote file tools in E2B. */
 /** Live routing for a cached runner — rebound to the current run's job/sink. */
 interface RunnerRoute {
@@ -161,6 +167,12 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	/** The run's current sandbox (rebound on switch_environment) + its keepalive. */
 	private activeSbx: SandboxCore | undefined;
 	private keepaliveTimer: ReturnType<typeof setInterval> | undefined;
+	/** Agent's run-finished text — carried into the run-completed card. */
+	private lastRunSummary = "";
+	/** Per-run outcome rollup for the run-completed event. */
+	private lastPrUrl: string | undefined;
+	private lastPushed = false;
+	private readonly runChecks: { command: string; ok: boolean }[] = [];
 
 	/** Extend E2B lifetime + refresh janitor activity every 10 min while a run
 	 *  is in flight — `lastActivityAt` is otherwise only stamped once at run
@@ -473,6 +485,8 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	 * become delta rows in usage_events so the web Usage page sees cloud runs.
 	 */
 	private trackUsage(e: RunViewEvent, job: CloudJob, agentIndex = 0): void {
+		// The main agent's closing report — the run-completed card reuses it.
+		if (e.type === "run-finished" && agentIndex === 0) this.lastRunSummary = String(e.text ?? "");
 		let L = this.usageLedgers.get(agentIndex);
 		if (!L) {
 			L = {
@@ -673,12 +687,25 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			.collection<SessionDoc>("sessions")
 			.findOne({ uid: job.uid, sessionId: job.sessionId });
 		if (!session) throw new Error("Session not found.");
+		this.lastRunSummary = "";
+		this.lastPrUrl = undefined;
+		this.lastPushed = false;
+		this.runChecks.length = 0;
 		try {
-			if (job.kind === "push-plan") return await this.pushPlan(job, session, settings);
-			if (job.kind === "open-pr") return await this.openPrJob(job, session, settings);
-			if (job.mode === "ask") return await this.ask(job, session, settings);
-			if (job.mode === "multi") return await this.multi(job, session, settings);
-			return await this.sandboxed(job, session, settings);
+			if (job.kind === "push-plan") await this.pushPlan(job, session, settings);
+			else if (job.kind === "open-pr") await this.openPrJob(job, session, settings);
+			else if (job.mode === "ask") await this.ask(job, session, settings);
+			else if (job.mode === "multi") await this.multi(job, session, settings);
+			else await this.sandboxed(job, session, settings);
+			// True job end — the UI's single "completed" signal. run-finished is
+			// only the agent's summary; this fires after push/PR/verify all land.
+			await this.sink.emit({
+				type: "run-completed",
+				summary: this.lastRunSummary,
+				prUrl: this.lastPrUrl ?? session.prUrl,
+				pushed: this.lastPushed,
+				checks: this.runChecks,
+			});
 		} finally {
 			this.stopSandboxKeepalive();
 		}
@@ -811,10 +838,19 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				connected = !!(await sbx.connect(oldId, creds, providerName));
 			}
 			if (connected) {
-				await sbx.keepalive(60);
-				dbg("sandbox", "reused", { sandboxId: oldId });
-				await this.sink.emit({ type: "info", text: `Reused warm sandbox ${oldId}` });
-				return sbx;
+				// connect() returning a handle proves nothing — a VM at
+				// end-of-life can accept the handshake then die under load.
+				const alive = await sbx
+					.runIn("/", "echo ok", 15_000)
+					.then((r) => r.stdout.includes("ok"))
+					.catch(() => false);
+				if (alive) {
+					await sbx.keepalive(60);
+					dbg("sandbox", "reused", { sandboxId: oldId });
+					await this.sink.emit({ type: "info", text: `Reused warm sandbox ${oldId}` });
+					return sbx;
+				}
+				dbg("sandbox", "connected but unresponsive", { sandboxId: oldId });
 			}
 			dbg("sandbox", "unreachable after retries", { sandboxId: oldId });
 		}
@@ -884,45 +920,11 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		return sbx;
 	}
 
-	/** Shared sandboxed-run prologue: provider → sandbox → clone → attachments →
-	 *  branch/preflight. Both `sandboxed` (single agent) and `multi` use it. */
-	private async prepareSandboxed(
-		job: CloudJob,
-		session: SessionDoc,
-		settings: UserSettings,
-	): Promise<{
-		provider: ProviderSettings;
-		sbx: SandboxCore;
-		token: string;
-		atts: { filename: string; mime: string; text?: string; data?: Buffer }[];
-		mode: AgentMode;
-	}> {
-		this.throwIfStopped();
-		const resolved = resolveProvider(settings, job);
-		if (resolved.error) throw new Error(resolved.error);
-		const provider = resolved.settings!;
-		this.runProvider = provider;
-		await this.loadPricing(provider);
-		this.sink.mask(provider.apiKey);
-		this.embedProvider = this.embedProviderFor(job, provider);
-		// Stamp sandbox activity — the janitor's idle-pause reads this, not ticks.
-		if (session.sandboxId) {
-			await this.db
-				.collection("sandboxes")
-				.updateOne({ uid: this.sink.uid, sandboxId: session.sandboxId }, { $set: { lastActivityAt: new Date() } })
-				.catch(swallow("executor", "op"));
-		}
-		const mode: AgentMode =
-			job.mode === "plan" ? "plan" : session.securityProfile === "bypass" ? "bypass" : "smart";
-		await this.sink.emit({ type: "cloud-status", text: "Starting sandbox…" });
-		let sbx = await this.ensureSandbox(session, settings, { llm: provider, task: job.task });
-		this.startSandboxKeepalive(sbx);
-		this.throwIfStopped();
-		const token = await this.githubToken(session, settings);
-		this.sink.mask(token);
-
-		// The cloned flag can desync from reality (new/empty sandbox after an
-		// expired one) — verify the repo dir actually exists before trusting it.
+	/** Shared "repo exists, valid, and on the session branch" — used by
+	 *  sandboxed runs, open-pr/push-plan jobs, and post-death resurrection.
+	 *  The `cloned` flag can desync from reality (new/empty sandbox after an
+	 *  expired one), so the repo dir is probed before it's trusted. */
+	private async ensureRepoReady(session: SessionDoc, sbx: SandboxCore, token: string): Promise<void> {
 		if (session.cloned) {
 			// `test -d .git` alone passes on an interrupted clone (.git exists, empty
 			// worktree). Require a *valid* repo via git status, then repair an empty
@@ -960,6 +962,77 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			await this.sink.emit({ type: "cloud-status", text: `Cloning ${session.repo}…` });
 			await this.cloneStart(session, sbx, token);
 		}
+		// A (re)clone lands on the default/start ref — an existing session
+		// branch must be checked out and reconciled first, or reconcile math
+		// (`origin/<branch>..HEAD`) compares it against `main` by accident.
+		if (session.branch) {
+			const cur = await sbx.runIn(REPO_DIR, "git rev-parse --abbrev-ref HEAD", 15_000).catch(swallow("executor", "op"));
+			if (cur?.stdout.trim() !== session.branch) {
+				// A dirty worktree can block the switch — stash it first, then
+				// restore (mirrors reconcileBranch's autosave approach).
+				const dirty = (await sbx.runIn(REPO_DIR, "git status --porcelain", 15_000).catch(swallow("executor", "op")))?.stdout.trim() !== "";
+				let stashed = false;
+				if (dirty) {
+					const st = await sbx.runIn(REPO_DIR, "git stash push -m kronyx-branch-switch", 30_000).catch(swallow("executor", "op"));
+					stashed = st?.exitCode === 0 && !st.stdout.includes("No local changes");
+				}
+				const r = await sbx
+					.runIn(
+						REPO_DIR,
+						`git fetch origin && (git checkout ${JSON.stringify(session.branch)} || git checkout -B ${JSON.stringify(session.branch)} origin/${session.branch})`,
+						90_000,
+					)
+					.catch(swallow("executor", "op"));
+				if (!r || r.exitCode !== 0)
+					await this.sink.emit({ type: "info", text: `Could not check out ${session.branch} — staying on the local checkout.` });
+				if (stashed) {
+					const pop = await sbx.runIn(REPO_DIR, "git stash pop", 30_000).catch(swallow("executor", "op"));
+					if (pop?.exitCode !== 0)
+						await this.sink.emit({ type: "info", text: "Stashed changes couldn't be auto-restored after the branch switch — kept in `git stash`." });
+				}
+			}
+			await this.reconcileBranch(session, sbx);
+		}
+	}
+
+	/** Shared sandboxed-run prologue: provider → sandbox → clone → attachments →
+	 *  branch/preflight. Both `sandboxed` (single agent) and `multi` use it. */
+	private async prepareSandboxed(
+		job: CloudJob,
+		session: SessionDoc,
+		settings: UserSettings,
+	): Promise<{
+		provider: ProviderSettings;
+		sbx: SandboxCore;
+		token: string;
+		atts: { filename: string; mime: string; text?: string; data?: Buffer }[];
+		mode: AgentMode;
+	}> {
+		this.throwIfStopped();
+		const resolved = resolveProvider(settings, job);
+		if (resolved.error) throw new Error(resolved.error);
+		const provider = resolved.settings!;
+		this.runProvider = provider;
+		await this.loadPricing(provider);
+		this.sink.mask(provider.apiKey);
+		this.embedProvider = this.embedProviderFor(job, provider);
+		// Stamp sandbox activity — the janitor's idle-pause reads this, not ticks.
+		if (session.sandboxId) {
+			await this.db
+				.collection("sandboxes")
+				.updateOne({ uid: this.sink.uid, sandboxId: session.sandboxId }, { $set: { lastActivityAt: new Date() } })
+				.catch(swallow("executor", "op"));
+		}
+		const mode: AgentMode =
+			job.mode === "plan" ? "plan" : session.securityProfile === "bypass" ? "bypass" : "smart";
+		await this.sink.emit({ type: "cloud-status", text: "Starting sandbox…" });
+		let sbx = await this.ensureSandbox(session, settings, { llm: provider, task: job.task });
+		this.startSandboxKeepalive(sbx);
+		this.throwIfStopped();
+		const token = await this.githubToken(session, settings);
+		this.sink.mask(token);
+
+		await this.ensureRepoReady(session, sbx, token);
 
 		const atts = await this.attachments(job);
 		if (job.planSlug) {
@@ -982,12 +1055,9 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		if (mode !== "plan") {
 			await this.ensureBranch(job, session, sbx, token);
 			await this.preflight(job, session, sbx, token, settings);
-		} else if (session.branch) {
-			// Plan after an implement: read the session's feature branch — but
-			// reconcile it first; a bare local checkout can sit behind origin.
-			await sbx.runIn(REPO_DIR, `git checkout ${JSON.stringify(session.branch)}`, 60_000).catch(swallow("executor", "op"));
-			await this.reconcileBranch(session, sbx);
 		}
+		// Plan mode: the session branch (when it exists) was already checked
+		// out and reconciled by ensureRepoReady — nothing further to do.
 
 		return { provider, sbx, token, atts, mode };
 	}
@@ -1111,16 +1181,62 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			return;
 		}
 		this.throwIfStopped();
-		// Checkpoint: committed work goes remote BEFORE the risky tail — a
-		// sandbox death during verify/push loses only the verify output.
-		await sbx
-			.commitAndPush(REPO_DIR, session.branch!, "kronyx: checkpoint before verify", COMMIT_EXCLUDES)
-			.catch(async () => this.sink.emit({ type: "info", text: "Checkpoint push failed — continuing to verify." }));
-		await this.sink.patchRun({ status: "verifying" }).catch(swallow("executor", "op"));
-		await this.verify(sbx);
-		this.throwIfStopped();
-		await this.sink.patchRun({ status: "pushing" }).catch(swallow("executor", "op"));
-		await this.pushAndPr(job, session, settings, sbx, token);
+		await this.runTail(job, session, settings, () => sbx, (next) => {
+			sbx = next;
+			this.activeSbx = next;
+			live.handle = next.inner!;
+		}, token);
+	}
+
+	/**
+	 * Post-run tail: checkpoint commit+push → pushAndPr → verify. The PR opens
+	 * BEFORE verify so a dying VM or a failing check can't block it (verify
+	 * results still land in the run-completed card). The VM can die at any
+	 * point — on sandbox death recreate + reclone the pushed branch and retry
+	 * once; only uncommitted work is lost.
+	 */
+	private async runTail(
+		job: CloudJob,
+		session: SessionDoc,
+		settings: UserSettings,
+		getSbx: () => SandboxCore,
+		setSbx: (next: SandboxCore) => void,
+		token: string,
+	): Promise<void> {
+		for (let attempt = 0; ; attempt++) {
+			const sbx = getSbx();
+			try {
+				// Checkpoint: committed work goes remote FIRST — the pushed
+				// branch is the only durable state in an ephemeral VM.
+				if (session.branch) {
+					await sbx
+						.commitAndPush(REPO_DIR, session.branch, "kronyx: checkpoint before verify", COMMIT_EXCLUDES)
+						.catch(async () => this.sink.emit({ type: "info", text: "Checkpoint push failed — continuing." }));
+				}
+				await this.sink.patchRun({ status: "pushing" }).catch(swallow("executor", "op"));
+				await this.pushAndPr(job, session, settings, sbx, token);
+				this.throwIfStopped();
+				if (settings.data.postRunChecks !== false) {
+					await this.sink.patchRun({ status: "verifying" }).catch(swallow("executor", "op"));
+					await this.verify(sbx);
+				}
+				return;
+			} catch (err) {
+				if (attempt > 0 || !isSandboxDeath(err) || this.stopRequested) throw err;
+				await this.sink.emit({
+					type: "info",
+					text: "Sandbox died during the run tail — recreating and resuming from the pushed branch (uncommitted changes were lost).",
+				});
+				// Drop the dead id so ensureSandbox creates instead of reconnecting.
+				session.sandboxId = undefined;
+				session.cloned = false;
+				await this.sink.patchSession({ sandboxId: null, cloned: false });
+				const next = await this.ensureSandbox(session, settings);
+				setSbx(next);
+				this.startSandboxKeepalive(next);
+				await this.ensureRepoReady(session, next, token);
+			}
+		}
 	}
 
 	// ------------------------------------------------------------------
@@ -1129,7 +1245,8 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 
 	private async multi(job: CloudJob, session: SessionDoc, settings: UserSettings): Promise<void> {
 		const ctx = await this.prepareSandboxed(job, session, settings);
-		const { provider, sbx, token, atts, mode } = ctx;
+		const { provider, token, atts, mode } = ctx;
+		let sbx = ctx.sbx;
 		this.throwIfStopped();
 		// Sweep stale state from a previously killed multi run: slice worktrees,
 		// and any open merge/rebase or leftover edits in the main checkout —
@@ -1438,16 +1555,10 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		this.throwIfStopped();
 		await this.afterRun(job);
 		this.throwIfStopped();
-		// Checkpoint the merged fan-in tree before verify — same durability
-		// argument as the single-agent tail.
-		await sbx
-			.commitAndPush(REPO_DIR, session.branch!, "kronyx: checkpoint before verify", COMMIT_EXCLUDES)
-			.catch(async () => this.sink.emit({ type: "info", text: "Checkpoint push failed — continuing to verify." }));
-		await this.sink.patchRun({ status: "verifying" }).catch(swallow("executor", "op"));
-		await this.verify(sbx);
-		this.throwIfStopped();
-		await this.sink.patchRun({ status: "pushing" }).catch(swallow("executor", "op"));
-		await this.pushAndPr(job, session, settings, sbx, token);
+		await this.runTail(job, session, settings, () => sbx, (next) => {
+			sbx = next;
+			this.activeSbx = next;
+		}, token);
 	}
 
 	/**
@@ -1822,6 +1933,10 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	}
 
 	private async verify(sbx: SandboxCore): Promise<string> {
+		// A dead VM must not emit fake "check failed" rows — throw so runTail
+		// recreates the sandbox, reclones the branch, and retries.
+		const alive = await sbx.runIn("/", "echo ok", 15_000).catch(() => undefined);
+		if (!alive?.stdout.includes("ok")) throw new Error("Sandbox died before post-run verification");
 		const probe = await sbx
 			.runIn(REPO_DIR, "ls package.json go.mod requirements.txt pyproject.toml 2>/dev/null || true")
 			.catch(swallow("executor", "op", ({ stdout: "", exitCode: 1, stderr: "" })));
@@ -1841,12 +1956,14 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			if (!hasModules?.stdout.includes("yes")) skipped = "skipped — no node_modules in the clone";
 		}
 		if (skipped) {
+			this.runChecks.push({ command: cmd, ok: true });
 			await this.sink.emit({ type: "check", command: cmd, ok: true, durationMs: 0, output: skipped });
 			results.push(`${cmd} → ${skipped}`);
 		} else if (cmd) {
 			await this.sink.emit({ type: "cloud-status", text: `Verifying: ${cmd}` });
 			const r = await sbx.runIn(REPO_DIR, cmd, 300_000).catch(swallow("executor", "op"));
 			const ok = !!r && r.exitCode === 0;
+			this.runChecks.push({ command: cmd, ok });
 			await this.sink.emit({ type: "check", command: cmd, ok, durationMs: 0, output: (r?.stdout || r?.stderr || "").slice(0, 1000) });
 			results.push(`${cmd} → ${ok ? "passed" : "failed"}`);
 		}
@@ -1860,8 +1977,13 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		let start = "";
 		if (probe.includes("package.json")) {
 			const pkg = await sbx.runIn(REPO_DIR, "cat package.json | grep -oE '\"(start|dev)\":[^,}]*' | head -3").catch(swallow("executor", "op"));
-			if (pkg?.stdout.includes("\"dev\"")) start = "npm run dev";
-			else if (pkg?.stdout.includes("\"start\"")) start = "npm start";
+			const lines = (pkg?.stdout ?? "").split("\n");
+			const line = lines.find((l) => l.includes("\"dev\"")) ?? lines.find((l) => l.includes("\"start\""));
+			// Scripts that boot a non-HTTP app (extension host, desktop) never
+			// bind a port — the poll would report a false failure every run.
+			if (line && !/extensionDevelopmentPath|electron|tauri|vscode-test|extensionTests/i.test(line)) {
+				start = line.includes("\"dev\"") ? "npm run dev" : "npm start";
+			}
 		} else if (probe.includes("requirements.txt") || probe.includes("pyproject.toml")) {
 			const hasMain = await sbx.runIn(REPO_DIR, "ls main.py app.py 2>/dev/null || true").catch(swallow("executor", "op"));
 			const f = hasMain?.stdout.trim().split("\n").find((l) => l.includes(".py"));
@@ -1884,12 +2006,14 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		const port = found?.stdout.trim();
 		if (!found || found.exitCode !== 0 || !port) {
 			const log = (await sbx.runIn("/", "tail -20 /tmp/kronyx-app.log").catch(swallow("executor", "op")))?.stdout ?? "";
+			this.runChecks.push({ command: `boot: ${start}`, ok: false });
 			await this.sink.emit({ type: "check", command: `boot: ${start}`, ok: false, durationMs: 20_000, output: log.slice(0, 800) });
 			return "boot → failed (no port)";
 		}
 		const resp = await sbx.runIn("/", `curl -s -o /dev/null -w "%{http_code}" -m 5 http://localhost:${port}`).catch(swallow("executor", "op"));
 		const code = resp?.stdout.trim() ?? "000";
 		const ok = code.startsWith("2") || code.startsWith("3");
+		this.runChecks.push({ command: `boot: ${start}`, ok });
 		await this.sink.emit({ type: "check", command: `boot: ${start} (port ${port}, HTTP ${code})`, ok, durationMs: 0, output: "" });
 		await this.captureScreenshot(sbx, `http://localhost:${port}`);
 		return `boot → ${ok ? "passed" : "failed"} (:${port} → ${code})`;
@@ -1934,11 +2058,18 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		// commits over base — an agent that changed nothing must not produce
 		// an empty PR (e.g. it reported an environment limitation).
 		if (!dirty && session.branch && session.base) {
+			// origin/<base> may be missing locally (aged/single-branch clone) —
+			// fetch first so the ahead count is meaningful.
+			await sbx.runIn(REPO_DIR, `git fetch origin ${JSON.stringify(session.base)}`, 60_000).catch(swallow("executor", "op"));
 			const ahead = await sbx
 				.runIn(REPO_DIR, `git rev-list --count origin/${session.base}..HEAD 2>/dev/null || git rev-list --count ${session.base}..HEAD`, 30_000)
 				.catch(swallow("executor", "op"));
-			const commits = Number(ahead?.stdout.trim()) || 0;
-			if (commits === 0) {
+			const commits = Number(ahead?.stdout.trim());
+			if (!ahead || ahead.exitCode !== 0 || Number.isNaN(commits)) {
+				// An uncomputable count used to collapse to 0 and report "no
+				// changes" even on a branch with commits — push instead.
+				await this.sink.emit({ type: "info", text: "Couldn't compute commits ahead of base — attempting push/PR anyway." });
+			} else if (commits === 0) {
 				await this.sink.emit({ type: "info", text: "No changes on the branch — skipping PR." });
 				return;
 			}
@@ -1980,6 +2111,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		await this.sink.emit({ type: "cloud-status", text: wantPr ? "Pushing branch and opening PR…" : `Pushing commits to ${session.branch}…` });
 		try {
 			await sbx.commitAndPush(REPO_DIR, session.branch, `kronyx: ${job.task.slice(0, 60)}`, COMMIT_EXCLUDES);
+			this.lastPushed = true;
 		} catch (err) {
 			// Remote moved since run start — try fetch + rebase, then one retry.
 			const msg = err instanceof Error ? err.message : String(err);
@@ -1992,6 +2124,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				);
 			}
 			await sbx.commitAndPush(REPO_DIR, session.branch, `kronyx: ${job.task.slice(0, 60)}`, COMMIT_EXCLUDES);
+			this.lastPushed = true;
 		}
 		if (!wantPr) {
 			await this.sink.emit({ type: "cloud-status", text: `Pushed to ${session.branch}.` });
@@ -2044,6 +2177,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			`Automated change by Kronyx cloud session.\n\nTask: ${job.task}`,
 			token,
 		);
+		this.lastPrUrl = pr.url;
 		await this.sink.patchSession({ prUrl: pr.url });
 		await this.db.collection("prs").updateOne(
 			{ uid: job.uid, runId: job.runId },
@@ -2056,10 +2190,17 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	/** Open a PR for the session branch (explicit user action — not automatic). */
 	private async openPrJob(job: CloudJob, session: SessionDoc, settings: UserSettings): Promise<void> {
 		dbg("run", "openPrJob", { runId: job.runId, branch: session.branch, base: session.base });
-		const sbx = await this.ensureSandbox(session, settings);
+		let sbx = await this.ensureSandbox(session, settings);
+		this.startSandboxKeepalive(sbx);
 		const token = await this.githubToken(session, settings);
 		this.sink.mask(token);
-		await this.pushAndPr(job, session, settings, sbx, token);
+		// A fresh/recreated sandbox has no repo — clone and land on the session
+		// branch first, or pushAndPr sees an empty tree and skips the PR.
+		await this.ensureRepoReady(session, sbx, token);
+		await this.runTail(job, session, settings, () => sbx, (next) => {
+			sbx = next;
+			this.activeSbx = next;
+		}, token);
 		dbg("run", "openPrJob done", { runId: job.runId });
 	}
 
@@ -2067,17 +2208,29 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	private async pushPlan(job: CloudJob, session: SessionDoc, settings: UserSettings): Promise<void> {
 		const plan = await this.db.collection("plans").findOne({ uid: job.uid, sessionId: job.sessionId, slug: job.planSlug });
 		if (!plan) throw new Error("Plan not found.");
-		const sbx = await this.ensureSandbox(session, settings);
+		let sbx = await this.ensureSandbox(session, settings);
+		this.startSandboxKeepalive(sbx);
 		const token = await this.githubToken(session, settings);
 		this.sink.mask(token);
-		if (!session.cloned) {
-			if (!session.repo || !token) throw new Error("No repository or GitHub credential on this session.");
-			await this.cloneStart(session, sbx, token);
+		for (let attempt = 0; ; attempt++) {
+			try {
+				await this.ensureRepoReady(session, sbx, token);
+				await this.ensureBranch(job, session, sbx, token);
+				await sbx.writeFile(`${REPO_DIR}/.kronyx/plans/${job.planSlug}.md`, String(plan.markdown));
+				await sbx.runIn(REPO_DIR, "mkdir -p .kronyx/plans").catch(swallow("executor", "op"));
+				await sbx.commitAndPush(REPO_DIR, session.branch!, `kronyx: plan ${job.planSlug}`, COMMIT_EXCLUDES);
+				this.lastPushed = true;
+				await this.sink.emit({ type: "info", text: `Pushed .kronyx/plans/${job.planSlug}.md to ${session.branch}` });
+				return;
+			} catch (err) {
+				if (attempt > 0 || !isSandboxDeath(err) || this.stopRequested) throw err;
+				await this.sink.emit({ type: "info", text: "Sandbox died — recreating and retrying the plan push." });
+				session.sandboxId = undefined;
+				session.cloned = false;
+				await this.sink.patchSession({ sandboxId: null, cloned: false });
+				sbx = await this.ensureSandbox(session, settings);
+				this.startSandboxKeepalive(sbx);
+			}
 		}
-		await this.ensureBranch(job, session, sbx, token);
-		await sbx.writeFile(`${REPO_DIR}/.kronyx/plans/${job.planSlug}.md`, String(plan.markdown));
-		await sbx.runIn(REPO_DIR, "mkdir -p .kronyx/plans").catch(swallow("executor", "op"));
-		await sbx.commitAndPush(REPO_DIR, session.branch!, `kronyx: plan ${job.planSlug}`, COMMIT_EXCLUDES);
-		await this.sink.emit({ type: "info", text: `Pushed .kronyx/plans/${job.planSlug}.md to ${session.branch}` });
 	}
 }

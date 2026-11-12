@@ -22,7 +22,8 @@ const KIND: Record<string, string> = {
 	"mode-blocked": "Mode",
 	"loop-detected": "Stopped",
 	"run-stopping": "Stopping",
-	"run-finished": "Done",
+	"run-finished": "Summary",
+	"run-completed": "Completed",
 	"run-failed": "Failed",
 };
 
@@ -590,8 +591,13 @@ function Event({ user, sessionId, e, events, runs, githubUrl }: { user: User; se
 	const text =
 		(ev.text as string) || (ev.error as string) || (ev.detail as string) || (ev.command as string) ||
 		(ev.status as string) || "";
-	// run-finished → "Task completed" summary card: stats + GitHub link.
-	if (ev.type === "run-finished") {
+	// run-completed → the completion card (agent summary + outcome rollup).
+	// run-finished is only the agent's report — once run-completed lands it's
+	// folded into that card. Legacy runs lack the event: the run-finished card
+	// is still the run's completion view for them.
+	const hasRunCompleted = events.some((x) => x.runId === e.runId && x.event.type === "run-completed");
+	if (ev.type === "run-finished" && hasRunCompleted) return null;
+	if (ev.type === "run-completed" || ev.type === "run-finished") {
 		// Skip zero-diff churn (binary/.pyc artifacts) — not meaningful changes.
 		const files = events.filter(
 			(x) => x.runId === e.runId && x.event.type === "file-changed" && Number(x.event.added ?? 0) + Number(x.event.removed ?? 0) > 0,
@@ -607,16 +613,26 @@ function Event({ user, sessionId, e, events, runs, githubUrl }: { user: User; se
 		const run = runs.find((r) => r.runId === e.runId);
 		const dur = run?.durationMs ? fmtDur(run.durationMs) : "";
 		const ts = fmtTime(e.at);
-		const summary = String(ev.text ?? ev.summary ?? "");
+		const summary = String(ev.summary ?? ev.text ?? "");
+		// Our rollup of the non-agent outcomes (the "other items") — the agent
+		// summary above is its own report; this is what the job itself did.
+		const rollup: string[] = [];
+		if (ev.type === "run-completed") {
+			if (ev.pushed) rollup.push("Changes pushed");
+			if (ev.prUrl) rollup.push("PR opened");
+			const cl = Array.isArray(ev.checks) ? (ev.checks as { ok: boolean }[]) : [];
+			const ok = cl.filter((c) => c.ok).length;
+			if (cl.length) rollup.push(`${ok}/${cl.length} checks passed`);
+		}
 		return (
 			<div className={`result-card${issues ? " has-issues" : ""}`}>
 				<div className="result-title">
 					<span className="check-circle">✓</span>
-					<span>Task completed</span>
+					<span>{ev.type === "run-completed" || run?.status === "completed" ? "Task completed" : "Agent summary"}</span>
 					{issues > 0 ? (
 						<span className="status-pill warn" style={{ marginLeft: "auto" }}>{issues} issue{issues > 1 ? "s" : ""}</span>
 					) : (
-						<span className="status-pill completed" style={{ marginLeft: "auto" }}>Completed</span>
+						<span className="status-pill completed" style={{ marginLeft: "auto" }}>{run?.status === "completed" ? "Completed" : "Summary"}</span>
 					)}
 				</div>
 				{issues > 0 && (
@@ -625,6 +641,7 @@ function Event({ user, sessionId, e, events, runs, githubUrl }: { user: User; se
 					</div>
 				)}
 				{summary && <div className="result-summary"><Md text={summary} /></div>}
+				{rollup.length > 0 && <div className="result-summary muted" style={{ fontSize: 12 }}>{rollup.join(" · ")}</div>}
 				<div className="result-stats">
 					{files.length > 0 && <div className="result-stat"><b>{files.length}</b><span className="muted">Files changed</span></div>}
 					<div className="result-stat"><b className="fd-add">+{added}</b><span className="muted">Lines added</span></div>

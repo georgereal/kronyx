@@ -26,7 +26,7 @@ Env: backend reads `backend/.env` (copy of `web/.env.local` — MONGODB_URI, FIR
 
 ## Cloud agent data flow
 
-`POST /api/sessions` → `POST /api/sessions/:id/messages` enqueues `cloud_jobs` → worker claims → E2B sandbox (clone, attachments, branch `kronyx/<slug>-<id>` at first agent run, drift rebase, verify, push, `openPr`) → `run_events` → UI polls (3s) or SSE `?stream=1&token=<idToken>`.
+`POST /api/sessions` → `POST /api/sessions/:id/messages` enqueues `cloud_jobs` → worker claims → E2B sandbox (clone, attachments, branch `kronyx/<slug>-<id>` at first agent run, drift rebase, checkpoint push, `openPr`, then optional verify) → `run_events` → UI polls (3s) or SSE `?stream=1&token=<idToken>`. Sandboxes are ephemeral — the tail recreates + reclones + retries once on VM death; "completed" is the `run-completed` event at job end (run-finished is only the agent's summary).
 
 Modes: `ask` = no sandbox (chat only); `plan` = read-only sandbox + `save_plan` → `plans` collection (UI card: Implement / Push to branch); `agent` = full writes → PR. Attachments: ≤20KB text inlined, all files land in `.kronyx/attachments/` (excluded from commits, along with `.kronyx/shots/` browser screenshots).
 

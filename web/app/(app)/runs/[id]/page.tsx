@@ -32,6 +32,7 @@ const KIND: Record<string, string> = {
 	checks: "Checks",
 	status: "Status",
 	"run-finished": "Run finished",
+	"run-completed": "Run completed",
 	"run-failed": "Run failed",
 };
 
