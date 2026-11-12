@@ -135,6 +135,13 @@ export async function runJanitorSweep(db: Db): Promise<{ users: number; killed: 
 	const idlePauseCutoff = new Date(Date.now() - IDLE_PAUSE_MIN * 60_000);
 	let killed = 0;
 	let paused = 0;
+	// Never pause a sandbox under a live run — lastActivityAt is only a
+	// heartbeat; activeRunId is the ground truth for "work in flight".
+	const busySessions = new Set(
+		(await db.collection("sessions").find({ activeRunId: { $ne: null } }).project({ sessionId: 1, uid: 1 }).toArray()).map(
+			(s) => `${s.uid}:${s.sessionId}`,
+		),
+	);
 	// Idle pause — durable backstop for the in-process timer (dies on restarts).
 	const idleRows = await db
 		.collection("sandboxes")
@@ -144,6 +151,7 @@ export async function runJanitorSweep(db: Db): Promise<{ users: number; killed: 
 		})
 		.toArray();
 	for (const row of idleRows) {
+		if (row.sessionId && busySessions.has(`${row.uid}:${row.sessionId}`)) continue;
 		const provider = providerFor(row);
 		if (!provider.capabilities.pause || !provider.pauseById) continue;
 		const ok = await provider.pauseById(String(row.sandboxId), credsFor(row.uid)).catch(swallow("misc", "op", false));

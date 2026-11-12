@@ -42,6 +42,13 @@ export class SandboxCore {
 		}, this.idleMinutes * 60_000);
 	}
 
+	/** Activity resets the idle-pause countdown — a live run must never be
+	 *  paused out from under itself (previously the timer only armed at
+	 *  create/connect, so it fired mid-run regardless of activity). */
+	private touch(): void {
+		if (this.handle) this.armIdlePause();
+	}
+
 	/** Pause the sandbox (snapshot filesystem/memory); resumes via connect(). */
 	async pause(): Promise<boolean> {
 		if (!this.handle || !this.provider.pauseById) return false;
@@ -102,11 +109,13 @@ export class SandboxCore {
 
 	/** Extend the sandbox lifetime from now (idle keepalive while a run is active). */
 	async keepalive(minutes: number): Promise<void> {
+		this.touch();
 		await this.handle?.setTimeout?.(minutes * 60_000).catch(swallow("sandbox", "op"));
 	}
 
 	async runIn(dir: string, command: string, timeoutMs = 120_000): Promise<{ exitCode: number; stdout: string; stderr: string }> {
 		if (!this.handle) throw new Error("Sandbox not initialized.");
+		this.touch();
 		return this.handle.run(command, { cwd: dir, timeoutMs });
 	}
 
@@ -164,12 +173,14 @@ export class SandboxCore {
 	/** Raw file write into the sandbox filesystem (text or binary). */
 	async writeFile(absPath: string, content: string | Uint8Array): Promise<void> {
 		if (!this.handle) throw new Error("Sandbox not initialized.");
+		this.touch();
 		await this.handle.writeFile(absPath, content);
 	}
 
 	/** Raw file read; null when missing/unreadable. */
 	async readFile(absPath: string): Promise<string | null> {
 		if (!this.handle) return null;
+		this.touch();
 		return this.handle.readFile(absPath).catch(swallow("sandbox", "op", null));
 	}
 

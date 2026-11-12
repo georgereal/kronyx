@@ -158,6 +158,32 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	>();
 	/** Live slice agents of a multi run — requestStop fans out to all of them. */
 	private sliceAgents: { runner: AgentRunner; live: LiveSlot }[] = [];
+	/** The run's current sandbox (rebound on switch_environment) + its keepalive. */
+	private activeSbx: SandboxCore | undefined;
+	private keepaliveTimer: ReturnType<typeof setInterval> | undefined;
+
+	/** Extend E2B lifetime + refresh janitor activity every 10 min while a run
+	 *  is in flight — `lastActivityAt` is otherwise only stamped once at run
+	 *  start, and a >60min run outlives the sandbox's initial timeout. */
+	private startSandboxKeepalive(sbx: SandboxCore): void {
+		this.stopSandboxKeepalive();
+		this.activeSbx = sbx;
+		this.keepaliveTimer = setInterval(() => {
+			const cur = this.activeSbx;
+			if (!cur) return;
+			void cur.keepalive(60).catch(swallow("executor", "op"));
+			void this.db
+				.collection("sandboxes")
+				.updateOne({ uid: this.sink.uid, sandboxId: cur.sandboxId }, { $set: { lastActivityAt: new Date() } })
+				.catch(swallow("executor", "op"));
+		}, 10 * 60_000);
+	}
+
+	private stopSandboxKeepalive(): void {
+		if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
+		this.keepaliveTimer = undefined;
+		this.activeSbx = undefined;
+	}
 	/** process-wide: `${baseUrl}|${modelId}` → catalog entry (null = unknown) */
 	private static modelMetaCache = new Map<string, ModelOption | null>();
 
@@ -198,6 +224,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	/** Stop at the next safe point: aborts a live agent AND gates setup/run phases. */
 	requestStop(): void {
 		this.stopRequested = true;
+		this.stopSandboxKeepalive();
 		this.flushToolOutput();
 		void this.sink.emit({ type: "run-stopping", text: "Stopping — interrupting the run…" }).catch(swallow("executor", "op"));
 		this.runner?.stop();
@@ -646,11 +673,15 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			.collection<SessionDoc>("sessions")
 			.findOne({ uid: job.uid, sessionId: job.sessionId });
 		if (!session) throw new Error("Session not found.");
-		if (job.kind === "push-plan") return this.pushPlan(job, session, settings);
-		if (job.kind === "open-pr") return this.openPrJob(job, session, settings);
-		if (job.mode === "ask") return this.ask(job, session, settings);
-		if (job.mode === "multi") return this.multi(job, session, settings);
-		return this.sandboxed(job, session, settings);
+		try {
+			if (job.kind === "push-plan") return await this.pushPlan(job, session, settings);
+			if (job.kind === "open-pr") return await this.openPrJob(job, session, settings);
+			if (job.mode === "ask") return await this.ask(job, session, settings);
+			if (job.mode === "multi") return await this.multi(job, session, settings);
+			return await this.sandboxed(job, session, settings);
+		} finally {
+			this.stopSandboxKeepalive();
+		}
 	}
 
 	private async githubToken(session: SessionDoc, settings: UserSettings): Promise<string> {
@@ -885,6 +916,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			job.mode === "plan" ? "plan" : session.securityProfile === "bypass" ? "bypass" : "smart";
 		await this.sink.emit({ type: "cloud-status", text: "Starting sandbox…" });
 		let sbx = await this.ensureSandbox(session, settings, { llm: provider, task: job.task });
+		this.startSandboxKeepalive(sbx);
 		this.throwIfStopped();
 		const token = await this.githubToken(session, settings);
 		this.sink.mask(token);
@@ -1046,6 +1078,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				() => sbx,
 				(next) => {
 					sbx = next;
+					this.activeSbx = next;
 				},
 				live,
 				token,
@@ -1078,8 +1111,15 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			return;
 		}
 		this.throwIfStopped();
+		// Checkpoint: committed work goes remote BEFORE the risky tail — a
+		// sandbox death during verify/push loses only the verify output.
+		await sbx
+			.commitAndPush(REPO_DIR, session.branch!, "kronyx: checkpoint before verify", COMMIT_EXCLUDES)
+			.catch(async () => this.sink.emit({ type: "info", text: "Checkpoint push failed — continuing to verify." }));
+		await this.sink.patchRun({ status: "verifying" }).catch(swallow("executor", "op"));
 		await this.verify(sbx);
 		this.throwIfStopped();
+		await this.sink.patchRun({ status: "pushing" }).catch(swallow("executor", "op"));
 		await this.pushAndPr(job, session, settings, sbx, token);
 	}
 
@@ -1395,8 +1435,15 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		this.throwIfStopped();
 		await this.afterRun(job);
 		this.throwIfStopped();
+		// Checkpoint the merged fan-in tree before verify — same durability
+		// argument as the single-agent tail.
+		await sbx
+			.commitAndPush(REPO_DIR, session.branch!, "kronyx: checkpoint before verify", COMMIT_EXCLUDES)
+			.catch(async () => this.sink.emit({ type: "info", text: "Checkpoint push failed — continuing to verify." }));
+		await this.sink.patchRun({ status: "verifying" }).catch(swallow("executor", "op"));
 		await this.verify(sbx);
 		this.throwIfStopped();
+		await this.sink.patchRun({ status: "pushing" }).catch(swallow("executor", "op"));
 		await this.pushAndPr(job, session, settings, sbx, token);
 	}
 
@@ -1586,6 +1633,13 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			await this.sink.patchSession({ branch });
 			session.branch = branch;
 			await this.sink.emit({ type: "info", text: `Created branch ${branch}` });
+			// Push immediately — the branch should be visible on the remote from
+			// the first tool call, not only at PR time. Non-fatal on failure.
+			const p = await sbx
+				.runIn(REPO_DIR, `git push -u origin ${JSON.stringify(branch)}`, 60_000)
+				.catch(swallow("executor", "op", { exitCode: 1, stdout: "", stderr: "" }));
+			if (p.exitCode !== 0)
+				await this.sink.emit({ type: "info", text: "Couldn't push the new branch yet — it will be pushed with the first commits." });
 			return;
 		}
 		// Reconcile local branch vs origin/<branch> BEFORE any work:
@@ -1775,7 +1829,17 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 					? "go test ./..."
 					: "";
 		const results: string[] = [];
-		if (cmd) {
+		let skipped = "";
+		if (cmd === "npm test --if-present") {
+			// A fresh clone has no deps — the test run can only fail (or die
+			// with the sandbox); skip it rather than burn the 5-min cap.
+			const hasModules = await sbx.runIn(REPO_DIR, "test -d node_modules && echo yes").catch(swallow("executor", "op"));
+			if (!hasModules?.stdout.includes("yes")) skipped = "skipped — no node_modules in the clone";
+		}
+		if (skipped) {
+			await this.sink.emit({ type: "check", command: cmd, ok: true, durationMs: 0, output: skipped });
+			results.push(`${cmd} → ${skipped}`);
+		} else if (cmd) {
 			await this.sink.emit({ type: "cloud-status", text: `Verifying: ${cmd}` });
 			const r = await sbx.runIn(REPO_DIR, cmd, 300_000).catch(swallow("executor", "op"));
 			const ok = !!r && r.exitCode === 0;
