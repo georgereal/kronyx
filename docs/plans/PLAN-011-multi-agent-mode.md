@@ -1,9 +1,9 @@
 # PLAN-011: Multi-Agent Mode
 
-- Status: Proposed
+- Status: Implemented
 - Owner: Jacob
 - Created: 2026-11-02
-- Decided: -
+- Decided: 2026-11-12
 - Closed: -
 - Related: PLAN-007 (sandboxes/agent mode)
 
@@ -59,8 +59,14 @@ New session mode `multi`:
 
 ## Decision and reason
 
-Pending.
+Implemented as proposed (phase 1): planner → worktree-per-slice parallel `AgentRunner`s → sequential merge fan-in with inline coordinator conflict resolution → verify → single PR. Code review added hardening beyond the original design:
+
+- `parseSlices` returns `{ slices, dropped }` — slices with unbounded/missing `owns` or over the cap are deferred to the post-merge coordinator (full model), never silently lost.
+- `ownsMatch` rejects `..` traversal; `guardWrite` is advisory (file tools only) with a post-run `git diff`/`ls-files` boundary audit per worktree emitting violation events.
+- Fan-in aborts the merge back to a clean tree when the coordinator can't resolve a conflict; the run-start sweep clears stale merge/rebase/worktree state from killed runs.
+- `run_command` intentionally remains unguarded — sandbox-level enforcement is phase 2 territory; the boundary audit is the detection net.
 
 ## Work log
 
 - 2026-11-02: proposed; design agreed in planning session (one merged PR, 4–6 cap, prevent-by-design, worktree substrate).
+- 2026-11-12: implemented + audited. Hardening fixes: `**`-owns/traversal escape closed, merge-poisoning on failed resolution fixed (`merge --abort`), stale `MERGE_HEAD` sweep added, digest cap scaled per agent, dropped slices routed to coordinator with reasons, `save_plan` filtered from slice tools, fan-in summary line, sub-run docs + `droppedSlices` persisted on the run. Tests: `test/decompose.test.ts`.

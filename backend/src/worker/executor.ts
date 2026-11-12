@@ -951,10 +951,10 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			await this.ensureBranch(job, session, sbx, token);
 			await this.preflight(job, session, sbx, token, settings);
 		} else if (session.branch) {
-			// Plan after an implement: read the session's feature branch, not stale base.
-			await sbx
-				.runIn(REPO_DIR, `git fetch origin ${session.branch} && git checkout ${session.branch}`, 60_000)
-				.catch(swallow("executor", "op"));
+			// Plan after an implement: read the session's feature branch — but
+			// reconcile it first; a bare local checkout can sit behind origin.
+			await sbx.runIn(REPO_DIR, `git checkout ${JSON.stringify(session.branch)}`, 60_000).catch(swallow("executor", "op"));
+			await this.reconcileBranch(session, sbx);
 		}
 
 		return { provider, sbx, token, atts, mode };
@@ -1120,7 +1120,11 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 
 		const sliceRows = slices.map((s) => ({ index: s.index, title: s.title, status: "queued", summary: "" }));
 		await this.sink.emit({ type: "fanout", slices: slices.map((s) => ({ index: s.index, title: s.title, owns: s.owns })) }, { agentIndex: 0 });
-		await this.sink.patchRun({ mode: "multi", slices: sliceRows });
+		await this.sink.patchRun({
+			mode: "multi",
+			slices: sliceRows,
+			droppedSlices: droppedSlices.map((d) => ({ title: d.title, task: d.task.slice(0, 500), reason: d.reason })),
+		});
 		if (slices.some((s) => s.env?.template))
 			await this.sink.emit({
 				type: "info",
@@ -1375,6 +1379,13 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		}
 		await sealMerge();
 		await this.sink.emit({ type: "fanin", results }, { agentIndex: 0 });
+		// One-line outcome for the timeline — the fanin card shows detail, this
+		// gives the partial-vs-total-failure signal at a glance.
+		const cnt = (st: string) => results.filter((r) => r.status === st).length;
+		await this.sink.emit({
+			type: "info",
+			text: `Fan-in complete: ${cnt("merged")} merged, ${cnt("resolved")} resolved, ${cnt("failed")} failed${droppedSlices.length ? `, ${droppedSlices.length} deferred to coordinator` : ""}.`,
+		});
 
 		// Worktree cleanup (branches stay — they're merged history).
 		for (const s of slices) {
@@ -1546,9 +1557,32 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 
 	private async ensureBranch(job: CloudJob, session: SessionDoc, sbx: SandboxCore, token: string): Promise<void> {
 		const base = session.base ?? "main";
+		// Refresh the remote credential up front — the clone URL embeds a token
+		// that expires, and every fetch/push below (plus the agent's own git
+		// commands) hits the stale URL.
+		if (session.repo && token) {
+			await this.sink.emit({ type: "cloud-status", text: `Refreshing git credentials and syncing ${session.branch ?? base}…` });
+			await this.syncGhAuth(sbx, session.repo, token);
+		}
 		if (!session.branch) {
 			const branch = `kronyx/${slugify(job.task)}-${job.runId.replace(/^web-/, "").slice(0, 6)}`;
-			await sbx.createBranch(REPO_DIR, branch);
+			// Fork from the fetched start point, not local HEAD — a warm clone
+			// can be arbitrarily stale (ask/plan runs never sync the repo).
+			// Same startRef semantics as cloneStart; falls back to local HEAD.
+			const startRef = String(session.startRef ?? "").trim() || base;
+			const f = await sbx
+				.runIn(REPO_DIR, `git fetch origin ${JSON.stringify(startRef)}`, 120_000)
+				.catch(swallow("executor", "op", { exitCode: 1, stdout: "", stderr: "" }));
+			const c =
+				f.exitCode === 0
+					? await sbx.runIn(REPO_DIR, `git checkout -B ${JSON.stringify(branch)} FETCH_HEAD`, 60_000).catch(swallow("executor", "op"))
+					: null;
+			if (c?.exitCode === 0) {
+				if (startRef !== base) await this.sink.emit({ type: "info", text: `Starting from ${startRef}` });
+			} else {
+				await this.sink.emit({ type: "info", text: `Could not check out ${startRef} — branching from the local checkout.` });
+				await sbx.createBranch(REPO_DIR, branch);
+			}
 			await this.sink.patchSession({ branch });
 			session.branch = branch;
 			await this.sink.emit({ type: "info", text: `Created branch ${branch}` });
@@ -1557,12 +1591,6 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		// Reconcile local branch vs origin/<branch> BEFORE any work:
 		// ahead/behind counts decide — pull clean, keep unpushed commits,
 		// rebase divergence now, or stop and ask the user.
-		// Refresh the remote credential up front — the clone URL embeds a token
-		// that expires, and the agent's own git commands hit the stale URL.
-		if (session.repo && token) {
-			await this.sink.emit({ type: "cloud-status", text: `Refreshing git credentials and syncing ${session.branch}…` });
-			await this.syncGhAuth(sbx, session.repo, token);
-		}
 		await this.reconcileBranch(session, sbx);
 		const behind = await sbx.driftBehind(REPO_DIR, base);
 		if (behind > 0) {
@@ -1625,29 +1653,42 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			return; // clean or strictly ahead — nothing to pull
 		}
 		const dirty = (await sbx.runIn(REPO_DIR, "git status --porcelain").catch(swallow("executor", "op")))?.stdout.trim() !== "";
+		// Uncommitted leftovers (usually crash debris) are stashed before a
+		// sync, then restored — never silently orphaned in `git stash`.
+		let stashed = false;
+		const stash = async () => {
+			if (!dirty) return;
+			const r = await sbx.runIn(REPO_DIR, "git stash push -m kronyx-autosave").catch(swallow("executor", "op"));
+			stashed = r?.exitCode === 0 && !r.stdout.includes("No local changes");
+			if (stashed) await this.sink.emit({ type: "info", text: "Stashed uncommitted changes to sync the latest branch." });
+		};
+		const unstash = async () => {
+			if (!stashed) return;
+			const r = await sbx.runIn(REPO_DIR, "git stash pop").catch(swallow("executor", "op"));
+			if (r?.exitCode !== 0)
+				await this.sink.emit({ type: "info", text: "Stashed changes couldn't be auto-restored (conflict with the pulled code) — kept in `git stash`." });
+		};
 		if (ahead === 0) {
 			// Strictly behind — pull latest.
-			if (dirty) {
-				await sbx.runIn(REPO_DIR, "git stash push -m kronyx-autosave").catch(swallow("executor", "op"));
-				await this.sink.emit({ type: "info", text: "Stashed uncommitted changes to pull the latest branch." });
-			}
+			await stash();
 			const r = await sbx.runIn(REPO_DIR, `git reset --hard origin/${branch}`).catch(swallow("executor", "op"));
 			if (r?.exitCode === 0) await this.sink.emit({ type: "cloud-status", text: `Synced to origin/${branch} (${behind} commit(s)).` });
+			await unstash();
 			return;
 		}
 		// Diverged — rebase now rather than at push time.
 		await this.sink.emit({ type: "info", text: `Branch diverged: ${ahead} local / ${behind} remote commit(s) — rebasing first…` });
-		if (dirty) {
-			await sbx.runIn(REPO_DIR, "git stash push -m kronyx-autosave").catch(swallow("executor", "op"));
-		}
+		await stash();
 		const ok = await sbx.rebaseOnto(REPO_DIR, branch);
 		if (!ok) {
 			throw new Error(
 				`Remote branch ${branch} diverged and the auto-rebase hit conflicts. ` +
-					"Resolve manually or start a new session branch — refusing to work on top of a conflicted state.",
+					"Resolve manually or start a new session branch — refusing to work on top of a conflicted state." +
+					(stashed ? " Uncommitted changes are preserved in `git stash`." : ""),
 			);
 		}
 		await this.sink.emit({ type: "cloud-status", text: `Rebased ${ahead} commit(s) onto origin/${branch}.` });
+		await unstash();
 	}
 
 	/**
