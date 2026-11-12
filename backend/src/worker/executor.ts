@@ -1137,7 +1137,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		await sbx
 			.runIn(
 				REPO_DIR,
-				`git worktree prune; git merge --abort 2>/dev/null; git rebase --abort 2>/dev/null; git cherry-pick --abort 2>/dev/null; if [ -n "$(git diff --name-only --diff-filter=U 2>/dev/null)" ]; then git reset --hard HEAD; fi; rm -rf /home/user/repo-wt* 2>/dev/null; true`,
+				`rm -rf /home/user/repo-wt* 2>/dev/null; git worktree prune; git merge --abort 2>/dev/null; git rebase --abort 2>/dev/null; git cherry-pick --abort 2>/dev/null; if [ -n "$(git diff --name-only --diff-filter=U 2>/dev/null)" ]; then git reset --hard HEAD; fi; true`,
 				30_000,
 			)
 			.catch(swallow("executor", "op"));
@@ -1225,13 +1225,15 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 
 		const runSlice = async (s: SliceSpec): Promise<void> => {
 			const sliceLive: LiveSlot = { handle: sbx.inner! };
-			const finishText = { value: "" };
+			const finishText: { value: string; failed?: string } = { value: "" };
 			const runner = this.makeSliceRunner(job, session, s, sbx, sliceLive, mode, finishText);
 			this.sliceAgents.push({ runner, live: sliceLive });
 			await markSlice(s, "running");
 			try {
+				// AgentRunner.run() never throws — failures arrive as run-failed events.
 				await runner.run(this.sliceTask(s), provider);
-				await markSlice(s, this.stopRequested ? "stopped" : "done", finishText.value || "Done.");
+				if (finishText.failed && !this.stopRequested) await markSlice(s, "failed", finishText.failed.slice(0, 400));
+				else await markSlice(s, this.stopRequested ? "stopped" : "done", finishText.value || "Done.");
 			} catch (err) {
 				await markSlice(s, this.stopRequested ? "stopped" : "failed", String(err).slice(0, 400));
 			} finally {
@@ -1256,7 +1258,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		 *  slices), not mechanical conflict resolution. */
 		const runCoordinator = async (task: string, strong = false): Promise<boolean> => {
 			const coordLive: LiveSlot = { handle: sbx.inner! };
-			const coordFinish = { value: "" };
+			const coordFinish: { value: string; failed?: string } = { value: "" };
 			const coordinator = this.makeSliceRunner(
 				job,
 				session,
@@ -1273,6 +1275,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			let coordErr: unknown;
 			try {
 				await coordinator.run(task, strong ? provider : await this.cheapProvider(provider));
+				if (coordFinish.failed) coordErr = coordFinish.failed;
 			} catch (e) {
 				coordErr = e;
 			} finally {
@@ -1518,7 +1521,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		sbx: SandboxCore,
 		sliceLive: LiveSlot,
 		mode: AgentMode,
-		finishText: { value: string },
+		finishText: { value: string; failed?: string },
 		coordinator = false,
 	): AgentRunner {
 		const dir = coordinator ? REPO_DIR : SLICE_DIR(slice.index);
@@ -1567,6 +1570,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				]) as Promise<never>,
 			emit: (e) => {
 				if (e.type === "run-finished") finishText.value = String(e.text ?? "");
+				if (e.type === "run-failed") finishText.failed = String(e.error ?? "Run failed");
 				if (e.type !== "assistant-delta" && e.type !== "reasoning-delta") dbg("run", `s${agentIndex}:${e.type}`, e);
 				this.trackUsage(e, job, agentIndex);
 				void this.sink.emit(e, { agentIndex });
