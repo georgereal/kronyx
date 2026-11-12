@@ -81,6 +81,20 @@ export const e2bProvider: SandboxProvider = {
 		}
 	},
 
+	async getInfoById(id, creds) {
+		try {
+			const info = await Sandbox.getInfo(id, { apiKey: apiKey(creds) });
+			return {
+				state: info.state === "paused" ? "paused" : "running",
+				templateId: info.templateId,
+				name: info.name,
+			};
+		} catch (err) {
+			if (err instanceof Error && /not found|not exist/i.test(err.message)) return { state: "gone" as const };
+			return null;
+		}
+	},
+
 	async pauseById(id, creds) {
 		try {
 			await Sandbox.betaPause(id, { apiKey: apiKey(creds) });

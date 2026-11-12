@@ -544,6 +544,10 @@ tbody tr:hover {
 	border-bottom: 1px solid var(--border);
 	font-size: 12.5px;
 }
+.rank-row .dot { width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--muted); display: inline-block; }
+.rank-row .dot.running { background: var(--accent); }
+.rank-row .dot.completed { background: var(--ok); }
+.rank-row .dot.failed { background: var(--err); }
 .rank-row:last-child {
 	border-bottom: 0;
 }

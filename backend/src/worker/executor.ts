@@ -489,9 +489,12 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	private trackUsage(e: RunViewEvent, job: CloudJob, agentIndex = 0): void {
 		// The main agent's closing report — the run-completed card reuses it.
 		if (e.type === "run-finished" && agentIndex === 0) this.lastRunSummary = String(e.text ?? "");
-		const meta = (e as { meta?: { kind?: string } }).meta;
-		if (e.type === "info" && meta?.kind === "context_compaction")
+		const meta = (e as { meta?: Record<string, unknown> & { kind?: string } }).meta;
+		if (e.type === "info" && meta?.kind === "context_compaction") {
 			this.lastCompaction = meta as { estTokensBefore?: number; estTokensAfter?: number };
+			// Flat first-class event — the /api/compactions feed queries these.
+			void this.sink.emit({ type: "compaction", ...meta }, agentIndex ? { agentIndex } : undefined);
+		}
 		let L = this.usageLedgers.get(agentIndex);
 		if (!L) {
 			L = {
@@ -554,11 +557,12 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			// Stamp context-fill fields onto the event — the UI's meter reads
 			// requestTokens/contextWindow directly, no client-side diffing.
 			const win = this.modelMeta?.contextWindow ?? p?.contextWindow;
-			const stamped = e as { requestTokens?: number; contextWindow?: number; contextPct?: number };
+			const stamped = e as { requestTokens?: number; contextWindow?: number; contextPct?: number; contextBudget?: number };
 			stamped.requestTokens = delta.tokensIn;
-			if (win) {
-				stamped.contextWindow = win;
-				stamped.contextPct = Math.min(100, Math.round((delta.tokensIn / win) * 100));
+			const effWin = stamped.contextBudget ?? win;
+			if (effWin) {
+				stamped.contextWindow = effWin;
+				stamped.contextPct = Math.min(100, Math.round((delta.tokensIn / effWin) * 100));
 			}
 			void record("ok", delta, L.lastUsageAt ? now - L.lastUsageAt : now - L.runStartedAt, {
 				iteration: ev.iteration,
@@ -811,7 +815,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		this.templates = await this.liveTemplates(provider, creds);
 		const sbx = new SandboxCore();
 		sbx.onLifecycle = (event, sandboxId) => {
-			const state = event === "pause" ? "paused" : event === "start" ? "running" : event === "resume" ? "running" : undefined;
+			const state = event === "pause" ? "paused" : event === "start" || event === "resume" || event === "connect" ? "running" : undefined;
 			void recordSandboxEvent(this.db, {
 				uid: this.sink.uid,
 				sandboxId,
@@ -897,6 +901,9 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		}
 		await sbx.keepalive(60);
 		const newId = sbx.sandboxId;
+		// Persist the provider-verified template identity — the requested name
+		// is what we asked for; getInfo reports what actually booted.
+		const createdInfo = newId ? await provider.getInfoById?.(newId, creds).catch(() => null) : null;
 		// Old sandbox proven unreachable after retries — flag it for the janitor,
 		// the single owner of kills.
 		if (oldId) {
@@ -912,7 +919,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			.collection("sandboxes")
 			.updateOne(
 				{ uid: this.sink.uid, sandboxId: newId },
-				{ $set: { uid: this.sink.uid, sessionId: session.sessionId, sandboxId: newId, provider: providerName, state: "active", at: new Date() }, $setOnInsert: { createdAt: new Date() } },
+				{ $set: { uid: this.sink.uid, sessionId: session.sessionId, sandboxId: newId, provider: providerName, template: createdInfo?.name ?? template ?? null, templateId: createdInfo?.templateId ?? null, repo: session.repo ?? null, state: "active", at: new Date() }, $setOnInsert: { createdAt: new Date() } },
 				{ upsert: true },
 			)
 			.catch(swallow("executor", "op"));
@@ -999,6 +1006,23 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				}
 			}
 			await this.reconcileBranch(session, sbx);
+		}
+		// Stamp the repo the VM actually cloned — like templateId, the remote
+		// URL is the truth; session.repo is only what we asked for.
+		const remote = await sbx
+			.runIn(REPO_DIR, "git remote get-url origin", 15_000)
+			.catch(swallow("executor", "op", { stdout: "", exitCode: 1, stderr: "" }));
+		const m = /github\.com[/:]([\w.-]+\/[\w.-]+?)(?:\.git)?\s*$/.exec(remote.stdout.trim());
+		if (m?.[1]) {
+			const repo = m[1];
+			const id = sbx.sandboxId;
+			if (id)
+				void this.db
+					.collection("sandboxes")
+					.updateOne({ uid: this.sink.uid, sandboxId: id }, { $set: { repo } })
+					.catch(swallow("executor", "op"));
+			if (session.repo && session.repo !== repo)
+				await this.sink.emit({ type: "info", text: `Sandbox remote is ${repo}, but the session says ${session.repo} — repo mismatch.` });
 		}
 	}
 

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AgentMessage, AgentRuntimePrepareTurnContext } from "@cline/shared";
-import { createPrepareTurn } from "../src/agent/compaction";
+import { createPrepareTurn, taskContextBudget } from "../src/agent/compaction";
 
 let seq = 0;
 const msg = (role: AgentMessage["role"], content: AgentMessage["content"]): AgentMessage => ({
@@ -263,6 +263,34 @@ describe("createPrepareTurn", () => {
 		expect(JSON.stringify(out.messages![2].content)).toContain("output elided by context compaction");
 	});
 
+	it("contextBudget caps trigger math even on huge model windows", async () => {
+		// Reproduces the 1M-window bug: ~56K context on a 1M-window model would
+		// never compact (soft tier at 400K). With a 100K budget, soft tier (40K)
+		// engages and elides superseded results.
+		const msgs: AgentMessage[] = [
+			msg("user", [{ type: "text", text: "audit the executor for bugs" }]),
+			call("r1", "read_file", { path: "a.ts" }),
+			result("r1", "read_file", "x".repeat(20_000)),
+			call("r2", "read_file", { path: "a.ts" }),
+			result("r2", "read_file", "y".repeat(20_000)),
+		];
+		for (let i = 3; i < 10; i++) {
+			msgs.push(call(`r${i}`, "read_file", { path: `f${i}.ts` }), result(`r${i}`, "read_file", "z".repeat(8_000)));
+		}
+		const turn = createPrepareTurn({ contextBudget: 100_000 });
+		const out = (await turn(ctx(msgs, 1_000_000)))!;
+		const texts = out.messages!.map((m) => JSON.stringify(m.content));
+		expect(texts[2]).toContain("output elided by context compaction"); // superseded read stubbed under budget
+	});
+
+	it("taskContextBudget classifies read-heavy vs implementation tasks", () => {
+		expect(taskContextBudget("audit the executor for bugs we missed")).toBe(100_000);
+		expect(taskContextBudget("explore how compaction works")).toBe(100_000);
+		expect(taskContextBudget("some task", "plan")).toBe(100_000);
+		expect(taskContextBudget("fix the login redirect bug")).toBe(200_000);
+		expect(taskContextBudget("add a dark mode toggle")).toBe(200_000);
+	});
+
 	it("summarize tier replaces the oldest turns when stubbing can't reach target", async () => {
 		const window = 2_000; // target 1100
 		const msgs: AgentMessage[] = [msg("user", [{ type: "text", text: "task " + "t".repeat(8000) }])];
@@ -275,7 +303,9 @@ describe("createPrepareTurn", () => {
 		});
 		const out = (await turn(ctx(msgs, window, { overflowRecovery: true })))!;
 		expect(out.messages![0].role).toBe("user");
-		expect(JSON.stringify(out.messages![0].content)).toContain("summarized by context compaction");
+		// the task message stays verbatim; the recap lands after it
+		expect(JSON.stringify(out.messages![0].content)).toContain("t".repeat(100));
+		expect(JSON.stringify(out.messages![1].content)).toContain("summarized by context compaction");
 		expect(out.messages!.length).toBeLessThan(msgs.length);
 	});
 });

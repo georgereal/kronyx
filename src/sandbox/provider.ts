@@ -67,6 +67,9 @@ export interface SandboxProvider {
 	connect(id: string, creds: ProviderCreds): Promise<SandboxHandle | null>;
 	/** Id-based ops used by the janitor (no live handle). */
 	pauseById?(id: string, creds: ProviderCreds): Promise<boolean>;
+	/** Remote state probe — lets the janitor/events verify instead of trusting
+	 *  the local DB row. "gone" = the sandbox no longer exists. */
+	getInfoById?(id: string, creds: ProviderCreds): Promise<{ state: "running" | "paused" | "gone"; templateId?: string; name?: string } | null>;
 	killById(id: string, creds: ProviderCreds): Promise<boolean>;
 	listLive?(creds: ProviderCreds): Promise<{ id: string; startedAt?: string }[]>;
 	/** Templates usable with this account — public fleet plus account-built images. */

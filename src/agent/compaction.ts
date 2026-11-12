@@ -16,6 +16,26 @@ const HEAD_CHARS = 6_000;
 const TAIL_CHARS = 2_000;
 const CALL_INPUT_CAP = 600;
 const DEFAULT_CONTEXT_WINDOW = 128_000;
+
+/** Economical context ceiling — decode cost grows with context regardless of
+ *  the model's max window, so trigger compaction against a budget, not the
+ *  catalogued 200K/1M. */
+export const DEFAULT_CONTEXT_BUDGET = 200_000;
+const CONTEXT_BUDGET_FLOOR = 64_000;
+
+/**
+ * Task-aware context budget: read-heavy work (audits, exploration, plans)
+ * piles up large tool results and benefits from earlier compaction; coding
+ * work gets the full default. Classification is heuristic — a miss only
+ * shifts the trigger point; recall_context recovers anything elided.
+ */
+export function taskContextBudget(task: string, mode?: string): number {
+	const readHeavy =
+		mode === "plan" ||
+		/\b(audit\w*|review\w*|explor\w*|investigat\w*|analy[sz]\w*|research\w*|inspect\w*|check (the|for|that)\b|how does|why does|walk me|explain)\b/i.test(task);
+	const budget = readHeavy ? 100_000 : DEFAULT_CONTEXT_BUDGET;
+	return Math.max(CONTEXT_BUDGET_FLOOR, budget);
+}
 const PATH_KEYS = ["path", "file", "filePath", "rel"];
 const ATTACH_RE = /^--- attached file: (.+?) ---\n[\s\S]*?--- end \1 ---$/;
 
@@ -66,6 +86,8 @@ export interface PrepareTurnOptions {
 	/** Provider/model identity — tunes provider-specific projections (reasoning retention). */
 	providerId?: string;
 	modelId?: string;
+	/** Effective context ceiling for trigger math — see DEFAULT_CONTEXT_BUDGET. */
+	contextBudget?: number;
 	/**
 	 * Optional LLM recap: called with the oldest messages when stubbing alone
 	 * can't reach the target. Returns the summary text, or undefined to skip.
@@ -140,7 +162,10 @@ function pathKeyOf(input: unknown): string | undefined {
  */
 export function createPrepareTurn(opts: PrepareTurnOptions = {}) {
 	return async (ctx: AgentRuntimePrepareTurnContext): Promise<AgentRuntimePrepareTurnResult | undefined> => {
-		const window = ctx.model.info?.contextWindow ?? opts.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
+		const window = Math.min(
+			ctx.model.info?.contextWindow ?? opts.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
+			Math.max(CONTEXT_BUDGET_FLOOR, opts.contextBudget ?? DEFAULT_CONTEXT_BUDGET),
+		);
 
 		// Pass 1 (always): clamp individual oversized tool outputs.
 		let clamped = 0;
@@ -298,11 +323,15 @@ export function createPrepareTurn(opts: PrepareTurnOptions = {}) {
 		// Last resort (hard tier only): an LLM recap replaces the oldest turns
 		// when stubbing alone can't reach the target.
 		let summarized = false;
+		let summary: string | undefined;
 		if (!soft && opts.summarize && est > target && mutable.length > KEEP_RECENT_MESSAGES) {
 			const prefix = mutable.slice(0, mutable.length - KEEP_RECENT_MESSAGES);
-			const summary = await opts.summarize(prefix).catch(() => undefined);
+			// The task message (first user turn) survives verbatim — a good
+			// compaction is a brief for future work, not a summary of the task.
+			const pinTask = prefix[0]?.role === "user" ? 1 : 0;
+			summary = prefix.length > pinTask ? await opts.summarize(prefix.slice(pinTask)).catch(() => undefined) : undefined;
 			if (summary) {
-				mutable.splice(0, prefix.length, {
+				mutable.splice(pinTask, prefix.length - pinTask, {
 					id: `compact-${Date.now()}`,
 					role: "user",
 					content: [
@@ -354,6 +383,12 @@ export function createPrepareTurn(opts: PrepareTurnOptions = {}) {
 				summarized,
 				forced,
 				soft,
+				contextBudget: window,
+				contextWindow: ctx.model.info?.contextWindow ?? opts.contextWindow,
+				model: ctx.model.id,
+				provider: ctx.model.provider,
+				actualInputTokens: ctx.previousRequestInputTokens,
+				recap: summary,
 				estTokensBefore: estBefore,
 				estTokensAfter: est,
 			},

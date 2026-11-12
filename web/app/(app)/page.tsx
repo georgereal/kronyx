@@ -9,31 +9,21 @@ import { Skeleton } from "@/components/Skeleton";
 import { Stat } from "@/components/Stat";
 import { StatusPill } from "@/components/StatusPill";
 import { apiFetch } from "@/lib/api";
-import { fmtCost, RangePicker, useUsageCalls } from "@/lib/usage";
+import type { SessionDoc } from "@/lib/types";
+import { ago, fmtCost, RangePicker, useUsageCalls } from "@/lib/usage";
 
 export default function Overview() {
 	const [range, setRange] = useState(86_400_000);
 	const { calls, loading, user } = useUsageCalls(range);
-	const [devices, setDevices] = useState<{ id: string; name: string; lastSyncAt: string }[]>([]);
-	const [settingsAt, setSettingsAt] = useState("");
+	const [sessions, setSessions] = useState<SessionDoc[]>([]);
 
 	useEffect(() => {
 		if (!user) return;
 		void (async () => {
-			const res = await apiFetch("/api/settings", user);
+			const res = await apiFetch("/api/sessions", user);
 			if (!res.ok) return;
-			const body = (await res.json()) as {
-				devices?: Record<string, { name?: string; lastSyncAt?: string }>;
-				settings?: { updatedAt?: string };
-			};
-			setDevices(
-				Object.entries(body.devices ?? {}).map(([id, d]) => ({
-					id,
-					name: d.name || id.slice(0, 8),
-					lastSyncAt: d.lastSyncAt ?? "",
-				})),
-			);
-			setSettingsAt(body.settings?.updatedAt ?? "");
+			const body = (await res.json()) as { sessions?: SessionDoc[] };
+			setSessions((body.sessions ?? []).slice(0, 6));
 		})();
 	}, [user]);
 
@@ -107,21 +97,21 @@ export default function Overview() {
 			<div className="stat-grid" style={{ gridTemplateColumns: "1fr 2fr", gap: 12 }}>
 				<div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
 				<div className="card" style={{ padding: 16 }}>
-					<div className="chart-title">Devices</div>
-					{devices.length === 0 && <div className="muted" style={{ fontSize: 12 }}>No devices synced yet.</div>}
-					{devices.map((d) => (
-						<div key={d.id} className="rank-row">
-							<span style={{ flex: 1 }}>{d.name}</span>
-							<span className="muted num" style={{ fontSize: 11 }}>
-								{d.lastSyncAt ? new Date(d.lastSyncAt).toLocaleDateString() : ""}
-							</span>
+					<div className="chart-title">
+						Recent sessions · <Link href="/sessions" style={{ color: "var(--accent)" }}>view all →</Link>
+					</div>
+					{sessions.length === 0 && <div className="muted" style={{ fontSize: 12 }}>No sessions yet.</div>}
+					{sessions.map((s) => (
+						<div key={s.sessionId} className="rank-row">
+							<span
+								className={`dot ${s.lastStatus === "running" || s.lastStatus === "queued" ? "running" : s.lastStatus === "completed" ? "completed" : s.lastStatus === "failed" ? "failed" : ""}`}
+							/>
+							<Link href={`/sessions/${s.sessionId}`} style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "inherit" }}>
+								{s.title ?? s.repo ?? "Session"}
+							</Link>
+							<span className="muted num" style={{ fontSize: 11 }}>{ago(s.updatedAt)}</span>
 						</div>
 					))}
-					{settingsAt && (
-						<div className="muted" style={{ fontSize: 11, marginTop: 8 }}>
-							Settings synced {new Date(settingsAt).toLocaleString()}
-						</div>
-					)}
 				</div>
 				<div className="card" style={{ padding: 16 }}>
 					<div className="chart-title">Top models</div>

@@ -154,6 +154,18 @@ export async function runJanitorSweep(db: Db): Promise<{ users: number; killed: 
 		if (row.sessionId && busySessions.has(`${row.uid}:${row.sessionId}`)) continue;
 		const provider = providerFor(row);
 		if (!provider.capabilities.pause || !provider.pauseById) continue;
+		// Verify actual provider state — the DB row can lag an in-process pause
+		// (SandboxCore's idle timer pauses + records independently). Pausing an
+		// already-paused VM would double-record the event.
+		const info = await provider.getInfoById?.(String(row.sandboxId), credsFor(row.uid)).catch(() => null);
+		if (info?.state === "paused") {
+			await db.collection("sandboxes").updateOne({ _id: row._id }, { $set: { state: "paused", at: new Date() } });
+			continue;
+		}
+		if (info?.state === "gone") {
+			await db.collection("sandboxes").updateOne({ _id: row._id }, { $set: { state: "dead", at: new Date() } });
+			continue;
+		}
 		const ok = await provider.pauseById(String(row.sandboxId), credsFor(row.uid)).catch(swallow("misc", "op", false));
 		if (ok) {
 			await db

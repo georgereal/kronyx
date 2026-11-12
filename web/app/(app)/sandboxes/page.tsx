@@ -6,7 +6,7 @@ import { Skeleton } from "@/components/Skeleton";
 import { apiFetch, useUser } from "@/lib/api";
 
 interface LiveVm { sandboxId: string; templateId?: string; state?: string; startedAt?: string }
-interface Hist { sandboxId?: string; device?: string; deviceId?: string; template?: string; repo?: string; runId?: string; event?: string; state?: string; reason?: string; sessionId?: string; at?: string }
+interface Hist { sandboxId?: string; device?: string; deviceId?: string; template?: string; templateId?: string; repo?: string; runId?: string; event?: string; state?: string; reason?: string; sessionId?: string; at?: string; createdAt?: string }
 interface SbxEvent { sandboxId?: string; sessionId?: string; provider?: string; event?: string; state?: string; reason?: string; device?: string; runId?: string; at?: string }
 interface ProviderStatus { name: string; configured: boolean; reason?: string }
 
@@ -119,7 +119,7 @@ export default function SandboxesPage() {
 			{tab === "live" && liveRows.length > 0 && (
 				<div className="card table-card">
 					<table>
-						<thead><tr><th>Sandbox</th><th>State</th><th>Session</th><th>Repo</th><th>Template</th><th>Last event</th><th></th></tr></thead>
+						<thead><tr><th>Sandbox</th><th>State</th><th>Session</th><th>Repo</th><th>Template</th><th>Created</th><th>Last event</th><th></th></tr></thead>
 						<tbody>
 							{liveRows.map((h, i) => (
 								<>
@@ -128,7 +128,8 @@ export default function SandboxesPage() {
 										<td><span className={`sess-pill ${h.state === "paused" ? "completed" : "running"}`}>{h.state}</span></td>
 										<td className="muted mono">{h.sessionId ? <a href={`/sessions/${h.sessionId}`}>{h.sessionId.slice(0, 8)}</a> : "—"}</td>
 										<td className="muted">{h.repo || "—"}</td>
-										<td className="muted">{h.template || "base"}</td>
+										<td className="muted" title={h.templateId ?? undefined}>{h.template ?? "—"}{h.templateId && h.template !== h.templateId ? <span className="muted" style={{ fontSize: 10 }}> ·{h.templateId.slice(0, 8)}</span> : null}</td>
+										<td className="muted">{fmt(h.createdAt)}</td>
 										<td className="muted">{fmt(h.at)}</td>
 										<td style={{ whiteSpace: "nowrap" }} onClick={(e) => e.stopPropagation()}>
 											{h.state !== "paused" && <button className="btn ghost sm" onClick={() => void pause(h.sandboxId!)}>Pause</button>}{" "}
@@ -137,7 +138,7 @@ export default function SandboxesPage() {
 									</tr>
 									{expanded === h.sandboxId && (
 										<tr key={`${i}-ev`}>
-											<td colSpan={7} style={{ paddingLeft: 24, background: "var(--bg)" }}>{timeline(eventsFor(h.sandboxId))}</td>
+											<td colSpan={8} style={{ paddingLeft: 24, background: "var(--bg)" }}>{timeline(eventsFor(h.sandboxId))}</td>
 										</tr>
 									)}
 								</>
@@ -148,39 +149,29 @@ export default function SandboxesPage() {
 			)}
 			{tab === "live" && !loading && liveRows.length === 0 && history.length > 0 && <Empty>No live sandboxes.</Empty>}
 
-			{tab === "history" && events.length > 0 && (
+			{tab === "history" && deadRows.length > 0 && (
 				<div className="card table-card">
 					<table>
-						<thead><tr><th>Time</th><th>Sandbox</th><th>Event</th><th>Reason</th><th>Provider</th><th>Session</th></tr></thead>
-						<tbody>
-							{events.map((e, i) => (
-								<tr key={i}>
-									<td className="muted" style={{ whiteSpace: "nowrap" }}>{fmt(e.at)}</td>
-									<td className="mono">{(e.sandboxId ?? "").slice(0, 16)}</td>
-									<td><span style={{ color: eventDot(e.event) }}>●</span> <span style={{ textTransform: "capitalize" }}>{e.event ?? e.state ?? "—"}</span></td>
-									<td className="muted">{e.reason || "—"}</td>
-									<td className="muted">{e.provider || e.device || "—"}</td>
-									<td className="muted mono">{e.sessionId ? <a href={`/sessions/${e.sessionId}`}>{e.sessionId.slice(0, 8)}</a> : "—"}</td>
-								</tr>
-							))}
-						</tbody>
-					</table>
-				</div>
-			)}
-			{tab === "history" && events.length === 0 && deadRows.length > 0 && (
-				<div className="card table-card">
-					<table>
-						<thead><tr><th>Sandbox</th><th>State</th><th>Reason</th><th>Session</th><th>Repo</th><th>Time</th></tr></thead>
+						<thead><tr><th>Sandbox</th><th>State</th><th>Reason</th><th>Session</th><th>Repo</th><th>Template</th><th>Created</th><th>Last event</th></tr></thead>
 						<tbody>
 							{deadRows.map((h, i) => (
-								<tr key={i}>
-									<td className="mono">{(h.sandboxId ?? "").slice(0, 16)}</td>
-									<td>{h.state ?? h.event ?? "—"}</td>
-									<td className="muted">{h.reason || "—"}</td>
-									<td className="muted mono">{h.sessionId ? <a href={`/sessions/${h.sessionId}`}>{h.sessionId.slice(0, 8)}</a> : h.device || "—"}</td>
-									<td className="muted">{h.repo || "—"}</td>
-									<td className="muted">{fmt(h.at)}</td>
-								</tr>
+								<>
+									<tr key={i} onClick={() => setExpanded(expanded === h.sandboxId ? null : h.sandboxId!)} style={{ cursor: "pointer" }}>
+										<td className="mono">{expanded === h.sandboxId ? "▾" : "▸"} {(h.sandboxId ?? "").slice(0, 16)}</td>
+										<td>{h.state ?? h.event ?? "—"}</td>
+										<td className="muted">{h.reason || "—"}</td>
+										<td className="muted mono">{h.sessionId ? <a href={`/sessions/${h.sessionId}`}>{h.sessionId.slice(0, 8)}</a> : h.device || "—"}</td>
+										<td className="muted">{h.repo || "—"}</td>
+										<td className="muted" title={h.templateId ?? undefined}>{h.template ?? "—"}{h.templateId && h.template !== h.templateId ? <span className="muted" style={{ fontSize: 10 }}> ·{h.templateId.slice(0, 8)}</span> : null}</td>
+										<td className="muted">{fmt(h.createdAt)}</td>
+										<td className="muted">{fmt(h.at)}</td>
+									</tr>
+									{expanded === h.sandboxId && (
+										<tr key={`${i}-ev`}>
+											<td colSpan={8} style={{ paddingLeft: 24, background: "var(--bg)" }}>{timeline(eventsFor(h.sandboxId))}</td>
+										</tr>
+									)}
+								</>
 							))}
 						</tbody>
 					</table>

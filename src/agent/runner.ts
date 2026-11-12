@@ -2,7 +2,7 @@ import { Agent } from "@cline/agents";
 import type { AgentMessage, AgentRuntimeEvent, AgentTool, AgentToolResultPart } from "@cline/shared";
 import { createFileTools, type FileChangeKind, WRITE_TOOL_NAMES } from "../tools/fileTools";
 import { buildSystemPrompt } from "./systemPrompt";
-import { createPrepareTurn } from "./compaction";
+import { createPrepareTurn, taskContextBudget } from "./compaction";
 import { createRecallTool, type PriorTranscript, type RecallScorer } from "./recall";
 import { countTokens } from "./tokenize";
 
@@ -60,6 +60,8 @@ export type RunViewEvent =
 			requestTokens?: number;
 			contextWindow?: number;
 			contextPct?: number;
+			/** Effective context ceiling for this run's task profile (compaction triggers against this, not the model's max window). */
+			contextBudget?: number;
 		}
 	| { type: "run-finished"; status: string; text: string; iterations: number }
 	| { type: "run-failed"; error: string }
@@ -119,6 +121,8 @@ const READ_ONLY_HIDDEN = new Set([
 export class AgentRunner {
 	private agent: Agent | undefined;
 	private running = false;
+	/** Effective context ceiling for the current run's task profile. */
+	private contextBudget: number | undefined;
 	private digests: RunDigest[] = [];
 	private readonly toolStarts = new Map<string, number>();
 
@@ -185,6 +189,7 @@ export class AgentRunner {
 	async run(task: string, settings: ProviderSettings): Promise<void> {
 		if (this.running) throw new Error("A run is already in progress.");
 		this.running = true;
+		this.contextBudget = taskContextBudget(task, this.host.currentMode());
 		this.host.emit({ type: "run-started", task });
 		try {
 			// A stop that landed before run() (e.g. during worker sandbox setup) still halts here.
@@ -272,6 +277,7 @@ export class AgentRunner {
 			toolExecution: "sequential",
 			prepareTurn: createPrepareTurn({
 				contextWindow: settings.contextWindow,
+				contextBudget: this.contextBudget,
 				providerId: settings.providerId,
 				modelId: settings.modelId,
 				summarize: settings.baseUrl
@@ -398,6 +404,7 @@ export class AgentRunner {
 					totalCost: event.usage.totalCost,
 					iteration: event.snapshot.iteration,
 					contextMsgs: event.snapshot.messages.length,
+					contextBudget: this.contextBudget,
 				});
 				break;
 			case "status-notice":
@@ -431,9 +438,14 @@ async function summarizeMessages(settings: ProviderSettings, messages: readonly 
 				{
 					role: "user",
 					content:
-						"Summarize this coding-agent transcript prefix in <=300 words for the SAME agent continuing the task. " +
-						"Keep: goal, decisions made, files changed (paths), errors hit and how they were resolved, current state, next step. " +
-						"Plain compact prose, no headers.\n\n" + transcript,
+						"Write a brief for the SAME agent to continue this coding task — not a narrative summary of the transcript. " +
+						"The original task message is preserved verbatim elsewhere, so do not restate it. In <=300 words of compact prose cover: " +
+						"(1) the agent's current occupation — what it was doing and the live state; " +
+						"(2) its intentions and planned next steps; " +
+						"(3) remaining work and the criteria for considering the task complete; " +
+						"(4) files read or changed, with paths; " +
+						"(5) errors hit and their resolutions, if worth remembering; " +
+						"(6) pointers to details it may need later (it can retrieve them with recall_context).\n\n" + transcript,
 				},
 			],
 		}),

@@ -39,6 +39,14 @@ export const RANGES = [
 export const fmtCost = (c: number | null) =>
 	c === null ? "—" : c === 0 ? "$0" : `$${c < 0.01 ? c.toFixed(4) : c.toFixed(2)}`;
 export const fmtDur = (ms: number) => (ms >= 1000 ? `${(ms / 1000).toFixed(2)}s` : `${ms}ms`);
+export function ago(iso?: string): string {
+	if (!iso) return "";
+	const s = (Date.now() - new Date(iso).getTime()) / 1000;
+	if (s < 60) return "just now";
+	if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+	if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+	return `${Math.floor(s / 86400)}d ago`;
+}
 export const host = (u: string) => {
 	try {
 		return new URL(u).hostname.replace(/^www\./, "");

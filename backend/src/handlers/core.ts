@@ -159,6 +159,68 @@ export async function usage(req: Request): Promise<Response> {
 	return json({ calls, users });
 }
 
+/** GET /api/compactions — context-compaction history from dedicated
+ *  `compaction` run events (emitted by the worker when prepareTurn trims). */
+export async function compactions(req: Request): Promise<Response> {
+	const uid = await authenticate(req);
+	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
+	const url = new URL(req.url);
+	const filter: Record<string, unknown> = { uid, "event.type": "compaction" };
+	const since = Number(url.searchParams.get("since"));
+	const until = Number(url.searchParams.get("until"));
+	if (since || until) {
+		filter.ingestedAt = {};
+		if (since) (filter.ingestedAt as Record<string, Date>).$gte = new Date(since);
+		if (until) (filter.ingestedAt as Record<string, Date>).$lte = new Date(until);
+	}
+	const limit = Math.min(1000, Number(url.searchParams.get("limit")) || 300);
+	const db = await getDb();
+	const rows = await db
+		.collection("run_events")
+		.find(filter)
+		.sort({ ingestedAt: -1 })
+		.limit(limit)
+		.project({ _id: 0, runId: 1, sessionId: 1, ingestedAt: 1, event: 1 })
+		.toArray();
+	const runIds = [...new Set(rows.map((r) => String(r.runId)))];
+	const runs = await db
+		.collection("runs")
+		.find({ uid, runId: { $in: runIds } })
+		.project({ runId: 1, task: 1, modelId: 1, status: 1 })
+		.toArray();
+	const runMeta = new Map(runs.map((r) => [String(r.runId), r]));
+	const items = rows.map((r) => {
+		const ev = (r.event ?? {}) as Record<string, unknown>;
+		const run = runMeta.get(String(r.runId)) ?? {};
+		return {
+			at: r.ingestedAt,
+			runId: r.runId,
+			sessionId: r.sessionId,
+			agentIndex: ev.agentIndex ?? 0,
+			task: (run as { task?: string }).task,
+			model: ev.model ?? (run as { modelId?: string }).modelId,
+			provider: ev.provider,
+			status: (run as { status?: string }).status,
+			forced: ev.forced,
+			soft: ev.soft,
+			contextBudget: ev.contextBudget,
+			contextWindow: ev.contextWindow,
+			actualInputTokens: ev.actualInputTokens,
+			recap: typeof ev.recap === "string" ? ev.recap.slice(0, 20_000) : undefined,
+			estTokensBefore: ev.estTokensBefore,
+			estTokensAfter: ev.estTokensAfter,
+			stubbed: ev.stubbed,
+			clamped: ev.clamped,
+			superseded: ev.superseded,
+			callsElided: ev.callsElided,
+			reasoningPruned: ev.reasoningPruned,
+			attachmentsStubbed: ev.attachmentsStubbed,
+			summarized: ev.summarized,
+		};
+	});
+	return json({ items });
+}
+
 interface IncomingCall {
 	clientRowId?: number;
 	at?: number;

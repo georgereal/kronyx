@@ -55,6 +55,14 @@ export class SandboxCore {
 		const id = this.sandboxId;
 		if (!id) return false;
 		try {
+			// Skip the provider call when the VM is already paused (e.g. the
+			// janitor beat the idle timer) — pausing twice double-records.
+			const info = await this.provider.getInfoById?.(id, this.creds).catch(() => null);
+			if (info?.state === "paused") {
+				clearTimeout(this.idleTimer);
+				this.handle = undefined;
+				return true;
+			}
 			const ok = await this.provider.pauseById(id, this.creds);
 			if (ok) {
 				clearTimeout(this.idleTimer);
@@ -98,7 +106,11 @@ export class SandboxCore {
 			return null;
 		}
 		if (!this.handle) return null;
-		this.report("resume");
+		// "resume" only when the VM was actually paused — attaching to a running
+		// sandbox is a connect, not a resume. Best-effort probe; unknown state
+		// still reports resume (the historical label) rather than silence.
+		const info = await this.provider.getInfoById?.(id, creds).catch(() => null);
+		this.report(info?.state === "paused" ? "resume" : "connect");
 		this.armIdlePause();
 		return this.handle;
 	}
