@@ -10,14 +10,6 @@ import { ProviderGate } from "@/components/ProviderGate";
 import { apiFetch, useUser } from "@/lib/api";
 import type { SessionDoc } from "@/lib/types";
 
-const ENV_KEY = "kronyx.env";
-
-interface SavedEnv {
-	repo: string;
-	base: string;
-	installationId: number;
-}
-
 interface Repo {
 	repo: string;
 	defaultBranch: string;
@@ -51,6 +43,9 @@ export default function SessionsLanding() {
 	const [error, setError] = useState("");
 	const [lastSession, setLastSession] = useState<SessionDoc | null>(null);
 	const [repoModal, setRepoModal] = useState(false);
+	const [branchStep, setBranchStep] = useState<Repo | null>(null);
+	const [branchList, setBranchList] = useState<string[]>([]);
+	const [branchQuery, setBranchQuery] = useState("");
 	const [repos, setRepos] = useState<Repo[]>([]);
 	const [installations, setInstallations] = useState<Installation[]>([]);
 	const [appSlug, setAppSlug] = useState("");
@@ -75,30 +70,6 @@ export default function SessionsLanding() {
 		});
 	}, [user]);
 
-	// Restore last-used repo once, validated against installed repos.
-	useEffect(() => {
-		if (!user) return;
-		const raw = localStorage.getItem(ENV_KEY);
-		if (!raw) return;
-		let saved: SavedEnv;
-		try {
-			saved = JSON.parse(raw) as SavedEnv;
-		} catch {
-			localStorage.removeItem(ENV_KEY);
-			return;
-		}
-		void apiFetch("/api/github/repos", user).then(async (res) => {
-			if (!res.ok) return;
-			const { repos } = (await res.json()) as { repos: Repo[] };
-			const match = (repos ?? []).find((r) => r.repo === saved.repo && r.installationId === saved.installationId);
-			if (!match) {
-				localStorage.removeItem(ENV_KEY);
-				return;
-			}
-			setEnv((e) => (e.repo ? e : { ...e, repo: match.repo, base: match.defaultBranch, installationId: match.installationId }));
-		});
-	}, [user]);
-
 	if (!user) return null;
 
 	const refreshRepos = async () => {
@@ -112,9 +83,24 @@ export default function SessionsLanding() {
 		if (body.appSlug) setAppSlug(body.appSlug);
 	};
 
+	// Repo pick → branch step: fetch branches for that repo and let the user
+	// choose the start point before any pending session is created.
 	const pickRepo = (r: Repo) => {
-		const next: EnvState = { ...env, repo: r.repo, base: r.defaultBranch, startRef: "", prLabel: "", installationId: r.installationId };
+		setBranchStep(r);
+		setBranchList([]);
+		setBranchQuery("");
+		const q = `?installationId=${r.installationId}&repo=${encodeURIComponent(r.repo)}`;
+		void apiFetch(`/api/github/branches${q}`, user)
+			.then(async (res) => (res.ok ? setBranchList(((await res.json()) as { branches: string[] }).branches ?? []) : undefined))
+			.catch(() => {});
+	};
+
+	const pickBranch = (b: string) => {
+		const r = branchStep;
+		if (!r) return;
+		const next: EnvState = { ...env, repo: r.repo, base: b, startRef: b, prLabel: "", installationId: r.installationId };
 		setEnv(next);
+		setBranchStep(null);
 		setRepoModal(false);
 		if (pending) {
 			const p = pending;
@@ -206,10 +192,6 @@ export default function SessionsLanding() {
 			setBusy(false);
 			return;
 		}
-		if (e.repo && e.installationId) {
-			const saved: SavedEnv = { repo: e.repo, base: e.base, installationId: e.installationId };
-			localStorage.setItem(ENV_KEY, JSON.stringify(saved));
-		}
 		const { session } = (await res.json()) as { session: { sessionId: string } };
 		await apiFetch(`/api/sessions/${session.sessionId}/messages`, user, {
 			method: "POST",
@@ -257,10 +239,11 @@ export default function SessionsLanding() {
 		</div>
 		{repoModal && (
 			<Modal
-				title="Select a repository"
+				title={branchStep ? `Start ${branchStep.repo} from` : "Select a repository"}
 				onClose={() => {
 					setRepoModal(false);
 					setPending(null);
+					setBranchStep(null);
 					setAddingUrl(false);
 					setAddWaiting("");
 					setAddErr("");
@@ -268,38 +251,71 @@ export default function SessionsLanding() {
 					setCreateErr("");
 				}}
 			>
-				<p className="muted" style={{ fontSize: 12.5, marginTop: 0 }}>
-					Kronyx clones this repo into a cloud sandbox and opens a PR against it.
-				</p>
-				<input
-					className="pop-search"
-					style={{ width: "100%", margin: "0 0 8px" }}
-					placeholder="Search repos…"
-					value={repoQuery}
-					onChange={(ev) => setRepoQuery(ev.target.value)}
-					autoFocus
-				/>
-				<div className="pop-scroll" style={{ maxHeight: 320 }}>
-					{repos
-						.filter((r) => r.repo.toLowerCase().includes(repoQuery.toLowerCase()))
-						.map((r) => (
-							<button
-								key={`${r.installationId}:${r.repo}`}
-								className="pop-item"
-								onClick={() => pickRepo(r)}
-							>
-								<GitBranch size={13} />
-								<span className="mono" style={{ flex: 1 }}>{r.repo}</span>
-								<span className="right">{r.defaultBranch}</span>
-							</button>
-						))}
-					{repos.length === 0 && (
-						<div className="pop-item disabled">
-							No repos — <Link href="/connect" style={{ color: "var(--accent)" }}>connect GitHub</Link>
+				{branchStep ? (
+					<>
+						<p className="muted" style={{ fontSize: 12.5, marginTop: 0 }}>
+							Pick the branch the session starts from — the work branch forks here and the PR merges back into it.
+						</p>
+						<input
+							className="pop-search"
+							style={{ width: "100%", margin: "0 0 8px" }}
+							placeholder="Search branches…"
+							value={branchQuery}
+							onChange={(ev) => setBranchQuery(ev.target.value)}
+							autoFocus
+						/>
+						<div className="pop-scroll" style={{ maxHeight: 320 }}>
+							{[branchStep.defaultBranch, ...branchList.filter((b) => b !== branchStep.defaultBranch)]
+								.filter((b) => b.toLowerCase().includes(branchQuery.toLowerCase()))
+								.slice(0, 80)
+								.map((b) => (
+									<button key={b} className="pop-item" onClick={() => pickBranch(b)}>
+										<GitBranch size={13} />
+										<span className="mono" style={{ flex: 1 }}>{b}</span>
+										{b === branchStep.defaultBranch && <span className="right">default</span>}
+									</button>
+								))}
 						</div>
-					)}
-				</div>
-				{!addingUrl && !addWaiting && (
+						<button className="pop-item" style={{ borderTop: "1px solid var(--border)", marginTop: 6 }} onClick={() => setBranchStep(null)}>
+							<span style={{ flex: 1 }} className="muted">← Back to repositories</span>
+						</button>
+					</>
+				) : (
+					<>
+						<p className="muted" style={{ fontSize: 12.5, marginTop: 0 }}>
+							Kronyx clones this repo into a cloud sandbox and opens a PR against it.
+						</p>
+						<input
+							className="pop-search"
+							style={{ width: "100%", margin: "0 0 8px" }}
+							placeholder="Search repos…"
+							value={repoQuery}
+							onChange={(ev) => setRepoQuery(ev.target.value)}
+							autoFocus
+						/>
+						<div className="pop-scroll" style={{ maxHeight: 320 }}>
+							{repos
+								.filter((r) => r.repo.toLowerCase().includes(repoQuery.toLowerCase()))
+								.map((r) => (
+									<button
+										key={`${r.installationId}:${r.repo}`}
+										className="pop-item"
+										onClick={() => pickRepo(r)}
+									>
+										<GitBranch size={13} />
+										<span className="mono" style={{ flex: 1 }}>{r.repo}</span>
+										<span className="right">{r.defaultBranch}</span>
+									</button>
+								))}
+							{repos.length === 0 && (
+								<div className="pop-item disabled">
+									No repos — <Link href="/connect" style={{ color: "var(--accent)" }}>connect GitHub</Link>
+								</div>
+							)}
+						</div>
+					</>
+				)}
+				{!branchStep && !addingUrl && !addWaiting && (
 					<button
 						className="pop-item"
 						style={{ borderTop: "1px solid var(--border)", marginTop: 6 }}
@@ -308,7 +324,7 @@ export default function SessionsLanding() {
 						<span style={{ flex: 1, color: "var(--accent)" }}>Add a repo by URL…</span>
 					</button>
 				)}
-				{addingUrl && !addWaiting && (
+				{!branchStep && addingUrl && !addWaiting && (
 					<div style={{ borderTop: "1px solid var(--border)", marginTop: 6, padding: "10px 12px", display: "flex", flexDirection: "column", gap: 8 }}>
 						<div className="muted" style={{ fontSize: 11 }}>
 							Repo under another account or org — paste its URL and we&apos;ll get access
@@ -329,7 +345,7 @@ export default function SessionsLanding() {
 						{addErr && <div style={{ color: "var(--err)", fontSize: 11.5 }}>{addErr}</div>}
 					</div>
 				)}
-				{addWaiting && (
+				{!branchStep && addWaiting && (
 					<div style={{ borderTop: "1px solid var(--border)", marginTop: 6, padding: "10px 12px", display: "flex", flexDirection: "column", gap: 8 }}>
 						<div className="muted" style={{ fontSize: 12 }}>
 							We don&apos;t have access to <span className="mono">{parseRepoUrl(addUrl)}</span> yet. Grant the Kronyx app
@@ -344,12 +360,12 @@ export default function SessionsLanding() {
 						{addErr && <div style={{ color: "var(--err)", fontSize: 11.5 }}>{addErr}</div>}
 					</div>
 				)}
-				{installations.some((i) => i.type === "Organization") && !creating && (
+				{!branchStep && installations.some((i) => i.type === "Organization") && !creating && (
 					<button className="pop-item" style={{ borderTop: "1px solid var(--border)", marginTop: 6 }} onClick={() => setCreating(true)}>
 						<span style={{ flex: 1, color: "var(--accent)" }}>+ New private repository…</span>
 					</button>
 				)}
-				{creating && (
+				{!branchStep && creating && (
 					<div style={{ borderTop: "1px solid var(--border)", marginTop: 6, padding: "10px 12px", display: "flex", flexDirection: "column", gap: 8 }}>
 						<div className="muted" style={{ fontSize: 11 }}>Create a private repo in an organization</div>
 						<div style={{ display: "flex", gap: 8 }}>

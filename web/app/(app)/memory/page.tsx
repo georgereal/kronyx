@@ -33,7 +33,7 @@ interface MemEvent {
 	query?: string;
 	preview?: string;
 	topScore?: number;
-	items?: { scope?: string; status?: string; preview?: string; score?: number }[];
+	items?: { scope?: string; status?: string; preview?: string; score?: number; branch?: string }[];
 	previews?: string[];
 	paths?: string[];
 	[k: string]: unknown;
@@ -44,6 +44,7 @@ interface MemDoc {
 	sessionId: string;
 	scope: string;
 	repo?: string;
+	branch?: string;
 	content: string;
 	origin?: { runId?: string; kind?: string };
 	confidence?: number;
@@ -103,8 +104,8 @@ function detail(e: MemEvent): string {
 }
 
 /** What actually entered context — recalled memories or scored chunks. */
-function injected(e: MemEvent): { text: string; score?: number }[] {
-	if (e.items?.length) return e.items.filter((i) => i.preview).map((i) => ({ text: i.preview!, score: i.score }));
+function injected(e: MemEvent): { text: string; score?: number; branch?: string }[] {
+	if (e.items?.length) return e.items.filter((i) => i.preview).map((i) => ({ text: i.preview!, score: i.score, branch: i.branch }));
 	if (e.previews?.length) return e.previews.filter(Boolean).map((t) => ({ text: t }));
 	if (e.paths?.length) return e.paths.map((t) => ({ text: t }));
 	if (e.preview) return [{ text: e.preview }];
@@ -116,7 +117,7 @@ export default function MemoryPage() {
 	const [range, setRange] = useState(86_400_000 * 7);
 	const [data, setData] = useState<MemoryResponse | null>(null);
 	const [loading, setLoading] = useState(true);
-	const [openItems, setOpenItems] = useState<{ title: string; items: { text: string; score?: number }[] } | null>(null);
+	const [openItems, setOpenItems] = useState<{ title: string; items: { text: string; score?: number; branch?: string }[] } | null>(null);
 
 	useEffect(() => {
 		if (!user) return;
@@ -299,6 +300,11 @@ export default function MemoryPage() {
 										{t.score.toFixed(2)}
 									</span>
 								)}
+								{t.branch && (
+									<span className="sess-pill running" style={{ marginRight: 6, fontSize: 10 }} title="written on branch">
+										@{t.branch}
+									</span>
+								)}
 								{t.text}
 							</div>
 						))}
@@ -340,7 +346,10 @@ export default function MemoryPage() {
 										{m.status}
 									</span>
 								</td>
-								<td className="muted" style={{ fontSize: 11.5 }}>{m.repo ?? "—"}</td>
+								<td className="muted" style={{ fontSize: 11.5 }}>
+									{m.repo ?? "—"}
+									{m.branch ? <span className="mono">@{m.branch}</span> : ""}
+								</td>
 								<td className="muted mono" style={{ fontSize: 11.5 }}>
 									{m.origin?.runId ? (
 										<Link href={`/runs/${m.origin.runId}`} style={{ color: "inherit" }}>

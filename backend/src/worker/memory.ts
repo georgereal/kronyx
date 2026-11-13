@@ -130,6 +130,8 @@ export interface MemoryDoc {
 	sessionId: string;
 	scope: "conversation" | "project";
 	repo?: string;
+	/** Session's base branch when the fact was written — same-branch facts rank higher. */
+	branch?: string;
 	content: string;
 	origin: { runId: string; kind: "agent" | "user" };
 	confidence: number;
@@ -209,8 +211,18 @@ const MEM_RECALL_MIN_SCORE = 0.3;
 const MEM_DUPE_SCORE = 0.92;
 /** Candidates never recalled after this long are presumed stale and superseded. */
 const MEM_STALE_MS = 30 * 24 * 3600 * 1000;
+/** Superseded docs are hard-deleted after this long — actual removal, not status churn. */
+const MEM_SUPERSEDED_TTL_MS = 30 * 24 * 3600 * 1000;
+/** Active memories not recalled for this long are retired — dead knowledge. */
+const MEM_UNRECALLED_MS = 90 * 24 * 3600 * 1000;
 /** Penalty per failed-run outcome when ranking vector hits (per point of score). */
 const MEM_FAILED_RUN_PENALTY = 0.1;
+/** Ranking bonus for memories written on the current base branch. */
+const MEM_SAME_BRANCH_BONUS = 0.04;
+/** Ranking bonus scaled by exp(-ageDays/30) — ~30d half-life nudge, not a cutoff. */
+const MEM_RECENCY_BONUS = 0.05;
+/** Failed-run record with no successes at this many injections → retire as poison. */
+const MEM_POISON_FAILED = 3;
 
 /**
  * In-process chunk-vector cache, keyed by content hash so identical messages
@@ -292,7 +304,7 @@ export function memoryWriteTool(
 	sessionId: string,
 	runId: string,
 	provider?: EmbedProvider,
-	repo?: string,
+	ctx?: { repo?: string; branch?: string },
 	report?: MemoryReport,
 ): AgentTool<{ fact: string; scope?: string }, string> {
 	return {
@@ -310,6 +322,7 @@ export function memoryWriteTool(
 		async execute(input) {
 			const fact = String(input.fact ?? "").slice(0, 500);
 			if (!fact) return "Empty fact ignored.";
+			const repo = ctx?.repo;
 			// project scope only makes sense with a repo to partition on.
 			const scope: MemoryDoc["scope"] = input.scope === "project" && repo ? "project" : "conversation";
 			const doc: MemoryDoc = {
@@ -318,6 +331,7 @@ export function memoryWriteTool(
 				sessionId,
 				scope,
 				...(repo ? { repo } : {}),
+				...(ctx?.branch ? { branch: ctx.branch } : {}),
 				content: fact,
 				origin: { runId, kind: "agent" },
 				confidence: 0.8,
@@ -347,7 +361,9 @@ export function memoryWriteTool(
 					.toArray()
 					.catch(swallow("memory", "op", []));
 				const near = (dup as unknown as (MemoryDoc & { score?: number })[]).find(
-					(d) => (d.score ?? 0) >= MEM_DUPE_SCORE && (d.scope === "project" ? d.repo === repo : d.sessionId === sessionId),
+					(d) =>
+						(d.score ?? 0) >= MEM_DUPE_SCORE &&
+						(d.scope === "project" ? d.repo === repo && d.branch === ctx?.branch : d.sessionId === sessionId),
 				);
 				if (near) {
 					await db.collection("memories").updateOne(
@@ -403,24 +419,54 @@ export async function searchMemories(
 	repo?: string,
 	report?: MemoryReport,
 	runId?: string,
+	base?: string,
 ): Promise<MemoryDoc[]> {
 	const t0 = Date.now();
-	// Staleness sweep: candidates never injected after MEM_STALE_MS are presumed
-	// dead knowledge — supersede them so they stop competing for the top-8.
+	// Staleness sweep (fires on every recall — cheap updateMany calls):
+	// 1) candidates never injected after MEM_STALE_MS → superseded
+	// 2) active memories that only ever appear in failed runs → superseded
+	// 3) active memories unrecalled for 90d → superseded
+	// 4) superseded docs past TTL → hard-deleted
 	const staleScope: Record<string, unknown>[] = [{ scope: "conversation", sessionId }];
 	if (repo) staleScope.push({ scope: "project", repo });
-	void db
-		.collection("memories")
-		.updateMany(
-			{
+	const now = Date.now();
+	void Promise.all([
+		db
+			.collection("memories")
+			.updateMany(
+				{
+					uid,
+					status: "candidate",
+					createdAt: { $lt: new Date(now - MEM_STALE_MS) },
+					$and: [{ $or: staleScope }, { $or: [{ injectedCount: 0 }, { injectedCount: { $exists: false } }] }],
+				},
+				{ $set: { status: "superseded", supersededAt: new Date(), supersededReason: "stale-never-recalled" } },
+			),
+		db
+			.collection("memories")
+			.updateMany(
+				{
+					uid,
+					status: "active",
+					failedRuns: { $gte: MEM_POISON_FAILED },
+					$or: [{ helpedRuns: 0 }, { helpedRuns: { $exists: false } }],
+				},
+				{ $set: { status: "superseded", supersededAt: new Date(), supersededReason: "consistently-failed" } },
+			),
+		db
+			.collection("memories")
+			.updateMany(
+				{ uid, status: "active", lastRecalledAt: { $lt: new Date(now - MEM_UNRECALLED_MS) } },
+				{ $set: { status: "superseded", supersededAt: new Date(), supersededReason: "unrecalled-90d" } },
+			),
+		db
+			.collection("memories")
+			.deleteMany({
 				uid,
-				status: "candidate",
-				createdAt: { $lt: new Date(Date.now() - MEM_STALE_MS) },
-				$and: [{ $or: staleScope }, { $or: [{ injectedCount: 0 }, { injectedCount: { $exists: false } }] }],
-			},
-			{ $set: { status: "superseded", supersededAt: new Date(), supersededReason: "stale-never-recalled" } },
-		)
-		.catch(swallow("memory", "op"));
+				status: "superseded",
+				$or: [{ supersededAt: { $lt: new Date(now - MEM_SUPERSEDED_TTL_MS) } }, { supersededAt: { $exists: false }, createdAt: { $lt: new Date(now - MEM_SUPERSEDED_TTL_MS) } }],
+			}),
+	]).catch(swallow("memory", "op"));
 	// Repeated runs often recall with the same task text — cache the query
 	// embedding briefly (5min) instead of re-billing an /embeddings call.
 	let vector: number[] | undefined;
@@ -459,9 +505,18 @@ export async function searchMemories(
 			.filter(
 				(h) => (h.scope === "project" ? repo !== undefined && h.repo === repo : h.sessionId === sessionId) && (h.score === undefined || h.score >= MEM_RECALL_MIN_SCORE),
 			)
-			// Outcome-aware ranking: memories repeatedly injected into failed runs
-			// sink below equally-similar ones with clean records.
-			.sort((a, b) => (b.score ?? 0.5) - MEM_FAILED_RUN_PENALTY * (b.failedRuns ?? 0) - ((a.score ?? 0.5) - MEM_FAILED_RUN_PENALTY * (a.failedRuns ?? 0)));
+			// Ranking: vector score − failed-run penalty + same-branch bonus +
+			// a gentle ~30d-half-life recency nudge (not a cutoff — old but
+			// relevant facts still surface).
+			.map((h) => ({
+				...h,
+				rank:
+					(h.score ?? 0.5) -
+					MEM_FAILED_RUN_PENALTY * (h.failedRuns ?? 0) +
+					(base && h.branch === base ? MEM_SAME_BRANCH_BONUS : 0) +
+					MEM_RECENCY_BONUS * Math.exp(-(now - new Date(h.createdAt).getTime()) / (30 * 24 * 3600 * 1000)),
+			}))
+			.sort((a, b) => b.rank - a.rank);
 		if (eligible.length) {
 			const top = eligible.slice(0, 8) as (MemoryDoc & { score?: number })[];
 			// Recall is the verification signal: promote candidates that made it into
@@ -485,7 +540,7 @@ export async function searchMemories(
 				candidates: (hits as unknown[]).length,
 				hits: top.length,
 				query: query.slice(0, 140),
-				items: top.map((m) => ({ scope: m.scope, status: m.status, preview: m.content.slice(0, 120), score: m.score })),
+				items: top.map((m) => ({ scope: m.scope, status: m.status, preview: m.content.slice(0, 120), score: m.score, branch: m.branch })),
 				topScore: top[0]?.score,
 				tookMs: Date.now() - t0,
 			});
@@ -515,7 +570,7 @@ export async function searchMemories(
 		queryCacheHit,
 		hits: injected.length,
 		query: query.slice(0, 140),
-		items: injected.map((m) => ({ scope: m.scope, status: m.status, preview: m.content.slice(0, 120) })),
+		items: injected.map((m) => ({ scope: m.scope, status: m.status, preview: m.content.slice(0, 120), branch: m.branch })),
 		tookMs: Date.now() - t0,
 	});
 	return fallback;

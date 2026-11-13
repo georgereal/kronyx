@@ -4,6 +4,7 @@ import type { User } from "firebase/auth";
 import { Cpu, GitBranch, Paperclip, Plus, SendHorizontal, Settings2, Square, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { apiFetch } from "@/lib/api";
+import { Modal } from "@/components/Modal";
 import type { ModelGroup, ModelOption } from "@/lib/types";
 
 export type Mode = "ask" | "plan" | "agent" | "multi";
@@ -90,6 +91,9 @@ export function Composer({
 	const [repoQuery, setRepoQuery] = useState("");
 	const [modelQuery, setModelQuery] = useState("");
 	const [branches, setBranches] = useState<string[]>([]);
+	const [branchQuery, setBranchQuery] = useState("");
+	const [envPage, setEnvPage] = useState<"menu" | "branch">("menu");
+	const [showAdvanced, setShowAdvanced] = useState(false);
 	const [prs, setPrs] = useState<Pr[]>([]);
 	const taRef = useRef<HTMLTextAreaElement>(null);
 	const fileRef = useRef<HTMLInputElement>(null);
@@ -115,9 +119,10 @@ export function Composer({
 
 	useEffect(() => onModel?.(modelId, modelProfile), [modelId, modelProfile, onModel]);
 
-	// Branch + open-PR lists for the start-point picker — lazy per repo.
+	// Branch + open-PR lists for the start-point picker — lazy per repo,
+	// fetched when the branch page opens.
 	useEffect(() => {
-		if (!env?.repo || !env.installationId || menu !== "env") return;
+		if (!env?.repo || !env.installationId || menu !== "env" || envPage !== "branch") return;
 		const repo = env.repo;
 		const inst = env.installationId;
 		setBranches([]);
@@ -129,14 +134,20 @@ export function Composer({
 		void apiFetch(`/api/github/prs${q}`, user)
 			.then(async (r) => (r.ok ? setPrs(((await r.json()) as { prs: Pr[] }).prs ?? []) : undefined))
 			.catch(() => {});
-	}, [env?.repo, env?.installationId, menu, user]);
+	}, [env?.repo, env?.installationId, menu, envPage, user]);
 
 	useEffect(() => {
 		if (autoFocus) taRef.current?.focus();
 	}, [autoFocus]);
 
-	const toggleMenu = (m: typeof menu) => setMenu((cur) => (cur === m ? "none" : m));
-	const closeMenus = () => setMenu("none");
+	const toggleMenu = (m: typeof menu) => {
+		setMenu((cur) => (cur === m ? "none" : m));
+		setEnvPage("menu");
+	};
+	const closeMenus = () => {
+		setMenu("none");
+		setEnvPage("menu");
+	};
 
 	const submit = () => {
 		const task = text.trim();
@@ -185,6 +196,8 @@ export function Composer({
 
 	const slashFiltered = SLASH_COMMANDS.filter((c) => c.name.startsWith(text.slice(1).toLowerCase()));
 	const repoFiltered = repos.filter((r) => r.repo.toLowerCase().includes(repoQuery.toLowerCase()));
+	// Selected repo only, until the user searches or nothing is selected.
+	const repoShown = env?.repo && !repoQuery ? repoFiltered.filter((r) => r.repo === env.repo) : repoFiltered;
 	const modelFiltered = groups
 		.map((g) => ({ ...g, models: g.models.filter((m) => m.id.toLowerCase().includes(modelQuery.toLowerCase())).slice(0, 60) }))
 		.filter((g) => g.models.length > 0);
@@ -257,44 +270,33 @@ export function Composer({
 								<Settings2 size={15} />
 							</button>
 							{menu === "env" && (
-								<div className="pop" onClick={(e) => e.stopPropagation()}>
-									<div className="pop-title">Repository</div>
-									<input className="pop-search" placeholder="Search repos…" value={repoQuery} onChange={(e) => setRepoQuery(e.target.value)} />
-									<div className="pop-scroll">
-										{repoFiltered.map((r) => (
-											<button
-												key={r.repo}
-												className="pop-item"
-												onClick={() => {
-													if (env.repo === r.repo) return;
-													onEnv({ ...env, repo: r.repo, base: r.defaultBranch, startRef: "", prLabel: "", installationId: r.installationId });
-												}}
-											>
-												<GitBranch size={13} />
-												<span className="mono" style={{ flex: 1 }}>{r.repo}</span>
-												{env.repo === r.repo && <span className="right">✓</span>}
-												{env.repo !== r.repo && env.extraRepos.includes(r.repo) && <span className="right">extra</span>}
-											</button>
-										))}
-										{repos.length === 0 && (
-											<div className="pop-item disabled">
-												No repos —{" "}
-												<a href="/connect" style={{ color: "var(--accent)" }}>connect GitHub</a>
-											</div>
-										)}
-									</div>
-									{env.repo && (
+								<Modal title={envPage === "branch" ? `Select branch — ${env.repo}` : "Environment"} onClose={closeMenus}>
+									{envPage === "branch" && env.repo ? (
 										<>
+											<button className="pop-item" onClick={() => setEnvPage("menu")}>
+												<span className="muted" style={{ flex: 1 }}>← {env.repo}</span>
+											</button>
 											<div className="pop-sep" />
 											<div className="pop-title">Start from</div>
-											<div className="pop-scroll" style={{ maxHeight: 180 }}>
-												{branches.slice(0, 40).map((b) => {
+											{branches.length > 15 && (
+												<input
+													className="pop-search"
+													placeholder="Search branches…"
+													value={branchQuery}
+													onChange={(e) => setBranchQuery(e.target.value)}
+												/>
+											)}
+											<div className="pop-scroll" style={{ maxHeight: 220 }}>
+												{branches.filter((b) => b.toLowerCase().includes(branchQuery.toLowerCase())).slice(0, 60).map((b) => {
 													const sel = !env.prLabel && (env.startRef || env.base) === b;
 													return (
 														<button
 															key={b}
 															className="pop-item"
-															onClick={() => onEnv({ ...env, base: b, startRef: b, prLabel: "" })}
+															onClick={() => {
+																onEnv({ ...env, base: b, startRef: b, prLabel: "" });
+																setEnvPage("menu");
+															}}
 														>
 															<GitBranch size={13} />
 															<span className="mono" style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis" }}>{b}</span>
@@ -314,14 +316,15 @@ export function Composer({
 																<button
 																	key={p.number}
 																	className="pop-item"
-																	onClick={() =>
+																	onClick={() => {
 																		onEnv({
 																			...env,
 																			base: p.baseRef,
 																			startRef: p.headRepo === env.repo ? p.headRef : `pull/${p.number}/head`,
 																			prLabel: `#${p.number}`,
-																		})
-																	}
+																		});
+																		setEnvPage("menu");
+																	}}
 																>
 																	<span style={{ flex: 1, minWidth: 0 }}>
 																		<span style={{ display: "block", fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
@@ -338,69 +341,109 @@ export function Composer({
 													</div>
 												</>
 											)}
-											<div className="pop-sep" />
-											<div className="pop-title">Extra repos (read-only context)</div>
-											<div className="pop-scroll" style={{ maxHeight: 140 }}>
-												{repoFiltered.filter((r) => r.repo !== env.repo).map((r) => (
+										</>
+									) : (
+										<>
+											<div className="pop-title">Repository</div>
+											<input className="pop-search" placeholder={env.repo ? "Search all repos…" : "Search repos…"} value={repoQuery} onChange={(e) => setRepoQuery(e.target.value)} />
+											<div className="pop-scroll" style={{ maxHeight: 200 }}>
+												{repoShown.map((r) => (
 													<button
 														key={r.repo}
+														className="pop-item"
+														onClick={() => {
+															if (env.repo === r.repo) {
+																onEnv({ ...env, repo: "", base: "", startRef: "", prLabel: "", installationId: null });
+																return;
+															}
+															onEnv({ ...env, repo: r.repo, base: r.defaultBranch, startRef: "", prLabel: "", installationId: r.installationId });
+														}}
+													>
+														<GitBranch size={13} />
+														<span className="mono" style={{ flex: 1 }}>{r.repo}</span>
+														{env.repo === r.repo && <span className="right">✓</span>}
+														{env.repo !== r.repo && env.extraRepos.includes(r.repo) && <span className="right">extra</span>}
+													</button>
+												))}
+												{repos.length === 0 && (
+													<div className="pop-item disabled">
+														No repos —{" "}
+														<a href="/connect" style={{ color: "var(--accent)" }}>connect GitHub</a>
+													</div>
+												)}
+											</div>
+											{env.repo && (
+												<>
+													<div className="pop-sep" />
+													<button
+														className="pop-item"
+														onClick={() => {
+															setBranchQuery("");
+															setEnvPage("branch");
+														}}
+													>
+														<GitBranch size={13} />
+														<span style={{ flex: 1 }}>Select branch</span>
+														<span className="right mono" style={{ maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+															{env.prLabel || env.startRef || env.base} →
+														</span>
+													</button>
+												</>
+											)}
+											<div className="pop-sep" />
+											<button className="pop-item" onClick={() => setShowAdvanced((v) => !v)}>
+												<span style={{ flex: 1 }}>Advanced</span>
+												<span className="right">{showAdvanced ? "▾" : "▸"}</span>
+											</button>
+											{showAdvanced && (
+												<>
+													<div className="pop-item" style={{ cursor: "default" }}>
+														<span style={{ flex: 1 }}>Virtual environment</span>
+														<input
+															className="pop-search"
+															style={{ width: 130, margin: 0 }}
+															placeholder="e2b template"
+															value={env.template}
+															onChange={(e) => onEnv({ ...env, template: e.target.value })}
+														/>
+													</div>
+													<button
 														className="pop-item"
 														onClick={() =>
 															onEnv({
 																...env,
-																extraRepos: env.extraRepos.includes(r.repo)
-																	? env.extraRepos.filter((x) => x !== r.repo)
-																	: [...env.extraRepos, r.repo],
+																securityProfile:
+																	env.securityProfile === "agent" ? "controlled" : env.securityProfile === "controlled" ? "bypass" : "agent",
 															})
 														}
 													>
-														<span className="mono" style={{ flex: 1 }}>{r.repo}</span>
-														<span className="right">{env.extraRepos.includes(r.repo) ? "✓" : ""}</span>
+														<span style={{ flex: 1 }}>Security profile</span>
+														<span className="right">
+															{env.securityProfile === "bypass" ? "Bypass approvals" : env.securityProfile === "controlled" ? "Approve each change" : "Agent (default)"}
+														</span>
 													</button>
-												))}
-											</div>
+													<div className="pop-item disabled">
+														<span style={{ flex: 1 }}>MCP connectors</span>
+														<span className="right">Coming soon</span>
+													</div>
+												</>
+											)}
 										</>
 									)}
-									<div className="pop-sep" />
-									<div className="pop-title">Environment</div>
-									<div className="pop-item" style={{ cursor: "default" }}>
-										<span style={{ flex: 1 }}>Virtual environment</span>
-										<input
-											className="pop-search"
-											style={{ width: 130, margin: 0 }}
-											placeholder="e2b template"
-											value={env.template}
-											onChange={(e) => onEnv({ ...env, template: e.target.value })}
-										/>
-									</div>
-									<button
-										className="pop-item"
-										onClick={() =>
-											onEnv({
-												...env,
-												securityProfile:
-													env.securityProfile === "agent" ? "controlled" : env.securityProfile === "controlled" ? "bypass" : "agent",
-											})
-										}
-									>
-										<span style={{ flex: 1 }}>Security profile</span>
-										<span className="right">
-											{env.securityProfile === "bypass" ? "Bypass approvals" : env.securityProfile === "controlled" ? "Approve each change" : "Agent (default)"}
-										</span>
-									</button>
-									<div className="pop-item disabled">
-										<span style={{ flex: 1 }}>MCP connectors</span>
-										<span className="right">Coming soon</span>
-									</div>
-								</div>
+								</Modal>
 							)}
 						</div>
 					)}
 					{env?.repo ? (
-						<span className="sess-chip mono" style={{ maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis" }}>
+						<button
+							className="sess-chip mono"
+							style={{ maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis", cursor: "pointer" }}
+							onClick={() => toggleMenu("env")}
+							title="Change repository or branch"
+						>
 							{env.repo}
-							{env.prLabel ? ` ${env.prLabel}` : env.startRef && env.startRef !== env.base ? ` @${env.startRef}` : ""}
-						</span>
+							{env.prLabel ? ` ${env.prLabel}` : ` @${env.startRef || env.base}`}
+						</button>
 					) : (
 						env && onEnv && mode !== "ask" && (
 							<button className="chip-btn" onClick={() => toggleMenu("env")}>
