@@ -8,7 +8,7 @@ import type { PriorTranscript } from "../agent/recall";
 import type { AgentMessage } from "@cline/shared";
 import { checksOnFinish, runChecks } from "../checks";
 import { E2bSandbox, sandboxBackend, sandboxEnabled } from "../sandbox/e2b";
-import { appendFact, indexFile, loadMemoryContext, logEpisode } from "../agent/memory";
+import { appendFact, createIdeRecallScorer, indexFile, loadMemoryContext, logEpisode } from "../agent/memory";
 import { createFileTools } from "../tools/fileTools";
 import { insertMemoryEvent, openStore } from "../store";
 import { createIdeTools } from "./ideTools";
@@ -147,6 +147,7 @@ export class SessionController {
 	private runnerRoot: string | undefined;
 	private approveAll = false;
 	private changedPaths = new Set<string>();
+	private indexTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	private diagBaseline: { errors: number; warnings: number } | undefined;
 	private runStartedAt = 0;
 	private replayed = false;
@@ -353,6 +354,10 @@ export class SessionController {
 				onBeforeWrite: (abs, before) => this.deps.diffReview.record(abs, before),
 				execCommand: (command) => this.execCommand(command),
 				priorTranscripts: () => this.transcripts,
+				recallScorer: async (query, chunks) => {
+					const s = await readProviderSettings(this.deps.context.secrets);
+					return s ? createIdeRecallScorer(root, s.baseUrl, s.apiKey)(query, chunks) : undefined;
+				},
 				saveTranscript: (messages) => {
 					this.transcripts = [...this.transcripts, { label: `run ${this.transcripts.length + 1}`, messages }].slice(-5);
 					this.deps.saveTranscript?.(this.name, messages);
@@ -367,6 +372,21 @@ export class SessionController {
 		return this.runner;
 	}
 
+	/** Re-indexes a changed file after 500 ms of quiet, so rapid agent edits embed once. */
+	private scheduleIndex(root: string, rel: string): void {
+		const key = `${root}\0${rel}`;
+		clearTimeout(this.indexTimers.get(key));
+		this.indexTimers.set(
+			key,
+			setTimeout(() => {
+				this.indexTimers.delete(key);
+				void readProviderSettings(this.deps.context.secrets).then((s) => {
+					if (s) void indexFile(root, rel, s.baseUrl, s.apiKey);
+				});
+			}, 500),
+		);
+	}
+
 	private onEvent(event: Parameters<RunViewProvider["post"]>[0]): void {
 		this.surface.post(event);
 		// Delta events are transient streaming frames — final messages persist separately.
@@ -378,9 +398,7 @@ export class SessionController {
 			const abs = path.resolve(this.runnerRoot, event.path);
 			this.changedPaths.add(abs);
 			this.deps.comments.noteChangedFile(abs, event.kind, this.runTask);
-			void readProviderSettings(this.deps.context.secrets).then((s) => {
-				if (s) void indexFile(this.runnerRoot!, event.path, s.baseUrl, s.apiKey);
-			});
+			this.scheduleIndex(this.runnerRoot, event.path);
 		}
 		if (event.type === "usage") {
 			const now = Date.now();

@@ -111,6 +111,8 @@ export async function openStore(root: string): Promise<Store | undefined> {
 		db.exec(`CREATE TABLE IF NOT EXISTS chunks(
 			root TEXT, path TEXT, idx INTEGER, text TEXT, embedding BLOB,
 			PRIMARY KEY(root, path, idx))`);
+		db.exec(`CREATE TABLE IF NOT EXISTS embedding_cache(
+			hash TEXT, model TEXT, embedding BLOB, PRIMARY KEY(hash, model))`);
 	} catch (error) {
 		lastError = error instanceof Error ? `${error.message}\n${error.stack ?? ""}` : String(error);
 		db = undefined;
@@ -357,6 +359,37 @@ export function deleteChunks(d: Store | undefined, path2: string, root?: string)
 	try {
 		if (root) run(d, "DELETE FROM chunks WHERE path = ? AND root = ?", [path2, root]);
 		else run(d, "DELETE FROM chunks WHERE path = ?", [path2]);
+	} catch { /* store unavailable */ }
+}
+
+/** Distinct indexed paths for a root — used to prune chunks of deleted files. */
+export function listIndexedPaths(d: Store | undefined, root: string): string[] {
+	try {
+		return all(d, "SELECT DISTINCT path FROM chunks WHERE root = ?", [root]).map((r) => String(r.path));
+	} catch {
+		return [];
+	}
+}
+
+/** Cached embedding by content hash + model; avoids re-embedding unchanged text. */
+export function getEmbeddingCache(d: Store | undefined, hash: string, model: string): Float32Array | undefined {
+	try {
+		const rows = all(d, "SELECT embedding FROM embedding_cache WHERE hash = ? AND model = ?", [hash, model]);
+		if (!rows[0]) return undefined;
+		const bytes = new Uint8Array(rows[0].embedding as Uint8Array);
+		const copy = new Uint8Array(bytes.byteLength);
+		copy.set(bytes);
+		return new Float32Array(copy.buffer);
+	} catch {
+		return undefined;
+	}
+}
+
+export function putEmbeddingCache(d: Store | undefined, hash: string, model: string, embedding: Float32Array): void {
+	try {
+		run(d, "INSERT OR REPLACE INTO embedding_cache(hash, model, embedding) VALUES (?, ?, ?)", [
+			hash, model, Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength),
+		]);
 	} catch { /* store unavailable */ }
 }
 

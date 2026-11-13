@@ -42,7 +42,23 @@ export interface RecallOptions {
 const cap = (text: string): string =>
 	text.length > MAX_OUTPUT_CHARS ? `${text.slice(0, MAX_OUTPUT_CHARS)}\n…[${text.length - MAX_OUTPUT_CHARS} chars elided]` : text;
 
-const messageText = (m: AgentMessage): string => JSON.stringify(m.content);
+/**
+ * Readable text for a message: text parts verbatim, tool calls/results as
+ * compact labelled lines. Avoids JSON escaping (\n, \") in snippets.
+ */
+const messageText = (m: AgentMessage): string =>
+	m.content
+		.map((p) => {
+			if (p.type === "text") return p.text;
+			if (p.type === "tool-call") return `[call ${p.toolName}] ${JSON.stringify(p.input)}`;
+			if (p.type === "tool-result") {
+				const out = typeof p.output === "string" ? p.output : JSON.stringify(p.output ?? "");
+				return `[result ${p.toolName}] ${out}`;
+			}
+			return "";
+		})
+		.filter(Boolean)
+		.join("\n");
 
 function findToolResult(messages: readonly AgentMessage[], toolCallId: string): AgentToolResultPart | undefined {
 	for (const m of messages) {

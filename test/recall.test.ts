@@ -90,6 +90,14 @@ describe("recall_context", () => {
 		expect(out).toContain("FULL-OUTPUT-xyz");
 	});
 
+	it("renders keyword snippets without JSON escapes", async () => {
+		const multi = [msg("assistant", [{ type: "text", text: "first line\nsecond \"quoted\" tokenizer line" }])];
+		const out = await Promise.resolve(tool.execute({ query: "tokenizer" }, ctxWith(multi)));
+		expect(out).toContain("second \"quoted\" tokenizer line");
+		expect(out).not.toContain("\\n");
+		expect(out).not.toContain("\\\"");
+	});
+
 	it("bounds oversized recall output", async () => {
 		const big = [msg("tool", [{ type: "tool-result", toolCallId: "big1", toolName: "read_file", output: "z".repeat(20_000) }])];
 		const scored = createRecallTool({ scorer: async () => [{ idx: 0, score: 0.99 }] });
