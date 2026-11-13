@@ -25,10 +25,30 @@ export async function loadMemoryContext(
 	const [rules, facts] = await Promise.all([read(RULES), read(FACTS)]);
 	const parts: string[] = [];
 	if (rules.trim()) parts.push(`Workspace rules (.kronyx/rules.md):\n${rules.trim()}`);
-	if (facts.trim()) parts.push(`Remembered project facts (.kronyx/memory/facts.md):\n${facts.trim()}`);
+	// Facts are appended forever — inject a bounded tail so the block can't
+	// silently eat the context budget (same cap as the cloud memory block).
+	const factsText = facts.trim();
+	const factsCapped =
+		factsText.length > 2400 ? factsText.slice(-2400).replace(/^[^\n]*\n?/, "") : factsText;
+	if (factsCapped) parts.push(`Remembered project facts (.kronyx/memory/facts.md):\n${factsCapped}`);
+	let hits: string[] = [];
 	if (task && settings) {
-		const hits = await searchMemory(root, task, settings.baseUrl, settings.apiKey).catch(() => []);
+		hits = await searchMemory(root, task, settings.baseUrl, settings.apiKey).catch(() => []);
 		if (hits.length > 0) parts.push(`Relevant code/memory snippets (semantic search):\n${hits.join("\n\n")}`);
+	}
+	// Parity with the cloud contextManifest — record what actually entered context.
+	if (parts.length) {
+		const { openStore, insertMemoryEvent } = await import("../store");
+		insertMemoryEvent(await openStore(root), {
+			op: "memory_inject",
+			detail: {
+				chars: parts.join("").length,
+				factLines: factsCapped ? factsCapped.split("\n").length : 0,
+				factsTruncated: factsCapped.length < factsText.length,
+				snippets: hits.length,
+				previews: factsCapped.split("\n").filter(Boolean).slice(-5).map((l) => l.slice(0, 120)),
+			},
+		}, root);
 	}
 	return parts.join("\n\n");
 }
@@ -39,6 +59,8 @@ export async function appendFact(root: string, fact: string): Promise<void> {
 	await fs.mkdir(path.dirname(file), { recursive: true });
 	const line = fact.trim().replace(/\n+/g, " ");
 	await fs.appendFile(file, `${line.startsWith("-") ? line : `- ${line}`}\n`);
+	const { openStore, insertMemoryEvent } = await import("../store");
+	insertMemoryEvent(await openStore(root), { op: "memory_fact", detail: { chars: line.length } }, root);
 }
 
 // ---------- vector memory (ADR-0005: API embeddings; ADR-0004: sqlite store) ----------
@@ -64,18 +86,32 @@ export function chunkText(text: string): string[] {
 	return chunks.filter((c) => c.trim().length > 20).slice(0, 20);
 }
 
-export async function embedTexts(baseUrl: string, apiKey: string, texts: string[]): Promise<Float32Array[]> {
+export async function embedTexts(baseUrl: string, apiKey: string, texts: string[], op = "memory", root = ""): Promise<Float32Array[]> {
 	const model = embeddingModel();
 	if (!model) return [];
-	const res = await fetch(`${baseUrl.replace(/\/$/, "")}/embeddings`, {
-		method: "POST",
-		headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-		body: JSON.stringify({ model, input: texts }),
-		signal: AbortSignal.timeout(30_000),
-	});
-	if (!res.ok) return [];
-	const json = (await res.json()) as { data?: { embedding: number[] }[] };
-	return (json.data ?? []).map((d) => new Float32Array(d.embedding));
+	const t0 = Date.now();
+	let status = "failed";
+	let tokensIn = 0;
+	try {
+		const res = await fetch(`${baseUrl.replace(/\/$/, "")}/embeddings`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+			body: JSON.stringify({ model, input: texts }),
+			signal: AbortSignal.timeout(30_000),
+		});
+		if (!res.ok) return [];
+		const json = (await res.json()) as { data?: { embedding: number[] }[]; usage?: { prompt_tokens?: number; total_tokens?: number } };
+		status = "ok";
+		tokensIn = json.usage?.prompt_tokens ?? json.usage?.total_tokens ?? Math.ceil(texts.join("").length / 4);
+		return (json.data ?? []).map((d) => new Float32Array(d.embedding));
+	} finally {
+		// Ledger row — syncs to usage_events like chat calls do (kind="embedding").
+		const { openStore, insertApiCall } = await import("../store");
+		insertApiCall(await openStore(root), {
+			session: "", task: "", at: t0, status, baseUrl, model,
+			tokensIn, tokensOut: 0, kind: "embedding", op, durationMs: Date.now() - t0,
+		}, root);
+	}
 }
 
 const cosine = (a: Float32Array, b: Float32Array): number => {
@@ -97,15 +133,16 @@ export async function indexFile(root: string, rel: string, baseUrl: string, apiK
 	const text = await fs.readFile(abs, "utf8").catch(() => "");
 	if (!text || text.length > 300_000) return;
 	const chunks = chunkText(text);
-	const vectors = await embedTexts(baseUrl, apiKey, chunks);
+	const vectors = await embedTexts(baseUrl, apiKey, chunks, "memory_index", root);
 	if (vectors.length === 0) return;
-	const { openStore, deleteChunks, upsertChunk, kvSet } = await import("../store");
+	const { openStore, deleteChunks, upsertChunk, kvSet, insertMemoryEvent } = await import("../store");
 	const d = await openStore(root);
 	kvSet(d, `mtime:${root}:${rel}`, (await fs.stat(abs)).mtimeMs);
 	deleteChunks(d, rel, root);
 	chunks.forEach((chunk, i) => {
 		if (vectors[i]) upsertChunk(d, rel, i, chunk, vectors[i], root);
 	});
+	insertMemoryEvent(d, { op: "index_file", detail: { path: rel, chunks: chunks.length } }, root);
 }
 
 /** Full-workspace index: embeds changed files incrementally (mtime in kv). */
@@ -116,7 +153,7 @@ export async function indexWorkspace(
 	log: (line: string) => void = () => {},
 ): Promise<number> {
 	if (!embeddingModel()) return 0;
-	const { openStore, deleteChunks, upsertChunk, kvGet, kvSet } = await import("../store");
+	const { openStore, deleteChunks, upsertChunk, kvGet, kvSet, insertMemoryEvent } = await import("../store");
 	const d = await openStore(root);
 	if (!d) return 0;
 	const files: { rel: string; mtime: number }[] = [];
@@ -137,7 +174,7 @@ export async function indexWorkspace(
 		deleteChunks(d, file.rel, root);
 		for (let i = 0; i < chunks.length; i += BATCH) {
 			const batch = chunks.slice(i, i + BATCH);
-			const vectors = await embedTexts(baseUrl, apiKey, batch);
+			const vectors = await embedTexts(baseUrl, apiKey, batch, "memory_index", root);
 			batch.forEach((chunk, j) => {
 				if (vectors[j]) upsertChunk(d, file.rel, i + j, chunk, vectors[j], root);
 			});
@@ -146,6 +183,7 @@ export async function indexWorkspace(
 		if (++done % 25 === 0) log(`  ${done}/${stale.length} files indexed`);
 	}
 	log(`Index done: ${done} file(s) updated.`);
+	insertMemoryEvent(d, { op: "index_done", detail: { scanned: files.length, stale: stale.length, indexed: done } }, root);
 	return done;
 }
 
@@ -164,17 +202,36 @@ async function* walkWorkspace(root: string, rel: string): AsyncGenerator<string>
 /** Semantic search over the local chunk index; returns top-k snippets. */
 export async function searchMemory(root: string, query: string, baseUrl: string, apiKey: string): Promise<string[]> {
 	if (!embeddingModel()) return [];
-	const { openStore, listChunks } = await import("../store");
+	const t0 = Date.now();
+	const { openStore, listChunks, insertMemoryEvent } = await import("../store");
 	const d = await openStore(root);
 	const chunks = listChunks(d, undefined, root);
-	if (chunks.length === 0) return [];
-	const [qv] = await embedTexts(baseUrl, apiKey, [query]);
-	if (!qv) return [];
-	return chunks
+	if (chunks.length === 0) {
+		insertMemoryEvent(d, { op: "memory_search", detail: { chunks: 0, hits: 0, tookMs: Date.now() - t0 } }, root);
+		return [];
+	}
+	const [qv] = await embedTexts(baseUrl, apiKey, [query], "memory_search", root);
+	if (!qv) {
+		insertMemoryEvent(d, { op: "memory_search", detail: { chunks: chunks.length, hits: 0, noEmbed: true, tookMs: Date.now() - t0 } }, root);
+		return [];
+	}
+	const scored = chunks
 		.map((c) => ({ ...c, score: cosine(qv, c.embedding) }))
 		.sort((a, b) => b.score - a.score)
-		.slice(0, topK())
-		.map((c) => `// ${c.path}\n${c.text.slice(0, 800)}`);
+		.slice(0, topK());
+	const hits = scored.map((c) => `// ${c.path}\n${c.text.slice(0, 800)}`);
+	insertMemoryEvent(d, {
+		op: "memory_search",
+		detail: {
+			chunks: chunks.length,
+			hits: hits.length,
+			query: query.slice(0, 140),
+			paths: scored.map((c) => c.path).slice(0, 8),
+			topScore: scored[0]?.score,
+			tookMs: Date.now() - t0,
+		},
+	}, root);
+	return hits;
 }
 
 /** Feedback capture: accept/reject decisions per PLAN-006 provenance. Stored in the

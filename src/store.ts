@@ -105,6 +105,9 @@ export async function openStore(root: string): Promise<Store | undefined> {
 			id INTEGER PRIMARY KEY, root TEXT, sandbox_id TEXT, device TEXT, device_id TEXT,
 			template TEXT, repo TEXT, run_id TEXT, event TEXT, at INTEGER,
 			synced INTEGER DEFAULT 0)`);
+		db.exec(`CREATE TABLE IF NOT EXISTS memory_events(
+			id INTEGER PRIMARY KEY, root TEXT, session TEXT, run_id TEXT, at INTEGER,
+			op TEXT, detail TEXT, device_id TEXT, synced INTEGER DEFAULT 0)`);
 		db.exec(`CREATE TABLE IF NOT EXISTS chunks(
 			root TEXT, path TEXT, idx INTEGER, text TEXT, embedding BLOB,
 			PRIMARY KEY(root, path, idx))`);
@@ -211,7 +214,7 @@ export function migrateLegacyStore(legacyPath: string): void {
 		if (all(db, "SELECT value FROM kv WHERE key = ?", [`migrated:${legacyPath}`]).length) return;
 		if (!existsSync(legacyPath)) return;
 		db.exec(`ATTACH DATABASE '${legacyPath.replace(/'/g, "''")}' AS legacy`);
-		for (const t of ["runs", "session_events", "api_calls", "usage_history", "prs", "transcripts", "episodes", "kv", "sandboxes", "eval_results", "chunks"]) {
+			for (const t of ["runs", "session_events", "api_calls", "usage_history", "prs", "transcripts", "episodes", "kv", "sandboxes", "eval_results", "chunks", "memory_events"]) {
 			try {
 				const cols = (db.prepare(`SELECT name FROM pragma_table_info(?)`).all(t) as { name: string }[])
 					.map((c) => c.name).filter((n) => n !== "id");
@@ -373,6 +376,57 @@ export function listChunks(d: Store | undefined, limit = 20000, root?: string): 
 	} catch {
 		return [];
 	}
+}
+
+// ---------- memory events (vector/index diagnostics, syncable) ----------
+
+export function insertMemoryEvent(
+	d: Store | undefined,
+	e: { op: string; detail?: Record<string, unknown>; session?: string; runId?: string; deviceId?: string; at?: number },
+	root = "",
+): void {
+	try {
+		run(d, "INSERT INTO memory_events(root, session, run_id, at, op, detail, device_id) VALUES (?, ?, ?, ?, ?, ?, ?)", [
+			root, e.session ?? "", e.runId ?? "", e.at ?? Date.now(), e.op, e.detail ? JSON.stringify(e.detail) : "", e.deviceId ?? "",
+		]);
+	} catch { /* store unavailable */ }
+}
+
+export interface MemoryEventFilter {
+	since?: number;
+	until?: number;
+	ops?: string[];
+	limit?: number;
+}
+
+export function listMemoryEvents(d: Store | undefined, filter: MemoryEventFilter = {}, root?: string): Record<string, unknown>[] {
+	const where: string[] = [];
+	const params: unknown[] = [];
+	if (root !== undefined) { where.push("root = ?"); params.push(root); }
+	if (filter.ops?.length) { where.push(`op IN (${filter.ops.map(() => "?").join(",")})`); params.push(...filter.ops); }
+	if (filter.since !== undefined) { where.push("at >= ?"); params.push(filter.since); }
+	if (filter.until !== undefined) { where.push("at <= ?"); params.push(filter.until); }
+	params.push(filter.limit ?? 500);
+	try {
+		return all(d, `SELECT * FROM memory_events${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY at DESC LIMIT ?`, params);
+	} catch {
+		return [];
+	}
+}
+
+export function listUnsyncedMemoryEvents(d: Store | undefined, limit = 200): Record<string, unknown>[] {
+	try {
+		return all(d, "SELECT * FROM memory_events WHERE synced = 0 ORDER BY at LIMIT ?", [limit]);
+	} catch {
+		return [];
+	}
+}
+
+export function markMemoryEventsSynced(d: Store | undefined, ids: number[]): void {
+	if (!d || ids.length === 0) return;
+	try {
+		run(d, `UPDATE memory_events SET synced = 1 WHERE id IN (${ids.map(() => "?").join(",")})`, ids);
+	} catch { /* store unavailable */ }
 }
 
 // ---------- usage history ----------

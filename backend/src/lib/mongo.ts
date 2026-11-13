@@ -38,6 +38,7 @@ export async function getDb(): Promise<Db> {
 	await db.collection("run_reports").createIndex({ uid: 1, runId: 1 }, { unique: true });
 	await db.collection("run_transcripts").createIndex({ uid: 1, runId: 1 }, { unique: true });
 	await db.collection("run_transcripts").createIndex({ uid: 1, sessionId: 1, savedAt: 1 });
+	await db.collection("memory_events").createIndex({ uid: 1, at: -1 });
 	await db.collection("memories").createIndex({ uid: 1, memoryId: 1 }, { unique: true });
 	await db.collection("memories").createIndex({ uid: 1, sessionId: 1, scope: 1, status: 1 });
 	await db.collection("sandboxes").createIndex({ uid: 1, sessionId: 1, at: 1 });

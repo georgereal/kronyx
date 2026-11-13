@@ -30,6 +30,7 @@ import {
 	sessionMemoryContext,
 	type ContextManifest,
 	type EmbedProvider,
+	type MemoryDoc,
 } from "./memory";
 
 const REPO_DIR = "/home/user/repo";
@@ -377,14 +378,18 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		const planSlugs = planDocs.map((p) => String(p.slug));
 		// Context manifest (ADR §9): record what rehydration actually loaded.
 		const embed: EmbedProvider | undefined = this.embedProvider;
-		const memories = await searchMemories(this.db, job.uid, job.sessionId, job.task, embed, session.repo ?? undefined).catch(
+		const memories = await searchMemories(this.db, job.uid, job.sessionId, job.task, embed, session.repo ?? undefined, this.memoryReport, job.runId).catch(
 			swallow("executor", "op", []),
 		);
+		// sessionMemoryContext injects the newest 10 — record exactly those, not
+		// the whole recall set, or outcome credit lands on memories never seen.
+		const injectedMemories = memories.slice(-10);
 		const manifest: ContextManifest = {
 			contextId: randomUUID(),
 			transcriptsIncluded: transcripts.map((t) => t.label),
 			digestCount: (session as { digests?: unknown[] }).digests?.length ?? 0,
-			memoryIdsUsed: memories.map((m) => m.memoryId),
+			memoryIdsUsed: injectedMemories.map((m) => m.memoryId),
+			memoryChars: injectedMemories.reduce((s, m) => s + m.content.length, 0),
 			planSlugs,
 			builtAt: new Date(),
 		};
@@ -409,15 +414,26 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 					(await this.db.collection("sessions").findOne({ uid: job.uid, sessionId: job.sessionId }))) as SessionDoc | null;
 				if (fresh) void sessCache?.set(sessKey, fresh, 5_000).catch(() => {});
 				// Cold-start already searched for this exact task — reuse it.
-				const mem =
-					task === job.task
-						? memories
-						: await searchMemories(this.db, job.uid, job.sessionId, task, embed, session.repo ?? undefined).catch(
-								swallow("executor", "op", memories),
-							);
+				let mem = memories;
+				if (task !== job.task) {
+					mem = await searchMemories(this.db, job.uid, job.sessionId, task, embed, session.repo ?? undefined, this.memoryReport, job.runId).catch(
+						swallow("executor", "op", memories),
+					);
+					// A different recall set is being injected — merge it into the
+					// manifest so recordMemoryOutcome credits the right memories.
+					const newIds = mem.slice(-10).map((m) => m.memoryId);
+					if (newIds.length)
+						void this.db
+							.collection("runs")
+							.updateOne(
+								{ uid: job.uid, runId: job.runId },
+								{ $addToSet: { "contextManifest.memoryIdsUsed": { $each: newIds } } },
+							)
+							.catch(swallow("executor", "op"));
+				}
 				return sessionMemoryContext({ ...session, ...fresh } as SessionDoc, planSlugs, mem);
 			},
-			recallScorer: embed ? createRecallScorer(embed) : undefined,
+			recallScorer: embed ? createRecallScorer(embed, this.memoryReport) : undefined,
 			checkPermission: async (toolName, input) => {
 				// Lazy-load once per runner: global rules from the user's synced
 				// settings (data.permissions object or permissionsJson string);
@@ -576,6 +592,11 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 
 	private usageSeq = 0;
 
+	/** Memory/vector diagnostics → flat `memory` run_events (the /api/memory feed). */
+	private memoryReport = (d: Record<string, unknown>): void => {
+		void this.sink.emit({ type: "memory", ...d });
+	};
+
 	/** EmbedProvider wired to record each embeddings call as a usage row. */
 	private embedProviderFor(job: CloudJob, p: ProviderSettings): EmbedProvider {
 		return {
@@ -690,6 +711,24 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		}
 	}
 
+	/** Outcome feedback: memories injected at cold start get credited with the
+	 *  run's result — the signal that separates "retrieved" from "useful". */
+	private async recordMemoryOutcome(job: CloudJob, status: "completed" | "failed", runId = job.runId): Promise<void> {
+		const run = await this.db
+			.collection("runs")
+			.findOne({ uid: job.uid, runId }, { projection: { contextManifest: 1 } })
+			.catch(swallow("executor", "op", null));
+		const ids = ((run?.contextManifest as { memoryIdsUsed?: string[] } | undefined)?.memoryIdsUsed ?? []).filter(Boolean);
+		if (!ids.length) return;
+		await this.db
+			.collection("memories")
+			.updateMany(
+				{ uid: job.uid, memoryId: { $in: ids } },
+				{ $inc: { [status === "completed" ? "helpedRuns" : "failedRuns"]: 1 }, $set: { lastOutcome: status, lastOutcomeRunId: runId } },
+			)
+			.catch(swallow("executor", "op"));
+	}
+
 	async run(job: CloudJob): Promise<void> {
 		const settings = await loadUserSettings(this.db, job.uid);
 		const session = await this.db
@@ -707,6 +746,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			else if (job.mode === "ask") await this.ask(job, session, settings);
 			else if (job.mode === "multi") await this.multi(job, session, settings);
 			else await this.sandboxed(job, session, settings);
+			if (!this.stopRequested) await this.recordMemoryOutcome(job, "completed");
 			// True job end — the UI's single "completed" signal. run-finished is
 			// only the agent's summary; this fires after push/PR/verify all land.
 			await this.sink.emit({
@@ -717,6 +757,9 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				checks: this.runChecks,
 				compaction: this.lastCompaction,
 			});
+		} catch (e) {
+			if (!this.stopRequested) await this.recordMemoryOutcome(job, "failed").catch(swallow("executor", "op"));
+			throw e;
 		} finally {
 			this.stopSandboxKeepalive();
 		}
@@ -763,7 +806,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		this.embedProvider = this.embedProviderFor(job, s);
 		const atts = await this.attachments(job);
 		const { runner } = await this.ensureRunner(job, session, "ask", "ask", () =>
-			Promise.resolve([memoryWriteTool(this.db, job.uid, job.sessionId, job.runId, this.embedProvider, session.repo ?? undefined)]),
+			Promise.resolve([memoryWriteTool(this.db, job.uid, job.sessionId, job.runId, this.embedProvider, session.repo ?? undefined, this.memoryReport)]),
 		);
 		this.throwIfStopped();
 		await this.sink.emit({ type: "cloud-status", text: "Contacting model…" });
@@ -1120,7 +1163,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 					planDir: PLAN_DIR,
 					onCommandOutput: (chunk) => this.queueToolOutput(chunk),
 				}),
-				memoryWriteTool(this.db, job.uid, job.sessionId, job.runId, this.embedProvider, session.repo ?? undefined),
+				memoryWriteTool(this.db, job.uid, job.sessionId, job.runId, this.embedProvider, session.repo ?? undefined, this.memoryReport),
 				// browser_use drives a UI sub-agent; skip in plan mode (read-only).
 				...(mode === "plan"
 					? []
@@ -1371,10 +1414,39 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 
 		for (const s of slices) await patchSliceRun(s.index, { task: s.title, status: "queued" });
 
+		// Cold-start memory recall — same pipeline as ensureRunner. The parent
+		// manifest gets the base recall; each slice re-searches on its own task
+		// inside memoryContext and records its own manifest on its sub-run doc.
+		const embed = this.embedProvider;
+		const baseMemories = await searchMemories(this.db, job.uid, job.sessionId, job.task, embed, session.repo ?? undefined, this.memoryReport, job.runId).catch(
+			swallow("executor", "op", [] as MemoryDoc[]),
+		);
+		const baseInjected = baseMemories.slice(-10);
+		const planSlugs = (
+			(await this.db
+				.collection("plans")
+				.find({ uid: job.uid, sessionId: job.sessionId })
+				.project({ slug: 1 })
+				.toArray()
+				.catch(swallow("executor", "op", [] as { slug?: string }[]))) as { slug?: string }[]
+		).map((p) => String(p.slug));
+		const sliceTranscripts = await loadTranscripts(this.db, job.uid, job.sessionId).catch(swallow("executor", "op", [] as PriorTranscript[]));
+		const ctxManifest: ContextManifest = {
+			contextId: randomUUID(),
+			transcriptsIncluded: sliceTranscripts.map((t) => t.label),
+			digestCount: (session as { digests?: unknown[] }).digests?.length ?? 0,
+			memoryIdsUsed: baseInjected.map((m) => m.memoryId),
+			memoryChars: baseInjected.reduce((s, m) => s + m.content.length, 0),
+			planSlugs,
+			builtAt: new Date(),
+		};
+		await this.sink.patchRun({ contextManifest: ctxManifest }).catch(swallow("executor", "op"));
+		const sliceMem = { embed, baseMemories, planSlugs, transcripts: sliceTranscripts };
+
 		const runSlice = async (s: SliceSpec): Promise<void> => {
 			const sliceLive: LiveSlot = { handle: sbx.inner! };
 			const finishText: { value: string; failed?: string } = { value: "" };
-			const runner = this.makeSliceRunner(job, session, s, sbx, sliceLive, mode, finishText);
+			const runner = this.makeSliceRunner(job, session, s, sbx, sliceLive, mode, finishText, sliceMem);
 			this.sliceAgents.push({ runner, live: sliceLive });
 			await markSlice(s, "running");
 			try {
@@ -1382,8 +1454,10 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				await runner.run(this.sliceTask(s), provider);
 				if (finishText.failed && !this.stopRequested) await markSlice(s, "failed", finishText.failed.slice(0, 400));
 				else await markSlice(s, this.stopRequested ? "stopped" : "done", finishText.value || "Done.");
+				if (!this.stopRequested) await this.recordMemoryOutcome(job, finishText.failed ? "failed" : "completed", `${job.runId}-s${s.index}`);
 			} catch (err) {
 				await markSlice(s, this.stopRequested ? "stopped" : "failed", String(err).slice(0, 400));
+				if (!this.stopRequested) await this.recordMemoryOutcome(job, "failed", `${job.runId}-s${s.index}`);
 			} finally {
 				const i = this.sliceAgents.findIndex((a) => a.runner === runner);
 				if (i >= 0) this.sliceAgents.splice(i, 1);
@@ -1415,6 +1489,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				coordLive,
 				mode,
 				coordFinish,
+				sliceMem,
 				true,
 			);
 			this.sliceAgents.push({ runner: coordinator, live: coordLive });
@@ -1435,6 +1510,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 					durationMs: Date.now() - coordStarted,
 					...(coordErr ? { summary: String(coordErr).slice(0, 400) } : {}),
 				});
+				if (!this.stopRequested) await this.recordMemoryOutcome(job, coordErr ? "failed" : "completed", `${job.runId}-s0`);
 			}
 			if (coordErr)
 				await this.sink.emit({ type: "info", text: `Coordinator pass failed: ${String(coordErr).slice(0, 200)}` });
@@ -1654,8 +1730,9 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		].join("\n");
 	}
 
-	/** Slice/coordinator runner: minimal host — own worktree tools, boundary
-	 *  guard on writes, events tagged with agentIndex. No browser/env tools. */
+	/** Slice/coordinator runner: own worktree tools, boundary guard on
+	 *  writes, memory context + recall scorer, events tagged with agentIndex.
+	 *  No browser/env tools. */
 	private makeSliceRunner(
 		job: CloudJob,
 		session: SessionDoc,
@@ -1664,12 +1741,17 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		sliceLive: LiveSlot,
 		mode: AgentMode,
 		finishText: { value: string; failed?: string },
+		mem: { embed: EmbedProvider | undefined; baseMemories: MemoryDoc[]; planSlugs: string[]; transcripts: PriorTranscript[] },
 		coordinator = false,
 	): AgentRunner {
 		const dir = coordinator ? REPO_DIR : SLICE_DIR(slice.index);
 		const handle = delegatingHandle(sliceLive);
 		let permLayers: PermissionLayers | undefined;
 		const agentIndex = slice.index;
+		const sliceRunId = `${job.runId}-s${agentIndex}`;
+		/** Memory report events for this slice — tagged with agentIndex so the
+		 *  events page can attribute them to the right sub-agent. */
+		const sliceReport = (d: Record<string, unknown>) => void this.sink.emit({ type: "memory", ...d }, { agentIndex });
 		return new AgentRunner({
 			workspaceRoot: dir,
 			relativePath: (abs) => abs.replace(`${dir}/`, ""),
@@ -1685,6 +1767,27 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			environment: coordinator
 				? "an E2B cloud sandbox — you are the merge coordinator finishing a parallel multi-agent run"
 				: `an E2B cloud sandbox — one of several parallel agents working in a git worktree of the same repository`,
+			// Slice tasks differ from job.task — re-search per slice and record
+			// the actually-injected ids on the slice's own run doc so outcome
+			// credit attributes to this slice, not the parent.
+			memoryContext: async (task) => {
+				const recalled =
+					task === job.task
+						? mem.baseMemories
+						: await searchMemories(this.db, job.uid, job.sessionId, task, mem.embed, session.repo ?? undefined, sliceReport, sliceRunId).catch(swallow("executor", "op", mem.baseMemories));
+				const injected = recalled.slice(-10);
+				if (injected.length)
+					void this.db
+						.collection("runs")
+						.updateOne(
+							{ uid: job.uid, runId: sliceRunId },
+							{ $set: { "contextManifest.memoryIdsUsed": injected.map((m) => m.memoryId), "contextManifest.memoryChars": injected.reduce((s, m) => s + m.content.length, 0) } },
+						)
+						.catch(swallow("executor", "op"));
+				return sessionMemoryContext(session as SessionDoc & { mode?: string }, mem.planSlugs, recalled);
+			},
+			recallScorer: mem.embed ? createRecallScorer(mem.embed, sliceReport) : undefined,
+			priorTranscripts: () => mem.transcripts,
 			log: (tag, msg) => console.log(`[slice${agentIndex}:${tag}] ${msg}`),
 			checkPermission: async (toolName, input) => {
 				if (!permLayers) {
@@ -1708,7 +1811,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 						allowedPaths: coordinator ? undefined : slice.owns,
 						onCommandOutput: (chunk) => this.queueToolOutput(chunk, agentIndex),
 					}).filter((t) => t.name !== "save_plan"),
-					memoryWriteTool(this.db, job.uid, job.sessionId, job.runId, this.embedProvider, session.repo ?? undefined),
+					memoryWriteTool(this.db, job.uid, job.sessionId, sliceRunId, mem.embed, session.repo ?? undefined, sliceReport),
 				]) as Promise<never>,
 			emit: (e) => {
 				if (e.type === "run-finished") finishText.value = String(e.text ?? "");

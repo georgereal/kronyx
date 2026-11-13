@@ -66,6 +66,8 @@ export const routes: Route[] = makeRoutes([
 	["PUT", "/api/settings", core.putSettings],
 	["GET", "/api/usage", core.usage],
 	["GET", "/api/compactions", core.compactions],
+	["GET", "/api/memory", core.memory],
+	["GET", "/api/ide", core.ide],
 	["POST", "/api/ingest", core.ingest],
 	["GET", "/api/github/repos", gh.repos],
 	["GET", "/api/github/branches", gh.branches],

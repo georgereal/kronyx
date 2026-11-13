@@ -9,6 +9,9 @@ import type { AgentMessage } from "@cline/shared";
 import { checksOnFinish, runChecks } from "../checks";
 import { E2bSandbox, sandboxBackend, sandboxEnabled } from "../sandbox/e2b";
 import { appendFact, indexFile, loadMemoryContext, logEpisode } from "../agent/memory";
+import { createFileTools } from "../tools/fileTools";
+import { insertMemoryEvent, openStore } from "../store";
+import { createIdeTools } from "./ideTools";
 import { autoApproveWrites, estimateCostUsd, implementPrompt, modelPricing, planDir, promptForApiKey, providerErrorMessage, readProviderSettings, resolveProvider, writeProviderValue } from "../config";
 import { log } from "../log";
 import type { ApiCallRow } from "../store";
@@ -92,12 +95,59 @@ export interface SessionDeps {
 	refreshModels: () => Promise<void>;
 }
 
+/** Level-0 developer context: what the user is looking at right now — injected into the system prompt. */
+function devContext(root: string): string {
+	const lines: string[] = ["IDE state (from VS Code):"];
+	const ed = vscode.window.activeTextEditor;
+	if (ed?.document.uri.scheme === "file") {
+		const rel = path.relative(root, ed.document.uri.fsPath).split(path.sep).join("/");
+		const sel = ed.selection;
+		const selText = sel.isEmpty ? "" : `, selected lines ${sel.start.line + 1}-${sel.end.line + 1}`;
+		lines.push(`- Active file: ${rel}${selText}${ed.document.isDirty ? " (unsaved changes)" : ""}`);
+	}
+	const tabs = [
+		...new Set(
+			vscode.window.tabGroups.all
+				.flatMap((g) => g.tabs)
+				.map((t) => (t.input instanceof vscode.TabInputText ? t.input.uri : undefined))
+				.filter((u): u is vscode.Uri => !!u && u.scheme === "file")
+				.map((u) => path.relative(root, u.fsPath).split(path.sep).join("/"))
+				.filter((r) => !r.startsWith("..")),
+		),
+	];
+	if (tabs.length) lines.push(`- Open tabs: ${tabs.slice(0, 12).join(", ")}`);
+	const dirty = vscode.workspace.textDocuments
+		.filter((d) => d.isDirty && d.uri.scheme === "file")
+		.map((d) => path.relative(root, d.uri.fsPath).split(path.sep).join("/"));
+	if (dirty.length) lines.push(`- Unsaved files: ${dirty.slice(0, 10).join(", ")}`);
+	lines.push(
+		"- IDE tools available: get_diagnostics, get_file_structure, search_symbols, get_symbol_context, " +
+			"get_call_hierarchy, rename_symbol — prefer them over search_files/grep for symbol lookups, " +
+			"finding callers, renames, and checking errors.",
+	);
+	return lines.join("\n");
+}
+
+/** Workspace diagnostic counts (error/warning) — run baseline vs post-run comparison. */
+function diagCounts(): { errors: number; warnings: number } {
+	let errors = 0;
+	let warnings = 0;
+	for (const [, diags] of vscode.languages.getDiagnostics()) {
+		for (const d of diags) {
+			if (d.severity === vscode.DiagnosticSeverity.Error) errors++;
+			else if (d.severity === vscode.DiagnosticSeverity.Warning) warnings++;
+		}
+	}
+	return { errors, warnings };
+}
+
 /** Owns one session surface (sidebar view or editor tab): runner, messages, git hooks. */
 export class SessionController {
 	private runner: AgentRunner | undefined;
 	private runnerRoot: string | undefined;
 	private approveAll = false;
 	private changedPaths = new Set<string>();
+	private diagBaseline: { errors: number; warnings: number } | undefined;
 	private runStartedAt = 0;
 	private replayed = false;
 	private runTask = "";
@@ -275,7 +325,29 @@ export class SessionController {
 				checkPermission: async (toolName, input) => evaluate(this.permLayers, toolName, input, this.deps.modeRef.current),
 				currentMode: () => this.deps.modeRef.current,
 				planDir: planDir(),
-				memoryContext: (task, s) => loadMemoryContext(root, task, s),
+				createTools: async () => [
+					...createFileTools({
+						root,
+						isDirty: (abs) => vscode.workspace.textDocuments.some((doc) => doc.isDirty && doc.uri.fsPath === abs),
+						onFileChanged: (abs, kind, stats) =>
+							this.onEvent({ type: "file-changed", path: path.relative(root, abs).split(path.sep).join("/"), kind, ...stats } as Parameters<RunViewProvider["post"]>[0]),
+						onBeforeWrite: (abs, before) => this.deps.diffReview.record(abs, before),
+						execCommand: (command) => this.execCommand(command),
+						planDir: planDir() ? () => planDir()! : undefined,
+						onMemoryFact: (fact) => appendFact(root, fact),
+					}),
+					...createIdeTools({
+						root,
+						onBeforeWrite: (abs, before) => this.deps.diffReview.record(abs, before),
+						onFileChanged: (abs) =>
+							this.onEvent({ type: "file-changed", path: path.relative(root, abs).split(path.sep).join("/"), kind: "modified" } as Parameters<RunViewProvider["post"]>[0]),
+						report: (d) =>
+							void openStore(root).then((st) =>
+								insertMemoryEvent(st, { op: String(d.op ?? "ide_context"), detail: d, session: this.name }, root),
+							),
+					}),
+				],
+				memoryContext: async (task, s) => [devContext(root), await loadMemoryContext(root, task, s)].filter(Boolean).join("\n\n"),
 				onMemoryFact: (fact) => appendFact(root, fact),
 				log: (tag, message) => log(tag, message),
 				onBeforeWrite: (abs, before) => this.deps.diffReview.record(abs, before),
@@ -374,6 +446,7 @@ export class SessionController {
 			this.runStartedAt = Date.now();
 			this.runTask = event.task;
 			this.lastUsageAt = 0;
+			this.diagBaseline = diagCounts();
 		}
 		if (event.type === "run-finished") {
 			this.deps.setStatus("idle");
@@ -389,6 +462,13 @@ export class SessionController {
 				cacheWrite: this.lastUsage.cacheWriteTokens,
 			});
 			this.recordDigest(event.status, event.text);
+			if (this.diagBaseline && this.runnerRoot) {
+				const after = diagCounts();
+				const root = this.runnerRoot;
+				void openStore(root).then((st) =>
+					insertMemoryEvent(st, { op: "diagnostics", session: this.name, detail: { before: this.diagBaseline, after } }, root),
+				);
+			}
 			void this.onFinished(event.status);
 		}
 		if (event.type === "run-failed") {

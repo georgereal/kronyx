@@ -8,7 +8,12 @@
 	const rangeEl = document.getElementById("range");
 	const modelEl = document.getElementById("model");
 	const statusEl = document.getElementById("status");
+	const viewEl = document.getElementById("view");
+	const callsTable = document.querySelector("table");
+	const ideTable = document.getElementById("ideTable");
+	const ideRowsEl = document.getElementById("ideRows");
 	let calls = [];
+	let ideEvents = [];
 
 	const fmtTok = (n) => (n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n));
 	const fmtCost = (c) => (c === null || c === undefined ? "—" : c === 0 ? "$0" : `$${c < 0.01 ? c.toFixed(4) : c.toFixed(2)}`);
@@ -41,13 +46,78 @@
 				</tr>`;
 			})
 			.join("");
-		emptyEl.hidden = calls.length > 0;
+		emptyEl.hidden = calls.length > 0 || viewEl.value !== "calls";
+		emptyEl.textContent = "No API calls recorded yet. Run a task to see per-request usage.";
 		const tin = calls.reduce((s, c) => s + Number(c.tokens_in), 0);
 		const tout = calls.reduce((s, c) => s + Number(c.tokens_out), 0);
 		const known = calls.filter((c) => c.cost_usd !== null && c.cost_usd !== undefined);
 		const cost = known.reduce((s, c) => s + Number(c.cost_usd), 0);
 		totalsEl.textContent = `${calls.length} request${calls.length === 1 ? "" : "s"} · ${fmtTok(tin)} in · ${fmtTok(tout)} out${known.length ? ` · ${fmtCost(cost)} est.` : ""}`;
+		renderIde();
 		drawChart();
+	}
+
+	function ideDetail(d) {
+		const p = [];
+		if (d.file) p.push(d.file);
+		if (d.query) p.push(`"${d.query}"`);
+		if (d.direction) p.push(d.direction);
+		if (d.newName) p.push(`→ ${d.newName}`);
+		if (d.results != null) p.push(`${d.results} result${d.results === 1 ? "" : "s"}`);
+		if (d.defs != null) p.push(`${d.defs} def`);
+		if (d.refs != null) p.push(`${d.refs} ref${d.refs === 1 ? "" : "s"}`);
+		if (d.impls != null) p.push(`${d.impls} impl`);
+		if (d.files != null) p.push(`${d.files} file${d.files === 1 ? "" : "s"}`);
+		if (d.edits != null) p.push(`${d.edits} edit${d.edits === 1 ? "" : "s"}`);
+		if (d.before && d.after) {
+			const dErr = d.after.errors - d.before.errors;
+			const dWarn = d.after.warnings - d.before.warnings;
+			p.push(`errors ${dErr >= 0 ? "+" : ""}${dErr} · warnings ${dWarn >= 0 ? "+" : ""}${dWarn}`);
+		}
+		if (d.tookMs != null) p.push(`${d.tookMs}ms`);
+		return p.join(" · ") || "—";
+	}
+
+	function renderIde() {
+		const parsed = ideEvents.map((e) => {
+			let d = {};
+			try { d = JSON.parse(e.detail || "{}"); } catch { /* keep */ }
+			return { e, d };
+		});
+		ideRowsEl.innerHTML = parsed
+			.map(({ e, d }) => {
+				const t = new Date(Number(e.at));
+				const when = `${t.toLocaleDateString(undefined, { month: "short", day: "2-digit" }).toUpperCase()} ${t.toLocaleTimeString()}`;
+				const det = ideDetail(d);
+				return `<tr>
+					<td class="time">${esc(when)}</td>
+					<td class="model">${esc(d.tool || e.op || "")}</td>
+					<td class="provider" title="${esc(det)}">${esc(det)}</td>
+					<td class="key">${esc(e.session || "")}</td>
+				</tr>`;
+			})
+			.join("");
+		if (viewEl.value === "ide") {
+			emptyEl.hidden = parsed.length > 0;
+			emptyEl.textContent = "No IDE tool events yet — symbol/diagnostic calls from the agent appear here.";
+			const perTool = {};
+			for (const { e, d } of parsed) {
+				const t = d.tool || e.op || "?";
+				perTool[t] = (perTool[t] || 0) + 1;
+			}
+			totalsEl.textContent = `${parsed.length} event${parsed.length === 1 ? "" : "s"} · ` +
+				Object.entries(perTool).sort((a, b) => b[1] - a[1]).map(([t, n]) => `${t}: ${n}`).join(" · ");
+		}
+	}
+
+	function applyView() {
+		const ide = viewEl.value === "ide";
+		callsTable.hidden = ide;
+		ideTable.hidden = !ide;
+		chart.hidden = ide;
+		modelEl.hidden = ide;
+		statusEl.hidden = ide;
+		render();
 	}
 
 	function drawChart() {
@@ -82,6 +152,7 @@
 	}
 
 	rangeEl.addEventListener("change", query);
+	viewEl.addEventListener("change", applyView);
 	modelEl.addEventListener("change", query);
 	statusEl.addEventListener("change", query);
 	document.getElementById("refresh").addEventListener("click", query);
@@ -95,6 +166,7 @@
 		}
 		if (msg.type !== "calls") return;
 		calls = msg.calls;
+		ideEvents = msg.ideEvents || [];
 		const current = modelEl.value;
 		modelEl.innerHTML = '<option value="">All models</option>' + msg.models.map((m) => `<option${m === current ? " selected" : ""}>${esc(m)}</option>`).join("");
 		render();

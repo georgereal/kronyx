@@ -116,6 +116,7 @@ const READ_ONLY_HIDDEN = new Set([
 	"run_command",
 	"browser_use",
 	"switch_environment",
+	"rename_symbol",
 ]);
 
 export class AgentRunner {

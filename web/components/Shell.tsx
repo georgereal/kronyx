@@ -3,6 +3,7 @@
 import { signOut } from "firebase/auth";
 import {
 	BarChart3,
+	Database,
 	ChevronsLeft,
 	KeyRound,
 	LogOut,
@@ -11,6 +12,7 @@ import {
 	Box,
 	Settings,
 	Shrink,
+	Wrench,
 	History,
 	Home,
 } from "lucide-react";
@@ -28,6 +30,8 @@ const TABS = [
 	{ href: "/sessions", label: "Sessions", icon: <History size={14} /> },
 	{ href: "/usage", label: "Usage", icon: <BarChart3 size={14} /> },
 	{ href: "/compaction", label: "Compaction", icon: <Shrink size={14} /> },
+	{ href: "/memory", label: "Memory", icon: <Database size={14} /> },
+	{ href: "/ide", label: "IDE Tools", icon: <Wrench size={14} /> },
 	{ href: "/sandboxes", label: "Sandboxes", icon: <Box size={14} /> },
 	{ href: "/keys", label: "API Keys", icon: <KeyRound size={14} /> },
 	{ href: "/settings", label: "Settings", icon: <Settings size={14} /> },
@@ -177,7 +181,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
 					</button>
 				</div>
 			</aside>}
-			<main className={`container${["/settings", "/usage", "/compaction", "/sandboxes", "/runs"].includes(pathname) ? " wide" : ""}`}>{children}</main>
+			<main className={`container${["/settings", "/usage", "/compaction", "/memory", "/ide", "/sandboxes", "/runs"].includes(pathname) ? " wide" : ""}`}>{children}</main>
 		</div>
 	);
 }

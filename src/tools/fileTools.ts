@@ -29,6 +29,7 @@ export const WRITE_TOOL_NAMES = new Set([
 	"insert_lines",
 	"run_command",
 	"file_editor",
+	"rename_symbol",
 ]);
 
 const MAX_FILE_BYTES = 2 * 1024 * 1024;

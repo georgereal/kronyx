@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { apiKey, webAppUrl } from "./auth";
-import { listUnsyncedApiCalls, listUnsyncedPrs, listUnsyncedRunEvents, listUnsyncedRuns, listUnsyncedSandboxEvents, markApiCallsSynced, markPrsSynced, markRunEventsSynced, markRunsSynced, markSandboxEventsSynced, type Store } from "./store";
+import { deviceName, getDeviceId } from "./settingsSync";
+import { listUnsyncedApiCalls, listUnsyncedMemoryEvents, listUnsyncedPrs, listUnsyncedRunEvents, listUnsyncedRuns, listUnsyncedSandboxEvents, markApiCallsSynced, markMemoryEventsSynced, markPrsSynced, markRunEventsSynced, markRunsSynced, markSandboxEventsSynced, type Store } from "./store";
 import { log } from "./log";
 
 const BATCH_SIZE = 200;
@@ -58,16 +59,19 @@ export class UsageSync implements vscode.Disposable {
 			const events = listUnsyncedRunEvents(d, 500);
 			const prs = listUnsyncedPrs(d, 100);
 			const sandboxes = listUnsyncedSandboxEvents(d, 200);
-			if (rows.length + runs.length + events.length + prs.length + sandboxes.length === 0) return;
+			const memory = listUnsyncedMemoryEvents(d, 200);
+			const deviceId = rows.length + memory.length ? await getDeviceId(this.context).catch(() => "") : "";
+			if (rows.length + runs.length + events.length + prs.length + sandboxes.length + memory.length === 0) return;
 			const res = await fetch(`${endpoint}/api/ingest`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
 				body: JSON.stringify({
-					calls: rows.map(toWire),
+					calls: rows.map((r) => toWire(r, deviceId)),
 					runs: runs.map((r) => ({ runId: r.run_id, task: r.task, session: r.session, status: r.status, durationMs: r.duration_ms, at: r.at, tokensIn: r.tokens_in, tokensOut: r.tokens_out, workspace: r.root || undefined })),
 					events: events.map((r) => ({ runId: r.run_id, seq: r.id, session: r.session, event: safeJson(r.event), workspace: r.root || undefined })),
 					prs: prs.map((r) => ({ runId: r.run_id, session: r.session, task: r.task, repo: r.repo, branch: r.branch, url: r.url, title: r.title, status: r.status, at: r.at, workspace: r.root || undefined })),
 					sandboxes: sandboxes.map((r) => ({ sandboxId: r.sandbox_id, device: r.device, deviceId: r.device_id, template: r.template, repo: r.repo, runId: r.run_id, event: r.event, at: r.at, workspace: r.root || undefined })),
+					memory: memory.map((r) => ({ clientRowId: r.id, session: r.session, runId: r.run_id, at: r.at, op: r.op, detail: safeJson(r.detail), device: deviceName(), deviceId: r.device_id || deviceId, workspace: r.root || undefined })),
 				}),
 				signal: AbortSignal.timeout(15_000),
 			});
@@ -86,8 +90,9 @@ export class UsageSync implements vscode.Disposable {
 			markRunEventsSynced(d, events.map((r) => Number(r.id)));
 			markPrsSynced(d, prs.map((r) => Number(r.id)));
 			markSandboxEventsSynced(d, sandboxes.map((r) => Number(r.id)));
+			markMemoryEventsSynced(d, memory.map((r) => Number(r.id)));
 			this.backoffMs = 0;
-			log("sync", `uploaded ${rows.length} call(s), ${runs.length} run(s), ${events.length} event(s), ${prs.length} pr(s)`);
+			log("sync", `uploaded ${rows.length} call(s), ${runs.length} run(s), ${events.length} event(s), ${prs.length} pr(s), ${memory.length} memory`);
 		} catch (error) {
 			this.backoffMs = Math.min(MAX_BACKOFF_MS, Math.max(15_000, this.backoffMs * 2));
 			this.nextAttemptAt = Date.now() + this.backoffMs;
@@ -112,7 +117,7 @@ function safeJson(v: unknown): unknown {
 }
 
 /** sql.js row → ingest wire shape (camelCase, includes local id for dedupe). */
-function toWire(r: Record<string, unknown>): Record<string, unknown> {
+function toWire(r: Record<string, unknown>, fallbackDeviceId = ""): Record<string, unknown> {
 	return {
 		clientRowId: r.id,
 		at: r.at,
@@ -122,8 +127,8 @@ function toWire(r: Record<string, unknown>): Record<string, unknown> {
 		model: r.model || undefined,
 		profile: r.profile || undefined,
 		keyLabel: r.key_label || undefined,
-		device: r.device || undefined,
-		deviceId: r.device_id || undefined,
+		device: r.device || deviceName(),
+		deviceId: r.device_id || fallbackDeviceId || undefined,
 		tokensIn: r.tokens_in,
 		tokensOut: r.tokens_out,
 		cacheRead: r.cache_read,

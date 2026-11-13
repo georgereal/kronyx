@@ -124,7 +124,7 @@ export async function recordDigests(
 		.updateOne({ uid, sessionId }, { $set: { digests: digests.slice(-max), updatedAt: new Date() } });
 }
 
-interface MemoryDoc {
+export interface MemoryDoc {
 	memoryId: string;
 	uid: string;
 	sessionId: string;
@@ -136,7 +136,17 @@ interface MemoryDoc {
 	status: "candidate" | "active" | "superseded";
 	version: number;
 	createdAt: Date;
+	/** Usage evidence: how often this memory entered a run's context and how those runs ended. */
+	injectedCount?: number;
+	lastRecalledAt?: Date;
+	lastInjectedRunId?: string;
+	helpedRuns?: number;
+	failedRuns?: number;
+	lastOutcome?: string;
 }
+
+/** Diagnostic sink for vector/memory operations — worker wires this to run_events. */
+export type MemoryReport = (d: Record<string, unknown>) => void;
 
 export interface EmbedProvider {
 	baseUrl: string;
@@ -193,6 +203,14 @@ const RECALL_MIN_CHUNK_CHARS = 40;
 const RECALL_MAX_EMBEDS = 40;
 const RECALL_VEC_CACHE_MAX = 4000;
 const RECALL_MIN_SCORE = 0.2;
+/** $vectorSearch quality floor — below this, a "hit" is noise being injected. */
+const MEM_RECALL_MIN_SCORE = 0.3;
+/** Near-identical embedding match → merge instead of storing a duplicate fact. */
+const MEM_DUPE_SCORE = 0.92;
+/** Candidates never recalled after this long are presumed stale and superseded. */
+const MEM_STALE_MS = 30 * 24 * 3600 * 1000;
+/** Penalty per failed-run outcome when ranking vector hits (per point of score). */
+const MEM_FAILED_RUN_PENALTY = 0.1;
 
 /**
  * In-process chunk-vector cache, keyed by content hash so identical messages
@@ -220,17 +238,23 @@ function cosine(a: number[], b: number[]): number {
  * cosine-similar hits. Returns undefined when the provider can't embed at all
  * (tool falls back to keyword search).
  */
-export function createRecallScorer(provider: EmbedProvider): RecallScorer {
+export function createRecallScorer(provider: EmbedProvider, report?: MemoryReport): RecallScorer {
 	return async (query, chunks) => {
+		const t0 = Date.now();
 		const qVec = await embedText(provider, query, "recall_context");
-		if (!qVec) return undefined;
+		if (!qVec) {
+			report?.({ op: "recall_context", usedVector: false, chunks: chunks.length, tookMs: Date.now() - t0 });
+			return undefined;
+		}
 		let embedded = 0;
+		let cacheHits = 0;
 		const scored: { idx: number; score: number }[] = [];
 		for (const c of chunks) {
 			const text = c.text.slice(0, RECALL_CHUNK_CHARS);
 			if (text.length < RECALL_MIN_CHUNK_CHARS) continue;
 			const key = createHash("sha256").update(text).digest("hex").slice(0, 24);
 			let v = recallVecCache.get(key);
+			if (v) cacheHits++;
 			if (!v && embedded < RECALL_MAX_EMBEDS) {
 				v = await embedText(provider, text, "recall_context");
 				embedded++;
@@ -245,7 +269,19 @@ export function createRecallScorer(provider: EmbedProvider): RecallScorer {
 			const score = v ? cosine(qVec, v) : 0;
 			if (score >= RECALL_MIN_SCORE) scored.push({ idx: c.idx, score });
 		}
-		return scored.sort((a, b) => b.score - a.score).slice(0, 8);
+		const hits = scored.sort((a, b) => b.score - a.score).slice(0, 8);
+		report?.({
+			op: "recall_context",
+			usedVector: true,
+			chunks: chunks.length,
+			cacheHits,
+			embeddingsMade: embedded,
+			hits: hits.length,
+			topScore: hits[0]?.score,
+			previews: hits.slice(0, 3).map((h) => chunks[h.idx]?.text.slice(0, 100) ?? ""),
+			tookMs: Date.now() - t0,
+		});
+		return hits;
 	};
 }
 
@@ -257,6 +293,7 @@ export function memoryWriteTool(
 	runId: string,
 	provider?: EmbedProvider,
 	repo?: string,
+	report?: MemoryReport,
 ): AgentTool<{ fact: string; scope?: string }, string> {
 	return {
 		name: "memory_write",
@@ -289,7 +326,40 @@ export function memoryWriteTool(
 				createdAt: new Date(),
 			};
 			const embedding = provider ? await embedText(provider, fact, "memory_write") : undefined;
+			// Semantic dedupe: a near-identical fact already stored → merge into it
+			// (reworded rewrites of "tests pass" shouldn't crowd the top-8).
+			if (embedding) {
+				const dup = await db
+					.collection("memories")
+					.aggregate([
+						{
+							$vectorSearch: {
+								index: "memories_vector",
+								path: "embedding",
+								queryVector: embedding,
+								numCandidates: 10,
+								limit: 3,
+								filter: { uid, status: { $in: ["active", "candidate"] } },
+							},
+						},
+						{ $addFields: { score: { $meta: "vectorSearchScore" } } },
+					])
+					.toArray()
+					.catch(swallow("memory", "op", []));
+				const near = (dup as unknown as (MemoryDoc & { score?: number })[]).find(
+					(d) => (d.score ?? 0) >= MEM_DUPE_SCORE && (d.scope === "project" ? d.repo === repo : d.sessionId === sessionId),
+				);
+				if (near) {
+					await db.collection("memories").updateOne(
+						{ uid, memoryId: near.memoryId },
+						{ $set: { content: fact, embedding, updatedAt: new Date() }, $inc: { version: 1 } },
+					);
+					report?.({ op: "memory_write", embedded: true, scope, deduped: true, preview: fact.slice(0, 120) });
+					return "Fact recorded (merged into an existing memory).";
+				}
+			}
 			await db.collection("memories").insertOne(embedding ? { ...doc, embedding } : doc);
+			report?.({ op: "memory_write", embedded: !!embedding, scope, preview: fact.slice(0, 120) });
 			const stale = await db
 				.collection("memories")
 				.find({ uid, sessionId })
@@ -331,14 +401,35 @@ export async function searchMemories(
 	query: string,
 	provider?: EmbedProvider,
 	repo?: string,
+	report?: MemoryReport,
+	runId?: string,
 ): Promise<MemoryDoc[]> {
+	const t0 = Date.now();
+	// Staleness sweep: candidates never injected after MEM_STALE_MS are presumed
+	// dead knowledge — supersede them so they stop competing for the top-8.
+	const staleScope: Record<string, unknown>[] = [{ scope: "conversation", sessionId }];
+	if (repo) staleScope.push({ scope: "project", repo });
+	void db
+		.collection("memories")
+		.updateMany(
+			{
+				uid,
+				status: "candidate",
+				createdAt: { $lt: new Date(Date.now() - MEM_STALE_MS) },
+				$and: [{ $or: staleScope }, { $or: [{ injectedCount: 0 }, { injectedCount: { $exists: false } }] }],
+			},
+			{ $set: { status: "superseded", supersededAt: new Date(), supersededReason: "stale-never-recalled" } },
+		)
+		.catch(swallow("memory", "op"));
 	// Repeated runs often recall with the same task text — cache the query
 	// embedding briefly (5min) instead of re-billing an /embeddings call.
 	let vector: number[] | undefined;
+	let queryCacheHit = false;
 	if (provider) {
 		const cache = await getCache().catch(() => undefined);
 		const key = `embed:${createHash("sha256").update(query.slice(0, 8000)).digest("hex").slice(0, 32)}`;
 		vector = (await cache?.get(key).catch(() => undefined)) as number[] | undefined;
+		if (vector) queryCacheHit = true;
 		if (!vector) {
 			vector = await embedText(provider, query, "memory_recall");
 			if (vector) void cache?.set(key, vector, 5 * 60_000).catch(() => {});
@@ -360,25 +451,74 @@ export async function searchMemories(
 						filter: { uid, scope: { $in: ["conversation", "project"] }, status: { $in: ["active", "candidate"] } },
 					},
 				},
+				{ $addFields: { score: { $meta: "vectorSearchScore" } } },
 			])
 			.toArray()
 			.catch(swallow("memory", "op", []));
-		const eligible = (hits as unknown as MemoryDoc[]).filter((h) =>
-			h.scope === "project" ? repo !== undefined && h.repo === repo : h.sessionId === sessionId,
-		);
+		const eligible = (hits as unknown as (MemoryDoc & { score?: number })[])
+			.filter(
+				(h) => (h.scope === "project" ? repo !== undefined && h.repo === repo : h.sessionId === sessionId) && (h.score === undefined || h.score >= MEM_RECALL_MIN_SCORE),
+			)
+			// Outcome-aware ranking: memories repeatedly injected into failed runs
+			// sink below equally-similar ones with clean records.
+			.sort((a, b) => (b.score ?? 0.5) - MEM_FAILED_RUN_PENALTY * (b.failedRuns ?? 0) - ((a.score ?? 0.5) - MEM_FAILED_RUN_PENALTY * (a.failedRuns ?? 0)));
 		if (eligible.length) {
-			const top = eligible.slice(0, 8);
-			// Recall is the verification signal: promote candidates that made it into context.
-			void db
-				.collection("memories")
-				.updateMany({ uid, status: "candidate", memoryId: { $in: top.map((m) => m.memoryId) } }, { $set: { status: "active" } })
-				.catch(swallow("memory", "op"));
+			const top = eligible.slice(0, 8) as (MemoryDoc & { score?: number })[];
+			// Recall is the verification signal: promote candidates that made it into
+			// context, and record the usage evidence (which run, how often).
+			const ids = top.map((m) => m.memoryId);
+			void Promise.all([
+				db
+					.collection("memories")
+					.updateMany({ uid, status: "candidate", memoryId: { $in: ids } }, { $set: { status: "active" } }),
+				db
+					.collection("memories")
+					.updateMany(
+						{ uid, memoryId: { $in: ids } },
+						{ $set: { lastRecalledAt: new Date(), lastInjectedRunId: runId ?? "" }, $inc: { injectedCount: 1 } },
+					),
+			]).catch(swallow("memory", "op"));
+			report?.({
+				op: "memory_recall",
+				path: "vector",
+				queryCacheHit,
+				candidates: (hits as unknown[]).length,
+				hits: top.length,
+				query: query.slice(0, 140),
+				items: top.map((m) => ({ scope: m.scope, status: m.status, preview: m.content.slice(0, 120), score: m.score })),
+				topScore: top[0]?.score,
+				tookMs: Date.now() - t0,
+			});
 			return top;
 		}
 	}
 	// No embeddings available (provider lacks the model) — recency is the
-	// honest degenerate, not a keyword workaround.
-	return loadMemories(db, uid, sessionId, repo);
+	// honest degenerate, not a keyword workaround. sessionMemoryContext injects
+	// the newest entries (slice(-10)) — report and count exactly those.
+	const fallback = await loadMemories(db, uid, sessionId, repo);
+	const injected = fallback.slice(-10);
+	const ids = injected.map((m) => m.memoryId);
+	void Promise.all([
+		db
+			.collection("memories")
+			.updateMany({ uid, status: "candidate", memoryId: { $in: ids } }, { $set: { status: "active" } }),
+		db
+			.collection("memories")
+			.updateMany(
+				{ uid, memoryId: { $in: ids } },
+				{ $set: { lastRecalledAt: new Date(), lastInjectedRunId: runId ?? "" }, $inc: { injectedCount: 1 } },
+			),
+	]).catch(swallow("memory", "op"));
+	report?.({
+		op: "memory_recall",
+		path: provider ? "recent-fallback" : "no-embedder",
+		queryCacheHit,
+		hits: injected.length,
+		query: query.slice(0, 140),
+		items: injected.map((m) => ({ scope: m.scope, status: m.status, preview: m.content.slice(0, 120) })),
+		tookMs: Date.now() - t0,
+	});
+	return fallback;
 }
 
 /** Lightweight context manifest (ADR §9) — what actually entered this run's context. */
@@ -387,6 +527,8 @@ export interface ContextManifest {
 	transcriptsIncluded: string[];
 	digestCount: number;
 	memoryIdsUsed: string[];
+	/** Characters of memory content injected into the system prompt. */
+	memoryChars?: number;
 	planSlugs: string[];
 	builtAt: Date;
 }
@@ -422,7 +564,11 @@ export function sessionMemoryContext(
 		const files = d.filesChanged?.length ? ` Files: ${d.filesChanged.join(", ")}.` : "";
 		lines.push(`- Earlier task ${i + 1}: "${d.task}" → ${d.status}. ${d.summary?.slice(0, 300) ?? ""}${files}`);
 	}
+	// Injected memories cost real context — cap the block, newest facts win.
+	let memChars = 0;
 	for (const m of memories.slice(-10)) {
+		if (memChars + m.content.length > 2400) break;
+		memChars += m.content.length;
 		lines.push(`- Remembered: ${m.content}${m.status === "candidate" ? " (unverified)" : ""}`);
 	}
 	if (plans.length) lines.push(`- Saved plans: ${plans.join(", ")} (implementable on request)`);

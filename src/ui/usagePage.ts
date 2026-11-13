@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { listApiCalls, openStore, type ApiCallFilter } from "../store";
+import { listApiCalls, listMemoryEvents, openStore, type ApiCallFilter } from "../store";
 
 let panel: vscode.WebviewPanel | undefined;
 
@@ -32,6 +32,10 @@ export function openUsagePage(context: vscode.ExtensionContext): void {
   <div class="title-row">
     <h1>AI Usage</h1>
     <div class="filters">
+      <select id="view">
+        <option value="calls">API calls</option>
+        <option value="ide">IDE tools</option>
+      </select>
       <select id="range">
         <option value="3600000">Last hour</option>
         <option value="86400000" selected>Last 24h</option>
@@ -61,6 +65,14 @@ export function openUsagePage(context: vscode.ExtensionContext): void {
   </thead>
   <tbody id="rows"></tbody>
 </table>
+<table id="ideTable" hidden>
+  <thead>
+    <tr>
+      <th>Time</th><th>Tool</th><th>Detail</th><th>Session</th>
+    </tr>
+  </thead>
+  <tbody id="ideRows"></tbody>
+</table>
 <div id="empty" hidden>No API calls recorded yet. Run a task to see per-request usage.</div>
 <script src="${js}"></script>
 </body>
@@ -89,7 +101,13 @@ async function handle(message: UsageMessage): Promise<void> {
 			const filter = message.type === "query" ? (message.filter ?? {}) : {};
 			const calls = listApiCalls(d, { limit: 2000, ...filter });
 			const models = [...new Set(calls.map((c) => String(c.model)).filter(Boolean))].sort();
-			void panel?.webview.postMessage({ type: "calls", calls, models });
+			const ideEvents = listMemoryEvents(d, {
+				ops: ["ide_context", "diagnostics"],
+				since: filter.since,
+				until: filter.until,
+				limit: 2000,
+			});
+			void panel?.webview.postMessage({ type: "calls", calls, models, ideEvents });
 			break;
 		}
 	}

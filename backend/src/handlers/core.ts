@@ -221,6 +221,237 @@ export async function compactions(req: Request): Promise<Response> {
 	return json({ items });
 }
 
+/**
+ * GET /api/memory — vector/memory telemetry from three sources:
+ *  - worker `memory` run_events (vector vs fallback path, cache hits)
+ *  - extension `memory_events` rows uploaded via /api/ingest
+ *  - `usage_events` kind=embedding + the `memories` collection itself.
+ */
+export async function memory(req: Request): Promise<Response> {
+	const uid = await authenticate(req);
+	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
+	const url = new URL(req.url);
+	const since = Number(url.searchParams.get("since"));
+	const until = Number(url.searchParams.get("until"));
+	const limit = Math.min(1000, Number(url.searchParams.get("limit")) || 300);
+	const range: Record<string, Date> = {};
+	if (since) range.$gte = new Date(since);
+	if (until) range.$lte = new Date(until);
+	const db = await getDb();
+
+	// Cloud-side diagnostics: flat `memory` run_events emitted by the worker.
+	const evFilter: Record<string, unknown> = { uid, "event.type": "memory" };
+	if (since || until) evFilter.ingestedAt = range;
+	const cloudRows = await db
+		.collection("run_events")
+		.find(evFilter)
+		.sort({ ingestedAt: -1 })
+		.limit(limit)
+		.project({ _id: 0, runId: 1, sessionId: 1, ingestedAt: 1, event: 1 })
+		.toArray();
+	// Extension-side diagnostics: synced sqlite memory_events.
+	const extFilter: Record<string, unknown> = { uid };
+	if (since || until) extFilter.at = range;
+	const extRows = await db
+		.collection("memory_events")
+		.find(extFilter)
+		.sort({ at: -1 })
+		.limit(limit)
+		.project({ _id: 0, uid: 0 })
+		.toArray();
+	const runIds = [...new Set(cloudRows.map((r) => String(r.runId)))];
+	const runs = await db
+		.collection("runs")
+		.find({ uid, runId: { $in: runIds } })
+		.project({ runId: 1, task: 1 })
+		.toArray();
+	const taskOf = new Map(runs.map((r) => [String(r.runId), String((r as { task?: string }).task ?? "")]));
+
+	// Historical recall: every cold-start run stores contextManifest.memoryIdsUsed
+	// on its runs doc — that predates live `memory` run_events, so derive recall
+	// events from it for runs that have none (deduped by runId below).
+	const manifestFilter: Record<string, unknown> = { uid, "contextManifest.memoryIdsUsed.0": { $exists: true } };
+	if (since || until) manifestFilter["contextManifest.builtAt"] = range;
+	const manifestRuns = await db
+		.collection("runs")
+		.find(manifestFilter)
+		.sort({ "contextManifest.builtAt": -1 })
+		.limit(limit)
+		.project({ runId: 1, sessionId: 1, task: 1, contextManifest: 1 })
+		.toArray()
+		.catch(swallow("memory", "op", [] as Record<string, unknown>[]));
+	const memIds = [
+		...new Set(
+			manifestRuns.flatMap((r) => ((r.contextManifest as { memoryIdsUsed?: string[] })?.memoryIdsUsed ?? []).map(String)),
+		),
+	];
+	const memDocs = memIds.length
+		? await db
+				.collection("memories")
+				.find({ uid, memoryId: { $in: memIds } })
+				.project({ memoryId: 1, content: 1, scope: 1, status: 1 })
+				.toArray()
+				.catch(swallow("memory", "op", [] as Record<string, unknown>[]))
+		: [];
+	const memById = new Map(memDocs.map((m) => [String(m.memoryId), m]));
+	const liveRecallRuns = new Set(cloudRows.filter((r) => (r.event as { op?: string })?.op === "memory_recall").map((r) => String(r.runId)));
+	const manifestEvents = manifestRuns
+		.filter((r) => !liveRecallRuns.has(String(r.runId)))
+		.map((r) => {
+			const m = (r.contextManifest ?? {}) as { memoryIdsUsed?: string[]; memoryChars?: number; builtAt?: Date };
+			const ids = m.memoryIdsUsed ?? [];
+			return {
+				at: m.builtAt,
+				source: "cloud",
+				op: "memory_recall",
+				path: "cold-start",
+				runId: r.runId,
+				sessionId: r.sessionId,
+				task: r.task ?? taskOf.get(String(r.runId)),
+				hits: ids.length,
+				chars: m.memoryChars,
+				items: ids.map((id) => {
+					const d = memById.get(String(id));
+					return { scope: d?.scope, status: d?.status, preview: String(d?.content ?? id).slice(0, 120) };
+				}),
+			};
+		});
+
+	const events = [
+		...manifestEvents,
+		...cloudRows.map((r) => {
+			const ev = (r.event ?? {}) as Record<string, unknown>;
+			return { at: r.ingestedAt, source: "cloud", runId: r.runId, sessionId: r.sessionId, task: taskOf.get(String(r.runId)), ...ev };
+		}),
+		...extRows.map((r) => {
+			const d = (r.detail ?? {}) as Record<string, unknown>;
+			return { at: r.at, source: "ext", session: r.session, runId: r.runId || undefined, workspace: r.workspace, device: r.device, deviceId: r.deviceId, op: r.op, ...d };
+		}),
+	]
+		.sort((a, b) => new Date(String(b.at)).getTime() - new Date(String(a.at)).getTime())
+		.slice(0, limit);
+
+	// Embedding-call accounting shared by both tiers.
+	const usageFilter: Record<string, unknown> = { uid, kind: "embedding" };
+	if (since || until) usageFilter.at = range;
+	const byOp = await db
+		.collection("usage_events")
+		.aggregate([
+			{ $match: usageFilter },
+			{
+				$group: {
+					_id: { op: "$op", status: "$status" },
+					calls: { $sum: 1 },
+					tokensIn: { $sum: "$tokensIn" },
+				},
+			},
+		])
+		.toArray();
+	const embedUsage: Record<string, { calls: number; tokensIn: number; failed: number }> = {};
+	for (const r of byOp) {
+		const op = String(r._id?.op || "other");
+		const e = (embedUsage[op] ??= { calls: 0, tokensIn: 0, failed: 0 });
+		e.calls += Number(r.calls) || 0;
+		e.tokensIn += Number(r.tokensIn) || 0;
+		if (r._id?.status === "failed") e.failed += Number(r.calls) || 0;
+	}
+
+	// The memories store itself: coverage + recency.
+	const memAgg = await db
+		.collection("memories")
+		.aggregate([
+			{ $match: { uid } },
+			{
+				$group: {
+					_id: { status: "$status", scope: "$scope" },
+					n: { $sum: 1 },
+					embedded: { $sum: { $cond: [{ $ifNull: ["$embedding", false] }, 1, 0] } },
+				},
+			},
+		])
+		.toArray()
+		.catch(swallow("memory", "op", [] as Record<string, unknown>[]));
+	const memoryStats = { total: 0, embedded: 0, byStatus: {} as Record<string, number>, byScope: {} as Record<string, number> };
+	for (const r of memAgg as { _id?: { status?: string; scope?: string }; n?: number; embedded?: number }[]) {
+		const n = Number(r.n) || 0;
+		memoryStats.total += n;
+		memoryStats.embedded += Number(r.embedded) || 0;
+		memoryStats.byStatus[r._id?.status ?? "?"] = (memoryStats.byStatus[r._id?.status ?? "?"] ?? 0) + n;
+		memoryStats.byScope[r._id?.scope ?? "?"] = (memoryStats.byScope[r._id?.scope ?? "?"] ?? 0) + n;
+	}
+	const docs = await db
+		.collection("memories")
+		.find({ uid })
+		.sort({ createdAt: -1 })
+		.limit(50)
+		.project({ _id: 0, embedding: 0 })
+		.toArray()
+		.catch(swallow("memory", "op", [] as Record<string, unknown>[]));
+
+	// Atlas-side index/storage info — best effort (denied on some tiers).
+	const collStats = await db
+		.command({ collStats: "memories" })
+		.then((s) => ({ count: s.count, size: s.size, storageSize: s.storageSize }))
+		.catch(() => null);
+	const searchIndexes = await db
+		.collection("memories")
+		.aggregate([{ $listSearchIndexes: {} }])
+		.toArray()
+		.then((rows) => rows.map((r) => ({ name: r.name, status: r.status, queryable: r.queryable })))
+		.catch(() => null);
+
+	return json({ events, embedUsage, memoryStats, docs, collStats, searchIndexes });
+}
+
+/**
+ * GET /api/ide — IDE-tool telemetry: extension `memory_events` rows with
+ * op=ide_context (per-call tool/file/latency) or op=diagnostics (per-run
+ * error/warning deltas). Rows are written to local SQLite by the extension
+ * and pushed here via /api/ingest.
+ */
+export async function ide(req: Request): Promise<Response> {
+	const uid = await authenticate(req);
+	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
+	const url = new URL(req.url);
+	const since = Number(url.searchParams.get("since"));
+	const until = Number(url.searchParams.get("until"));
+	const limit = Math.min(1000, Number(url.searchParams.get("limit")) || 500);
+	const filter: Record<string, unknown> = { uid, op: { $in: ["ide_context", "diagnostics"] } };
+	if (since || until) {
+		filter.at = {};
+		if (since) (filter.at as Record<string, Date>).$gte = new Date(since);
+		if (until) (filter.at as Record<string, Date>).$lte = new Date(until);
+	}
+	const db = await getDb();
+	const rows = await db
+		.collection("memory_events")
+		.find(filter)
+		.sort({ at: -1 })
+		.limit(limit)
+		.project({ _id: 0, uid: 0 })
+		.toArray();
+	const tools: Record<string, { calls: number; tookMs: number; results: number }> = {};
+	const events = rows.map((r) => {
+		const d = (r.detail ?? {}) as Record<string, unknown>;
+		const tool = String(d.tool ?? r.op ?? "");
+		const t = (tools[tool] ??= { calls: 0, tookMs: 0, results: 0 });
+		t.calls++;
+		t.tookMs += Number(d.tookMs) || 0;
+		t.results += Number(d.results ?? d.edits ?? 0) || 0;
+		return {
+			at: r.at,
+			op: r.op,
+			session: r.session,
+			runId: r.runId || undefined,
+			workspace: r.workspace,
+			device: r.device,
+			deviceId: r.deviceId,
+			...d,
+		};
+	});
+	return json({ events, tools });
+}
+
 interface IncomingCall {
 	clientRowId?: number;
 	at?: number;
@@ -260,13 +491,15 @@ export async function ingest(req: Request): Promise<Response> {
 		events?: { runId: string; seq: number }[];
 		prs?: Record<string, unknown>[];
 		sandboxes?: Record<string, unknown>[];
+		memory?: Record<string, unknown>[];
 	};
 	const calls = Array.isArray(body.calls) ? body.calls.slice(0, 500) : [];
 	const runs = Array.isArray(body.runs) ? body.runs : [];
 	const events = Array.isArray(body.events) ? body.events : [];
 	const prs = Array.isArray(body.prs) ? body.prs : [];
 	const sandboxes = Array.isArray(body.sandboxes) ? body.sandboxes : [];
-	if (calls.length + runs.length + events.length + prs.length + sandboxes.length === 0) return json({ inserted: 0 });
+	const memory = Array.isArray(body.memory) ? body.memory.slice(0, 500) : [];
+	if (calls.length + runs.length + events.length + prs.length + sandboxes.length + memory.length === 0) return json({ inserted: 0 });
 	const db = await getDb();
 	const docs = calls
 		.filter((c) => typeof c.at === "number" && c.at > 0)
@@ -351,7 +584,23 @@ export async function ingest(req: Request): Promise<Response> {
 		await db.collection("sandboxes").insertMany(docs, { ordered: false }).catch(swallow("core", "op"));
 		await db.collection("sandbox_events").insertMany(docs, { ordered: false }).catch(swallow("core", "op"));
 	}
-	return json({ inserted, runs: runs.length, events: events.length, prs: prs.length, sandboxes: sandboxes.length });
+	if (memory.length) {
+		const docs = memory.map((m) => ({
+			uid,
+			clientRowId: m.clientRowId,
+			session: m.session ?? "",
+			runId: m.runId ?? "",
+			at: new Date(Number(m.at) || Date.now()),
+			op: m.op ?? "",
+			detail: m.detail ?? {},
+			device: m.device ?? "",
+			deviceId: m.deviceId ?? "",
+			workspace: m.workspace ?? "",
+			ingestedAt: now,
+		}));
+		await db.collection("memory_events").insertMany(docs, { ordered: false }).catch(swallow("core", "op"));
+	}
+	return json({ inserted, runs: runs.length, events: events.length, prs: prs.length, sandboxes: sandboxes.length, memory: memory.length });
 }
 
 export { resolveApiKey };
