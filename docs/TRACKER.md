@@ -2,15 +2,15 @@
 
 Every plan and decision, open or closed. Rules in [PROCESS.md](PROCESS.md).
 
-Open: 18 | Closed: 0
+Open: 19 | Closed: 0
 
 | ID | Title | Type | Status | Owner | Created | Decided | Closed |
 |---|---|---|---|---|---|---|---|
 | [ADR-0001](decisions/ADR-0001-build-on-cline-sdk.md) | Build on the Cline SDK with our own VS Code extension | Decision | Accepted | Jacob | 2026-10-31 | 2026-10-31 | - |
 | [ADR-0002](decisions/ADR-0002-core-language-typescript.md) | Core language: TypeScript | Decision | Proposed | Jacob | 2026-10-31 | - | - |
 | [ADR-0003](decisions/ADR-0003-defer-open-weights-models.md) | Defer own open-weights models; start with RAG and memory | Decision | Proposed | Jacob | 2026-10-31 | - | - |
-| [ADR-0004](decisions/ADR-0004-vector-store.md) | Vector store: embedded LanceDB or sqlite-vec | Decision | Proposed | Jacob | 2026-10-31 | - | - |
-| [ADR-0005](decisions/ADR-0005-embedding-model-local-or-api.md) | Embedding model: local or API | Decision | Proposed | Jacob | 2026-10-31 | - | - |
+| [ADR-0004](decisions/ADR-0004-vector-store.md) | Vector store: embedded LanceDB or sqlite-vec | Decision | Accepted | Jacob | 2026-10-31 | - | - |
+| [ADR-0005](decisions/ADR-0005-embedding-model-local-or-api.md) | Embedding model: local or API (API default; local model deferred) | Decision | Accepted | Jacob | 2026-10-31 | - | - |
 | [ADR-0006](decisions/ADR-0006-microvm-firecracker-runner.md) | MicroVM host: remote Linux runner with Firecracker | Decision | Proposed | Jacob | 2026-10-31 | - | - |
 | [ADR-0007](decisions/ADR-0007-tool-protocol.md) | Tool protocol: native function calling with XML fallback, MCP for external tools | Decision | Proposed | Jacob | 2026-10-31 | - | - |
 | [ADR-0008](decisions/ADR-0008-own-file-tools.md) | Kronyx owns its file tools | Decision | Accepted | Jacob | 2026-10-31 | 2026-10-31 | - |
@@ -24,3 +24,4 @@ Open: 18 | Closed: 0
 | [PLAN-008](plans/PLAN-008-eval-harness.md) | Eval harness | Plan | Proposed | Jacob | 2026-10-31 | - | - |
 | [PLAN-009](plans/PLAN-009-learning-loop.md) | Learning loop | Plan | Proposed | Jacob | 2026-10-31 | - | - |
 | [PLAN-010](plans/PLAN-010-context-memory-hierarchy.md) | Context and memory hierarchy (compaction, handoff, recall) | Plan | Proposed | Jacob | 2026-11-04 | - | - |
+| [PLAN-011](plans/PLAN-011-multi-agent-mode.md) | Multi-agent mode (planner, worktree per slice, fan-in) | Plan | Implemented | Jacob | 2026-11-02 | 2026-11-12 | - |
