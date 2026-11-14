@@ -14,6 +14,7 @@ export interface WarmDoc {
 	status?: string;
 	snapshotId?: string;
 	depsOk?: boolean;
+	depsHash?: string;
 	updatedAt?: Date | string;
 	startedAt?: Date | string;
 	failedAt?: Date | string;
@@ -34,8 +35,10 @@ const ms = (t: Date | string | undefined): number | undefined => {
 /**
  * Decides what a warm-boot lookup should do with the stored repo_templates doc.
  * Pure: the caller supplies `now`, so every state can be tested without a DB.
+ * `currentDepsHash` is the repo's live manifest fingerprint (see
+ * depsFingerprint); pass undefined when it cannot be fetched.
  */
-export function decideWarm(doc: WarmDoc | null | undefined, now: number): WarmDecision {
+export function decideWarm(doc: WarmDoc | null | undefined, now: number, currentDepsHash?: string): WarmDecision {
 	if (!doc) return { action: "bake" };
 	if (doc.status === "building") {
 		const started = ms(doc.startedAt) ?? ms(doc.updatedAt);
@@ -49,10 +52,22 @@ export function decideWarm(doc: WarmDoc | null | undefined, now: number): WarmDe
 		return { action: "bake" };
 	}
 	if (doc.status === "ready" && typeof doc.snapshotId === "string") {
-		// A ready snapshot whose install failed is not a usable warm state.
-		if (doc.depsOk === false) return { action: "skip", reason: "deps_failed" };
+		// A ready snapshot whose install failed is not a usable warm state, but
+		// it must not wedge the repo: apply the same cooldown as `failed`, then
+		// rebake — the lockfile may have been fixed upstream.
+		if (doc.depsOk === false) {
+			const failed = ms(doc.failedAt) ?? ms(doc.updatedAt);
+			if (failed !== undefined && now - failed < FAILED_COOLDOWN_MS) return { action: "skip", reason: "deps_failed" };
+			return { action: "bake" };
+		}
 		const updated = ms(doc.updatedAt);
-		if (updated !== undefined && now - updated < READY_TTL_MS) return { action: "use", snapshotId: doc.snapshotId };
+		if (updated !== undefined && now - updated < READY_TTL_MS) {
+			// currentDepsHash === undefined means the lookup could not fingerprint
+			// the repo (no token/network) — reuse rather than force a rebake. A
+			// defined hash must match; a missing stored hash counts as a mismatch.
+			if (currentDepsHash !== undefined && doc.depsHash !== currentDepsHash) return { action: "bake" };
+			return { action: "use", snapshotId: doc.snapshotId };
+		}
 		return { action: "bake" };
 	}
 	return { action: "bake" };

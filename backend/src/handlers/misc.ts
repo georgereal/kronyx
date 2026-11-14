@@ -111,7 +111,7 @@ export async function janitor(req: Request): Promise<Response> {
 }
 
 /** Shared janitor sweep — also run by the worker on a timer. */
-export async function runJanitorSweep(db: Db): Promise<{ users: number; killed: number; paused: number }> {
+export async function runJanitorSweep(db: Db): Promise<{ users: number; killed: number; paused: number; snapshotsDeleted: number }> {
 	const users: { _id: string; settings?: { secrets?: Record<string, string>; data?: Record<string, unknown> } }[] = await db
 		.collection("users")
 		.find({ "settings.secrets": { $exists: true } })
@@ -270,7 +270,28 @@ export async function runJanitorSweep(db: Db): Promise<{ users: number; killed: 
 			}
 		}
 	}
-	return { users: users.length, killed, paused };
+	// Orphaned repo snapshots: `kronyx-repo-<key>` templates with no owning
+	// repo_templates doc (deleted via the templates API, or the doc was lost).
+	let snapshotsDeleted = 0;
+	for (const u of users) {
+		const creds: ProviderCreds = { secrets: u.settings?.secrets ?? {}, data: u.settings?.data ?? {} };
+		const owned = new Set(
+			(await db.collection("repo_templates").find({ uid: u._id }).project({ key: 1 }).toArray()).map((d) => String(d.key)),
+		);
+		for (const p of Object.values(providers)) {
+			if (!p.listTemplates || !p.deleteSnapshotById || p.validate(creds)) continue;
+			const templates = await p.listTemplates(creds).catch(swallow("misc", "op", []));
+			for (const t of templates) {
+				const key = t.names.map((n) => /^kronyx-repo-(\w+)$/.exec(n)?.[1]).find(Boolean);
+				if (!key || owned.has(key)) continue;
+				if (await p.deleteSnapshotById(t.id, creds).catch(swallow("misc", "op", false))) {
+					console.log(`[janitor] deleted orphaned repo snapshot ${t.id} (${p.name})`);
+					snapshotsDeleted++;
+				}
+			}
+		}
+	}
+	return { users: users.length, killed, paused, snapshotsDeleted };
 }
 
 /** GET/POST /api/mcp — connector stubs; execution comes later. */

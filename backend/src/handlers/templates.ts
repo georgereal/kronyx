@@ -69,8 +69,16 @@ export async function deleteTemplate(req: Request, p: Record<string, string>): P
 	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
 	const db = await getDb();
 	const docs = await db.collection("image_bakes").find({ uid, name: p.name }).toArray();
-	if (!docs.length) return json({ error: "not_found" }, { status: 404 });
-	const ids = docs.flatMap((d) => [d.snapshotId, d.templateId].filter((x): x is string => typeof x === "string" && !!x));
+	// Repo warm snapshots share the same template namespace under the
+	// `kronyx-repo-<key>` name — deleting one must drop its repo_templates doc
+	// and provider artifact too, or both are orphaned.
+	const repoKey = /^kronyx-repo-(\w+)$/.exec(p.name)?.[1];
+	const repoDocs = repoKey ? await db.collection("repo_templates").find({ uid, key: repoKey }).toArray() : [];
+	if (!docs.length && !repoDocs.length) return json({ error: "not_found" }, { status: 404 });
+	const ids = docs
+		.flatMap((d) => [d.snapshotId, d.templateId])
+		.concat(repoDocs.map((d) => d.snapshotId))
+		.filter((x): x is string => typeof x === "string" && !!x);
 	if (ids.length) {
 		const settings = await loadUserSettings(db, uid).catch(swallow("templates", "op", null));
 		if (settings) {
@@ -81,6 +89,7 @@ export async function deleteTemplate(req: Request, p: Record<string, string>): P
 		}
 	}
 	await db.collection("image_bakes").deleteMany({ uid, name: p.name });
+	if (repoDocs.length) await db.collection("repo_templates").deleteMany({ uid, key: repoKey });
 	return json({ ok: true });
 }
 

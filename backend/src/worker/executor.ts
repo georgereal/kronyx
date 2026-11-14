@@ -1064,7 +1064,14 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		const key = createHash("sha256").update(`${this.sink.uid}:${session.repo}`).digest("hex").slice(0, 16);
 		const col = this.db.collection("repo_templates");
 		const doc = await col.findOne({ key }).catch(swallow("executor", "op", null));
-		const decision = decideWarm(doc as WarmDoc | null, Date.now());
+		// Fingerprint the repo's live manifests only when the stored doc is a
+		// warm candidate — the GitHub calls aren't worth it otherwise. A defined
+		// hash that differs from doc.depsHash forces a rebake.
+		const liveHash =
+			doc?.status === "ready" && typeof doc.snapshotId === "string" && doc.depsOk !== false
+				? await this.repoDepsFingerprint(session, settings).catch(swallow("executor", "op", undefined))
+				: undefined;
+		const decision = decideWarm(doc as WarmDoc | null, Date.now(), liveHash);
 		if (decision.action === "use") return decision.snapshotId;
 		if (decision.action === "wait" || decision.action === "skip") {
 			if (decision.action === "skip") dbg("executor", `warm bake skipped for ${session.repo}: ${decision.reason}`);
@@ -1084,6 +1091,27 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				.catch(swallow("executor", "op"));
 		});
 		return null;
+	}
+
+	/** The repo's live manifest fingerprint via the GitHub contents API —
+	 *  undefined when it can't be fetched (no token, private repo, network). */
+	private async repoDepsFingerprint(session: SessionDoc, settings: UserSettings): Promise<string | undefined> {
+		const token = await this.githubToken(session, settings).catch(swallow("executor", "op", ""));
+		const headers: Record<string, string> = { Accept: "application/vnd.github+json" };
+		if (token) headers.Authorization = `Bearer ${token}`;
+		const files: Record<string, string> = {};
+		await Promise.all(
+			DEP_FILES.map(async (f) => {
+				const r = await fetch(`https://api.github.com/repos/${session.repo}/contents/${f}`, {
+					headers,
+					signal: AbortSignal.timeout(10_000),
+				}).catch(() => null);
+				if (!r?.ok) return;
+				const d = (await r.json().catch(() => null)) as { content?: string; encoding?: string } | null;
+				if (d?.encoding === "base64" && d.content) files[f] = Buffer.from(d.content, "base64").toString("utf8");
+			}),
+		);
+		return Object.keys(files).length ? depsFingerprint(files) : undefined;
 	}
 
 	/** Bake a repo snapshot: stock VM → clone → best-effort dep install →

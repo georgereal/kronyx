@@ -96,6 +96,7 @@ export const routes: Route[] = makeRoutes([
 	["GET", "/api/sessions", sess.listSessions],
 	["POST", "/api/sessions", sess.createSession],
 	["GET", "/api/sessions/:id", sess.getSession],
+	["DELETE", "/api/sessions/:id", sess.deleteSession],
 	["GET", "/api/sessions/:id/usage", sess.sessionUsage],
 	["POST", "/api/sessions/:id/messages", sess.postMessage],
 	["GET", "/api/sessions/:id/events", sess.sessionEvents],
