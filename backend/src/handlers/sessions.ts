@@ -4,7 +4,7 @@ import { authenticate } from "../lib/apiKeys";
 import { verifyIdToken } from "../lib/firebaseAdmin";
 import { getDb } from "../lib/mongo";
 import { installationRepos, installationToken, listInstallations } from "../lib/githubApp";
-import { getProvider, providers } from "../../../src/sandbox/provider";
+import { getProvider, providers, type ProviderCreds } from "../../../src/sandbox/provider";
 import { githubPat, loadUserSettings, resolveProvider } from "../worker/settings";
 import { listPlans, loadPlan } from "../lib/planStore";
 import { json } from "../routes";
@@ -533,4 +533,42 @@ export async function sessionEvents(req: Request, p: Record<string, string>): Pr
 			"x-accel-buffering": "no",
 		},
 	});
+}
+
+/** DELETE /api/sessions/:id — removes the session, its run history, and the
+ *  WIP snapshot. Live sandboxes are flagged killPending so the janitor reaps
+ *  them (deleting the row would orphan the VM). Refused while a run is live. */
+export async function deleteSession(req: Request, p: Record<string, string>): Promise<Response> {
+	const uid = await authenticate(req);
+	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
+	const db = await getDb();
+	const session = await db.collection("sessions").findOne({ uid, sessionId: p.id });
+	if (!session) return json({ error: "not_found" }, { status: 404 });
+	const live =
+		session.activeRunId ||
+		(await db.collection("runs").countDocuments({ uid, sessionId: p.id, status: { $in: ["queued", "claimed", "running", "stopping"] } })) > 0;
+	if (live) return json({ error: "run_active" }, { status: 409 });
+	// The WIP snapshot is provider state — delete it before the session doc
+	// loses its lastSnapshotId reference.
+	if (typeof session.lastSnapshotId === "string" && session.lastSnapshotId) {
+		const settings = await loadUserSettings(db, uid).catch(swallow("sessions", "op", null));
+		const provider = getProvider("e2b");
+		const creds: ProviderCreds | null = settings ? { secrets: settings.secrets, data: settings.data } : null;
+		if (creds && !provider.validate(creds) && provider.deleteSnapshotById)
+			await provider.deleteSnapshotById(session.lastSnapshotId, creds).catch(swallow("sessions", "op", false));
+	}
+	await db
+		.collection("sandboxes")
+		.updateMany({ uid, sessionId: p.id, state: { $in: ["active", "running", "paused"] } }, { $set: { killPending: true } })
+		.catch(swallow("sessions", "op"));
+	await Promise.all([
+		db.collection("sessions").deleteOne({ uid, sessionId: p.id }),
+		db.collection("runs").deleteMany({ uid, sessionId: p.id }),
+		db.collection("run_events").deleteMany({ uid, sessionId: p.id }),
+		db.collection("run_reports").deleteMany({ uid, sessionId: p.id }),
+		db.collection("run_transcripts").deleteMany({ uid, sessionId: p.id }),
+		db.collection("plans").deleteMany({ uid, sessionId: p.id }),
+		db.collection("attachments").deleteMany({ uid, sessionId: p.id }),
+	]);
+	return json({ ok: true });
 }
