@@ -1476,6 +1476,22 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 					await sbx.runIn(REPO_DIR, "git reset --hard HEAD", 60_000).catch(swallow("executor", "op"));
 				}
 			}
+			// Repo switch: the worktree holds a different repo than the session
+			// now targets. Checkpoint dirty work to the outgoing branch (still
+			// on the old repo), wipe, and fall through to a fresh clone.
+			if (session.cloned && session.repo) {
+				const remote = await sbx
+					.runIn(REPO_DIR, "git remote get-url origin", 15_000)
+					.catch(swallow("executor", "op", { stdout: "", exitCode: 1, stderr: "" }));
+				const m = /github\.com[/:]([\w.-]+\/[\w.-]+?)(?:\.git)?\s*$/.exec(remote.stdout.trim());
+				if (m?.[1] && m[1] !== session.repo) {
+					await this.sink.emit({ type: "cloud-status", text: `Switching repo — sandbox has ${m[1]}, session is on ${session.repo}…` });
+					await this.checkpointResetFrom(session, sbx);
+					await sbx.runIn("/", `rm -rf ${REPO_DIR}`, 30_000).catch(swallow("executor", "op"));
+					session.cloned = false;
+					await this.sink.patchSession({ cloned: false });
+				}
+			}
 			if (session.cloned && (!session.base || session.base === "main")) {
 				// Heal stale base for sessions cloned before default-branch detection.
 				const head = await sbx.runIn(REPO_DIR, "git symbolic-ref refs/remotes/origin/HEAD --short", 15_000).catch(swallow("executor", "op"));
@@ -1626,9 +1642,13 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		if (mode !== "plan") {
 			await this.ensureBranch(job, session, sbx, token);
 			await this.preflight(job, session, sbx, token, settings);
+		} else if (!session.branch) {
+			// Plan mode with no work branch: nothing checks the repo out to the
+			// picked start point — sync the worktree so reads see the right code.
+			await this.syncPlanWorktree(session, sbx);
 		}
-		// Plan mode: the session branch (when it exists) was already checked
-		// out and reconciled by ensureRepoReady — nothing further to do.
+		// Plan mode with an existing session branch: ensureRepoReady already
+		// checked it out and reconciled it — reads see that branch's code.
 
 		return { provider, sbx, token, atts, mode };
 	}
@@ -2441,6 +2461,56 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		});
 	}
 
+	/** Commit+push a dirty worktree to the outgoing branch (resetFrom), then
+	 *  clear it — shared by ensureBranch's refork path and plan-mode sync. */
+	private async checkpointResetFrom(session: SessionDoc, sbx: SandboxCore): Promise<void> {
+		if (!session.resetFrom) return;
+		const dirty = await sbx
+			.runIn(REPO_DIR, "git status --porcelain", 30_000)
+			.catch(swallow("executor", "op", { exitCode: 0, stdout: "", stderr: "" }));
+		if (dirty.stdout.trim()) {
+			await this.sink.emit({ type: "cloud-status", text: `Saving uncommitted work to ${session.resetFrom}…` });
+			await sbx
+				.commitAndPush(REPO_DIR, session.resetFrom, "kronyx: checkpoint before switching start point", COMMIT_EXCLUDES)
+				.then(() => this.sink.emit({ type: "info", text: `Uncommitted work pushed to ${session.resetFrom}.` }))
+				.catch(() => this.sink.emit({ type: "info", text: `Couldn't checkpoint to ${session.resetFrom} — uncommitted edits may be lost.` }));
+		}
+		await this.sink.patchSession({ resetFrom: null });
+		session.resetFrom = null;
+	}
+
+	/** Plan-mode worktree sync: no kronyx branch exists yet (or was just
+	 *  reset), so nothing checks the repo out to the session's start point —
+	 *  a stale VM checkout would keep serving the old branch's code. Fetch +
+	 *  check out startRef read-only; the work branch is created by the next
+	 *  agent run. */
+	private async syncPlanWorktree(session: SessionDoc, sbx: SandboxCore): Promise<void> {
+		await this.checkpointResetFrom(session, sbx);
+		const startRef = String(session.startRef ?? session.base ?? "").trim();
+		if (!startRef) return;
+		const r = await sbx
+			.runIn(REPO_DIR, `git fetch origin ${JSON.stringify(startRef)} && git checkout -B .kronyx-start FETCH_HEAD`, 120_000)
+			.catch(swallow("executor", "op", { exitCode: 1, stdout: "", stderr: "" }));
+		if (r?.exitCode === 0) {
+			await this.sink.emit({ type: "info", text: `Reading ${session.repo} at ${startRef}` });
+			return;
+		}
+		// Dirty leftovers can block the switch — stash (non-destructive) and retry.
+		const st = await sbx.runIn(REPO_DIR, "git stash push -m kronyx-plan-switch", 30_000).catch(swallow("executor", "op"));
+		const stashed = st?.exitCode === 0 && !st.stdout.includes("No local changes");
+		const r2 = await sbx
+			.runIn(REPO_DIR, `git checkout -B .kronyx-start FETCH_HEAD`, 60_000)
+			.catch(swallow("executor", "op", { exitCode: 1, stdout: "", stderr: "" }));
+		if (r2?.exitCode === 0) {
+			await this.sink.emit({
+				type: "info",
+				text: `Reading ${session.repo} at ${startRef}${stashed ? " (uncommitted changes kept in git stash)" : ""}`,
+			});
+		} else {
+			await this.sink.emit({ type: "info", text: `Could not check out ${startRef} — reading the existing checkout instead.` });
+		}
+	}
+
 	private async ensureBranch(job: CloudJob, session: SessionDoc, sbx: SandboxCore, token: string): Promise<void> {
 		const base = session.base ?? "main";
 		// Refresh the remote credential up front — the clone URL embeds a token
@@ -2455,20 +2525,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			// Per-task start-point change: the env picker cleared the branch and
 			// left the old one in resetFrom. Preserve uncommitted work on it
 			// before the new branch forks off the picked ref.
-			if (session.resetFrom) {
-				const dirty = await sbx
-					.runIn(REPO_DIR, "git status --porcelain", 30_000)
-					.catch(swallow("executor", "op", { exitCode: 0, stdout: "", stderr: "" }));
-				if (dirty.stdout.trim()) {
-					await this.sink.emit({ type: "cloud-status", text: `Saving uncommitted work to ${session.resetFrom}…` });
-					await sbx
-						.commitAndPush(REPO_DIR, session.resetFrom, "kronyx: checkpoint before switching start point", COMMIT_EXCLUDES)
-						.then(() => this.sink.emit({ type: "info", text: `Uncommitted work pushed to ${session.resetFrom}.` }))
-						.catch(() => this.sink.emit({ type: "info", text: `Couldn't checkpoint to ${session.resetFrom} — uncommitted edits may be lost.` }));
-				}
-				await this.sink.patchSession({ resetFrom: null });
-				session.resetFrom = null;
-			}
+			await this.checkpointResetFrom(session, sbx);
 			const branch = `kronyx/${slugify(job.task)}-${job.runId.replace(/^web-/, "").slice(0, 6)}`;
 			// Fork from the fetched start point, not local HEAD — a warm clone
 			// can be arbitrarily stale (ask/plan runs never sync the repo).

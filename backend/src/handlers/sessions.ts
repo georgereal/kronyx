@@ -142,6 +142,8 @@ export async function postMessage(req: Request, p: Record<string, string>): Prom
 		startRef?: string;
 		base?: string;
 		keepBranch?: boolean;
+		repo?: string;
+		installationId?: number;
 	};
 	const task = String(body.task ?? "").trim();
 	if (!task && !body.planSlug) return json({ error: "task required" }, { status: 400 });
@@ -154,7 +156,24 @@ export async function postMessage(req: Request, p: Record<string, string>): Prom
 	const startRef = String(body.startRef ?? "").trim();
 	const base = String(body.base ?? "").trim();
 	const envSet: Record<string, unknown> = {};
-	if ((startRef || base) && session.repo) {
+	// Repo switch: the picked repo differs — checkpoint the old branch, clear
+	// it, and retarget. The worker wipes + reclones when the remote doesn't
+	// match (all modes), so the sandbox always runs the session's repo.
+	const repo = /^[\w.-]+\/[\w.-]+$/.test(String(body.repo ?? "")) ? String(body.repo) : "";
+	if (repo && repo !== session.repo) {
+		if (session.activeRunId) return json({ error: "run_active" }, { status: 409 });
+		envSet.repo = repo;
+		const inst = Number(body.installationId);
+		envSet.installationId = Number.isFinite(inst) && inst > 0 ? inst : null;
+		envSet.resetFrom = session.branch;
+		envSet.branch = null;
+		envSet.prUrl = null;
+		if (base) {
+			envSet.base = base;
+			envSet.startRef = startRef || base;
+		}
+	}
+	if ((startRef || base) && (repo || session.repo)) {
 		const newRef = startRef || base;
 		// Compare against the session's LIVE ref (work branch first) — matching
 		// the composer's display semantics. Comparing startRef alone misses the

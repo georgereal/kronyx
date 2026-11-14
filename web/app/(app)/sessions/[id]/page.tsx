@@ -47,29 +47,42 @@ export default function SessionView() {
 	// else the picked startRef) — unless the user has since picked a different
 	// ref, which stays until they submit or the session ref moves again.
 	const [env, setEnv] = useState<EnvState | null>(null);
-	const syncedRef = useRef("");
+	const syncedEnv = useRef({ repo: "", ref: "" });
 	useEffect(() => {
 		if (!session) return;
+		const sRepo = session.repo ?? "";
 		const sessionRef = session.branch ?? session.startRef ?? "";
 		setEnv((prev) => {
-			if (!prev)
-				return {
-					repo: session.repo ?? "",
-					base: session.base ?? "",
-					startRef: sessionRef,
-					prLabel: "",
-					installationId: session.installationId ?? null,
-					extraRepos: session.extraRepos ?? [],
-					template: session.template ?? "",
-					securityProfile: (session.securityProfile as EnvState["securityProfile"]) ?? "agent",
-				};
-			// Ref still matches the last synced value (user hasn't overridden) →
-			// follow the session; a user pick stays until the session ref moves.
-			if (prev.startRef === syncedRef.current) return { ...prev, startRef: sessionRef, prLabel: "" };
-			return prev;
+			const init: EnvState = {
+				repo: sRepo,
+				base: session.base ?? "",
+				startRef: sessionRef,
+				prLabel: "",
+				installationId: session.installationId ?? null,
+				extraRepos: session.extraRepos ?? [],
+				template: session.template ?? "",
+				securityProfile: (session.securityProfile as EnvState["securityProfile"]) ?? "agent",
+			};
+			if (!prev) return init;
+			// Fields still matching the last synced values (user hasn't
+			// overridden) follow the session; user picks stay until the
+			// session's own value moves.
+			const next = { ...prev };
+			if (prev.repo === syncedEnv.current.repo) {
+				next.repo = sRepo;
+				next.installationId = session.installationId ?? null;
+				next.base = session.base ?? "";
+				next.extraRepos = session.extraRepos ?? [];
+				next.template = session.template ?? "";
+			}
+			if (!prev.startRef || prev.startRef === syncedEnv.current.ref) {
+				next.startRef = sessionRef;
+				next.prLabel = "";
+			}
+			return next;
 		});
-		syncedRef.current = sessionRef;
-	}, [session?.sessionId, session?.startRef, session?.base, session?.branch]);
+		syncedEnv.current = { repo: sRepo, ref: sessionRef };
+	}, [session?.sessionId, session?.repo, session?.installationId, session?.startRef, session?.base, session?.branch]);
 	// Bottom-pin: window scrollbar follows new events unless the user scrolls up.
 	const pinnedRef = useRef(true);
 
@@ -295,6 +308,8 @@ export default function SessionView() {
 				attachmentIds,
 				modelId: modelId || undefined,
 				profile: modelProfile || undefined,
+				repo: env?.repo || undefined,
+				installationId: env?.installationId ?? undefined,
 				startRef: env?.startRef || undefined,
 				base: env?.base || undefined,
 				keepBranch: env?.keepBranch || undefined,
@@ -504,7 +519,6 @@ export default function SessionView() {
 					onModel={(id, profile) => { setModelId(id); setModelProfile(profile); }}
 					env={env ?? undefined}
 					onEnv={setEnv}
-					lockRepo
 					currentBranch={session?.branch ?? undefined}
 				/>
 			</div>
