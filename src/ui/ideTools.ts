@@ -11,6 +11,10 @@ const MAX_SYMBOLS = 50;
 const MAX_REFS = 30;
 const MAX_DIAG_FILES = 50;
 const MAX_DIAG_PER_FILE = 10;
+const MAX_CODE_ACTIONS_MARKER = 50;
+const MAX_FORMAT_RESULTS_MARKER = 30;
+const MAX_DIAG_RESULT_MARKER = 10;
+const TRUNC_MARKER = "...";
 const MAX_HOVER_CHARS = 1_500;
 
 async function withTimeout<T>(p: Promise<T> | Thenable<T>, what: string): Promise<T | undefined> {

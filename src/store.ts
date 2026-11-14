@@ -393,7 +393,7 @@ export function putEmbeddingCache(d: Store | undefined, hash: string, model: str
 	} catch { /* store unavailable */ }
 }
 
-export function listChunks(d: Store | undefined, limit = 20000, root?: string): { path: string; text: string; embedding: Float32Array }[] {
+export function listChunks(d: Store | undefined, limit = 1000, root?: string): { path: string; text: string; embedding: Float32Array }[] {
 	try {
 		const rows = root
 			? all(d, "SELECT path, text, embedding FROM chunks WHERE root = ? LIMIT ?", [root, limit])
