@@ -30,6 +30,8 @@ async function withTimeout<T>(p: Promise<T> | Thenable<T>, what: string): Promis
 }
 
 const SEVERITY = ["error", "warning", "info", "hint"] as const;
+const MAX_CODE_ACTIONS = 50;
+const MAX_FORMAT_RESULTS = 30;
 
 interface IdeToolOptions {
 	root: string;
