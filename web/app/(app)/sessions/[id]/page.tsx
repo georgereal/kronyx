@@ -12,7 +12,9 @@ import { ProviderGate } from "@/components/ProviderGate";
 import { apiFetch, useUser } from "@/lib/api";
 import type { RunDoc, RunEvent, SessionDoc } from "@/lib/types";
 
-const ACTIVE = new Set(["queued", "running", "claimed", "stopping"]);
+// "pushing"/"verifying" are transient worker states in the post-run tail —
+// the run isn't done yet, so polling must continue or the UI freezes there.
+const ACTIVE = new Set(["queued", "running", "claimed", "stopping", "pushing", "verifying"]);
 
 interface SessionResponse {
 	session: SessionDoc;
@@ -93,7 +95,13 @@ export default function SessionView() {
 	const runOrder = new Map(runs.map((r, i) => [r.runId, i]));
 	const ordered = [...events].sort((a, b) => (runOrder.get(a.runId ?? "") ?? 0) - (runOrder.get(b.runId ?? "") ?? 0) || a.seq - b.seq);
 	const active = !!latestRun && ACTIVE.has(latestRun.status ?? "");
-	const halted = latestRun?.status === "stopped" || latestRun?.status === "failed" || latestRun?.status === "completed";
+	// Terminal events arrive over SSE ahead of the 4s runs poll — honor them so
+	// the status header doesn't lag a "Completed" card by a poll cycle.
+	// (run-finished is pre-tail; only run-completed/-failed are truly terminal.)
+	const runEnded = !!latestRun && events.some(
+		(e) => e.runId === latestRun.runId && (e.event.type === "run-completed" || e.event.type === "run-failed"),
+	);
+	const halted = runEnded || latestRun?.status === "stopped" || latestRun?.status === "failed" || latestRun?.status === "completed";
 	const stopping = (!!latestRun && latestRun.status === "stopping") || (!!stopPressed && !halted && stopPressed?.runId === latestRun?.runId);
 	// Boundary seq for demoting stragglers: the worker's run-stopping event, or
 	// the seq we froze at when Stop was pressed — whichever lands first.

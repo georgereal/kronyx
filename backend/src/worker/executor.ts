@@ -49,6 +49,8 @@ const ATTACH_DIR = ".kronyx/attachments";
 const SHOTS_DIR = ".kronyx/shots";
 const COMMIT_EXCLUDES = [ATTACH_DIR, SHOTS_DIR, ".kronyx/permissions.local.json"];
 const INLINE_TEXT_LIMIT = 20 * 1024;
+/** Hard cap on sandbox start (connect/resume/create ladder) — interruptible sooner via stop. */
+const SANDBOX_START_MS = Number(process.env.SANDBOX_START_TIMEOUT_MS) || 240_000;
 const TEXT_EXT = /\.(txt|md|markdown|ts|tsx|js|jsx|mjs|cjs|json|ya?ml|toml|py|go|rs|java|c|cc|cpp|h|hpp|cs|rb|php|sh|css|html|xml|sql|env|ini|cfg|log)$/i;
 
 export interface CloudJob {
@@ -262,6 +264,8 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	}
 
 	private stopRequested = false;
+	/** Resolved by requestStop — lets blocking setup calls (sandbox create) bail mid-await. */
+	private stopWaiters: (() => void)[] = [];
 	/** Mid-run VM swaps this job has already used (cap: 2). */
 	private switchCount = 0;
 	/** Current run's session — stopCleanup needs it for the WIP checkpoint. */
@@ -270,6 +274,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	/** Stop at the next safe point: aborts a live agent AND gates setup/run phases. */
 	requestStop(): void {
 		this.stopRequested = true;
+		this.stopWaiters.splice(0).forEach((fn) => fn());
 		// Capture before stopSandboxKeepalive clears activeSbx.
 		const sbx = this.activeSbx;
 		const session = this.activeSession;
@@ -329,6 +334,36 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 
 	private throwIfStopped(): void {
 		if (this.stopRequested) throw new Error("Stopped by user");
+	}
+
+	/**
+	 * Race a blocking setup call (ensureSandbox, sbx.create) against the stop
+	 * signal and a hard timeout. The underlying promise keeps running — if it
+	 * eventually produces a SandboxCore we close it so no VM leaks untracked.
+	 */
+	private raceStop<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+		return new Promise<T>((resolve, reject) => {
+			const fail = (err: Error) => {
+				clearTimeout(timer);
+				p.then((v) => {
+					if (v instanceof SandboxCore) void v.close().catch(swallow("executor", "op"));
+				}).catch(() => {});
+				reject(err);
+			};
+			const timer = setTimeout(() => fail(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`)), ms);
+			if (this.stopRequested) return fail(new Error("Stopped by user"));
+			this.stopWaiters.push(() => fail(new Error("Stopped by user")));
+			p.then(
+				(v) => {
+					clearTimeout(timer);
+					resolve(v);
+				},
+				(err) => {
+					clearTimeout(timer);
+					reject(err);
+				},
+			);
+		});
 	}
 
 	/**
@@ -1673,7 +1708,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		const mode: AgentMode =
 			job.mode === "plan" ? "plan" : session.securityProfile === "bypass" ? "bypass" : "smart";
 		await this.sink.emit({ type: "cloud-status", text: "Starting sandbox…" });
-		let sbx = await this.ensureSandbox(session, settings, { llm: provider, task: job.task });
+		let sbx = await this.raceStop(this.ensureSandbox(session, settings, { llm: provider, task: job.task }), SANDBOX_START_MS, "Sandbox start");
 		this.activeSession = session;
 		this.startSandboxKeepalive(sbx);
 		this.throwIfStopped();
@@ -1914,7 +1949,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				session.sandboxId = undefined;
 				session.cloned = false;
 				await this.sink.patchSession({ sandboxId: null, cloned: false });
-				const next = await this.ensureSandbox(session, settings);
+				const next = await this.raceStop(this.ensureSandbox(session, settings), SANDBOX_START_MS, "Sandbox start");
 				setSbx(next);
 				this.startSandboxKeepalive(next);
 				await this.ensureRepoReady(session, next, token);
@@ -2852,7 +2887,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		session.sandboxId = undefined;
 		session.cloned = false;
 		await this.sink.patchSession({ sandboxId: null, cloned: false, template: req.template });
-		const next = await this.ensureSandbox(session, settings, { template: req.template });
+		const next = await this.raceStop(this.ensureSandbox(session, settings, { template: req.template }), SANDBOX_START_MS, "Sandbox start");
 		if (session.repo && token) {
 			const defaultBranch = await next.cloneRepo(`https://github.com/${session.repo}`, token, REPO_DIR);
 			await this.sink.patchSession({ cloned: true, ...(defaultBranch ? { base: defaultBranch } : {}) });
@@ -3145,7 +3180,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	/** Open a PR for the session branch (explicit user action — not automatic). */
 	private async openPrJob(job: CloudJob, session: SessionDoc, settings: UserSettings): Promise<void> {
 		dbg("run", "openPrJob", { runId: job.runId, branch: session.branch, base: session.base });
-		let sbx = await this.ensureSandbox(session, settings);
+		let sbx = await this.raceStop(this.ensureSandbox(session, settings), SANDBOX_START_MS, "Sandbox start");
 		this.startSandboxKeepalive(sbx);
 		const token = await this.githubToken(session, settings);
 		this.sink.mask(token);
@@ -3164,7 +3199,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		if (!job.planSlug) throw new Error("No plan on this job.");
 		const plan = await loadPlan(this.db, job.uid, job.sessionId, job.planSlug);
 		if (!plan) throw new Error("Plan not found.");
-		let sbx = await this.ensureSandbox(session, settings);
+		let sbx = await this.raceStop(this.ensureSandbox(session, settings), SANDBOX_START_MS, "Sandbox start");
 		this.startSandboxKeepalive(sbx);
 		const token = await this.githubToken(session, settings);
 		this.sink.mask(token);
@@ -3184,7 +3219,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				session.sandboxId = undefined;
 				session.cloned = false;
 				await this.sink.patchSession({ sandboxId: null, cloned: false });
-				sbx = await this.ensureSandbox(session, settings);
+				sbx = await this.raceStop(this.ensureSandbox(session, settings), SANDBOX_START_MS, "Sandbox start");
 				this.startSandboxKeepalive(sbx);
 			}
 		}

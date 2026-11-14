@@ -130,8 +130,8 @@ async function runJob(job: CloudJob): Promise<void> {
 			if (run?.control === "stop_requested" && !stopped) {
 				stopped = true;
 				log(`stop requested for ${job.runId}`);
-				executor.requestStop();
 				stopWatchdog ??= setTimeout(() => void forceFinalize().catch(swallow("loop", "op")), 90_000);
+				executor.requestStop();
 			}
 		})().catch(swallow("loop", "op"));
 	}, STOP_CHECK_MS);
