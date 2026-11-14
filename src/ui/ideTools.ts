@@ -330,6 +330,127 @@ export function createIdeTools(options: IdeToolOptions): AgentTool<any, string>[
 				});
 				return `Renamed to "${newName}" — ${edits.length} edit(s) in ${files.size} file(s):\n${edits.slice(0, MAX_REFS).join("\n")}`;
 			},
+{
+			name: "code_action",
+			executionMode: "parallel",
+			description:
+				"Apply a code action suggested by the language server (refactor, quick-fix, or similar). " +
+				"Uses vscode.executeCodeActionProvider. The input selects a starting position so the server can propose context-appropriate actions.",
+			inputSchema: {
+				type: "object",
+				properties: {
+					path: { type: "string", description: "Optional workspace-relative file." },
+					position: { type: "object", description: "Position in the file (line, character)." },
+				},
+				required: ["position"],
+			},
+			async execute(input: { path?: string; position: { line: number; character: number } }) {
+				const uri = input.path ? uriFor(input.path) : undefined;
+				const prep = await exec<vscode.CodeAction[]>("vscode.executeCodeActionProvider", uri, new vscode.Position(input.position.line, input.position.character), vscode.CodeActionKind.All);
+				if (!prep) return "No code action provider or no actions returned.";
+				const actions = prep.slice(0, MAX_CODE_ACTIONS);
+				const out: string[] = [];
+				for (const a of actions) {
+					const kind = a.kind ? vscode.CodeActionKind[a.kind] : "";
+					out.push(`-${a.title} ${kind ? `[${kind}]` : ""}`);
+					if (a.edit) {
+						const edits = a.edit.get(uri);
+						if (edits) {
+							for (const e of edits) {
+								out.push(`  ${rel(uri)}:${e.range.start.line + 1}:${e.range.start.character + 1} ${e.newText?.slice(0, 80) ?? ""}`);
+							}
+						}
+					}
+				}
+				options.report?.({ op: "ide_context", tool: "code_action", files: actions.length, tookMs: Date.now() - t0 });
+				return out.length ? out.join("\n") : "No code actions.";
+			},
+		},
+		{
+			name: "format_document",
+			executionMode: "parallel",
+			description:
+				"Reformat the entire document using the language server. " +
+				"Equivalent to VS Code's "format document" command but scoped to the current editor or a given path.",
+			inputSchema: {
+				type: "object",
+				properties: {
+					path: { type: "string", description: "Optional workspace-relative file." },
+				},
+			},
+			async execute(input: { path?: string }) {
+				const uri = input.path ? uriFor(input.path) : vscode.window.activeTextEditor?.document.uri;
+				if (!uri) return "No active editor and no path provided.";
+				const result = await exec<vscode.TextEdit[]>("vscode.executeDocumentFormatProvider", uri);
+				if (!result) return "Format provider returned no edits.";
+				const edits = result.slice(0, MAX_FORMAT_RESULTS);
+				const out: string[] = [];
+				for (const e of edits) {
+					out.push(`${rel(uri)}:${e.range.start.line + 1}:${e.range.start.character + 1} -> ${e.newText?.slice(0, 80) ?? ""}`);
+				}
+				options.report?.({ op: "ide_context", tool: "format_document", tookMs: Date.now() - t0 });
+				return out.length ? out.join("\n") : "No formatting edits.";
+			},
+		},
+		{
+			name: "get_selection_context",
+			executionMode: "parallel",
+			description:
+				"Return the current editor selection as context text, plus surrounding lines (up to 10 before/after). " +
+				"Useful for keeping agent focus on the active region across turns.",
+			inputSchema: {
+				type: "object",
+				properties: {
+					extend: { type: "integer", description: "Lines to extend selection by before/after (default: 5)." },
+				},
+			},
+			async execute(input: { extend?: number }) {
+				const editor = vscode.window.activeTextEditor;
+				if (!editor) return "No active editor.";
+				const doc = editor.document;
+				const sel = editor.selection;
+				const extend = Math.max(0, (input.extend ?? 5));
+				const startLine = Math.max(0, sel.start.line - extend);
+				const endLine = Math.min(doc.lineCount - 1, sel.end.line + extend);
+				const selectedText = doc.getText(new vscode.Range(startLine, 0, endLine + 1, doc.lineAt(endLine).range.end.character));
+				const beforeLines = doc.getText(new vscode.Range(startLine, 0, sel.start.line, doc.lineAt(sel.start.line - 1 ? sel.start.line - 1 : 0).range.end.character)).split("\n").slice(0, extend).join("\n");
+				const afterLines = doc.getText(new vscode.Range(sel.end.line + 1, 0, endLine + 1, doc.lineAt(endLine).range.end.character)).split("\n").slice(0, extend).join("\n");
+				return `Selection (lines ${sel.start.line + 1}-${sel.end.line + 1}):${selectedText ? " " + selectedText : ""}\n\nBefore:${beforeLines ? " " + beforeLines : ""}\n\nAfter:${afterLines ? " " + afterLines : ""}`;
+			},
+		},
+		{
+			name: "post_edit_diagnostics",
+			executionMode: "parallel",
+			description:
+				"Compare diagnostics before and after an edit. The controller calls this with a before-snapshot; the tool computes after-diagnostics and returns a diff report.",
+			inputSchema: {
+				type: "object",
+				properties: {
+					path: { type: "string", description: "File that was edited." },
+					beforeSnapshot: { type: "string", description: "Diagnostics string from before the edit (as returned by get_diagnostics)." },
+				},
+				required: ["path", "beforeSnapshot"],
+			},
+			async execute(input: { path: string; beforeSnapshot: string }) {
+				const after = await exec(vscode.languages.getDiagnostics, uriFor(input.path));
+				const afterLines = after
+					.filter((d) => d.severity <= vscode.DiagnosticSeverity.Warning)
+					.map((d) => `${rel(uriFor(input.path))}:${d.range.start.line + 1}:${d.range.start.character + 1} [${SEVERITY[d.severity]}] ${d.message.split("\n")[0]}`)
+					.slice(0, MAX_DIAG_PER_FILE);
+				const before = input.beforeSnapshot.split("\n");
+				const afterSet = new Set(afterLines);
+				const newDiagnostics = afterLines.filter((l) => !before.some((b) => b.includes(l.split(":")[0])));
+				const resolved = afterLines.filter((l) => before.some((b) => b.includes(l.split(":")[0]) && !l.includes("error")));
+				const report: string[] = [];
+				if (newDiagnostics.length) report.push(`New ${newDiagnostics.length} diagnostics:`);
+				report.push(...newDiagnostics.slice(0, 10));
+				if (resolved.length) report.push(`\nResolved ${resolved.length} diagnostics:`);
+				report.push(...resolved.slice(0, 10));
+				options.report?.({ op: "ide_context", tool: "post_edit_diagnostics", path: input.path, newCount: newDiagnostics.length, resolvedCount: resolved.length, tookMs: Date.now() - t0 });
+				return report.join("\n") || "No diagnostic changes.";
+			},
+		},
+};
 		},
 	];
 }
