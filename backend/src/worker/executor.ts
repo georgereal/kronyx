@@ -20,6 +20,7 @@ import { FLAGS, flag } from "../lib/flags";
 import { githubPat, loadUserSettings, resolveProvider, type UserSettings } from "./settings";
 import { IMAGE_RECIPES } from "./imageRecipes";
 import { buildE2bTemplate } from "../lib/e2bTemplateBuild";
+import { DEP_FILES, decideWarm, depsFingerprint, stderrTail, type WarmDoc } from "./warmState";
 import type { RunSink } from "./events";
 import type { AgentMessage } from "@cline/shared";
 import type { PriorTranscript } from "../../../src/agent/recall";
@@ -1063,20 +1064,23 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		const key = createHash("sha256").update(`${this.sink.uid}:${session.repo}`).digest("hex").slice(0, 16);
 		const col = this.db.collection("repo_templates");
 		const doc = await col.findOne({ key }).catch(swallow("executor", "op", null));
-		const fresh = doc?.updatedAt && Date.now() - new Date(doc.updatedAt as Date).getTime() < 24 * 3600_000;
-		if (doc?.status === "ready" && typeof doc.snapshotId === "string" && fresh) return doc.snapshotId;
-		if (doc?.status === "building") return null;
+		const decision = decideWarm(doc as WarmDoc | null, Date.now());
+		if (decision.action === "use") return decision.snapshotId;
+		if (decision.action === "wait" || decision.action === "skip") {
+			if (decision.action === "skip") dbg("executor", `warm bake skipped for ${session.repo}: ${decision.reason}`);
+			return null;
+		}
 		await col
 			.updateOne(
 				{ key },
-				{ $set: { status: "building", uid: this.sink.uid, repo: session.repo, updatedAt: new Date() }, $setOnInsert: { createdAt: new Date() } },
+				{ $set: { status: "building", uid: this.sink.uid, repo: session.repo, startedAt: new Date(), updatedAt: new Date() }, $setOnInsert: { createdAt: new Date() } },
 				{ upsert: true },
 			)
 			.catch(swallow("executor", "op"));
 		void this.bakeWarmSnapshot(key, session, settings, creds, doc?.snapshotId as string | undefined).catch(async (e) => {
 			console.log(`[executor] warm snapshot bake failed for ${session.repo}:`, e);
 			await col
-				.updateOne({ key }, { $set: { status: "failed", error: String(e).slice(0, 300), updatedAt: new Date() } })
+				.updateOne({ key }, { $set: { status: "failed", error: String(e).slice(0, 300), updatedAt: new Date(), failedAt: new Date() } })
 				.catch(swallow("executor", "op"));
 		});
 		return null;
@@ -1088,7 +1092,8 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	private async bakeWarmSnapshot(key: string, session: SessionDoc, settings: UserSettings, creds: ProviderCreds, prevSnapshotId?: string): Promise<void> {
 		const col = this.db.collection("repo_templates");
 		const bake = new SandboxCore();
-		await bake.create({ creds, provider: "e2b", timeoutMs: 30 * 60_000 });
+		// Bake from the user's cloud.template so the warm VM matches the project's base.
+		await bake.create({ creds, provider: "e2b", template: String(settings.data.e2bTemplate ?? "") || undefined, timeoutMs: 30 * 60_000 });
 		// Register the bake VM so it's janitor-visible if the worker dies
 		// mid-bake (otherwise it's an untracked orphan).
 		const bakeId = bake.sandboxId;
@@ -1103,15 +1108,25 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			// Scrub the token-bearing remote URL before snapshotting — secrets
 			// must never be baked into the image.
 			await bake.runIn(REPO_DIR, `git remote set-url origin ${JSON.stringify(`https://github.com/${session.repo}`)}`, 15_000).catch(swallow("executor", "op"));
+			// Fingerprint the manifests so the record shows which deps were baked.
+			const manifests: Record<string, string> = {};
+			for (const f of DEP_FILES) {
+				const r = await bake.runIn(REPO_DIR, `cat ${f}`, 15_000).catch(() => null);
+				if (r?.exitCode === 0) manifests[f] = r.stdout;
+			}
+			const depsHash = depsFingerprint(manifests);
 			// Whatever installs within 10min is baked; the rest installs at runtime.
-			await bake
-				.runIn(REPO_DIR, "test -f package-lock.json && npm ci --no-audit --no-fund >/dev/null 2>&1; test -f yarn.lock && yarn install --frozen-lockfile >/dev/null 2>&1; true", 600_000)
-				.catch(swallow("executor", "op"));
+			// Exit codes are checked: a failed install must not be served as warm.
+			const install = await bake
+				.runIn(REPO_DIR, "if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; elif [ -f yarn.lock ]; then yarn install --frozen-lockfile; else exit 0; fi", 600_000)
+				.catch(() => ({ exitCode: 1, stdout: "", stderr: "install did not run" }));
+			const depsOk = install.exitCode === 0;
+			if (!depsOk) console.log(`[executor] warm bake install failed for ${session.repo}: ${stderrTail(install.stderr || install.stdout)}`);
 			// Named filesystem-only snapshot: same name → new build on the
 			// existing snapshot template; fs mode since boots are cold anyway.
 			const snapshotId = await bake.checkpoint({ mode: "filesystem", name: `kronyx-repo-${key}` });
 			if (!snapshotId) throw new Error("checkpoint returned no snapshot id");
-			await col.updateOne({ key }, { $set: { status: "ready", snapshotId, updatedAt: new Date() } }).catch(swallow("executor", "op"));
+			await col.updateOne({ key }, { $set: { status: "ready", snapshotId, depsOk, depsHash, updatedAt: new Date(), failedAt: null } }).catch(swallow("executor", "op"));
 			console.log(`[executor] warm snapshot ready for ${session.repo}: ${snapshotId}`);
 			// Delete the superseded snapshot so rebakes don't accumulate.
 			if (prevSnapshotId && prevSnapshotId !== snapshotId) await bake.deleteSnapshot(prevSnapshotId).catch(swallow("executor", "op", false));
@@ -1139,7 +1154,8 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		if (credErr) throw new Error(credErr);
 
 		const bake = new SandboxCore();
-		await bake.create({ creds, provider: "e2b", timeoutMs: 45 * 60_000 });
+		// Bake from the user's cloud.template so the warm image matches the project's base.
+		await bake.create({ creds, provider: "e2b", template: String(settings.data.e2bTemplate ?? "") || undefined, timeoutMs: 45 * 60_000 });
 		const bakeId = bake.sandboxId;
 		if (bakeId)
 			await this.db
