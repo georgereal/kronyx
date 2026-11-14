@@ -3,7 +3,8 @@
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Composer, type Mode } from "@/components/Composer";
+import { Composer, type EnvState, type Mode } from "@/components/Composer";
+import { RunStatusLine } from "@/components/RunStatusLine";
 import { ContextMeter } from "@/components/ContextMeter";
 import { Modal } from "@/components/Modal";
 import { PlanCard, Timeline } from "@/components/Timeline";
@@ -40,6 +41,24 @@ export default function SessionView() {
 	const [stopPressed, setStopPressed] = useState<{ runId: string; seq: number } | null>(null);
 	const evRef = useRef<Map<string, RunEvent>>(new Map());
 	const sseRef = useRef<EventSource | null>(null);
+	// Env picker — source of truth for the next task's start point (branch/PR
+	// ref within the session repo). Disabled while a run is active.
+	const [env, setEnv] = useState<EnvState | null>(null);
+	useEffect(() => {
+		if (!session) return;
+		setEnv((prev) =>
+			prev ?? {
+				repo: session.repo ?? "",
+				base: session.base ?? "",
+				startRef: session.startRef ?? "",
+				prLabel: "",
+				installationId: session.installationId ?? null,
+				extraRepos: session.extraRepos ?? [],
+				template: session.template ?? "",
+				securityProfile: (session.securityProfile as EnvState["securityProfile"]) ?? "agent",
+			},
+		);
+	}, [session?.sessionId, session?.startRef, session?.base]);
 	// Bottom-pin: window scrollbar follows new events unless the user scrolls up.
 	const pinnedRef = useRef(true);
 
@@ -259,7 +278,16 @@ export default function SessionView() {
 		if (!user) return;
 		await apiFetch(`/api/sessions/${id}/messages`, user, {
 			method: "POST",
-			body: JSON.stringify({ task, mode, attachmentIds, modelId: modelId || undefined, profile: modelProfile || undefined }),
+			body: JSON.stringify({
+				task,
+				mode,
+				attachmentIds,
+				modelId: modelId || undefined,
+				profile: modelProfile || undefined,
+				startRef: env?.startRef || undefined,
+				base: env?.base || undefined,
+				keepBranch: env?.keepBranch || undefined,
+			}),
 		});
 		// Immediate feedback: show "working" until the first event/run lands.
 		pendingRun.current = true;
@@ -451,6 +479,9 @@ export default function SessionView() {
 			)}
 			<div className="composer-dock">
 				<ContextMeter user={user} sessionId={id} events={events} />
+				{(active || stopping) && latestRun && (
+					<RunStatusLine events={events} runId={latestRun.runId} stopping={stopping && !active} />
+				)}
 				<Composer
 					user={user}
 					mode={mode}
@@ -460,6 +491,10 @@ export default function SessionView() {
 					running={active && !stopping}
 					stopping={stopping && !halted}
 					onModel={(id, profile) => { setModelId(id); setModelProfile(profile); }}
+					env={env ?? undefined}
+					onEnv={setEnv}
+					lockRepo
+					currentBranch={session?.branch ?? undefined}
 				/>
 			</div>
 			</div>

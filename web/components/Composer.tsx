@@ -26,6 +26,8 @@ export interface EnvState {
 	extraRepos: string[];
 	template: string;
 	securityProfile: "agent" | "bypass" | "controlled";
+	/** In-session: rebase the existing branch onto the picked ref instead of forking a new one. */
+	keepBranch?: boolean;
 }
 
 export const emptyEnv: EnvState = { repo: "", base: "", startRef: "", prLabel: "", installationId: null, extraRepos: [], template: "", securityProfile: "agent" };
@@ -67,6 +69,8 @@ export function Composer({
 	stopping,
 	autoFocus,
 	onModel,
+	lockRepo,
+	currentBranch,
 }: {
 	user: User;
 	mode: Mode;
@@ -80,6 +84,10 @@ export function Composer({
 	stopping?: boolean;
 	autoFocus?: boolean;
 	onModel?: (modelId: string, profile: string) => void;
+	/** In-session: hide repo switching — only branch/ref picks are allowed. */
+	lockRepo?: boolean;
+	/** Session's current work branch — enables the "keep branch" rebase option. */
+	currentBranch?: string;
 }) {
 	const [text, setText] = useState("");
 	const [atts, setAtts] = useState<Attachment[]>([]);
@@ -266,7 +274,12 @@ export function Composer({
 					</div>
 					{env && onEnv && (
 						<div className="anchor">
-							<button className="icon-btn" title="Environment" onClick={() => toggleMenu("env")}>
+							<button
+							className="icon-btn"
+							title={running ? "Environment (available when the run stops)" : "Environment"}
+							disabled={running}
+							onClick={() => toggleMenu("env")}
+						>
 								<Settings2 size={15} />
 							</button>
 							{menu === "env" && (
@@ -277,6 +290,16 @@ export function Composer({
 												<span className="muted" style={{ flex: 1 }}>← {env.repo}</span>
 											</button>
 											<div className="pop-sep" />
+											{currentBranch && (
+												<label className="pop-item" style={{ cursor: "pointer", gap: 8 }}>
+													<input
+														type="checkbox"
+														checked={!!env.keepBranch}
+														onChange={(e) => onEnv({ ...env, keepBranch: e.target.checked || undefined })}
+													/>
+													<span style={{ flex: 1, fontSize: 12 }}>Keep {currentBranch} — rebase onto the picked ref</span>
+												</label>
+											)}
 											<div className="pop-title">Start from</div>
 											{branches.length > 15 && (
 												<input
@@ -344,6 +367,8 @@ export function Composer({
 										</>
 									) : (
 										<>
+											{!lockRepo && (
+											<>
 											<div className="pop-title">Repository</div>
 											<input className="pop-search" placeholder={env.repo ? "Search all repos…" : "Search repos…"} value={repoQuery} onChange={(e) => setRepoQuery(e.target.value)} />
 											<div className="pop-scroll" style={{ maxHeight: 200 }}>
@@ -372,6 +397,8 @@ export function Composer({
 													</div>
 												)}
 											</div>
+											</>
+											)}
 											{env.repo && (
 												<>
 													<div className="pop-sep" />

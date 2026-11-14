@@ -66,6 +66,9 @@ interface SessionDoc {
 	base?: string;
 	/** Ref to check out at clone time — feature branch or pull/<n>/head. */
 	startRef?: string;
+	/** Previous kronyx branch after a per-task start-point change — dirty
+	 *  worktree state is checkpointed to it before the new branch forks. */
+	resetFrom?: string | null;
 	branch?: string;
 	sandboxId?: string;
 	installationId?: number;
@@ -2328,6 +2331,23 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		}
 		this.throwIfStopped();
 		if (!session.branch) {
+			// Per-task start-point change: the env picker cleared the branch and
+			// left the old one in resetFrom. Preserve uncommitted work on it
+			// before the new branch forks off the picked ref.
+			if (session.resetFrom) {
+				const dirty = await sbx
+					.runIn(REPO_DIR, "git status --porcelain", 30_000)
+					.catch(swallow("executor", "op", { exitCode: 0, stdout: "", stderr: "" }));
+				if (dirty.stdout.trim()) {
+					await this.sink.emit({ type: "cloud-status", text: `Saving uncommitted work to ${session.resetFrom}…` });
+					await sbx
+						.commitAndPush(REPO_DIR, session.resetFrom, "kronyx: checkpoint before switching start point", COMMIT_EXCLUDES)
+						.then(() => this.sink.emit({ type: "info", text: `Uncommitted work pushed to ${session.resetFrom}.` }))
+						.catch(() => this.sink.emit({ type: "info", text: `Couldn't checkpoint to ${session.resetFrom} — uncommitted edits may be lost.` }));
+				}
+				await this.sink.patchSession({ resetFrom: null });
+				session.resetFrom = null;
+			}
 			const branch = `kronyx/${slugify(job.task)}-${job.runId.replace(/^web-/, "").slice(0, 6)}`;
 			// Fork from the fetched start point, not local HEAD — a warm clone
 			// can be arbitrarily stale (ask/plan runs never sync the repo).

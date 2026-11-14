@@ -139,6 +139,9 @@ export async function postMessage(req: Request, p: Record<string, string>): Prom
 		profile?: string;
 		attachmentIds?: string[];
 		planSlug?: string;
+		startRef?: string;
+		base?: string;
+		keepBranch?: boolean;
 	};
 	const task = String(body.task ?? "").trim();
 	if (!task && !body.planSlug) return json({ error: "task required" }, { status: 400 });
@@ -146,6 +149,33 @@ export async function postMessage(req: Request, p: Record<string, string>): Prom
 	const session = await db.collection("sessions").findOne({ uid, sessionId: p.id });
 	if (!session) return json({ error: "not_found" }, { status: 404 });
 	const mode = ["ask", "plan", "agent", "multi"].includes(body.mode ?? "") ? body.mode! : (session.mode ?? "agent");
+	// Per-task start point from the composer's env picker. Applies only between
+	// runs — the picker is disabled while a run is live; guard here anyway.
+	const startRef = String(body.startRef ?? "").trim();
+	const base = String(body.base ?? "").trim();
+	const envSet: Record<string, unknown> = {};
+	if ((startRef || base) && session.repo) {
+		const newRef = startRef || base;
+		const curRef = session.startRef || session.base || "";
+		if (newRef && newRef !== curRef) {
+			if (session.activeRunId) return json({ error: "run_active" }, { status: 409 });
+			envSet.startRef = newRef;
+			if (base) envSet.base = base;
+			if (body.keepBranch && session.branch) {
+				// Rebase mode: keep the feature branch; the drift rebase stacks it
+				// onto the new ref. The stale PR link clears — openPr re-links.
+				envSet.prUrl = null;
+			} else if (session.branch) {
+				// New branch mode: the worker checkpoints dirty work to the old
+				// branch, then forks a fresh kronyx branch off the picked ref.
+				envSet.resetFrom = session.branch;
+				envSet.branch = null;
+				envSet.prUrl = null;
+			}
+		} else if (base && base !== session.base) {
+			envSet.base = base;
+		}
+	}
 	const runId = `web-${randomUUID()}`;
 	const now = new Date();
 	const doc = {
@@ -181,7 +211,7 @@ export async function postMessage(req: Request, p: Record<string, string>): Prom
 	});
 	await db
 		.collection("sessions")
-		.updateOne({ uid, sessionId: p.id }, { $set: { updatedAt: now, lastTask: task.slice(0, 120), mode } });
+		.updateOne({ uid, sessionId: p.id }, { $set: { updatedAt: now, lastTask: task.slice(0, 120), mode, ...envSet } });
 	// First event lands immediately — the timeline shows "Queued" instead of blank.
 	await db.collection("run_events").insertOne({
 		uid, runId, sessionId: p.id, seq: 1,

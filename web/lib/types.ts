@@ -26,6 +26,10 @@ export interface SessionDoc {
 	prUrl?: string | null;
 	mode?: string;
 	template?: string | null;
+	startRef?: string;
+	installationId?: number | null;
+	extraRepos?: string[];
+	securityProfile?: string;
 	updatedAt?: string;
 	lastTask?: string;
 	lastStatus?: string | null;
