@@ -1130,6 +1130,13 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			console.log(`[executor] warm snapshot ready for ${session.repo}: ${snapshotId}`);
 			// Delete the superseded snapshot so rebakes don't accumulate.
 			if (prevSnapshotId && prevSnapshotId !== snapshotId) await bake.deleteSnapshot(prevSnapshotId).catch(swallow("executor", "op", false));
+		} catch (e) {
+			// Record the failure so the cooldown in decideWarm applies. Without this,
+			// a failed bake stays `building` and is retried on every run.
+			await col
+				.updateOne({ key }, { $set: { status: "failed", failedAt: new Date(), updatedAt: new Date(), error: e instanceof Error ? e.message : String(e) } })
+				.catch(swallow("executor", "op"));
+			throw e;
 		} finally {
 			await bake.close().catch(swallow("executor", "op"));
 			if (bakeId)
@@ -1154,8 +1161,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		if (credErr) throw new Error(credErr);
 
 		const bake = new SandboxCore();
-		// Bake from the user's cloud.template so the warm image matches the project's base.
-		await bake.create({ creds, provider: "e2b", template: String(settings.data.e2bTemplate ?? "") || undefined, timeoutMs: 45 * 60_000 });
+		await bake.create({ creds, provider: "e2b", timeoutMs: 45 * 60_000 });
 		const bakeId = bake.sandboxId;
 		if (bakeId)
 			await this.db
