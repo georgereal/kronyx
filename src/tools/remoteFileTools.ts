@@ -32,6 +32,10 @@ export interface RemoteToolOptions {
 	/** Fires at save_plan time so the worker can persist the plan server-side —
 	 *  the sandbox copy alone dies with the VM (stop/kill before run-end capture). */
 	onPlanSaved?: (slug: string, markdown: string) => void;
+	/** Host-backed plan store — cloud plans live on the backend, not the VM.
+	 *  When absent, plan reads fall back to files under planDir. */
+	onListPlans?: () => Promise<{ slug: string; updatedAt?: string }[]>;
+	onReadPlan?: (slug: string) => Promise<string | null>;
 	/**
 	 * Multi-agent slice boundary: path globs (workdir-relative) the agent may
 	 * write to. Set → mutating file tools refuse paths outside the set; root
@@ -450,5 +454,44 @@ export function createRemoteFileTools(sandbox: SandboxHandle, workdir: string, o
 		},
 	};
 
-	return [readFile, writeFile, editFile, appendFile, insertLines, listFiles, searchFiles, runCommand, savePlan];
+	const plansDir = (): string => (opts.planDir ?? `${workdir}/.kronyx/plans`).replace(/\/+$/, "");
+	const listPlansTool: AgentTool<Record<string, never>, string> = {
+		name: "list_plans",
+		description: "List plans saved earlier in this session — slugs, one per line. Read one with read_plan.",
+		inputSchema: { type: "object", properties: {} },
+		async execute() {
+			if (opts.onListPlans) {
+				const plans = await opts.onListPlans().catch(() => []);
+				if (!plans.length) return "No saved plans.";
+				return plans.map((p) => `${p.slug}${p.updatedAt ? `  (${p.updatedAt})` : ""}`).join("\n");
+			}
+			const ls = await sandbox.run(`ls -1 ${JSON.stringify(plansDir())} 2>/dev/null || true`, { cwd: workdir });
+			const names = ls.stdout
+				.split("\n")
+				.map((n) => n.trim())
+				.filter((n) => n.endsWith(".md"));
+			return names.length ? names.map((n) => n.slice(0, -3)).join("\n") : "No saved plans.";
+		},
+	};
+	const readPlan: AgentTool<{ slug: string }, string> = {
+		name: "read_plan",
+		description: "Read a plan saved earlier in this session (see list_plans for slugs). Returns the plan markdown.",
+		inputSchema: {
+			type: "object",
+			properties: { slug: { type: "string", description: "Plan slug, e.g. from list_plans." } },
+			required: ["slug"],
+		},
+		async execute(input) {
+			const slug = String(input.slug ?? "").replace(/[^\w-]+/g, "-").slice(0, 60);
+			if (!slug) return "read_plan: a slug is required.";
+			if (opts.onReadPlan) {
+				const md = await opts.onReadPlan(slug).catch(() => null);
+				return md ?? `No plan named "${slug}".`;
+			}
+			const content = await sandbox.readFile(`${plansDir()}/${slug}.md`).catch(() => null);
+			return content ?? `No plan named "${slug}".`;
+		},
+	};
+
+	return [readFile, writeFile, editFile, appendFile, insertLines, listFiles, searchFiles, runCommand, savePlan, listPlansTool, readPlan];
 }

@@ -591,7 +591,34 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 		},
 	};
 
-	return [readFile, writeFile, editFile, appendFile, insertLines, listFiles, searchFiles, memoryWrite, runCommand, fileEditor, savePlan];
+	const plansDir = (): string => path.join(options.root, (options.planDir?.() ?? ".kronyx/plans").replace(/\/+$/, ""));
+	const listPlans: AgentTool<Record<string, never>, string> = {
+		name: "list_plans",
+		description: "List plans saved earlier — slugs, one per line. Read one with read_plan.",
+		inputSchema: { type: "object", properties: {} },
+		async execute() {
+			const names = await fs.readdir(plansDir()).catch(() => [] as string[]);
+			const slugs = names.filter((n) => n.endsWith(".md")).map((n) => n.slice(0, -3));
+			return slugs.length ? slugs.join("\n") : "No saved plans.";
+		},
+	};
+	const readPlan: AgentTool<{ slug: string }, string> = {
+		name: "read_plan",
+		description: "Read a plan saved earlier (see list_plans for slugs). Returns the plan markdown.",
+		inputSchema: {
+			type: "object",
+			properties: { slug: { type: "string", description: "Plan slug, e.g. from list_plans." } },
+			required: ["slug"],
+		},
+		async execute(input) {
+			const slug = String(input.slug ?? "").replace(/[^\w-]+/g, "-").slice(0, 60);
+			if (!slug) return "read_plan: a slug is required.";
+			const content = await fs.readFile(path.join(plansDir(), `${slug}.md`), "utf8").catch(() => null);
+			return content ?? `No plan named "${slug}".`;
+		},
+	};
+
+	return [readFile, writeFile, editFile, appendFile, insertLines, listFiles, searchFiles, memoryWrite, runCommand, fileEditor, savePlan, listPlans, readPlan];
 }
 
 function noMatchMessage(label: string, file: string, text: string, oldText: string): string {

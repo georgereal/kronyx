@@ -640,6 +640,20 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			createTools: makeTools as () => Promise<never>,
 			emit: (e) => {
 				if (e.type !== "assistant-delta" && e.type !== "reasoning-delta") dbg("run", e.type, e);
+				if (e.type === "run-finished" || e.type === "run-failed") {
+					// Mirror of the extension's recordDigest — without this the
+					// worker never populates runDigests, so sessions.digests stays
+					// empty and every cold-start agent gets zero session history.
+					runner.addRunDigest({
+						task: route.job?.task ?? job.task,
+						status: e.type === "run-finished" ? String(e.status ?? "completed") : "failed",
+						summary: String(e.type === "run-finished" ? e.text : e.error ?? ""),
+						filesChanged: [...this.liveChangedPaths]
+							.filter((p) => p.startsWith("0:"))
+							.map((p) => p.slice(2)),
+						at: Date.now(),
+					});
+				}
 				route.track?.(e);
 				void route.sink?.emit(e);
 			},
@@ -1640,7 +1654,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		}
 
 		if (mode !== "plan") {
-			await this.ensureBranch(job, session, sbx, token);
+			await this.ensureBranch(job, session, sbx, token, provider);
 			await this.preflight(job, session, sbx, token, settings);
 		} else if (!session.branch) {
 			// Plan mode with no work branch: nothing checks the repo out to the
@@ -1684,6 +1698,10 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 					// Persist the plan server-side the moment it's saved — capturePlan's
 					// run-end sweep can't help if the VM dies or the run is stopped.
 					onPlanSaved: (slug, markdown) => void savePlanFile(job.uid, job.sessionId, slug, markdown, job.runId).catch(swallow("executor", "op")),
+					// Plans persist server-side — sandbox files die with the VM, so
+					// reads must come from the backend store, not the worktree.
+					onListPlans: () => listPlans(this.db, job.uid, job.sessionId).catch(swallow("executor", "op", [])),
+					onReadPlan: (slug) => loadPlan(this.db, job.uid, job.sessionId, slug).then((p) => p?.markdown ?? null).catch(swallow("executor", "op", null)),
 				}),
 				memoryWriteTool(this.db, job.uid, job.sessionId, job.runId, this.embedProvider, { repo: session.repo ?? undefined, branch: session.base }, this.memoryReport),
 				// fetch_url runs worker-side — readable text for URLs the user links.
@@ -2359,7 +2377,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		/** Memory report events for this slice — tagged with agentIndex so the
 		 *  events page can attribute them to the right sub-agent. */
 		const sliceReport = (d: Record<string, unknown>) => void this.sink.emit({ type: "memory", ...d }, { agentIndex });
-		return new AgentRunner({
+		const runner = new AgentRunner({
 			workspaceRoot: dir,
 			relativePath: (abs) => abs.replace(`${dir}/`, ""),
 			isDirty: () => false,
@@ -2419,6 +2437,8 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 						onCommandOutput: (chunk) => this.queueToolOutput(chunk, agentIndex),
 						onFileChanged: (rel, kind, stats) => this.emitLiveFileChanged(rel, kind, stats, agentIndex),
 						isAborted: () => this.stopRequested,
+						onListPlans: () => listPlans(this.db, job.uid, job.sessionId).catch(swallow("executor", "op", [])),
+						onReadPlan: (slug) => loadPlan(this.db, job.uid, job.sessionId, slug).then((p) => p?.markdown ?? null).catch(swallow("executor", "op", null)),
 					}).filter((t) => t.name !== "save_plan"),
 					memoryWriteTool(this.db, job.uid, job.sessionId, sliceRunId, mem.embed, { repo: session.repo ?? undefined, branch: session.base }, sliceReport),
 					...createFetchTools(),
@@ -2426,11 +2446,23 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			emit: (e) => {
 				if (e.type === "run-finished") finishText.value = String(e.text ?? "");
 				if (e.type === "run-failed") finishText.failed = String(e.error ?? "Run failed");
+				if (e.type === "run-finished" || e.type === "run-failed") {
+					runner.addRunDigest({
+						task: coordinator ? job.task : this.sliceTask(slice),
+						status: e.type === "run-finished" ? String(e.status ?? "completed") : "failed",
+						summary: String(e.type === "run-finished" ? e.text : e.error ?? ""),
+						filesChanged: [...this.liveChangedPaths]
+							.filter((p) => p.startsWith(`${agentIndex}:`))
+							.map((p) => p.slice(p.indexOf(":") + 1)),
+						at: Date.now(),
+					});
+				}
 				if (e.type !== "assistant-delta" && e.type !== "reasoning-delta") dbg("run", `s${agentIndex}:${e.type}`, e);
 				this.trackUsage(e, job, agentIndex);
 				void this.sink.emit(e, { agentIndex });
 			},
 		});
+		return runner;
 	}
 
 	/**
@@ -2514,7 +2546,38 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		}
 	}
 
-	private async ensureBranch(job: CloudJob, session: SessionDoc, sbx: SandboxCore, token: string): Promise<void> {
+	/**
+	 * Branch slug: the model names it from the task (cheap call, matches how
+	 * planSlices reuses provider creds); falls back to <repo> so a failed/absent
+	 * LLM call still yields `kronyx/<repo>-<runid>` rather than dead code.
+	 */
+	private async branchSlug(job: CloudJob, session: SessionDoc, provider?: ProviderSettings): Promise<string> {
+		const p = provider ? await this.cheapProvider(provider).catch(() => provider) : undefined;
+		if (p?.baseUrl && p.apiKey && p.modelId) {
+			const res = await fetch(`${p.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json", Authorization: `Bearer ${p.apiKey}` },
+				body: JSON.stringify({
+					model: p.modelId,
+					messages: [
+						{
+							role: "user",
+							content: `Suggest a git branch slug for this coding task: 2-4 lowercase hyphenated words, max 24 chars, no prefix. Reply with ONLY the slug.\n\nTask: ${job.task.slice(0, 600)}`,
+						},
+					],
+					max_tokens: 20,
+					temperature: 0,
+				}),
+				signal: AbortSignal.timeout(15_000),
+			}).catch(swallow("executor", "op", null));
+			const body = res?.ok ? ((await res.json().catch(() => null)) as { choices?: { message?: { content?: string } }[] } | null) : null;
+			const slug = slugify(String(body?.choices?.[0]?.message?.content ?? ""));
+			if (slug && slug !== "run") return slug;
+		}
+		return slugify(session.repo?.split("/")[1] ?? "run");
+	}
+
+	private async ensureBranch(job: CloudJob, session: SessionDoc, sbx: SandboxCore, token: string, provider?: ProviderSettings): Promise<void> {
 		const base = session.base ?? "main";
 		// Refresh the remote credential up front — the clone URL embeds a token
 		// that expires, and every fetch/push below (plus the agent's own git
@@ -2529,7 +2592,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			// left the old one in resetFrom. Preserve uncommitted work on it
 			// before the new branch forks off the picked ref.
 			await this.checkpointResetFrom(session, sbx);
-			const branch = `kronyx/${slugify(job.task)}-${job.runId.replace(/^web-/, "").slice(0, 6)}`;
+			const branch = `kronyx/${await this.branchSlug(job, session, provider)}-${job.runId.replace(/^web-/, "").slice(0, 6)}`;
 			// Fork from the fetched start point, not local HEAD — a warm clone
 			// can be arbitrarily stale (ask/plan runs never sync the repo).
 			// Same startRef semantics as cloneStart; falls back to local HEAD.
@@ -3021,7 +3084,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		for (let attempt = 0; ; attempt++) {
 			try {
 				await this.ensureRepoReady(session, sbx, token);
-				await this.ensureBranch(job, session, sbx, token);
+				await this.ensureBranch(job, session, sbx, token, resolveProvider(settings, job).settings ?? undefined);
 				await sbx.writeFile(`${REPO_DIR}/.kronyx/plans/${job.planSlug}.md`, String(plan.markdown));
 				await sbx.runIn(REPO_DIR, "mkdir -p .kronyx/plans").catch(swallow("executor", "op"));
 				await sbx.commitAndPush(REPO_DIR, session.branch!, `kronyx: plan ${job.planSlug}`, COMMIT_EXCLUDES);
