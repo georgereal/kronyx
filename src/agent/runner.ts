@@ -124,6 +124,9 @@ export class AgentRunner {
 	private running = false;
 	/** Effective context ceiling for the current run's task profile. */
 	private contextBudget: number | undefined;
+	/** Live budget holder — prepareTurn ratchets this toward the model's real
+	 *  window; usage events stamp it so the UI meter tracks the ratchet. */
+	private budgetRef = { current: 0 };
 	private digests: RunDigest[] = [];
 	private readonly toolStarts = new Map<string, number>();
 
@@ -207,7 +210,12 @@ export class AgentRunner {
 				});
 				agent = undefined;
 			}
-			agent ??= await this.createAgent(settings, task, this.seedMessages());
+			if (!agent) {
+				// New Agent = new prepareTurn closure seeded from budgetRef — a
+				// reused agent keeps its ratcheted budget instead of resetting.
+				this.budgetRef.current = this.contextBudget;
+				agent = await this.createAgent(settings, task, this.seedMessages());
+			}
 			this.agent = agent;
 			const result = await agent.run(task);
 			this.host.saveTranscript?.(agent.snapshot().messages);
@@ -279,6 +287,8 @@ export class AgentRunner {
 			prepareTurn: createPrepareTurn({
 				contextWindow: settings.contextWindow,
 				contextBudget: this.contextBudget,
+				budgetRef: this.budgetRef,
+				maxTokens: settings.maxTokens,
 				providerId: settings.providerId,
 				modelId: settings.modelId,
 				summarize: settings.baseUrl
@@ -405,7 +415,7 @@ export class AgentRunner {
 					totalCost: event.usage.totalCost,
 					iteration: event.snapshot.iteration,
 					contextMsgs: event.snapshot.messages.length,
-					contextBudget: this.contextBudget,
+					contextBudget: this.budgetRef.current,
 				});
 				break;
 			case "status-notice":

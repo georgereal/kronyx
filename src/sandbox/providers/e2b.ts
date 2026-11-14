@@ -58,7 +58,7 @@ class E2bHandle implements SandboxHandle {
 
 export const e2bProvider: SandboxProvider = {
 	name: "e2b",
-	capabilities: { pause: true, reconnect: true, orphanSweep: true },
+	capabilities: { pause: true, reconnect: true, orphanSweep: true, autoPause: true, resume: true, snapshot: true, fork: true },
 	secretKeys: ["e2bApiKey"],
 
 	validate(creds) {
@@ -67,9 +67,18 @@ export const e2bProvider: SandboxProvider = {
 
 	async create(creds, opts) {
 		const key = apiKey(creds);
+		// lifecycle.onTimeout: the provider-side idle/timeout policy — pauses
+		// snapshot the VM instead of killing it, and survive worker restarts
+		// (our in-process idle timer doesn't). autoResume wakes a paused VM on
+		// inbound traffic (public URLs / browser_use).
+		const lifecycle =
+			opts.autoPause || opts.autoResume
+				? { onTimeout: "pause" as const, ...(opts.autoResume ? { autoResume: true } : {}) }
+				: undefined;
+		const base = { apiKey: key, timeoutMs: opts.timeoutMs, ...(lifecycle ? { lifecycle } : {}) };
 		const sbx = opts.template
-			? await Sandbox.create(opts.template, { apiKey: key, timeoutMs: opts.timeoutMs })
-			: await Sandbox.create({ apiKey: key, timeoutMs: opts.timeoutMs });
+			? await Sandbox.create(opts.template, base)
+			: await Sandbox.create(base);
 		return new E2bHandle(sbx);
 	},
 
@@ -81,6 +90,49 @@ export const e2bProvider: SandboxProvider = {
 		}
 	},
 
+	async resume(id, creds, opts) {
+		try {
+			// onResume 'restore' replays the memory snapshot; 'reboot' cold-boots
+			// from the disk snapshot — the worktree survives even when the
+			// memory snapshot is unusable (envd unresponsive at pause).
+			return new E2bHandle(
+				await Sandbox.connect(id, { apiKey: apiKey(creds), onResume: opts?.memory === false ? "reboot" : "restore" }),
+			);
+		} catch {
+			return null;
+		}
+	},
+
+	async checkpointById(id, creds, opts) {
+		try {
+			const snap = await Sandbox.createSnapshot(id, {
+				apiKey: apiKey(creds),
+				...(opts?.mode ? { mode: opts.mode } : {}),
+				...(opts?.name ? { name: opts.name } : {}),
+			});
+			return snap.snapshotId ?? null;
+		} catch {
+			return null;
+		}
+	},
+
+	async deleteSnapshotById(id, creds) {
+		try {
+			return await Sandbox.deleteSnapshot(id, { apiKey: apiKey(creds) });
+		} catch {
+			return false;
+		}
+	},
+
+	async forkById(id, creds, count, timeoutMs) {
+		try {
+			const results = await Sandbox.fork(id, { apiKey: apiKey(creds), count, ...(timeoutMs ? { timeoutMs } : {}) });
+			return results.filter((r): r is Sandbox => !(r instanceof Error)).map((s) => new E2bHandle(s));
+		} catch {
+			return [];
+		}
+	},
+
 	async getInfoById(id, creds) {
 		try {
 			const info = await Sandbox.getInfo(id, { apiKey: apiKey(creds) });
@@ -88,6 +140,7 @@ export const e2bProvider: SandboxProvider = {
 				state: info.state === "paused" ? "paused" : "running",
 				templateId: info.templateId,
 				name: info.name,
+				envdUnresponsiveAtPause: (info as { envdUnresponsiveAtPause?: boolean }).envdUnresponsiveAtPause,
 			};
 		} catch (err) {
 			if (err instanceof Error && /not found|not exist/i.test(err.message)) return { state: "gone" as const };
@@ -97,7 +150,7 @@ export const e2bProvider: SandboxProvider = {
 
 	async pauseById(id, creds) {
 		try {
-			await Sandbox.betaPause(id, { apiKey: apiKey(creds) });
+			await Sandbox.pause(id, { apiKey: apiKey(creds) });
 			return true;
 		} catch (err) {
 			// Already paused or gone is the goal state — returning false would

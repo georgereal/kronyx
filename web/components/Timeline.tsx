@@ -434,7 +434,7 @@ function PermissionCard({ user, item, active }: { user: User; item: Extract<Item
 	);
 }
 
-function PlanCard({ user, sessionId, slug }: { user: User; sessionId: string; slug: string }) {
+export function PlanCard({ user, sessionId, slug }: { user: User; sessionId: string; slug: string }) {
 	const [plan, setPlan] = useState<{ markdown: string; slug: string } | null>(null);
 	const [msg, setMsg] = useState("");
 

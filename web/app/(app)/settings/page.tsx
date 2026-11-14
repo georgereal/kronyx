@@ -78,6 +78,7 @@ interface SettingsDoc {
 		sandboxProvider?: string;
 		e2bTemplate?: string;
 		sandboxAutoSwitch?: boolean;
+		sliceForkMode?: "auto" | "always" | "never";
 		postRunChecks?: boolean;
 		modelDefaults?: Record<string, string>;
 		permissions?: { allow?: string[]; ask?: string[]; deny?: string[]; modes?: Record<string, { allow?: string[]; ask?: string[]; deny?: string[] }> };
@@ -129,6 +130,7 @@ export default function SettingsPage() {
 	const [sandboxProvider, setSandboxProvider] = useState("e2b");
 	const [e2bTemplate, setE2bTemplate] = useState("");
 	const [sandboxAutoSwitch, setSandboxAutoSwitch] = useState(true);
+	const [sliceForkMode, setSliceForkMode] = useState<"auto" | "always" | "never">("auto");
 	const [postRunChecks, setPostRunChecks] = useState(true);
 	const [modelDefaults, setModelDefaults] = useState<Record<string, string>>({});
 	type PermScope = "global" | "ask" | "plan" | "agent";
@@ -217,6 +219,7 @@ export default function SettingsPage() {
 				setSandboxProvider(settings?.data?.sandboxProvider ?? "e2b");
 				setE2bTemplate(settings?.data?.e2bTemplate ?? "");
 				setSandboxAutoSwitch(settings?.data?.sandboxAutoSwitch !== false);
+				setSliceForkMode(settings?.data?.sliceForkMode === "always" || settings?.data?.sliceForkMode === "never" ? settings.data.sliceForkMode : "auto");
 				setPostRunChecks(settings?.data?.postRunChecks !== false);
 				setModelDefaults(settings?.data?.modelDefaults ?? {});
 				const toText = (r?: { allow?: string[]; ask?: string[]; deny?: string[] }) => ({
@@ -234,7 +237,7 @@ export default function SettingsPage() {
 				// PUT replaces settings.data wholesale — retain keys this page doesn't own
 				// (providerId/baseUrl/modelId synced by the extension) so saving here
 				// doesn't wipe them.
-				const { activeProfile: _a, sandboxProvider: _s, e2bTemplate: _t, sandboxAutoSwitch: _sw, postRunChecks: _pc, modelDefaults: _m, permissions: _p, profiles: _pr, ...rest } =
+				const { activeProfile: _a, sandboxProvider: _s, e2bTemplate: _t, sandboxAutoSwitch: _sw, sliceForkMode: _sf, postRunChecks: _pc, modelDefaults: _m, permissions: _p, profiles: _pr, ...rest } =
 					(settings?.data ?? {}) as Record<string, unknown>;
 				setDataExtras(rest);
 			}
@@ -342,6 +345,7 @@ export default function SettingsPage() {
 					sandboxProvider,
 					e2bTemplate: e2bTemplate || undefined,
 					sandboxAutoSwitch,
+					sliceForkMode,
 					postRunChecks,
 					modelDefaults,
 					permissions: (() => {
@@ -618,6 +622,13 @@ export default function SettingsPage() {
 												/>
 												Allow switch_environment
 											</label>
+										</Field>
+										<Field label="Slice isolation" hint="multi-agent: worktree = one VM, fork = one VM per slice (auto = only when heavy or ≥3 slices)">
+											<select className="input" value={sliceForkMode} onChange={(e) => setSliceForkMode(e.target.value as typeof sliceForkMode)}>
+												<option value="auto">Auto</option>
+												<option value="always">Always fork</option>
+												<option value="never">Never (worktrees)</option>
+											</select>
 										</Field>
 									</>
 								)}

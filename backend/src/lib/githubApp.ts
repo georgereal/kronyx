@@ -20,6 +20,9 @@ async function gh(path: string, init: RequestInit = {}, token?: string): Promise
 			Accept: "application/vnd.github+json",
 			...(init.headers ?? {}),
 		},
+		// No default timeout on fetch — a hung GitHub API call would wedge the
+		// worker (token mints, repo lookups) with no error path.
+		signal: init.signal ?? AbortSignal.timeout(30_000),
 	});
 }
 

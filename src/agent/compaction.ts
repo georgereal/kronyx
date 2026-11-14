@@ -78,6 +78,12 @@ export interface CompactStats {
 	estTokensAfter: number;
 	forced: boolean;
 	soft: boolean;
+	/** Effective budget after any ratchet this pass. */
+	effectiveBudget: number;
+	/** Provider ceiling learned from an overflow rejection, when known. */
+	learnedCeiling?: number;
+	/** Headroom reserve (maxTokens + turn-growth EWA) used at the ceiling. */
+	reserve: number;
 }
 
 export interface PrepareTurnOptions {
@@ -88,6 +94,13 @@ export interface PrepareTurnOptions {
 	modelId?: string;
 	/** Effective context ceiling for trigger math — see DEFAULT_CONTEXT_BUDGET. */
 	contextBudget?: number;
+	/** Live budget holder: seeds effectiveBudget and is written back as the
+	 *  budget ratchets, so callers (runner → usage events → UI meter) can
+	 *  report the current value. */
+	budgetRef?: { current: number };
+	/** Model's max output tokens — part of the headroom reserve for the
+	 *  adaptive discard margin at the ceiling. */
+	maxTokens?: number;
 	/**
 	 * Optional LLM recap: called with the oldest messages when stubbing alone
 	 * can't reach the target. Returns the summary text, or undefined to skip.
@@ -161,11 +174,34 @@ function pathKeyOf(input: unknown): string | undefined {
  * The canonical transcript is untouched; stubs point the model at recall_context.
  */
 export function createPrepareTurn(opts: PrepareTurnOptions = {}) {
+	// Stateful budget (per Agent instance): starts at the task's economical
+	// budget, ratchets up toward the model's real window when mechanical trims
+	// can't reach the target (fill-anchored: B = est/0.55), and clamps down to
+	// a ceiling learned from provider overflow rejections.
+	let budget = Math.max(
+		CONTEXT_BUDGET_FLOOR,
+		opts.budgetRef?.current || opts.contextBudget || DEFAULT_CONTEXT_BUDGET,
+	);
+	let learnedCeiling: number | undefined;
+	// Per-turn context growth EWA — part of the discard reserve at the ceiling.
+	let growth = 8_000;
+	let prevEst = -1;
+	const setBudget = (b: number) => {
+		budget = b;
+		if (opts.budgetRef) opts.budgetRef.current = b;
+	};
+	setBudget(budget);
 	return async (ctx: AgentRuntimePrepareTurnContext): Promise<AgentRuntimePrepareTurnResult | undefined> => {
-		const window = Math.min(
+		// The Agent (and this closure) can be reused across run() calls — honor
+		// an external reseed (new task writes budgetRef.current) while internal
+		// setBudget writes keep the two in lockstep otherwise.
+		if (opts.budgetRef && opts.budgetRef.current > 0 && opts.budgetRef.current !== budget)
+			setBudget(opts.budgetRef.current);
+		const ceiling = Math.min(
 			ctx.model.info?.contextWindow ?? opts.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
-			Math.max(CONTEXT_BUDGET_FLOOR, opts.contextBudget ?? DEFAULT_CONTEXT_BUDGET),
+			learnedCeiling ?? Number.MAX_SAFE_INTEGER,
 		);
+		const window = Math.min(ceiling, Math.max(CONTEXT_BUDGET_FLOOR, budget));
 
 		// Pass 1 (always): clamp individual oversized tool outputs.
 		let clamped = 0;
@@ -269,8 +305,20 @@ export function createPrepareTurn(opts: PrepareTurnOptions = {}) {
 		});
 
 		const estNow = Math.max(estBefore - saved, 0);
+		growth = Math.min(64_000, Math.max(4_000, 0.7 * growth + 0.3 * (prevEst < 0 ? 0 : Math.max(0, estBefore - prevEst))));
+		prevEst = estBefore;
 		const forced = ctx.overflowRecovery === true;
-		const soft = !forced && estNow >= window * SOFT_TRIGGER_FRACTION && estNow < window * TRIGGER_FRACTION;
+		// The provider just rejected for context size — that IS the real
+		// ceiling; learn it (85% margin) so we stop overflowing every turn.
+		if (forced && ctx.previousRequestInputTokens) {
+			learnedCeiling = Math.floor(ctx.previousRequestInputTokens * 0.85);
+			if (learnedCeiling < budget) setBudget(learnedCeiling);
+		}
+		// Discard margin: below the ceiling the economical 70% trigger stands;
+		// at the ceiling, keep room for the response + one turn's growth.
+		const reserve = (opts.maxTokens ?? 8_192) + growth;
+		const triggerAt = window < ceiling ? window * TRIGGER_FRACTION : ceiling - reserve;
+		const soft = !forced && estNow >= window * SOFT_TRIGGER_FRACTION && estNow < triggerAt;
 		if (!forced && estNow < window * SOFT_TRIGGER_FRACTION) {
 			return clamped || superseded || callsElided ? { messages: mutable } : undefined;
 		}
@@ -320,11 +368,19 @@ export function createPrepareTurn(opts: PrepareTurnOptions = {}) {
 			stubbed++;
 		}
 
-		// Last resort (hard tier only): an LLM recap replaces the oldest turns
-		// when stubbing alone can't reach the target.
+		// Still over target after mechanical trims: while the budget is below
+		// the real ceiling, ratchet it (fill-anchored — next est sits at ~55%
+		// of the new budget) instead of discarding context. The LLM summary is
+		// reserved for when the ceiling itself is reached. ceilingNow folds in
+		// a ceiling learned THIS pass — `ceiling`/`window` above are stale then.
 		let summarized = false;
+		let ratcheted = false;
 		let summary: string | undefined;
-		if (!soft && opts.summarize && est > target && mutable.length > KEEP_RECENT_MESSAGES) {
+		const ceilingNow = Math.min(ceiling, learnedCeiling ?? Number.MAX_SAFE_INTEGER);
+		if (!soft && est > target && window < ceilingNow) {
+			setBudget(Math.min(ceilingNow, Math.max(budget, Math.ceil(est / TARGET_FRACTION))));
+			ratcheted = true;
+		} else if (!soft && opts.summarize && est > target && mutable.length > KEEP_RECENT_MESSAGES) {
 			const prefix = mutable.slice(0, mutable.length - KEEP_RECENT_MESSAGES);
 			// The task message (first user turn) survives verbatim — a good
 			// compaction is a brief for future work, not a summary of the task.
@@ -347,7 +403,7 @@ export function createPrepareTurn(opts: PrepareTurnOptions = {}) {
 			}
 		}
 
-		if (!stubbed && !clamped && !reasoningPruned && !attachmentsStubbed && !callsElided && !superseded && !summarized)
+		if (!stubbed && !clamped && !reasoningPruned && !attachmentsStubbed && !callsElided && !superseded && !summarized && !ratcheted)
 			return undefined;
 		const stats: CompactStats = {
 			stubbed,
@@ -361,6 +417,9 @@ export function createPrepareTurn(opts: PrepareTurnOptions = {}) {
 			estTokensAfter: est,
 			forced,
 			soft,
+			effectiveBudget: budget,
+			learnedCeiling,
+			reserve,
 		};
 		opts.onCompact?.(stats);
 		ctx.emitStatusNotice?.(
@@ -384,6 +443,9 @@ export function createPrepareTurn(opts: PrepareTurnOptions = {}) {
 				forced,
 				soft,
 				contextBudget: window,
+				effectiveBudget: budget,
+				learnedCeiling,
+				reserve,
 				contextWindow: ctx.model.info?.contextWindow ?? opts.contextWindow,
 				model: ctx.model.id,
 				provider: ctx.model.provider,

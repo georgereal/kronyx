@@ -5,7 +5,8 @@ import { useParams } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Composer, type Mode } from "@/components/Composer";
 import { ContextMeter } from "@/components/ContextMeter";
-import { Timeline } from "@/components/Timeline";
+import { Modal } from "@/components/Modal";
+import { PlanCard, Timeline } from "@/components/Timeline";
 import { ProviderGate } from "@/components/ProviderGate";
 import { apiFetch, useUser } from "@/lib/api";
 import type { RunDoc, RunEvent, SessionDoc } from "@/lib/types";
@@ -25,8 +26,12 @@ export default function SessionView() {
 	const id = params.id;
 	const [session, setSession] = useState<SessionDoc | null>(null);
 	const [runs, setRuns] = useState<RunDoc[]>([]);
+	const [plans, setPlans] = useState<{ slug: string; runId?: string }[]>([]);
+	const [openPlan, setOpenPlan] = useState<string | null>(null);
+	const [plansOpen, setPlansOpen] = useState(false);
 	const [events, setEvents] = useState<RunEvent[]>([]);
 	const [mode, setMode] = useState<Mode>("agent");
+	const modeInit = useRef(false);
 	const [modelId, setModelId] = useState("");
 	const [modelProfile, setModelProfile] = useState("");
 	const [prMsg, setPrMsg] = useState("");
@@ -93,6 +98,13 @@ export default function SessionView() {
 		const body = (await res.json()) as SessionResponse;
 		setSession(body.session);
 		setRuns(body.runs);
+		setPlans(body.plans ?? []);
+		// First load: seed the mode chip from the session's actual mode so the
+		// UI reflects what the next run will run as (sent per-message).
+		if (!modeInit.current && ["ask", "plan", "agent", "multi"].includes(body.session.mode ?? "")) {
+			modeInit.current = true;
+			setMode(body.session.mode as Mode);
+		}
 	}, [user, id]);
 
 	useEffect(() => {
@@ -156,10 +168,13 @@ export default function SessionView() {
 		if (!user) return;
 		for (const r of runs) {
 			if (ACTIVE.has(r.status ?? "") || loadedRuns.current.has(r.runId)) continue;
-			loadedRuns.current.add(r.runId);
 			void (async () => {
 				const res = await apiFetch(`/api/sessions/${id}/events?run=${r.runId}`, user);
+				// Mark loaded only after a successful fetch — a failed fetch
+				// (e.g. backend restarting mid-tail) must retry on the next
+				// runs change, or the timeline freezes at the last SSE event.
 				if (!res.ok) return;
+				loadedRuns.current.add(r.runId);
 				const body = (await res.json()) as { events: RunEvent[]; hasMore?: boolean };
 				pushEvents(body.events, r.runId);
 				if (body.events.length) {
@@ -295,7 +310,14 @@ export default function SessionView() {
 			</div>
 			<div className="sess-header" style={{ marginTop: -8 }}>
 				{session?.repo && <span className="sess-chip mono">⌘ {session.repo}</span>}
-				{session?.branch && <span className="sess-chip mono">⎇ {session.branch}</span>}
+				{session?.branch &&
+					(session.repo ? (
+						<a href={`https://github.com/${session.repo}/tree/${session.branch}`} target="_blank" rel="noreferrer" className="sess-chip mono">
+							⎇ {session.branch}
+						</a>
+					) : (
+						<span className="sess-chip mono">⎇ {session.branch}</span>
+					))}
 				{session?.template && <span className="sess-chip">{session.template}</span>}
 				{session?.prUrl ? (
 					<a href={session.prUrl} target="_blank" rel="noreferrer" className="sess-chip" style={{ color: "var(--accent)" }}>
@@ -318,6 +340,11 @@ export default function SessionView() {
 							}
 						}}>
 						Raise PR
+					</button>
+				)}
+				{plans.length > 0 && (
+					<button className="sess-chip" style={{ cursor: "pointer" }} onClick={() => setPlansOpen(true)}>
+						📄 Plans ({plans.length})
 					</button>
 				)}
 				{prMsg && <span className="sess-chip muted">{prMsg}</span>}
@@ -347,11 +374,14 @@ export default function SessionView() {
 					</div>
 				</details>
 			)}
-			{lifecycle.length > 0 && (
+			{(lifecycle.length > 0 || halted) && (
 				<details style={{ flex: "1 1 auto", minWidth: 0 }}>
 					<summary className="muted" style={{ cursor: "pointer", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
 						<span style={{ color: latestRun?.status === "failed" ? "var(--err)" : active ? "var(--amber, #facc15)" : "var(--ok, #4ade80)" }}>●</span>{" "}
-						Status log ({lifecycle.length}) — {String(lifecycle[lifecycle.length - 1].event.text ?? "")}
+						Status log ({lifecycle.length}) —{" "}
+						{halted
+							? latestRun?.status === "failed" ? "✗ Failed" : latestRun?.status === "stopped" ? "■ Stopped" : "✓ Completed"
+							: String(lifecycle[lifecycle.length - 1].event.text ?? "")}
 					</summary>
 					<div style={{ display: "flex", flexDirection: "column", gap: 2, marginTop: 4 }}>
 						{lifecycle.map((e, i) => (
@@ -369,6 +399,14 @@ export default function SessionView() {
 								</span>
 							</div>
 						))}
+						{halted && (
+							<div className="muted" style={{ display: "flex", gap: 6, alignItems: "center" }}>
+								<span style={{ color: latestRun?.status === "failed" ? "var(--err)" : "var(--ok, #4ade80)" }}>
+									{latestRun?.status === "failed" ? "✗" : latestRun?.status === "stopped" ? "■" : "✓"}
+								</span>
+								<span>{latestRun?.status === "failed" ? "Failed" : latestRun?.status === "stopped" ? "Stopped" : "Completed"}</span>
+							</div>
+						)}
 					</div>
 				</details>
 			)}
@@ -376,6 +414,30 @@ export default function SessionView() {
 			</div>
 			</div>
 			<div style={{ maxWidth: 860, margin: "0 auto" }}>
+			{plansOpen && (
+				<Modal title="Plans" onClose={() => setPlansOpen(false)}>
+					<div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+						{plans.map((p) => (
+							<button
+								key={p.slug}
+								className="sess-chip mono"
+								style={{ cursor: "pointer", textAlign: "left", padding: "8px 12px" }}
+								onClick={() => {
+									setOpenPlan(p.slug);
+									setPlansOpen(false);
+								}}>
+								📄 {p.slug}
+							</button>
+						))}
+						{plans.length === 0 && <div className="muted">No plans saved for this session yet.</div>}
+					</div>
+				</Modal>
+			)}
+			{openPlan && user && (
+				<Modal title={`Plan · ${openPlan}`} onClose={() => setOpenPlan(null)}>
+					<PlanCard user={user} sessionId={id} slug={openPlan} />
+				</Modal>
+			)}
 			<Timeline user={user} sessionId={id} events={ordered} runs={runs} active={active} lateAfter={lateAfter}
 				githubUrl={session?.prUrl ?? (session?.repo && session?.branch ? `https://github.com/${session.repo}/tree/${session.branch}` : undefined)} />
 			{submitted && (

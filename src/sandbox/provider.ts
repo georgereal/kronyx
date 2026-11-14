@@ -57,19 +57,47 @@ export interface SandboxProvider {
 		reconnect: boolean;
 		/** Provider-side listing for janitor orphan cleanup. */
 		orphanSweep: boolean;
+		/** Provider-side auto-pause on timeout (survives our restarts). */
+		autoPause?: boolean;
+		/** Resume a paused sandbox — memory restore or disk-only cold boot. */
+		resume?: boolean;
+		/** Full-disk snapshot checkpoints (createSnapshot). */
+		snapshot?: boolean;
+		/** Fork a running sandbox into N copies (multi-slice VMs). */
+		fork?: boolean;
 	};
 	/** Secret keys this provider consumes — masked in run events. */
 	readonly secretKeys: string[];
 	/** Error string when required credentials/config are missing, else null. */
 	validate(creds: ProviderCreds): string | null;
-	create(creds: ProviderCreds, opts: { template?: string; timeoutMs?: number }): Promise<SandboxHandle>;
+	create(creds: ProviderCreds, opts: { template?: string; timeoutMs?: number; autoPause?: boolean; autoResume?: boolean }): Promise<SandboxHandle>;
 	/** Reconnect to a live (or resumable) sandbox by id; null when gone. */
 	connect(id: string, creds: ProviderCreds): Promise<SandboxHandle | null>;
+	/**
+	 * Resume a paused sandbox by id. `memory:false` cold-boots from the disk
+	 * snapshot — the repo/worktree survives even when the memory snapshot is
+	 * unusable (envd was unresponsive at pause, or a plain resume 409s).
+	 * Null when the sandbox is gone.
+	 */
+	resume?(id: string, creds: ProviderCreds, opts?: { memory?: boolean }): Promise<SandboxHandle | null>;
+	/** Checkpoint of a live sandbox → persisted snapshot ID, or null.
+	 *  `mode:'filesystem'` persists disk only (smaller/faster; sandboxes
+	 *  created from it cold-boot). `name` makes it a named snapshot template —
+	 *  reusing a name assigns the build to the existing template. */
+	checkpointById?(id: string, creds: ProviderCreds, opts?: { mode?: "full" | "filesystem"; name?: string }): Promise<string | null>;
+	/** Delete a persisted snapshot/template (quota + storage hygiene). */
+	deleteSnapshotById?(id: string, creds: ProviderCreds): Promise<boolean>;
+	/** Fork a running sandbox into `count` copies; returns their handles.
+	 *  `timeoutMs` sets the forked VMs' TTL — E2B otherwise applies a short
+	 *  API default that can kill long slices mid-run. */
+	forkById?(id: string, creds: ProviderCreds, count: number, timeoutMs?: number): Promise<SandboxHandle[]>;
 	/** Id-based ops used by the janitor (no live handle). */
 	pauseById?(id: string, creds: ProviderCreds): Promise<boolean>;
 	/** Remote state probe — lets the janitor/events verify instead of trusting
-	 *  the local DB row. "gone" = the sandbox no longer exists. */
-	getInfoById?(id: string, creds: ProviderCreds): Promise<{ state: "running" | "paused" | "gone"; templateId?: string; name?: string } | null>;
+	 *  the local DB row. "gone" = the sandbox no longer exists.
+	 *  `envdUnresponsiveAtPause`: the stored snapshot can't memory-resume —
+	 *  resume with `memory:false` instead of condemning it. */
+	getInfoById?(id: string, creds: ProviderCreds): Promise<{ state: "running" | "paused" | "gone"; templateId?: string; name?: string; envdUnresponsiveAtPause?: boolean } | null>;
 	killById(id: string, creds: ProviderCreds): Promise<boolean>;
 	listLive?(creds: ProviderCreds): Promise<{ id: string; startedAt?: string }[]>;
 	/** Templates usable with this account — public fleet plus account-built images. */

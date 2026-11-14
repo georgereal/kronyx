@@ -6,6 +6,7 @@ import { getDb } from "../lib/mongo";
 import { installationRepos, installationToken, listInstallations } from "../lib/githubApp";
 import { getProvider, providers } from "../../../src/sandbox/provider";
 import { githubPat, loadUserSettings, resolveProvider } from "../worker/settings";
+import { listPlans, loadPlan } from "../lib/planStore";
 import { json } from "../routes";
 
 /** GET /api/sessions */
@@ -117,13 +118,13 @@ export async function getSession(req: Request, p: Record<string, string>): Promi
 	const [session, runs, plans] = await Promise.all([
 		db.collection("sessions").findOne({ uid, sessionId: p.id }),
 		db.collection("runs").find({ uid, sessionId: p.id }).sort({ createdAt: 1 }).limit(100).toArray(),
-		db.collection("plans").find({ uid, sessionId: p.id }).sort({ createdAt: -1 }).limit(20).toArray(),
+		listPlans(db, uid, p.id),
 	]);
 	if (!session) return json({ error: "not_found" }, { status: 404 });
 	return json({
 		session: { ...session, _id: undefined },
 		runs: runs.map((r) => ({ ...r, _id: undefined })),
-		plans: plans.map((pl) => ({ ...pl, _id: undefined, markdown: undefined })),
+		plans,
 	});
 }
 
@@ -180,7 +181,7 @@ export async function postMessage(req: Request, p: Record<string, string>): Prom
 	});
 	await db
 		.collection("sessions")
-		.updateOne({ uid, sessionId: p.id }, { $set: { updatedAt: now, lastTask: task.slice(0, 120) } });
+		.updateOne({ uid, sessionId: p.id }, { $set: { updatedAt: now, lastTask: task.slice(0, 120), mode } });
 	// First event lands immediately — the timeline shows "Queued" instead of blank.
 	await db.collection("run_events").insertOne({
 		uid, runId, sessionId: p.id, seq: 1,
@@ -197,7 +198,7 @@ export async function pushPlan(req: Request, p: Record<string, string>): Promise
 	const db = await getDb();
 	const [session, plan] = await Promise.all([
 		db.collection("sessions").findOne({ uid, sessionId: p.id }),
-		db.collection("plans").findOne({ uid, sessionId: p.id, slug: p.slug }),
+		loadPlan(db, uid, p.id, p.slug),
 	]);
 	if (!session || !plan) return json({ error: "not_found" }, { status: 404 });
 	const runId = `web-${randomUUID()}`;

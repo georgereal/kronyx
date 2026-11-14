@@ -105,6 +105,22 @@ async function runJob(job: CloudJob): Promise<void> {
 
 	let stopped = false;
 	const executor = new E2bOrchestratedExecutor(db, sink);
+	// Watchdog: executor.run should settle within seconds of requestStop, but
+	// an uninterruptible await (dead sandbox HTTP call, hung tool) can wedge it
+	// — and the session lock + queued jobs with it. Force-finalize after 90s.
+	let stopWatchdog: ReturnType<typeof setTimeout> | undefined;
+	const forceFinalize = async () => {
+		log(`stop watchdog: force-finalizing wedged run ${job.runId}`);
+		await sink.patchRun({ status: "stopped", error: "Stopped by user", finishedAt: new Date() }).catch(swallow("loop", "op"));
+		await db
+			.collection("cloud_jobs")
+			.updateOne({ jobId: job.jobId }, { $set: { status: "stopped", error: "Stopped by user", finishedAt: new Date() } })
+			.catch(swallow("loop", "op"));
+		await db
+			.collection("sessions")
+			.updateOne({ uid: job.uid, sessionId: job.sessionId, activeRunId: job.runId }, { $set: { activeRunId: null } })
+			.catch(swallow("loop", "op"));
+	};
 	const stopCheck = setInterval(() => {
 		void (async () => {
 			const run = await db.collection("runs").findOne({ uid: job.uid, runId: job.runId });
@@ -112,6 +128,7 @@ async function runJob(job: CloudJob): Promise<void> {
 				stopped = true;
 				log(`stop requested for ${job.runId}`);
 				executor.requestStop();
+				stopWatchdog ??= setTimeout(() => void forceFinalize().catch(swallow("loop", "op")), 90_000);
 			}
 		})().catch(swallow("loop", "op"));
 	}, STOP_CHECK_MS);
@@ -121,12 +138,18 @@ async function runJob(job: CloudJob): Promise<void> {
 		const t0 = Date.now();
 		await executor.run(job);
 		dbg("worker", "run end", { runId: job.runId, ms: Date.now() - t0 });
-		const status = stopped ? "stopped" : "completed";
+		// Re-check the doc — a watchdog-forced or just-requested stop must not be
+		// overwritten with "completed" when a late executor finally returns.
+		const cur = await db
+			.collection("runs")
+			.findOne({ uid: job.uid, runId: job.runId }, { projection: { control: 1, status: 1 } })
+			.catch(swallow("loop", "op", null));
+		const status = stopped || cur?.control === "stop_requested" || cur?.status === "stopped" ? "stopped" : "completed";
 		await sink.patchRun({ status, finishedAt: new Date() });
 		await db.collection("cloud_jobs").updateOne({ jobId: job.jobId }, { $set: { status: stopped ? "stopped" : "done", finishedAt: new Date() } });
 		log(`job ${job.jobId} ${status}`);
 	} catch (error) {
-		const message = stopped ? "Stopped by user" : error instanceof Error ? error.message : String(error);
+		const message = stopped || error instanceof Error && error.message === "Stopped by user" ? "Stopped by user" : String(error);
 		await sink.emit({ type: "run-failed", error: message }).catch(swallow("loop", "op"));
 		await sink.patchRun({ status: stopped ? "stopped" : "failed", error: message, finishedAt: new Date() }).catch(swallow("loop", "op"));
 		await db
@@ -137,6 +160,7 @@ async function runJob(job: CloudJob): Promise<void> {
 	} finally {
 		clearInterval(heartbeat);
 		clearInterval(stopCheck);
+		if (stopWatchdog) clearTimeout(stopWatchdog);
 		// Collated usage+trace report — drain first so all events have landed.
 		await sink
 			.drain()

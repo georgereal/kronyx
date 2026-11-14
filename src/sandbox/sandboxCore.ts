@@ -83,12 +83,19 @@ export class SandboxCore {
 		provider?: string;
 		template?: string;
 		timeoutMs?: number;
+		autoPause?: boolean;
+		autoResume?: boolean;
 	}): Promise<SandboxHandle> {
 		this.provider = getProvider(opts.provider);
 		const err = this.provider.validate(opts.creds);
 		if (err) throw new Error(err);
 		this.creds = opts.creds;
-		this.handle = await this.provider.create(opts.creds, { template: opts.template, timeoutMs: opts.timeoutMs });
+		this.handle = await this.provider.create(opts.creds, {
+			template: opts.template,
+			timeoutMs: opts.timeoutMs,
+			autoPause: opts.autoPause,
+			autoResume: opts.autoResume,
+		});
 		this.report("start");
 		this.armIdlePause();
 		return this.handle;
@@ -117,6 +124,47 @@ export class SandboxCore {
 
 	get providerName(): string {
 		return this.provider.name;
+	}
+
+	/**
+	 * Resume a paused sandbox by id. `memory:false` cold-boots from the disk
+	 * snapshot — the repo/worktree survives even when the memory snapshot is
+	 * unusable; use it before condemning an unresponsive sandbox. Null = gone.
+	 */
+	async resume(id: string, creds: ProviderCreds, opts?: { memory?: boolean }): Promise<SandboxHandle | null> {
+		if (!this.provider.capabilities.resume || !this.provider.resume) return null;
+		try {
+			this.handle = (await this.provider.resume(id, creds, opts)) ?? undefined;
+		} catch {
+			this.handle = undefined;
+			return null;
+		}
+		if (!this.handle) return null;
+		this.report(opts?.memory === false ? "resume-disk" : "resume");
+		this.armIdlePause();
+		return this.handle;
+	}
+
+	/** Checkpoint of the current sandbox → persisted snapshot ID. */
+	async checkpoint(opts?: { mode?: "full" | "filesystem"; name?: string }): Promise<string | null> {
+		const id = this.sandboxId;
+		if (!id || !this.provider.capabilities.snapshot || !this.provider.checkpointById) return null;
+		const snap = await this.provider.checkpointById(id, this.creds, opts);
+		if (snap) this.report("checkpoint");
+		return snap;
+	}
+
+	/** Delete a persisted snapshot by id (best-effort). */
+	async deleteSnapshot(id: string): Promise<boolean> {
+		if (!id || !this.provider.deleteSnapshotById) return false;
+		return this.provider.deleteSnapshotById(id, this.creds);
+	}
+
+	/** Fork the running sandbox into `count` handles (multi-slice VMs). */
+	async fork(count: number, timeoutMs?: number): Promise<SandboxHandle[]> {
+		const id = this.sandboxId;
+		if (!id || !this.provider.capabilities.fork || !this.provider.forkById) return [];
+		return this.provider.forkById(id, this.creds, count, timeoutMs);
 	}
 
 	/** Extend the sandbox lifetime from now (idle keepalive while a run is active). */
@@ -224,7 +272,9 @@ export async function openPr(
 	token: string,
 ): Promise<{ url: string; number: number; created: boolean }> {
 	const headers = { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "Content-Type": "application/json" };
-	const list = await fetch(`https://api.github.com/repos/${repo}/pulls?head=${repo.split("/")[0]}:${head}&state=open`, { headers });
+	// No default timeout on fetch — a hung GitHub request would wedge the run
+	// tail ("Pushing branch and opening PR…" forever). 30s per call.
+	const list = await fetch(`https://api.github.com/repos/${repo}/pulls?head=${repo.split("/")[0]}:${head}&state=open`, { headers, signal: AbortSignal.timeout(30_000) });
 	const existing = (await list.json()) as { html_url?: string; number?: number }[];
 	const found = Array.isArray(existing) ? existing[0] : undefined;
 	if (found?.html_url && found.number) return { url: found.html_url, number: found.number, created: false };
@@ -232,6 +282,7 @@ export async function openPr(
 		method: "POST",
 		headers,
 		body: JSON.stringify({ title, body, head, base }),
+		signal: AbortSignal.timeout(30_000),
 	});
 	if (!created.ok) throw new Error(`PR creation failed (${created.status}): ${await created.text()}`);
 	const pr = (await created.json()) as { html_url: string; number: number };

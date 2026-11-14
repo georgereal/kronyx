@@ -308,4 +308,43 @@ describe("createPrepareTurn", () => {
 		expect(JSON.stringify(out.messages![1].content)).toContain("summarized by context compaction");
 		expect(out.messages!.length).toBeLessThan(msgs.length);
 	});
+
+	it("ratchets the budget up (fill-anchored) instead of summarizing below the ceiling", async () => {
+		// ~200k chars of non-stubbable user text ≈ ~50k est tokens — over the
+		// 70% trigger of the 64k floor budget and unreachable to stubbing.
+		const msgs: AgentMessage[] = [msg("user", [{ type: "text", text: "task" }])];
+		for (let i = 0; i < 10; i++) msgs.push(msg("user", [{ type: "text", text: "u".repeat(20_000) }]));
+		for (let i = 0; i < 12; i++) {
+			msgs.push(call(`c${i}`, "read_file", { path: `f${i}.ts` }), result(`c${i}`, "read_file", "y".repeat(300)));
+		}
+		const budgetRef = { current: 0 };
+		let stats: import("../src/agent/compaction").CompactStats | undefined;
+		const turn = createPrepareTurn({
+			contextBudget: 64_000,
+			budgetRef,
+			onCompact: (s) => { stats = s; },
+		});
+		const out = await turn(ctx(msgs, 300_000));
+		expect(out).toBeDefined();
+		// est ~50k > target 35.2k, window 64k < ceiling 300k → B ≈ est/0.55 (~91k)
+		expect(budgetRef.current).toBeGreaterThan(80_000);
+		expect(budgetRef.current).toBeLessThanOrEqual(300_000);
+		expect(stats?.effectiveBudget).toBe(budgetRef.current);
+		// next pass uses the raised budget — same context now sits below trigger
+		const stats2 = await turn(ctx(msgs, 300_000));
+		void stats2;
+	});
+
+	it("learns the provider ceiling on overflow and clamps the budget", async () => {
+		const msgs: AgentMessage[] = [msg("user", [{ type: "text", text: "task" }])];
+		for (let i = 0; i < 12; i++) {
+			msgs.push(call(`c${i}`, "read_file", { path: `f${i}.ts` }), result(`c${i}`, "read_file", "y".repeat(20_000)));
+		}
+		const budgetRef = { current: 0 };
+		let stats: import("../src/agent/compaction").CompactStats | undefined;
+		const turn = createPrepareTurn({ contextBudget: 200_000, budgetRef, onCompact: (s) => { stats = s; } });
+		await turn(ctx(msgs, 400_000, { overflowRecovery: true, previousRequestInputTokens: 30_000 }));
+		expect(stats?.learnedCeiling).toBe(25_500);
+		expect(budgetRef.current).toBe(25_500);
+	});
 });

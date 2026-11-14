@@ -17,6 +17,7 @@ cd backend && npm run build && BACKEND_RUN_WORKER=1 npm start   # API :4000 + em
 cd web && npm run dev                              # UI on :3000, /api proxied to backend
 
 cd backend && npm run worker:dev                   # rebuild + in another shell: node dist/worker.js
+# NOTE: rebuilding dist/worker.js does NOT restart a running worker — restart the process for bundle changes to take effect
 npm run build && npx tsc --noEmit                  # extension bundle + typecheck (root)
 cd web && npx tsc --noEmit && npm run build        # web typecheck + build
 cd backend && npx tsc --noEmit                     # backend typecheck

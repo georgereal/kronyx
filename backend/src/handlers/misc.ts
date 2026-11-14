@@ -6,6 +6,7 @@ import { authenticate } from "../lib/apiKeys";
 import { getDb } from "../lib/mongo";
 import { fetchModels } from "../lib/models";
 import { recordSandboxEvent } from "../lib/sandboxEvents";
+import { loadPlan } from "../lib/planStore";
 import { json } from "../routes";
 
 const MAX_FILE = 4 * 1024 * 1024;
@@ -91,7 +92,9 @@ export async function getPlan(req: Request, p: Record<string, string>): Promise<
 	const sessionId = url.searchParams.get("session") ?? "";
 	const slug = url.searchParams.get("slug") ?? "";
 	const db = await getDb();
-	const plan = await db.collection("plans").findOne(p.id !== "_" ? { uid, planId: p.id } : { uid, sessionId, slug });
+	const plan = p.id !== "_"
+		? await db.collection("plans").findOne({ uid, planId: p.id })
+		: await loadPlan(db, uid, sessionId, slug);
 	if (!plan) return json({ error: "not_found" }, { status: 404 });
 	return json({ plan: { ...plan, _id: undefined } });
 }
@@ -172,6 +175,14 @@ export async function runJanitorSweep(db: Db): Promise<{ users: number; killed: 
 			await db.collection("sandboxes").updateOne({ _id: row._id }, { $set: { state: "dead", at: new Date() } });
 			continue;
 		}
+		// Fresh liveness check at the moment of pause — the busy snapshot was
+		// taken at sweep start and a run may have started mid-scan.
+		if (row.sessionId) {
+			const live =
+				(await db.collection("runs").countDocuments({ uid: row.uid, sessionId: row.sessionId, status: { $in: ["queued", "claimed", "running", "stopping"] } })) > 0 ||
+				(await db.collection("sessions").countDocuments({ uid: row.uid, sessionId: row.sessionId, activeRunId: { $ne: null } })) > 0;
+			if (live) continue;
+		}
 		const ok = await provider.pauseById(String(row.sandboxId), credsFor(row.uid)).catch(swallow("misc", "op", false));
 		if (ok) {
 			await db
@@ -201,6 +212,31 @@ export async function runJanitorSweep(db: Db): Promise<{ users: number; killed: 
 		// dead weight regardless of the run, so those still get cleaned up.
 		if (!row.killPending && row.sessionId && busySessions.has(`${row.uid}:${row.sessionId}`)) continue;
 		if (!row.killPending && !sessionIdle && !pausedLong) continue;
+		// Provider truth before any kill: a "gone" VM only needs the row marked;
+		// a "running" VM mislabeled paused (resumed between sweeps) must never be
+		// killed by a stale pausedLong verdict.
+		const provider = providerFor(row);
+		if (provider.getInfoById) {
+			const info = await provider.getInfoById(String(row.sandboxId), credsFor(row.uid)).catch(() => null);
+			if (info?.state === "gone") {
+				await db.collection("sandboxes").updateOne({ _id: row._id }, { $set: { killPending: false, state: "dead", reason: "provider-gone", deadAt: new Date() } });
+				continue;
+			}
+			if (!row.killPending && info?.state === "running" && row.state === "paused") {
+				// Resumed underneath us — refresh the row and re-evaluate next
+				// sweep rather than kill a live VM on a stale verdict.
+				await db.collection("sandboxes").updateOne({ _id: row._id }, { $set: { state: "running", at: new Date() } });
+				continue;
+			}
+		}
+		// busySessions was snapshotted at sweep start — a run can start while
+		// the sweep is mid-scan. Re-check liveness at the moment of the kill.
+		if (!row.killPending && row.sessionId) {
+			const live =
+				(await db.collection("runs").countDocuments({ uid: row.uid, sessionId: row.sessionId, status: { $in: ["queued", "claimed", "running", "stopping"] } })) > 0 ||
+				(await db.collection("sessions").countDocuments({ uid: row.uid, sessionId: row.sessionId, activeRunId: { $ne: null } })) > 0;
+			if (live) continue;
+		}
 		const reason = row.reason ?? (row.killPending ? "unreachable" : pausedLong ? "paused-48h" : "session-idle");
 		if (await kill(row.uid, String(row.sandboxId), typeof row.provider === "string" ? row.provider : undefined)) {
 			console.log(`[janitor] killed ${row.sandboxId} (${reason})`);

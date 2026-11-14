@@ -1,6 +1,7 @@
 import type { AgentTool } from "@cline/shared";
 import type { SandboxHandle } from "../sandbox/provider";
 import { isSharedManifest, ownsMatch } from "../agent/decompose";
+import { computeHunks, formatHunks } from "../diff/hunks";
 import { adaptIndentation, findMatches, mostSimilarRegion } from "./matching";
 
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
@@ -24,6 +25,13 @@ export interface RemoteToolOptions {
 	planDir?: string;
 	/** Live stdout/stderr chunks from the run_command tool (UI streaming). */
 	onCommandOutput?: (chunk: string) => void;
+	/** Live file-change events after writes (UI diff cards). */
+	onFileChanged?: (relPath: string, kind: "created" | "modified", stats: { added: number; removed: number; diff: string }) => void;
+	/** Checked inside the run_command poll loop so Stop can kill long commands. */
+	isAborted?: () => boolean;
+	/** Fires at save_plan time so the worker can persist the plan server-side —
+	 *  the sandbox copy alone dies with the VM (stop/kill before run-end capture). */
+	onPlanSaved?: (slug: string, markdown: string) => void;
 	/**
 	 * Multi-agent slice boundary: path globs (workdir-relative) the agent may
 	 * write to. Set → mutating file tools refuse paths outside the set; root
@@ -56,7 +64,17 @@ export function createRemoteFileTools(sandbox: SandboxHandle, workdir: string, o
 
 	const writeText = async (rel: string, text: string): Promise<boolean> => {
 		const existed = await exists(rel);
+		const before = existed && opts.onFileChanged ? await sandbox.readFile(abs(rel)).catch(() => null) : null;
 		await sandbox.writeFile(abs(rel), text);
+		if (opts.onFileChanged) {
+			let added = 0, removed = 0;
+			const hunks = computeHunks((before ?? "").replace(/\r\n/g, "\n"), text);
+			for (const hunk of hunks) {
+				added += hunk.newLines.length;
+				removed += hunk.oldLines.length;
+			}
+			opts.onFileChanged(rel, existed ? "modified" : "created", { added, removed, diff: formatHunks(hunks) });
+		}
 		return existed;
 	};
 
@@ -298,6 +316,7 @@ export function createRemoteFileTools(sandbox: SandboxHandle, workdir: string, o
 		name: "run_command",
 		description:
 			"Run a shell command in the cloud workspace (build, test, install, git). Returns exit code and output. " +
+			"Output streams live to the user — do NOT redirect to a file ('> log'); run plainly unless the file itself is needed. " +
 			"The command keeps running while the tool polls it — set timeout_seconds generously for installs/builds/test suites (they can take 5–30 minutes). Do NOT give up on a command just because it is slow.",
 		inputSchema: {
 			type: "object",
@@ -339,24 +358,68 @@ export function createRemoteFileTools(sandbox: SandboxHandle, workdir: string, o
 				return `${head?.stdout ?? ""}\n…[log truncated]…\n${tail?.stdout ?? ""}`;
 			};
 			let offset = 0;
+			let lastBeat = Date.now();
+			let lastProgress = Date.now();
+			let deadPolls = 0;
+			const kill = () =>
+				poll(`kill -TERM -- -$(cat ${JSON.stringify(pidF)} 2>/dev/null) 2>/dev/null; sleep 1; kill -KILL -- -$(cat ${JSON.stringify(pidF)} 2>/dev/null) 2>/dev/null`);
 			for (;;) {
 				await new Promise((r) => setTimeout(r, 10_000));
+				if (opts.isAborted?.()) {
+					const cur = await poll(`stat -c %s ${JSON.stringify(logF)} 2>/dev/null || echo 0`);
+					await kill();
+					const log = await fetchLog(Number(cur?.stdout.trim()) || 0);
+					await poll(`rm -f ${JSON.stringify(base)}.*`);
+					return `stopped by user\n${clampCmdOut(log.trim())}`;
+				}
 				const state = await poll(`cat ${JSON.stringify(exitF)} 2>/dev/null; echo __SIZE__; stat -c %s ${JSON.stringify(logF)} 2>/dev/null || echo 0`);
-				const [exitCode = "", , sizeS = "0"] = (state?.stdout ?? "\n__SIZE__\n0").split("\n");
+				// Poll itself is failing — the sandbox is gone/wedged. Don't
+				// heartbeat "0 KB" for the whole deadline; report it so the
+				// model (or a new sandbox) can recover.
+				if (state === null) {
+					if (++deadPolls >= 12)
+						return `sandbox unreachable for ~2m — the command may still be running (log ${logF}); the VM looks dead. Reconnect/retry rather than waiting.\n${clampCmdOut((await fetchLog(offset).catch(() => "")).trim())}`;
+					continue;
+				}
+				deadPolls = 0;
+				const [exitCode = "", , sizeS = "0"] = (state.stdout ?? "\n__SIZE__\n0").split("\n");
 				const size = Number(sizeS) || 0;
 				if (size > offset) {
 					const chunk = await poll(`tail -c +${offset + 1} ${JSON.stringify(logF)} | head -c 20000`);
 					if (chunk?.stdout) opts.onCommandOutput?.(chunk.stdout);
 					offset = size;
+					lastBeat = Date.now();
+					lastProgress = Date.now();
+				} else if (Date.now() - lastBeat > 30_000) {
+					// Quiet command (or output redirected by the agent) — heartbeat so
+					// the timeline card shows it is still alive.
+					const elapsed = Math.round((Date.now() - (deadline - budgetMs)) / 1000);
+					const mm = Math.floor(elapsed / 60), ss = elapsed % 60;
+					opts.onCommandOutput?.(`\n… still running (${mm > 0 ? `${mm}m ${ss}s` : `${ss}s`}, ${Math.round(size / 1024)} KB written) …\n`);
+					lastBeat = Date.now();
 				}
 				if (exitCode.trim() !== "") {
 					const log = await fetchLog(size);
 					await poll(`rm -f ${JSON.stringify(base)}.*`);
 					return `exit ${exitCode.trim()}\n${clampCmdOut(log.trim())}`;
 				}
+				// No output growth for 5m: an instant command would have
+				// written something — the shell is starved or the command is
+				// hung. Return control to the model instead of blocking it for
+				// the full deadline; the process stays alive for it to check,
+				// wait on, or kill.
+				if (Date.now() - lastProgress > 300_000) {
+					const pgid = (await poll(`cat ${JSON.stringify(pidF)} 2>/dev/null`))?.stdout.trim() ?? "";
+					return (
+						`no output for 5m — command appears stalled (still running, pgid ${pgid}, log ${logF}). ` +
+						`Decide how to proceed: poll again later (e.g. run "sleep 60 && tail -c 4000 ${logF}"), ` +
+						`check the process (ps aux | grep ${pgid}), or kill it ("kill -TERM -- -${pgid}"). ` +
+						`Do NOT just retry the same wait.\n${clampCmdOut((await fetchLog(size).catch(() => "")).trim())}`
+					);
+				}
 				if (Date.now() > deadline) {
 					// setsid made the script a process-group leader — kill the group.
-					await poll(`kill -TERM -- -$(cat ${JSON.stringify(pidF)} 2>/dev/null) 2>/dev/null; sleep 1; kill -KILL -- -$(cat ${JSON.stringify(pidF)} 2>/dev/null) 2>/dev/null`);
+					await kill();
 					const log = await fetchLog(size);
 					await poll(`rm -f ${JSON.stringify(base)}.*`);
 					return `timeout after ${Math.round(budgetMs / 1000)}s (killed)\n${clampCmdOut(log.trim())}`;
@@ -382,6 +445,7 @@ export function createRemoteFileTools(sandbox: SandboxHandle, workdir: string, o
 			const dir = (opts.planDir ?? `${workdir}/.kronyx/plans`).replace(/\/+$/, "");
 			await sandbox.run(`mkdir -p ${JSON.stringify(dir)}`, { cwd: workdir });
 			await sandbox.writeFile(`${dir}/${slug}.md`, input.plan);
+			opts.onPlanSaved?.(slug, input.plan);
 			return `Saved plan to ${dir}/${slug}.md — share it with the user and stop.`;
 		},
 	};
