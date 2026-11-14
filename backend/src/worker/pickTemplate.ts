@@ -36,6 +36,8 @@ export async function pickTemplate(provider: ProviderSettings, task: string, liv
 		| null;
 	const raw = body?.choices?.[0]?.message?.content?.trim() ?? "";
 	// Models love wrapping the answer — grab the first word that validates.
-	const candidate = raw.split(/\s+/).find((w) => isSelectable(w, live)) ?? (isSelectable(raw, live) ? raw : "");
+	// Strip surrounding punctuation/backticks too: "desktop," or "`desktop`" must still match.
+	const words = raw.split(/\s+/).map((w) => w.replace(/^[^\w/.-]+|[^\w/.:-]+$/g, "")).filter(Boolean);
+	const candidate = words.find((w) => isSelectable(w, live)) ?? (isSelectable(raw, live) ? raw : "");
 	return candidate ? resolveTemplateName(candidate, live) : null;
 }
