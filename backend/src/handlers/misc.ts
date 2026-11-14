@@ -178,6 +178,14 @@ export async function runJanitorSweep(db: Db): Promise<{ users: number; killed: 
 			paused++;
 		}
 	}
+	// Sessions with a live run — their sandbox is in use, even if the session
+	// hasn't been touched recently.
+	const busySessions = new Set<string>();
+	const liveRuns = await db
+		.collection("runs")
+		.find({ status: { $in: ["queued", "claimed", "running", "stopping"] } }, { projection: { uid: 1, sessionId: 1 } })
+		.toArray();
+	for (const r of liveRuns) busySessions.add(`${r.uid}:${r.sessionId}`);
 	// Policy kills — only driven by session inactivity, paused age, or a pending
 	// replacement kill. Never killed while a session is merely resting.
 	const rows: Record<string, any>[] = await db
@@ -190,6 +198,10 @@ export async function runJanitorSweep(db: Db): Promise<{ users: number; killed: 
 			: null;
 		const sessionIdle = !session?.updatedAt || new Date(session.updatedAt) < idleCutoff;
 		const pausedLong = row.state === "paused" && row.at && new Date(row.at) < pausedCutoff;
+		// Never kill the sandbox of a session with a live run — a long run may
+		// not touch session.updatedAt for hours. Unreachable (killPending) VMs are
+		// dead weight regardless of the run, so those still get cleaned up.
+		if (!row.killPending && row.sessionId && busySessions.has(`${row.uid}:${row.sessionId}`)) continue;
 		if (!row.killPending && !sessionIdle && !pausedLong) continue;
 		const reason = row.reason ?? (row.killPending ? "unreachable" : pausedLong ? "paused-48h" : "session-idle");
 		if (await kill(row.uid, String(row.sandboxId), typeof row.provider === "string" ? row.provider : undefined)) {
