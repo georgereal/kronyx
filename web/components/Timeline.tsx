@@ -4,6 +4,7 @@ import type { User } from "firebase/auth";
 import { Fragment, useEffect, useState } from "react";
 import { marked } from "marked";
 import { apiFetch } from "@/lib/api";
+import { fmtTok } from "@/components/AreaChart";
 import type { RunDoc, RunEvent } from "@/lib/types";
 
 const KIND: Record<string, string> = {
@@ -509,7 +510,7 @@ function Event({ user, sessionId, e, events, runs, githubUrl }: { user: User; se
 		return (
 			<div className="msg-row">
 				<span className="avatar">{(user.email ?? "U")[0].toUpperCase()}</span>
-				<div className="user-bubble" style={{ flex: 1 }}>
+				<div className="user-bubble" id={`msg-${e.runId}`} style={{ flex: 1 }}>
 					<span className="stream-text">{task}</span>
 					{attCount > 0 && <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>+{attCount} attached file{attCount > 1 ? "s" : ""}</div>}
 				</div>
@@ -706,6 +707,27 @@ export function Timeline({
 	const isLate = (item: Item): boolean =>
 		!!lateAfter && runIdOf(item) === lateAfter.runId && seqOf(item) > lateAfter.seq;
 
+	// Per-agent drill-down: click a fan-out/fan-in row → focused view shows only
+	// that agent's stream + its usage/context/memory stats; back restores all.
+	const [focus, setFocus] = useState<{ runId: string; ai: number } | null>(null);
+	const [usageRuns, setUsageRuns] = useState<{ runId: string; contextWindow: number | null; points: { agentIndex: number; requestTokens: number; tokensOut: number; costUsd: number | null }[] }[] | null>(null);
+	useEffect(() => {
+		if (!focus || usageRuns !== null) return;
+		void apiFetch(`/api/sessions/${sessionId}/usage`, user)
+			.then((r) => (r.ok ? r.json() : null))
+			.then((b: { contextWindow?: number | null; runs?: { runId: string; points: { agentIndex?: number; requestTokens?: number; tokensOut?: number; costUsd?: number | null }[] }[] } | null) => {
+				if (!b?.runs) return;
+				setUsageRuns(
+					b.runs.map((r) => ({
+						runId: r.runId,
+						contextWindow: b.contextWindow ?? null,
+						points: (r.points ?? []).map((p) => ({ agentIndex: p.agentIndex ?? 0, requestTokens: p.requestTokens ?? 0, tokensOut: p.tokensOut ?? 0, costUsd: p.costUsd ?? null })),
+					})),
+				);
+			})
+			.catch(() => {});
+	}, [focus, usageRuns, sessionId, user]);
+
 	const renderItem = (item: Item, frozen = false) => {
 		if (item.kind === "stream") {
 			const done = item.done || frozen;
@@ -751,17 +773,25 @@ export function Timeline({
 		if (et === "slice-status") return null;
 		if (et === "fanout") {
 			const slices = (item.e.event.slices as { index: number; title: string; owns: string[] }[]) ?? [];
+			const runId = item.e.runId ?? "";
 			return (
 				<div key={item.key} className="fanout-card">
-					<div className="fanout-head">Fanned out into {slices.length} parallel agents</div>
+					<div className="fanout-head">Fanned out into {slices.length} parallel agents <span className="muted" style={{ fontWeight: 400 }}>— click an agent for its run</span></div>
 					{slices.map((s) => (
-						<div key={s.index} className="fanout-row">
+						<div key={s.index} className="fanout-row clickable" onClick={() => setFocus({ runId, ai: s.index })}>
 							<span className="fanout-idx">#{s.index}</span>
 							<span className="fanout-title">{s.title}</span>
 							<span className="muted fanout-owns">{s.owns.slice(0, 3).join(", ")}{s.owns.length > 3 ? ` +${s.owns.length - 3}` : ""}</span>
-							<SlicePill i={s.index} runId={item.e.runId} />
+							<SlicePill i={s.index} runId={runId} />
+							<span className="fanout-go">›</span>
 						</div>
 					))}
+					<div className="fanout-row clickable" onClick={() => setFocus({ runId, ai: 0 })}>
+						<span className="fanout-idx">#0</span>
+						<span className="fanout-title">Coordinator / merge lane</span>
+						<span className="muted fanout-owns">orchestration + conflict resolution</span>
+						<span className="fanout-go">›</span>
+					</div>
 				</div>
 			);
 		}
@@ -772,10 +802,11 @@ export function Timeline({
 				<div key={item.key} className="fanin-card">
 					<div className="fanout-head">Merge results</div>
 					{results.map((r) => (
-						<div key={r.index} className="fanout-row">
+						<div key={r.index} className="fanout-row clickable" onClick={() => setFocus({ runId: item.e.runId ?? "", ai: r.index })}>
 							<span className={`fanin-icon ${r.status}`}>{icon(r.status)}</span>
 							<span className="fanout-title">{r.title}</span>
 							<span className="muted fanout-owns">{r.status}{r.detail ? ` — ${r.detail}` : ""}</span>
+							<span className="fanout-go">›</span>
 						</div>
 					))}
 				</div>
@@ -891,6 +922,54 @@ export function Timeline({
 					})}
 			</div>
 		);
+	// Focused per-agent view — replaces the consolidated stream while set.
+	if (focus) {
+		const { runId, ai } = focus;
+		const sliceMeta = runs?.find((r) => r.runId === runId)?.slices?.find((s) => s.index === ai);
+		const statusEv = [...events].reverse().find((e) => e.runId === runId && e.event.type === "slice-status" && e.event.index === ai);
+		const title = ai === 0 ? "Coordinator / merge lane" : sliceTitle(ai, runId);
+		const status = ai === 0 ? "" : sliceStatus(ai, runId);
+		const summary = sliceMeta?.summary ?? (statusEv ? String(statusEv.event.summary ?? "") : "");
+		const focusItems =
+			ai > 0 ? (laneItems.get(`${runId}:${ai}`) ?? []) : mainItems.filter((i) => laneKeyOf(i).runId === runId);
+		// Per-agent stats: usage points (session usage endpoint), memory +
+		// compaction events already in the stream.
+		const pts = usageRuns?.find((r) => r.runId === runId)?.points.filter((p) => p.agentIndex === ai) ?? [];
+		const tin = pts.reduce((s, p) => s + p.requestTokens, 0);
+		const tout = pts.reduce((s, p) => s + p.tokensOut, 0);
+		const cost = pts.reduce((s, p) => s + (p.costUsd ?? 0), 0);
+		const ctxWin = usageRuns?.find((r) => r.runId === runId)?.contextWindow ?? 0;
+		const maxCtx = ctxWin ? Math.round((Math.max(0, ...pts.map((p) => p.requestTokens)) / ctxWin) * 100) : 0;
+		const memCount = events.filter((e) => e.runId === runId && (e.event.agentIndex ?? 0) === ai && e.event.type === "memory").length;
+		const compactions = events.filter((e) => e.runId === runId && (e.event.agentIndex ?? 0) === ai && (e.event as { meta?: { kind?: string } }).meta?.kind === "context_compaction").length;
+		return (
+			<div className="timeline">
+				<div className="focus-bar">
+					<button className="focus-back" onClick={() => setFocus(null)}>← All agents</button>
+					<span className="fanout-idx">#{ai}</span>
+					<span className="fanout-title">{title}</span>
+					{status ? <span className={`slice-pill ${status}`}>{status}</span> : null}
+					<span className="focus-stats muted">
+						{tin > 0 && <>{fmtTok(tin)} in · {fmtTok(tout)} out{cost > 0 ? ` · $${cost.toFixed(4)}` : ""} · </>}
+						{maxCtx > 0 && <>ctx {maxCtx}% peak · </>}
+						{compactions > 0 && <>{compactions} compaction{compactions === 1 ? "" : "s"} · </>}
+						{memCount} memory · {focusItems.length} events
+					</span>
+				</div>
+				{summary ? <div className="focus-summary muted">{summary}</div> : null}
+				{focusItems.length === 0 ? (
+					<div className="muted" style={{ padding: 20 }}>No events yet for this agent.</div>
+				) : (
+					focusItems.map((item) => renderItem(item, !!lateAfter))
+				)}
+				{lateAfter && (
+					<div className={`stop-banner${lateAfter.halted ? " halted" : ""}`}>
+						{lateAfter.halted ? "⏸ Stopped" : "⏸ Stopping — waiting for the run to halt…"}
+					</div>
+				)}
+			</div>
+		);
+	}
 	return (
 		<div className="timeline">
 			{items.length === 0 && <div className="muted" style={{ padding: 20 }}>Waiting for events…</div>}

@@ -207,7 +207,14 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		this.keepaliveTimer = setInterval(() => {
 			const cur = this.activeSbx;
 			if (!cur) return;
-			void cur.keepalive(60).catch(swallow("executor", "op"));
+			void cur.keepalive(60).catch((err: unknown) => {
+				// Dead VM → keepalive is pointless; stop instead of logging every tick.
+				if (isSandboxDeath(err)) {
+					this.stopSandboxKeepalive();
+					return;
+				}
+				swallow("executor", "op")(err);
+			});
 			void this.db
 				.collection("sandboxes")
 				.updateOne({ uid: this.sink.uid, sandboxId: cur.sandboxId }, { $set: { lastActivityAt: new Date() } })
@@ -408,7 +415,12 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			.catch(swallow("executor", "op", { exitCode: 1, stdout: "", stderr: "" }));
 		for (const line of wts.stdout.split("\n").map((l) => l.trim()).filter((l) => /\/repo-wt\d+$/.test(l))) {
 			const n = line.match(/repo-wt(\d+)$/)![1];
-			const d = await sbx.runIn(line, "git status --porcelain", 15_000).catch(swallow("executor", "op"));
+			const d = await sbx.runIn(line, "git status --porcelain", 15_000).catch((err: unknown) => {
+				if (isSandboxDeath(err)) return "dead" as const;
+				swallow("executor", "op")(err);
+				return undefined;
+			});
+			if (d === "dead") break; // VM gone — remaining slices would just re-log the same death
 			if (!d?.stdout.trim()) continue;
 			const partBranch = `${session.branch}-part-${n}`;
 			const ok = await sbx
@@ -423,7 +435,12 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		// Forked slices (flags.sliceFork): each lives on its own VM, invisible
 		// to ls on the coordinator — checkpoint over their handles directly.
 		for (const [n, h] of this.sliceForks) {
-			const d = await h.run("git status --porcelain", { cwd: REPO_DIR, timeoutMs: 15_000 }).catch(swallow("executor", "op"));
+			const d = await h.run("git status --porcelain", { cwd: REPO_DIR, timeoutMs: 15_000 }).catch((err: unknown) => {
+				if (isSandboxDeath(err)) return "dead" as const;
+				swallow("executor", "op")(err);
+				return undefined;
+			});
+			if (d === "dead") break; // forked VM gone — remaining probes would just re-log the same death
 			if (!d?.stdout.trim()) continue;
 			const partBranch = `${session.branch}-part-${n}`;
 			const ok = await h
@@ -1965,7 +1982,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			}
 		}
 		if (!this.sliceForks.size)
-			await this.sink.emit({ type: "info", text: `Slices share one sandbox as git worktrees (isolation: ${isoMode}${wantFork ? " — fork flag off or fork unavailable" : ""}).` });
+			await this.sink.emit({ type: "info", text: `Slices share one sandbox as git worktrees — each commits to ${session.branch}-part-N, merged back at fan-in (isolation: ${isoMode}${wantFork ? " — fork flag off or fork unavailable" : ""}).` });
 		// Forked VMs must die on ANY exit path — a non-stop error between fork
 		// and fan-in otherwise leaks them to the janitor's idle timers.
 		try {
@@ -2274,11 +2291,31 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			text: `Fan-in complete: ${cnt("merged")} merged, ${cnt("resolved")} resolved, ${cnt("failed")} failed${droppedSlices.length ? `, ${droppedSlices.length} deferred to coordinator` : ""}.`,
 		});
 
+		// Delete merged part branches on the remote — their commits are
+		// reachable through the merge commits on session.branch. Failed
+		// slices keep theirs: it's the only copy of that unmerged work.
+		let cleaned = 0;
+		for (const r of results) {
+			if (r.status !== "merged" && r.status !== "resolved") continue;
+			const part = `${session.branch}-part-${r.index}`;
+			const ok = await sbx
+				.runIn(REPO_DIR, `git push origin --delete ${JSON.stringify(part)} && git branch -D ${JSON.stringify(part)} 2>/dev/null || true`, 60_000)
+				.then((x) => x.exitCode === 0)
+				.catch((err: unknown) => (isSandboxDeath(err) ? "dead" : false));
+			if (ok === "dead") break; // VM gone — every remaining op would just log the same death
+			if (ok) cleaned++;
+		}
+		if (cleaned)
+			await this.sink.emit({ type: "info", text: `Cleaned up ${cleaned} merged part branch${cleaned === 1 ? "" : "es"}.` });
+
 		// Worktree cleanup (branches stay — they're merged history). Forked
 		// slices have no worktree on this VM — kill their sandbox instead.
 		for (const s of slices) {
 			if (this.sliceForks.has(s.index)) continue;
-			await sbx.runIn(REPO_DIR, `git worktree remove --force ${SLICE_DIR(s.index)} 2>/dev/null || true`, 30_000).catch(swallow("executor", "op"));
+			const dead = await sbx
+				.runIn(REPO_DIR, `git worktree remove --force ${SLICE_DIR(s.index)} 2>/dev/null || true`, 30_000)
+				.catch((err: unknown) => isSandboxDeath(err));
+			if (dead) break; // VM gone — remaining worktree removes would just re-log the same death
 		}
 		} finally {
 			await this.killSliceForks();

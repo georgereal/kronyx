@@ -330,7 +330,7 @@ export async function sessionUsage(req: Request, p: Record<string, string>): Pro
 		.collection("usage_events")
 		.find({ uid, session: p.id, kind: "chat" })
 		.sort({ at: 1 })
-		.project({ runId: 1, task: 1, model: 1, tokensIn: 1, tokensOut: 1, cacheRead: 1, cacheWrite: 1, reasoningTokens: 1, costUsd: 1, billedCostUsd: 1, iteration: 1, contextMsgs: 1, contextWindow: 1, at: 1 })
+		.project({ runId: 1, task: 1, model: 1, tokensIn: 1, tokensOut: 1, cacheRead: 1, cacheWrite: 1, reasoningTokens: 1, costUsd: 1, billedCostUsd: 1, iteration: 1, contextMsgs: 1, contextWindow: 1, agentIndex: 1, at: 1 })
 		.limit(20_000)
 		.toArray();
 	const compaction = await db
@@ -367,6 +367,7 @@ export async function sessionUsage(req: Request, p: Record<string, string>): Pro
 			cacheWrite: r.cacheWrite ?? 0,
 			reasoningTokens: r.reasoningTokens ?? 0,
 			costUsd: r.billedCostUsd ?? r.costUsd ?? null,
+			agentIndex: r.agentIndex ?? 0,
 			at: r.at,
 		});
 		totals.tokensIn += Number(r.tokensIn ?? 0);

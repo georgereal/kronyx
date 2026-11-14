@@ -1,5 +1,5 @@
 import { getProvider, type ProviderCreds, type SandboxHandle, type SandboxProvider } from "./provider";
-import { swallow } from "../lib/errlog";
+import { errlog, swallow } from "../lib/errlog";
 
 /**
  * vscode-free sandbox wrapper shared by the extension's cloud controller
@@ -241,7 +241,14 @@ export class SandboxCore {
 	async readFile(absPath: string): Promise<string | null> {
 		if (!this.handle) return null;
 		this.touch();
-		return this.handle.readFile(absPath).catch(swallow("sandbox", "op", null));
+		return this.handle.readFile(absPath).catch((err: unknown) => {
+			// Missing file is a legitimate result, not an op failure — callers
+			// probe optional paths (.kronyx/permissions.json, plan files) and the
+			// log line per miss is pure noise. Log only real read errors.
+			if (!/not exist|no such file|not found|enoent/i.test(err instanceof Error ? err.message : String(err)))
+				errlog("sandbox", "op", err);
+			return null;
+		});
 	}
 
 	async close(): Promise<void> {

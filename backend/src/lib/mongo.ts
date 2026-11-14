@@ -36,7 +36,18 @@ export async function getDb(): Promise<Db> {
 	await db.collection("attachments").createIndex({ uid: 1, sessionId: 1 });
 	await db.collection("plans").createIndex({ uid: 1, sessionId: 1, slug: 1 }, { unique: true });
 	await db.collection("run_reports").createIndex({ uid: 1, runId: 1 }, { unique: true });
-	await db.collection("run_transcripts").createIndex({ uid: 1, runId: 1 }, { unique: true });
+	// Transcripts key on agentIndex too — the old {uid, runId} unique index
+	// predates multi-agent slices and silently dropped every slice > 0.
+	await db
+		.collection("run_transcripts")
+		.dropIndex("uid_1_runId_1")
+		.catch((err: unknown) => {
+			// Missing index = already migrated; anything else must be loud —
+			// a failed drop leaves the stale unique key silently eating slices.
+			const m = err instanceof Error ? err.message : String(err);
+			if (!/IndexNotFound|index not found|ns not found/i.test(m)) console.error("[mongo] run_transcripts index migration failed:", m);
+		});
+	await db.collection("run_transcripts").createIndex({ uid: 1, runId: 1, agentIndex: 1 }, { unique: true });
 	await db.collection("run_transcripts").createIndex({ uid: 1, sessionId: 1, savedAt: 1 });
 	await db.collection("memory_events").createIndex({ uid: 1, at: -1 });
 	await db.collection("memories").createIndex({ uid: 1, memoryId: 1 }, { unique: true });

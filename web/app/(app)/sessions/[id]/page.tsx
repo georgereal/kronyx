@@ -107,6 +107,26 @@ export default function SessionView() {
 	const lifecycle = events
 		.filter((e) => ["info", "cloud-status", "setup", "check"].includes(e.event.type))
 		.slice(-8);
+	// Minimap navigator: one right-edge tick per user message (run-started
+	// events), click scrolls to that bubble; active tick follows scroll.
+	const userMsgs = ordered.filter((e) => e.event.type === "run-started");
+	const [activeMsg, setActiveMsg] = useState<string>("");
+	useEffect(() => {
+		if (!userMsgs.length) return;
+		const onScroll = () => {
+			const mid = window.innerHeight * 0.5;
+			let current = "";
+			for (const e of userMsgs) {
+				const el = document.getElementById(`msg-${e.runId}`);
+				if (el && el.getBoundingClientRect().top <= mid) current = e.runId ?? "";
+			}
+			setActiveMsg((prev) => (prev === current ? prev : current));
+		};
+		onScroll();
+		window.addEventListener("scroll", onScroll, { passive: true });
+		return () => window.removeEventListener("scroll", onScroll);
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [userMsgs.length]);
 	// Session preflight — sandbox / repo / auth / model readiness, fetched once
 	// on load and after each refresh-triggering action.
 	const [preflight, setPreflight] = useState<{ ready: boolean; checks: { name: string; ok: boolean; detail: string }[] } | null>(null);
@@ -494,6 +514,18 @@ export default function SessionView() {
 			)}
 			<Timeline user={user} sessionId={id} events={ordered} runs={runs} active={active} lateAfter={lateAfter}
 				githubUrl={session?.prUrl ?? (session?.repo && session?.branch ? `https://github.com/${session.repo}/tree/${session.branch}` : undefined)} />
+			{userMsgs.length > 1 && (
+				<div className="msg-nav" role="navigation" aria-label="Jump to message">
+					{userMsgs.map((e) => (
+						<button
+							key={e.runId}
+							className={`msg-nav-tick${e.runId === activeMsg ? " on" : ""}`}
+							title={String(e.event.task ?? "").split("\n")[0].slice(0, 80)}
+							onClick={() => document.getElementById(`msg-${e.runId}`)?.scrollIntoView({ behavior: "smooth", block: "center" })}
+						/>
+					))}
+				</div>
+			)}
 			{submitted && (
 				<div className="msg-row" style={{ opacity: 0.8 }}>
 					<span className="avatar accent">K</span>

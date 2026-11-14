@@ -818,6 +818,24 @@ tbody tr:hover {
 }
 .fanout-head { font-weight: 600; margin-bottom: 6px; }
 .fanout-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
+.fanout-row.clickable { cursor: pointer; border-radius: 6px; padding: 3px 6px; margin: 0 -6px; }
+.fanout-row.clickable:hover { background: var(--surface-2, rgba(255, 255, 255, 0.04)); }
+.fanout-go { margin-left: auto; color: var(--muted); }
+.focus-bar {
+	display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+	padding: 8px 10px; margin: 4px 0 8px;
+	border: 1px solid var(--border); border-radius: 8px;
+	background: var(--surface, rgba(255, 255, 255, 0.02));
+	position: sticky; top: 0; z-index: 5;
+}
+.focus-back {
+	background: none; border: 1px solid var(--border); border-radius: 6px;
+	color: var(--fg, inherit); font: inherit; font-size: 12px;
+	padding: 3px 9px; cursor: pointer;
+}
+.focus-back:hover { background: var(--surface-2, rgba(255, 255, 255, 0.06)); }
+.focus-stats { margin-left: auto; font-size: 11px; }
+.focus-summary { font-size: 12px; padding: 0 4px 10px; white-space: pre-wrap; }
 .fanout-idx { color: var(--muted); font-variant-numeric: tabular-nums; }
 .fanout-title { font-weight: 500; }
 .fanout-owns { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -968,3 +986,16 @@ tbody tr:hover {
 @keyframes run-status-spin {
 	to { transform: rotate(360deg); }
 }
+
+/* Minimap: right-edge navigator — one tick per user message. */
+.msg-nav {
+	position: fixed; right: 10px; top: 50%; transform: translateY(-50%);
+	display: flex; flex-direction: column; gap: 6px; z-index: 30;
+}
+.msg-nav-tick {
+	width: 18px; height: 3px; border: 0; border-radius: 2px;
+	background: var(--border, #333); cursor: pointer; padding: 0;
+	transition: background 0.15s, width 0.15s;
+}
+.msg-nav-tick:hover { background: var(--muted, #888); width: 24px; }
+.msg-nav-tick.on { background: var(--accent, #7c9cff); }
