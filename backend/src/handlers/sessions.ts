@@ -156,21 +156,32 @@ export async function postMessage(req: Request, p: Record<string, string>): Prom
 	const envSet: Record<string, unknown> = {};
 	if ((startRef || base) && session.repo) {
 		const newRef = startRef || base;
-		const curRef = session.startRef || session.base || "";
+		// Compare against the session's LIVE ref (work branch first) — matching
+		// the composer's display semantics. Comparing startRef alone misses the
+		// change when the session sits on a forked kronyx branch (picking `main`
+		// must reset so the next run forks fresh off main).
+		const curRef = session.branch || session.startRef || session.base || "";
 		if (newRef && newRef !== curRef) {
-			if (session.activeRunId) return json({ error: "run_active" }, { status: 409 });
-			envSet.startRef = newRef;
-			if (base) envSet.base = base;
-			if (body.keepBranch && session.branch) {
-				// Rebase mode: keep the feature branch; the drift rebase stacks it
-				// onto the new ref. The stale PR link clears — openPr re-links.
-				envSet.prUrl = null;
-			} else if (session.branch) {
-				// New branch mode: the worker checkpoints dirty work to the old
-				// branch, then forks a fresh kronyx branch off the picked ref.
-				envSet.resetFrom = session.branch;
-				envSet.branch = null;
-				envSet.prUrl = null;
+			if (newRef === session.branch) {
+				// The picked ref IS the work branch — continue in place. Only the
+				// recorded start point/base update; no reset, refork, or PR clear.
+				envSet.startRef = newRef;
+				if (base) envSet.base = base;
+			} else {
+				if (session.activeRunId) return json({ error: "run_active" }, { status: 409 });
+				envSet.startRef = newRef;
+				if (base) envSet.base = base;
+				if (body.keepBranch && session.branch) {
+					// Rebase mode: keep the feature branch; the drift rebase stacks it
+					// onto the new ref. The stale PR link clears — openPr re-links.
+					envSet.prUrl = null;
+				} else if (session.branch) {
+					// New branch mode: the worker checkpoints dirty work to the old
+					// branch, then forks a fresh kronyx branch off the picked ref.
+					envSet.resetFrom = session.branch;
+					envSet.branch = null;
+					envSet.prUrl = null;
+				}
 			}
 		} else if (base && base !== session.base) {
 			envSet.base = base;

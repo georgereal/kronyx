@@ -41,10 +41,29 @@ describe("fetch_url", () => {
 	});
 
 	it("reports HTTP errors with status", async () => {
-		mockFetch(async () => new Response("nope", { status: 429, statusText: "Too Many Requests" }));
+		mockFetch(async () => new Response("nope", { status: 503, statusText: "Service Unavailable" }));
 		const out = await exec({ url: "https://deepwiki.com/x" });
+		expect(out).toContain("HTTP 503");
+	});
+
+	it("retries once on 429 honoring Retry-After, then reports honestly", async () => {
+		const spy = mockFetch(async () => new Response("nope", { status: 429, statusText: "Too Many Requests", headers: { "retry-after": "0.01" } }));
+		const out = await exec({ url: "https://deepwiki.com/x" });
+		expect(spy).toHaveBeenCalledTimes(2);
 		expect(out).toContain("HTTP 429");
 		expect(out).toContain("rate-limited");
+	});
+
+	it("returns the retried 200 after an initial 429", async () => {
+		let calls = 0;
+		const spy = mockFetch(async () => {
+			calls++;
+			return calls === 1
+				? new Response("slow down", { status: 429, headers: { "retry-after": "0.01" } })
+				: okResponse("page content", "text/plain");
+		});
+		expect(await exec({ url: "https://x.test/doc" })).toBe("page content");
+		expect(spy).toHaveBeenCalledTimes(2);
 	});
 
 	it("rejects non-http schemes", async () => {

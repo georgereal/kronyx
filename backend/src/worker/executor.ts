@@ -2487,8 +2487,12 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				await this.sink.emit({ type: "info", text: `Could not check out ${startRef} — branching from the local checkout.` });
 				await sbx.createBranch(REPO_DIR, branch);
 			}
-			await this.sink.patchSession({ branch });
+			// startRef follows the work branch — "where this session starts from"
+			// IS its branch once one exists, so the composer/submit path can tell
+			// continue-in-place from an actual start-point change.
+			await this.sink.patchSession({ branch, startRef: branch });
 			session.branch = branch;
+			session.startRef = branch;
 			await this.sink.emit({ type: "info", text: `Created branch ${branch}` });
 			// Push immediately — the branch should be visible on the remote from
 			// the first tool call, not only at PR time. Non-fatal on failure.

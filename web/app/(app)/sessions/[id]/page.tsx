@@ -43,22 +43,33 @@ export default function SessionView() {
 	const sseRef = useRef<EventSource | null>(null);
 	// Env picker — source of truth for the next task's start point (branch/PR
 	// ref within the session repo). Disabled while a run is active.
+	// env.startRef tracks the session's actual ref (work branch once forked,
+	// else the picked startRef) — unless the user has since picked a different
+	// ref, which stays until they submit or the session ref moves again.
 	const [env, setEnv] = useState<EnvState | null>(null);
+	const syncedRef = useRef("");
 	useEffect(() => {
 		if (!session) return;
-		setEnv((prev) =>
-			prev ?? {
-				repo: session.repo ?? "",
-				base: session.base ?? "",
-				startRef: session.startRef ?? "",
-				prLabel: "",
-				installationId: session.installationId ?? null,
-				extraRepos: session.extraRepos ?? [],
-				template: session.template ?? "",
-				securityProfile: (session.securityProfile as EnvState["securityProfile"]) ?? "agent",
-			},
-		);
-	}, [session?.sessionId, session?.startRef, session?.base]);
+		const sessionRef = session.branch ?? session.startRef ?? "";
+		setEnv((prev) => {
+			if (!prev)
+				return {
+					repo: session.repo ?? "",
+					base: session.base ?? "",
+					startRef: sessionRef,
+					prLabel: "",
+					installationId: session.installationId ?? null,
+					extraRepos: session.extraRepos ?? [],
+					template: session.template ?? "",
+					securityProfile: (session.securityProfile as EnvState["securityProfile"]) ?? "agent",
+				};
+			// Ref still matches the last synced value (user hasn't overridden) →
+			// follow the session; a user pick stays until the session ref moves.
+			if (prev.startRef === syncedRef.current) return { ...prev, startRef: sessionRef, prLabel: "" };
+			return prev;
+		});
+		syncedRef.current = sessionRef;
+	}, [session?.sessionId, session?.startRef, session?.base, session?.branch]);
 	// Bottom-pin: window scrollbar follows new events unless the user scrolls up.
 	const pinnedRef = useRef(true);
 

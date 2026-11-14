@@ -61,47 +61,49 @@ export function createFetchTools(): AgentTool<any, string>[] {
 				return `fetch_url: only http/https URLs are supported (got ${parsed.protocol}).`;
 			if (isPrivateHost(parsed.hostname)) return `fetch_url: refusing to fetch a private/loopback address.`;
 
+			const HEADERS = {
+				"User-Agent": UA,
+				Accept: "text/html,application/xhtml+xml,text/markdown,text/plain,application/json;q=0.9,*/*;q=0.5",
+				"Accept-Language": "en-US,en;q=0.9",
+			};
 			// Manual redirect handling — each hop re-validates protocol + host,
 			// otherwise a public URL could redirect into a private address.
-			let res: Response | null = null;
-			let current = parsed;
-			for (let hop = 0; hop <= 5; hop++) {
-				let r: Response;
-				try {
-					r = await fetch(current, {
-						redirect: "manual",
-						signal: AbortSignal.timeout(TIMEOUT_MS),
-						headers: {
-							"User-Agent": UA,
-							Accept: "text/html,application/xhtml+xml,text/markdown,text/plain,application/json;q=0.9,*/*;q=0.5",
-							"Accept-Language": "en-US,en;q=0.9",
-						},
-					});
-				} catch (e) {
-					return `fetch_url: request failed — ${e instanceof Error ? e.message : String(e)}`;
+			const get = async (): Promise<Response | string> => {
+				let current = parsed;
+				for (let hop = 0; hop <= 5; hop++) {
+					let r: Response;
+					try {
+						r = await fetch(current, { redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS), headers: HEADERS });
+					} catch (e) {
+						return `fetch_url: request failed — ${e instanceof Error ? e.message : String(e)}`;
+					}
+					if (![301, 302, 303, 307, 308].includes(r.status)) return r;
+					const loc = r.headers.get("location");
+					if (!loc) return r;
+					let next: URL;
+					try {
+						next = new URL(loc, current);
+					} catch {
+						return `fetch_url: redirect to an invalid URL (${loc.slice(0, 120)})`;
+					}
+					if (next.protocol !== "http:" && next.protocol !== "https:")
+						return `fetch_url: redirect to unsupported scheme ${next.protocol}`;
+					if (isPrivateHost(next.hostname)) return `fetch_url: refusing redirect to a private/loopback address.`;
+					current = next;
 				}
-				if (![301, 302, 303, 307, 308].includes(r.status)) {
-					res = r;
-					break;
-				}
-				const loc = r.headers.get("location");
-				if (!loc) {
-					res = r;
-					break;
-				}
-				let next: URL;
-				try {
-					next = new URL(loc, current);
-				} catch {
-					return `fetch_url: redirect to an invalid URL (${loc.slice(0, 120)})`;
-				}
-				if (next.protocol !== "http:" && next.protocol !== "https:")
-					return `fetch_url: redirect to unsupported scheme ${next.protocol}`;
-				if (isPrivateHost(next.hostname)) return `fetch_url: refusing redirect to a private/loopback address.`;
-				current = next;
-				if (hop === 5) return "fetch_url: too many redirects (>5).";
+				return "fetch_url: too many redirects (>5).";
+			};
+			let res = await get();
+			if (typeof res === "string") return res;
+			// One bounded retry on 429 — parallel agent fetches and origin
+			// rate-limiters both trip on bursts; honor Retry-After, capped.
+			if (res.status === 429) {
+				const ra = Number(res.headers.get("retry-after") ?? "");
+				const wait = Number.isFinite(ra) && ra > 0 ? Math.min(ra, 10) * 1000 : 4000 + Math.random() * 2000;
+				await new Promise((r) => setTimeout(r, wait));
+				res = await get();
+				if (typeof res === "string") return res;
 			}
-			if (!res) return "fetch_url: too many redirects (>5).";
 			if (!res.ok) {
 				const hint = res.status === 429 ? " (rate-limited — the site is blocking automated fetches)" : res.status === 403 ? " (forbidden — likely a bot block)" : "";
 				return `fetch_url: HTTP ${res.status} ${res.statusText}${hint}`;

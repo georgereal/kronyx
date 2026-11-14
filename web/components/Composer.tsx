@@ -466,7 +466,7 @@ export function Composer({
 							className="sess-chip mono"
 							style={{ maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis", cursor: "pointer" }}
 							onClick={() => toggleMenu("env")}
-							title="Change repository or branch"
+							title="Next run starts from this branch"
 						>
 							{env.repo}
 							{env.prLabel ? ` ${env.prLabel}` : ` @${env.startRef || env.base}`}
