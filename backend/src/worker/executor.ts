@@ -1645,7 +1645,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		} else if (!session.branch) {
 			// Plan mode with no work branch: nothing checks the repo out to the
 			// picked start point — sync the worktree so reads see the right code.
-			await this.syncPlanWorktree(session, sbx);
+			await this.syncPlanWorktree(session, sbx, token);
 		}
 		// Plan mode with an existing session branch: ensureRepoReady already
 		// checked it out and reconciled it — reads see that branch's code.
@@ -2484,7 +2484,10 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	 *  a stale VM checkout would keep serving the old branch's code. Fetch +
 	 *  check out startRef read-only; the work branch is created by the next
 	 *  agent run. */
-	private async syncPlanWorktree(session: SessionDoc, sbx: SandboxCore): Promise<void> {
+	private async syncPlanWorktree(session: SessionDoc, sbx: SandboxCore, token: string): Promise<void> {
+		// The remote URL embeds a token that expires — refresh before any
+		// fetch/push (checkpoint included), or warm sandboxes fail on a stale URL.
+		if (session.repo && token) await this.syncGhAuth(sbx, session.repo, token).catch(swallow("executor", "op"));
 		await this.checkpointResetFrom(session, sbx);
 		const startRef = String(session.startRef ?? session.base ?? "").trim();
 		if (!startRef) return;
