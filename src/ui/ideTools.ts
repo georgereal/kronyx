@@ -11,9 +11,6 @@ const MAX_SYMBOLS = 50;
 const MAX_REFS = 30;
 const MAX_DIAG_FILES = 50;
 const MAX_DIAG_PER_FILE = 10;
-const MAX_CODE_ACTIONS_MARKER = 50;
-const MAX_FORMAT_RESULTS_MARKER = 30;
-const MAX_DIAG_RESULT_MARKER = 10;
 const TRUNC_MARKER = "...";
 const MAX_HOVER_CHARS = 1_500;
 
@@ -334,8 +331,8 @@ export function createIdeTools(options: IdeToolOptions): AgentTool<any, string>[
 				});
 				return `Renamed to "${newName}" — ${edits.length} edit(s) in ${files.size} file(s):\n${edits.slice(0, MAX_REFS).join("\n")}`;
 			},
-{
-			name: "code_action",
+			{
+				name: "code_action",
 			executionMode: "parallel",
 			description:
 				"Apply a code action suggested by the language server (refactor, quick-fix, or similar). " +
@@ -349,6 +346,7 @@ export function createIdeTools(options: IdeToolOptions): AgentTool<any, string>[
 				required: ["position"],
 			},
 			async execute(input: { path?: string; position: { line: number; character: number } }) {
+				const t0 = Date.now();
 				const uri = input.path ? uriFor(input.path) : undefined;
 				const prep = await exec<vscode.CodeAction[]>("vscode.executeCodeActionProvider", uri, new vscode.Position(input.position.line, input.position.character), vscode.CodeActionKind.All);
 				if (!prep) return "No code action provider or no actions returned.";
@@ -366,6 +364,7 @@ export function createIdeTools(options: IdeToolOptions): AgentTool<any, string>[
 						}
 					}
 				}
+				if (prep.length > MAX_CODE_ACTIONS) out.push(`${TRUNC_MARKER} ${prep.length - MAX_CODE_ACTIONS} more actions`);
 				options.report?.({ op: "ide_context", tool: "code_action", files: actions.length, tookMs: Date.now() - t0 });
 				return out.length ? out.join("\n") : "No code actions.";
 			},
@@ -375,7 +374,7 @@ export function createIdeTools(options: IdeToolOptions): AgentTool<any, string>[
 			executionMode: "parallel",
 			description:
 				"Reformat the entire document using the language server. " +
-				"Equivalent to VS Code's "format document" command but scoped to the current editor or a given path.",
+				"Equivalent to VS Code's 'format document' command but scoped to the current editor or a given path.",
 			inputSchema: {
 				type: "object",
 				properties: {
@@ -383,6 +382,7 @@ export function createIdeTools(options: IdeToolOptions): AgentTool<any, string>[
 				},
 			},
 			async execute(input: { path?: string }) {
+				const t0 = Date.now();
 				const uri = input.path ? uriFor(input.path) : vscode.window.activeTextEditor?.document.uri;
 				if (!uri) return "No active editor and no path provided.";
 				const result = await exec<vscode.TextEdit[]>("vscode.executeDocumentFormatProvider", uri);
@@ -392,6 +392,7 @@ export function createIdeTools(options: IdeToolOptions): AgentTool<any, string>[
 				for (const e of edits) {
 					out.push(`${rel(uri)}:${e.range.start.line + 1}:${e.range.start.character + 1} -> ${e.newText?.slice(0, 80) ?? ""}`);
 				}
+				if (result.length > MAX_FORMAT_RESULTS) out.push(`${TRUNC_MARKER} ${result.length - MAX_FORMAT_RESULTS} more edits`);
 				options.report?.({ op: "ide_context", tool: "format_document", tookMs: Date.now() - t0 });
 				return out.length ? out.join("\n") : "No formatting edits.";
 			},
@@ -417,8 +418,8 @@ export function createIdeTools(options: IdeToolOptions): AgentTool<any, string>[
 				const startLine = Math.max(0, sel.start.line - extend);
 				const endLine = Math.min(doc.lineCount - 1, sel.end.line + extend);
 				const selectedText = doc.getText(new vscode.Range(startLine, 0, endLine + 1, doc.lineAt(endLine).range.end.character));
-				const beforeLines = doc.getText(new vscode.Range(startLine, 0, sel.start.line, doc.lineAt(sel.start.line - 1 ? sel.start.line - 1 : 0).range.end.character)).split("\n").slice(0, extend).join("\n");
-				const afterLines = doc.getText(new vscode.Range(sel.end.line + 1, 0, endLine + 1, doc.lineAt(endLine).range.end.character)).split("\n").slice(0, extend).join("\n");
+				const beforeLines = sel.start.line > startLine ? doc.getText(new vscode.Range(startLine, 0, sel.start.line, 0)).replace(/\n$/, "") : "";
+				const afterLines = endLine > sel.end.line ? doc.getText(new vscode.Range(sel.end.line + 1, 0, endLine + 1, 0)).replace(/\n$/, "") : "";
 				return `Selection (lines ${sel.start.line + 1}-${sel.end.line + 1}):${selectedText ? " " + selectedText : ""}\n\nBefore:${beforeLines ? " " + beforeLines : ""}\n\nAfter:${afterLines ? " " + afterLines : ""}`;
 			},
 		},
@@ -436,15 +437,20 @@ export function createIdeTools(options: IdeToolOptions): AgentTool<any, string>[
 				required: ["path", "beforeSnapshot"],
 			},
 			async execute(input: { path: string; beforeSnapshot: string }) {
-				const after = await exec(vscode.languages.getDiagnostics, uriFor(input.path));
+				const t0 = Date.now();
+				const target = uriFor(input.path);
+				const after = vscode.languages.getDiagnostics(target);
 				const afterLines = after
 					.filter((d) => d.severity <= vscode.DiagnosticSeverity.Warning)
 					.map((d) => `${rel(uriFor(input.path))}:${d.range.start.line + 1}:${d.range.start.character + 1} [${SEVERITY[d.severity]}] ${d.message.split("\n")[0]}`)
 					.slice(0, MAX_DIAG_PER_FILE);
 				const before = input.beforeSnapshot.split("\n");
-				const afterSet = new Set(afterLines);
-				const newDiagnostics = afterLines.filter((l) => !before.some((b) => b.includes(l.split(":")[0])));
-				const resolved = afterLines.filter((l) => before.some((b) => b.includes(l.split(":")[0]) && !l.includes("error")));
+				// Compare by file + severity + message so shifted line numbers don't count as new.
+				const key = (l: string) => l.replace(/:\d+:\d+ /, " ");
+				const beforeKeys = new Set(before.map(key));
+				const afterKeys = new Set(afterLines.map(key));
+				const newDiagnostics = afterLines.filter((l) => !beforeKeys.has(key(l)));
+				const resolved = before.filter((b) => b.startsWith(`${rel(target)}:`) && !afterKeys.has(key(b)));
 				const report: string[] = [];
 				if (newDiagnostics.length) report.push(`New ${newDiagnostics.length} diagnostics:`);
 				report.push(...newDiagnostics.slice(0, 10));
@@ -454,7 +460,6 @@ export function createIdeTools(options: IdeToolOptions): AgentTool<any, string>[
 				return report.join("\n") || "No diagnostic changes.";
 			},
 		},
-};
 		},
-	];
+		];
 }
