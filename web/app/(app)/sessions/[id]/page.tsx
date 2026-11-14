@@ -86,7 +86,10 @@ export default function SessionView() {
 	// Bottom-pin: window scrollbar follows new events unless the user scrolls up.
 	const pinnedRef = useRef(true);
 
-	const latestRun = runs[runs.length - 1];
+	// Slice sub-runs share the parent's runId and finish independently — a "done"
+	// slice sorted last would mask a live multi run and hide the Stop button.
+	const mainRuns = runs.filter((r) => r.mode !== "multi-slice" && !r.parentRunId);
+	const latestRun = mainRuns[mainRuns.length - 1];
 	const runOrder = new Map(runs.map((r, i) => [r.runId, i]));
 	const ordered = [...events].sort((a, b) => (runOrder.get(a.runId ?? "") ?? 0) - (runOrder.get(b.runId ?? "") ?? 0) || a.seq - b.seq);
 	const active = !!latestRun && ACTIVE.has(latestRun.status ?? "");

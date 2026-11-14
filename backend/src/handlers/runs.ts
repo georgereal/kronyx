@@ -75,14 +75,17 @@ export async function stopRun(req: Request, p: Record<string, string>): Promise<
 	const db = await getDb();
 	const run = await db.collection("runs").findOne({ uid, runId: p.id });
 	if (!run) return json({ error: "not_found" }, { status: 404 });
-	await db.collection("runs").updateOne({ uid, runId: p.id }, { $set: { control: "stop_requested", updatedAt: new Date() } });
+	// Multi runs spawn sibling docs (mode multi-slice) sharing the runId — the
+	// worker only polls the parent's `control`, but setting it on every doc is
+	// both harmless and lets the UI reflect stopping state per-slice.
+	await db.collection("runs").updateMany({ uid, runId: p.id }, { $set: { control: "stop_requested", updatedAt: new Date() } });
 	// Queued jobs never read control — kill them outright + release the session.
 	const job = await db.collection("cloud_jobs").findOneAndUpdate(
 		{ jobId: p.id, status: "queued" },
 		{ $set: { status: "stopped", finishedAt: new Date() } },
 	);
 	if (job) {
-		await db.collection("runs").updateOne(
+		await db.collection("runs").updateMany(
 			{ uid, runId: p.id },
 			{ $set: { status: "stopped", error: "Cancelled while queued", finishedAt: new Date(), updatedAt: new Date() } },
 		);
@@ -93,7 +96,7 @@ export async function stopRun(req: Request, p: Record<string, string>): Promise<
 		// Claimed/running: worker's stopCheck reads `control` — show progress meanwhile.
 		await db
 			.collection("runs")
-			.updateOne({ uid, runId: p.id, status: { $in: ["running", "claimed"] } }, { $set: { status: "stopping", updatedAt: new Date() } });
+			.updateMany({ uid, runId: p.id, status: { $in: ["running", "claimed"] } }, { $set: { status: "stopping", updatedAt: new Date() } });
 	}
 	return json({ ok: true });
 }

@@ -331,6 +331,11 @@ tbody tr:hover {
 	color: var(--err);
 	background: rgba(248, 113, 113, 0.12);
 }
+.pill-stale {
+	color: var(--warn, #fbbf24);
+	background: rgba(251, 191, 36, 0.12);
+	margin-left: 6px;
+}
 .model-cell {
 	max-width: 280px;
 	overflow: hidden;
@@ -999,3 +1004,39 @@ tbody tr:hover {
 }
 .msg-nav-tick:hover { background: var(--muted, #888); width: 24px; }
 .msg-nav-tick.on { background: var(--accent, #7c9cff); }
+
+/* Multi-agent board: one live card per agent inside the fan-out card. */
+.agent-board { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 8px; }
+.agent-card {
+	border: 1px solid var(--border); border-left-width: 3px; border-radius: 8px;
+	padding: 8px 10px; cursor: pointer;
+	background: var(--surface, rgba(255, 255, 255, 0.02));
+	transition: background 0.15s, border-color 0.15s;
+}
+.agent-card:hover { background: var(--surface-2, rgba(255, 255, 255, 0.05)); }
+.agent-card.running { border-left-color: var(--accent, #7c9cff); }
+.agent-card.done { border-left-color: var(--green, #4ade80); }
+.agent-card.failed { border-left-color: var(--red, #f87171); }
+.agent-card.stopped { border-left-color: var(--amber, #facc15); }
+.agent-card.queued { border-left-color: var(--border); }
+.agent-card-head { display: flex; align-items: center; gap: 8px; }
+.agent-card-head .slice-pill { margin-left: auto; }
+.agent-card .last-act {
+	font-size: 11.5px; margin-top: 5px;
+	overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.agent-card .agent-vitals { font-size: 10.5px; margin-top: 3px; }
+.focus-live { font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40%; }
+
+/* Sub-agent task card — assigned slice prompt, distinct from user bubbles. */
+.agent-task-card {
+	background: var(--surface, rgba(255, 255, 255, 0.03));
+	border: 1px solid var(--border); border-left: 3px solid var(--accent, #7c9cff);
+	border-radius: 10px; padding: 10px 14px;
+}
+.agent-task-card .ev-kind { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-bottom: 4px; }
+
+/* Orphan agent lanes — collapsed container, rows jump to focused view. */
+.orphan-lanes { margin: 6px 0 6px 14px; }
+.orphan-lanes > summary { font-size: 12px; cursor: pointer; padding: 4px 0; }
+.orphan-lanes .slice-lane > summary { cursor: pointer; }

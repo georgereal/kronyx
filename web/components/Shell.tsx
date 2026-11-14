@@ -15,6 +15,7 @@ import {
 	Wrench,
 	History,
 	Home,
+	ListChecks,
 } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
@@ -28,6 +29,7 @@ const COLLAPSE_KEY = "kronyx.sidebarCollapsed";
 const TABS = [
 	{ href: "/", label: "Overview", icon: <Home size={14} /> },
 	{ href: "/sessions", label: "Sessions", icon: <History size={14} /> },
+	{ href: "/jobs", label: "Jobs", icon: <ListChecks size={14} /> },
 	{ href: "/usage", label: "Usage", icon: <BarChart3 size={14} /> },
 	{ href: "/compaction", label: "Compaction", icon: <Shrink size={14} /> },
 	{ href: "/memory", label: "Memory", icon: <Database size={14} /> },

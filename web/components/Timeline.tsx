@@ -501,12 +501,25 @@ function Event({ user, sessionId, e, events, runs, githubUrl }: { user: User; se
 		: "";
 
 	if (ev.type === "run-started") {
-		// User message bubble: task text up front, inlined attachment context
-		// summarized as a chip instead of dumped into the bubble.
+		// Sub-agent runs (agentIndex>0) get an agent task card, not a user
+		// bubble — this is the agent's assigned slice, not something the user typed.
 		const raw = String(ev.task ?? "");
 		const split = raw.split(/\n\nAttached context:\n/);
 		const task = split[0];
 		const attCount = split.length > 1 ? (split[1].match(/--- attached file:/g) ?? []).length : 0;
+		if ((ev.agentIndex ?? 0) > 0) {
+			return (
+				<div className="msg-row">
+					<span className="avatar accent">A{(ev.agentIndex ?? 0)}</span>
+					<div className="agent-task-card" style={{ flex: 1 }}>
+						<div className="ev-kind">Agent {(ev.agentIndex ?? 0)} task</div>
+						<span className="stream-text">{task}</span>
+						{attCount > 0 && <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>+{attCount} attached file{attCount > 1 ? "s" : ""}</div>}
+					</div>
+					<span className="msg-time">{fmtTime(e.at)}</span>
+				</div>
+			);
+		}
 		return (
 			<div className="msg-row">
 				<span className="avatar">{(user.email ?? "U")[0].toUpperCase()}</span>
@@ -777,20 +790,43 @@ export function Timeline({
 			return (
 				<div key={item.key} className="fanout-card">
 					<div className="fanout-head">Fanned out into {slices.length} parallel agents <span className="muted" style={{ fontWeight: 400 }}>— click an agent for its run</span></div>
-					{slices.map((s) => (
-						<div key={s.index} className="fanout-row clickable" onClick={() => setFocus({ runId, ai: s.index })}>
-							<span className="fanout-idx">#{s.index}</span>
-							<span className="fanout-title">{s.title}</span>
-							<span className="muted fanout-owns">{s.owns.slice(0, 3).join(", ")}{s.owns.length > 3 ? ` +${s.owns.length - 3}` : ""}</span>
-							<SlicePill i={s.index} runId={runId} />
-							<span className="fanout-go">›</span>
-						</div>
-					))}
-					<div className="fanout-row clickable" onClick={() => setFocus({ runId, ai: 0 })}>
-						<span className="fanout-idx">#0</span>
-						<span className="fanout-title">Coordinator / merge lane</span>
-						<span className="muted fanout-owns">orchestration + conflict resolution</span>
-						<span className="fanout-go">›</span>
+					<div className="agent-board">
+						{slices.map((s) => {
+							const v = agentVitals(s.index, runId);
+							const st = sliceStatus(s.index, runId);
+							return (
+								<div key={s.index} className={`agent-card ${st}`} onClick={() => setFocus({ runId, ai: s.index })}>
+									<div className="agent-card-head">
+										<span className="fanout-idx">#{s.index}</span>
+										<span className="fanout-title">{s.title}</span>
+										<SlicePill i={s.index} runId={runId} />
+									</div>
+									<div className="muted last-act">{v.lastAct || s.owns.slice(0, 3).join(", ") || "queued"}</div>
+									<div className="muted agent-vitals">
+										{v.tin > 0 && <>{fmtTok(v.tin)} in · {fmtTok(v.tout)} out · </>}
+										{v.ctxPct > 0 && <>ctx {v.ctxPct}% · </>}
+										{v.files > 0 && <>{v.files} file{v.files === 1 ? "" : "s"} · </>}
+										{v.dur}
+									</div>
+								</div>
+							);
+						})}
+						{(() => {
+							const v = agentVitals(0, runId);
+							return (
+								<div className="agent-card coordinator" onClick={() => setFocus({ runId, ai: 0 })}>
+									<div className="agent-card-head">
+										<span className="fanout-idx">#0</span>
+										<span className="fanout-title">Coordinator</span>
+									</div>
+									<div className="muted last-act">{v.lastAct || "orchestration + merge"}</div>
+									<div className="muted agent-vitals">
+										{v.tin > 0 && <>{fmtTok(v.tin)} in · {fmtTok(v.tout)} out · </>}
+										{v.dur}
+									</div>
+								</div>
+							);
+						})()}
 					</div>
 				</div>
 			);
@@ -863,6 +899,38 @@ export function Timeline({
 	};
 	const SlicePill = ({ i, runId }: { i: number; runId?: string }) => <span className={`slice-pill ${sliceStatus(i, runId)}`}>{sliceStatus(i, runId)}</span>;
 
+	/** Live vitals for one agent lane — all derived from the event stream. */
+	const agentVitals = (ai: number, runId?: string) => {
+		let lastAct = "";
+		type UsageEv = { inputTokens?: number; outputTokens?: number; contextPct?: number; contextWindow?: number };
+		let usage: UsageEv | null = null;
+		let files = 0;
+		let startedAt = 0;
+		let endedAt = 0;
+		for (const e of events) {
+			if ((e.event.agentIndex ?? 0) !== ai || (runId && e.runId !== runId)) continue;
+			const ev = e.event as Record<string, unknown> & { type: string };
+			if (ev.type === "run-started") startedAt = Date.parse(e.at ?? "") || startedAt;
+			if (ev.type === "run-finished" || ev.type === "run-failed") endedAt = Date.parse(e.at ?? "") || endedAt;
+			if (ev.type === "usage") usage = ev as unknown as UsageEv;
+			if (ev.type === "file-changed") {
+				files++;
+				lastAct = `edited ${String(ev.path ?? "")}`;
+			}
+			if (ev.type === "tool-started") {
+				const inp = (ev.input ?? {}) as Record<string, unknown>;
+				lastAct = `${String(ev.name)} ${String(inp.path ?? inp.file ?? inp.command ?? inp.url ?? inp.query ?? inp.slug ?? "")}`.trim();
+			}
+			if (ev.type === "assistant-text") lastAct = String(ev.text ?? "").split("\n")[0].slice(0, 100);
+			if (ev.type === "run-finished") lastAct = "finished";
+			if (ev.type === "run-failed") lastAct = `failed: ${String(ev.error ?? "").slice(0, 80)}`;
+		}
+		// Live activity prefers the in-flight tool over the last text.
+		const secs = startedAt ? Math.round(((endedAt || Date.now()) - startedAt) / 1000) : 0;
+		const dur = secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`;
+		return { lastAct, tin: usage?.inputTokens ?? 0, tout: usage?.outputTokens ?? 0, ctxPct: usage?.contextPct ?? 0, files, dur: startedAt ? dur : "" };
+	};
+
 	const lateItems = lateAfter ? seen.filter(isLate) : [];
 	const normalItems = lateAfter ? seen.filter((i) => !isLate(i)) : seen;
 	// Multi-agent lanes: items tagged agentIndex>0 render grouped under the
@@ -914,7 +982,9 @@ export function Timeline({
 							>
 								<summary>
 									<span className="fanout-idx">#{i}</span> {sliceTitle(i, runId)} <SlicePill i={i} runId={runId} />
-									<span className="muted" style={{ marginLeft: "auto" }}>{litems.length} events</span>
+									<span className="muted" style={{ marginLeft: "auto", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "50%" }}>
+										{agentVitals(i, runId).lastAct ? `${agentVitals(i, runId).lastAct} · ` : ""}{litems.length} events
+									</span>
 								</summary>
 								<div className="slice-lane-body">{litems.map((item) => renderItem(item, !!lateAfter))}</div>
 							</details>
@@ -942,6 +1012,7 @@ export function Timeline({
 		const maxCtx = ctxWin ? Math.round((Math.max(0, ...pts.map((p) => p.requestTokens)) / ctxWin) * 100) : 0;
 		const memCount = events.filter((e) => e.runId === runId && (e.event.agentIndex ?? 0) === ai && e.event.type === "memory").length;
 		const compactions = events.filter((e) => e.runId === runId && (e.event.agentIndex ?? 0) === ai && (e.event as { meta?: { kind?: string } }).meta?.kind === "context_compaction").length;
+		const vitals = agentVitals(ai, runId);
 		return (
 			<div className="timeline">
 				<div className="focus-bar">
@@ -949,8 +1020,10 @@ export function Timeline({
 					<span className="fanout-idx">#{ai}</span>
 					<span className="fanout-title">{title}</span>
 					{status ? <span className={`slice-pill ${status}`}>{status}</span> : null}
+					{vitals.lastAct && status === "running" ? <span className="muted focus-live">{vitals.lastAct}</span> : null}
 					<span className="focus-stats muted">
 						{tin > 0 && <>{fmtTok(tin)} in · {fmtTok(tout)} out{cost > 0 ? ` · $${cost.toFixed(4)}` : ""} · </>}
+						{vitals.dur && <>{vitals.dur} · </>}
 						{maxCtx > 0 && <>ctx {maxCtx}% peak · </>}
 						{compactions > 0 && <>{compactions} compaction{compactions === 1 ? "" : "s"} · </>}
 						{memCount} memory · {focusItems.length} events
@@ -987,22 +1060,28 @@ export function Timeline({
 				);
 				const orphans = [...laneItems.keys()].filter((k) => !fanoutRunIds.has(k.split(":")[0]));
 				if (!orphans.length) return null;
+				// One collapsed container — orphan lanes belong to runs whose fan-out
+				// card isn't in this event window; stacking N sections at the bottom
+				// is noise. Clickable rows still drill into the agent's stream.
 				return (
-					<div className="slice-lanes">
+					<details className="slice-lanes orphan-lanes">
+						<summary className="muted">
+							{orphans.length} agent lane{orphans.length === 1 ? "" : "s"} without a fan-out card — click an agent to view its run
+						</summary>
 						{orphans.map((k) => {
-							const i = Number(k.split(":").pop());
+							const [rid, idx] = [k.split(":")[0], Number(k.split(":").pop())];
 							const litems = laneItems.get(k)!;
 							return (
 								<details key={k} className="slice-lane">
-									<summary>
-										<span className="fanout-idx">#{i}</span> Agent {i} events <span className="muted">(no fan-out card)</span>
-										<span className="muted" style={{ marginLeft: "auto" }}>{litems.length} events</span>
+									<summary onClick={(e) => { e.preventDefault(); setFocus({ runId: rid, ai: idx }); }}>
+										<span className="fanout-idx">#{idx}</span> {sliceTitle(idx, rid)}
+										<span className="muted" style={{ marginLeft: "auto" }}>{agentVitals(idx, rid).lastAct ? `${agentVitals(idx, rid).lastAct} · ` : ""}{litems.length} events</span>
 									</summary>
 									<div className="slice-lane-body">{litems.map((item) => renderItem(item, !!lateAfter))}</div>
 								</details>
 							);
 						})}
-					</div>
+					</details>
 				);
 			})()}
 			{lateAfter && (

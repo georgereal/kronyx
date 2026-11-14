@@ -53,6 +53,7 @@ export function makeRoutes(defs: [method: string, pattern: string, handler: Hand
 
 import * as core from "./handlers/core";
 import * as gh from "./handlers/github";
+import * as jobsH from "./handlers/jobs";
 import * as runsH from "./handlers/runs";
 import * as sess from "./handlers/sessions";
 import * as misc from "./handlers/misc";
@@ -78,6 +79,8 @@ export const routes: Route[] = makeRoutes([
 	["POST", "/api/github/resolve", gh.resolve],
 	["GET", "/api/github/callback", gh.callback],
 	["POST", "/api/github/link", gh.link],
+	["GET", "/api/jobs", jobsH.listJobs],
+	["POST", "/api/jobs/:id/requeue", jobsH.requeueJob],
 	["GET", "/api/runs", runsH.listRuns],
 	["GET", "/api/runs/:id/report", runsH.runReport],
 	["GET", "/api/runs/:id", runsH.getRun],
