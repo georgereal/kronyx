@@ -2450,7 +2450,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		const startRef = String(session.startRef ?? session.base ?? "");
 		if (!startRef || startRef === (defaultBranch || "main")) return;
 		const r = await sbx
-			.runIn(REPO_DIR, `git fetch origin ${JSON.stringify(startRef)} && git checkout -B .kronyx-start FETCH_HEAD`, 120_000)
+			.runIn(REPO_DIR, `git fetch origin ${JSON.stringify(startRef)} && git checkout FETCH_HEAD`, 120_000)
 			.catch(swallow("executor", "op", { exitCode: 1, stdout: "", stderr: "" }));
 		await this.sink.emit({
 			type: "info",
@@ -2492,7 +2492,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		const startRef = String(session.startRef ?? session.base ?? "").trim();
 		if (!startRef) return;
 		const r = await sbx
-			.runIn(REPO_DIR, `git fetch origin ${JSON.stringify(startRef)} && git checkout -B .kronyx-start FETCH_HEAD`, 120_000)
+			.runIn(REPO_DIR, `git fetch origin ${JSON.stringify(startRef)} && git checkout FETCH_HEAD`, 120_000)
 			.catch(swallow("executor", "op", { exitCode: 1, stdout: "", stderr: "" }));
 		if (r?.exitCode === 0) {
 			await this.sink.emit({ type: "info", text: `Reading ${session.repo} at ${startRef}` });
@@ -2502,7 +2502,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		const st = await sbx.runIn(REPO_DIR, "git stash push -m kronyx-plan-switch", 30_000).catch(swallow("executor", "op"));
 		const stashed = st?.exitCode === 0 && !st.stdout.includes("No local changes");
 		const r2 = await sbx
-			.runIn(REPO_DIR, `git checkout -B .kronyx-start FETCH_HEAD`, 60_000)
+			.runIn(REPO_DIR, `git checkout FETCH_HEAD`, 60_000)
 			.catch(swallow("executor", "op", { exitCode: 1, stdout: "", stderr: "" }));
 		if (r2?.exitCode === 0) {
 			await this.sink.emit({
