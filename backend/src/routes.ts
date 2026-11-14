@@ -56,6 +56,7 @@ import * as gh from "./handlers/github";
 import * as runsH from "./handlers/runs";
 import * as sess from "./handlers/sessions";
 import * as misc from "./handlers/misc";
+import * as tmpl from "./handlers/templates";
 
 export const routes: Route[] = makeRoutes([
 	["GET", "/api/me", core.me],
@@ -85,6 +86,10 @@ export const routes: Route[] = makeRoutes([
 	["GET", "/api/sandboxes", runsH.listSandboxes],
 	["DELETE", "/api/sandboxes/:id", runsH.deleteSandbox],
 	["POST", "/api/sandboxes/:id/pause", runsH.pauseSandbox],
+	["GET", "/api/templates", tmpl.listTemplates],
+	["POST", "/api/templates/bake", tmpl.bakeTemplate],
+	["POST", "/api/templates/build", tmpl.buildTemplate],
+	["DELETE", "/api/templates/:name", tmpl.deleteTemplate],
 	["GET", "/api/sessions", sess.listSessions],
 	["POST", "/api/sessions", sess.createSession],
 	["GET", "/api/sessions/:id", sess.getSession],

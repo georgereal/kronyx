@@ -56,6 +56,9 @@ async function claimNext(): Promise<CloudJob | null> {
 		{ sort: { createdAt: 1 }, returnDocument: "after" },
 	);
 	if (!job) return null;
+	// Non-run jobs (image bakes, template builds) own their own short-lived VM —
+	// no session lock applies.
+	if (job.kind && job.kind !== "run" && job.kind !== "push-plan" && job.kind !== "open-pr") return job;
 	// Per-session run lock: sessions are turn-based — one run at a time.
 	const locked = await db.collection("sessions").findOneAndUpdate(
 		{ uid: job.uid, sessionId: job.sessionId, activeRunId: { $in: [null, undefined] } },
@@ -173,7 +176,41 @@ async function runJob(job: CloudJob): Promise<void> {
 	}
 }
 
+/**
+ * kind:"bake"/"template-build" jobs — no session, no run doc. Heartbeat keeps
+ * the lease alive; status lands on the job + `image_bakes` (bakeImage writes
+ * ready/error itself; the catch covers crashes).
+ */
+async function runImageJob(job: CloudJob): Promise<void> {
+	const db = await getDb();
+	// No init() — there's no run doc to patch and we don't want a phantom run.
+	const sink = new RunSink(db, job.uid, job.jobId, "");
+	const heartbeat = setInterval(() => {
+		void db
+			.collection("cloud_jobs")
+			.updateOne({ jobId: job.jobId }, { $set: { heartbeatAt: new Date(), leaseUntil: lease() } })
+			.catch(swallow("loop", "op"));
+	}, HEARTBEAT_MS);
+	const executor = new E2bOrchestratedExecutor(db, sink);
+	try {
+		if (job.kind === "bake") await executor.bakeImage(job);
+		else await executor.buildTemplateApi(job);
+		await db.collection("cloud_jobs").updateOne({ jobId: job.jobId }, { $set: { status: "done", finishedAt: new Date() } });
+		log(`image job ${job.jobId} done`);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		await db
+			.collection("cloud_jobs")
+			.updateOne({ jobId: job.jobId }, { $set: { status: "failed", error: message, finishedAt: new Date() } })
+			.catch(swallow("loop", "op"));
+		log(`image job ${job.jobId} failed: ${message}`);
+	} finally {
+		clearInterval(heartbeat);
+	}
+}
+
 const JANITOR_MS = 2 * 60_000;
+let imageJobsRunning = 0;
 
 export async function startWorker(): Promise<void> {
 	log("started — polling cloud_jobs");
@@ -192,7 +229,26 @@ export async function startWorker(): Promise<void> {
 				await new Promise((r) => setTimeout(r, POLL_MS));
 				continue;
 			}
-			log(`claimed job ${job.jobId} (run ${job.runId}, mode ${job.mode})`);
+			log(`claimed job ${job.jobId} (kind ${job.kind ?? "run"}, run ${job.runId}, mode ${job.mode})`);
+			if (job.kind === "bake" || job.kind === "template-build") {
+				// Image jobs don't hold the loop — a bake mustn't make queued
+				// runs wait ~1min. Bounded concurrency so a spammed queue can't
+				// fork-bomb the worker.
+				if (imageJobsRunning < 2) {
+					imageJobsRunning++;
+					void runImageJob(job).finally(() => imageJobsRunning--);
+				} else {
+					// Requeue — try again next poll.
+					await getDb()
+						.then((d) =>
+							d
+								.collection("cloud_jobs")
+								.updateOne({ jobId: job.jobId }, { $set: { status: "queued", claimedBy: null, claimedAt: null, leaseUntil: null } }),
+						)
+						.catch(swallow("loop", "op"));
+				}
+				continue;
+			}
 			await runJob(job);
 		} catch (error) {
 			log(`poll error: ${error instanceof Error ? error.message : error}`);

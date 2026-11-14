@@ -1,6 +1,7 @@
 import { Agent } from "@cline/agents";
 import type { AgentMessage, AgentRuntimeEvent, AgentTool, AgentToolResultPart } from "@cline/shared";
 import { createFileTools, type FileChangeKind, WRITE_TOOL_NAMES } from "../tools/fileTools";
+import { createFetchTools } from "../tools/fetchTools";
 import { buildSystemPrompt } from "./systemPrompt";
 import { createPrepareTurn, taskContextBudget } from "./compaction";
 import { createRecallTool, type PriorTranscript, type RecallScorer } from "./recall";
@@ -242,16 +243,19 @@ export class AgentRunner {
 		let modeWarned = false;
 		const tools = this.host.createTools
 			? await this.host.createTools()
-			: createFileTools({
-					root: this.host.workspaceRoot,
-					isDirty: this.host.isDirty,
-					onFileChanged: (abs, kind, stats) =>
-						this.host.emit({ type: "file-changed", path: this.host.relativePath(abs), kind, ...stats }),
-					onBeforeWrite: this.host.onBeforeWrite,
-					execCommand: this.host.execCommand,
-					planDir: this.host.planDir ? () => this.host.planDir! : undefined,
-					onMemoryFact: this.host.onMemoryFact,
-				});
+			: [
+					...createFileTools({
+						root: this.host.workspaceRoot,
+						isDirty: this.host.isDirty,
+						onFileChanged: (abs, kind, stats) =>
+							this.host.emit({ type: "file-changed", path: this.host.relativePath(abs), kind, ...stats }),
+						onBeforeWrite: this.host.onBeforeWrite,
+						execCommand: this.host.execCommand,
+						planDir: this.host.planDir ? () => this.host.planDir! : undefined,
+						onMemoryFact: this.host.onMemoryFact,
+					}),
+					...createFetchTools(),
+				];
 		const mode = this.host.currentMode();
 		// Per-tool executionMode markers are honored only in write modes; ask/plan
 		// runs strip them to sequential so every call is an ordered boundary.

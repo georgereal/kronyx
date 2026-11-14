@@ -1,10 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import type { Db } from "mongodb";
 import { dbg, swallow } from "../lib/log";
 import { AgentRunner, type AgentMode, type ProviderSettings, type RunViewEvent } from "../../../src/agent/runner";
 import { getProvider, type ProviderCreds, type SandboxHandle, type SandboxProvider } from "../../../src/sandbox/provider";
 import { SandboxCore, openPr } from "../../../src/sandbox/sandboxCore";
 import { createRemoteFileTools } from "../../../src/tools/remoteFileTools";
+import { createFetchTools } from "../../../src/tools/fetchTools";
 import { BROWSER_DRIVER, BROWSER_DRIVER_PATH, SCREENSHOT_PATH, createBrowserTools } from "../../../src/tools/browserTools";
 import { createEnvTools } from "../../../src/tools/envTools";
 import { isAgentCliTemplate, resolveTemplateName, type TemplateInfo } from "../../../src/sandbox/templateCatalog";
@@ -16,6 +18,8 @@ import { recordSandboxEvent } from "../lib/sandboxEvents";
 import { listPlans, loadPlan, savePlanFile } from "../lib/planStore";
 import { FLAGS, flag } from "../lib/flags";
 import { githubPat, loadUserSettings, resolveProvider, type UserSettings } from "./settings";
+import { IMAGE_RECIPES } from "./imageRecipes";
+import { buildE2bTemplate } from "../lib/e2bTemplateBuild";
 import type { RunSink } from "./events";
 import type { AgentMessage } from "@cline/shared";
 import type { PriorTranscript } from "../../../src/agent/recall";
@@ -56,8 +60,10 @@ export interface CloudJob {
 	modelId?: string;
 	profile?: string;
 	attachmentIds?: string[];
-	kind?: "run" | "push-plan" | "open-pr";
+	kind?: "run" | "push-plan" | "open-pr" | "bake" | "template-build";
 	planSlug?: string | null;
+	/** Image recipe key (kind: "bake") or template name (kind: "template-build"). */
+	recipe?: string;
 }
 
 interface SessionDoc {
@@ -966,7 +972,10 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		this.embedProvider = this.embedProviderFor(job, s);
 		const atts = await this.attachments(job);
 		const { runner } = await this.ensureRunner(job, session, "ask", "ask", () =>
-			Promise.resolve([memoryWriteTool(this.db, job.uid, job.sessionId, job.runId, this.embedProvider, { repo: session.repo ?? undefined, branch: session.base }, this.memoryReport)]),
+			Promise.resolve([
+				memoryWriteTool(this.db, job.uid, job.sessionId, job.runId, this.embedProvider, { repo: session.repo ?? undefined, branch: session.base }, this.memoryReport),
+				...createFetchTools(),
+			]),
 		);
 		this.throwIfStopped();
 		await this.sink.emit({ type: "cloud-status", text: "Contacting model…" });
@@ -990,7 +999,17 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			E2bOrchestratedExecutor.templateCache.set(key, { at: Date.now(), list: shared });
 			return shared;
 		}
-		const list = await provider.listTemplates(creds).catch(swallow("executor", "op", []));
+		const list: TemplateInfo[] = (await provider.listTemplates?.(creds).catch(swallow("executor", "op", []))) ?? [];
+		// User-baked named snapshots are first-class selectable images.
+		const baked = await this.db
+			.collection("image_bakes")
+			.find({ uid: this.sink.uid, status: "ready" })
+			.toArray()
+			.catch(swallow("executor", "op", []));
+		for (const b of baked) {
+			if (b.snapshotId && !list.some((t) => t.id === b.snapshotId || t.names.includes(b.name)))
+				list.push({ id: b.snapshotId, names: [String(b.name)], public: false });
+		}
 		dbg("executor", "liveTemplates", { provider: provider.name, count: list.length });
 		if (list.length) {
 			E2bOrchestratedExecutor.templateCache.set(key, { at: Date.now(), list });
@@ -1069,6 +1088,105 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			await bake.close().catch(swallow("executor", "op"));
 			if (bakeId)
 				await this.db.collection("sandboxes").updateOne({ uid: this.sink.uid, sandboxId: bakeId }, { $set: { state: "dead", deadAt: new Date() } }).catch(swallow("executor", "op"));
+		}
+	}
+
+	/**
+	 * kind:"bake" job — boot a stock VM, run an image recipe, snapshot it under
+	 * a stable name so `Sandbox.create` can boot it directly (e.g. kronyx-browser
+	 * for browser_use without the e2b CLI). Status lives in `image_bakes`.
+	 */
+	async bakeImage(job: CloudJob): Promise<void> {
+		const recipe = IMAGE_RECIPES[job.recipe ?? "browser"];
+		if (!recipe) throw new Error(`unknown image recipe: ${job.recipe}`);
+		const col = this.db.collection("image_bakes");
+		const key = { uid: job.uid, name: recipe.imageName, kind: "bake" };
+		const settings = await loadUserSettings(this.db, job.uid);
+		const provider = getProvider("e2b");
+		const creds: ProviderCreds = { secrets: settings.secrets, data: settings.data };
+		const credErr = provider.validate(creds);
+		if (credErr) throw new Error(credErr);
+
+		const bake = new SandboxCore();
+		await bake.create({ creds, provider: "e2b", timeoutMs: 45 * 60_000 });
+		const bakeId = bake.sandboxId;
+		if (bakeId)
+			await this.db
+				.collection("sandboxes")
+				.insertOne({ uid: job.uid, sandboxId: bakeId, provider: "e2b", state: "running", reason: `image-bake:${recipe.imageName}`, at: new Date() })
+				.catch(swallow("executor", "op"));
+		try {
+			const r = await bake.runIn("/", recipe.commands, recipe.timeoutMs ?? 20 * 60_000);
+			if (r.exitCode !== 0) throw new Error(`recipe failed (exit ${r.exitCode}): ${(r.stderr || r.stdout).slice(-600)}`);
+			if (recipe.verify) {
+				const v = await bake.runIn("/", recipe.verify, 60_000);
+				if (v.exitCode !== 0) throw new Error(`verify failed: ${(v.stderr || v.stdout).slice(-400)}`);
+			}
+			// Named fs-only snapshot — re-bakes with the same name supersede the
+			// old one, and the name resolves as a Sandbox.create template.
+			const snapshotId = await bake.checkpoint({ mode: "filesystem", name: recipe.imageName });
+			if (!snapshotId) throw new Error("checkpoint returned no snapshot id");
+			const prev = await col.findOne(key).catch(swallow("executor", "op", null));
+			await col.updateOne(
+				key,
+				{
+					$set: { snapshotId, recipe: job.recipe ?? "browser", status: "ready", bakedAt: new Date(), error: null, kind: "bake" },
+					$setOnInsert: { createdAt: new Date() },
+				},
+				{ upsert: true },
+			);
+			console.log(`[executor] image bake ready: ${recipe.imageName} → ${snapshotId}`);
+			if (prev?.snapshotId && prev.snapshotId !== snapshotId) await bake.deleteSnapshot(prev.snapshotId).catch(swallow("executor", "op", false));
+		} catch (e) {
+			await col
+				.updateOne(key, { $set: { status: "error", error: e instanceof Error ? e.message : String(e), finishedAt: new Date() } })
+				.catch(swallow("executor", "op"));
+			throw e;
+		} finally {
+			await bake.close().catch(swallow("executor", "op"));
+			if (bakeId)
+				await this.db
+					.collection("sandboxes")
+					.updateOne({ uid: job.uid, sandboxId: bakeId }, { $set: { state: "dead", deadAt: new Date() } })
+					.catch(swallow("executor", "op"));
+		}
+	}
+
+	/**
+	 * kind:"template-build" job — real E2B template build via the REST API
+	 * (flag templateBuildApi). Durable named template vs a snapshot: shows up
+	 * in listTemplates and doesn't age out. Status lives in `image_bakes`.
+	 */
+	async buildTemplateApi(job: CloudJob): Promise<void> {
+		const name = String(job.recipe ?? "kronyx-browser").slice(0, 60);
+		const col = this.db.collection("image_bakes");
+		// api-build docs key on name+kind so they never clobber a snapshot bake
+		// of the same alias.
+		const key = { uid: job.uid, name, kind: "api-build" };
+		const settings = await loadUserSettings(this.db, job.uid);
+		const apiKey = String(settings.secrets.e2bApiKey ?? process.env.E2B_API_KEY ?? "");
+		if (!apiKey) throw new Error("E2B_API_KEY is not configured");
+		// dist/index.js → backend/dist/../e2b-template — one level up from the bundle.
+		// FROM e2bdev/base is correct for v3: fromDockerfile() serializes it as
+		// fromImage "e2bdev/base", same as the SDK's own Template().base().
+		const dockerfile = await readFile(new URL("../e2b-template/Dockerfile", import.meta.url), "utf8");
+		await col.updateOne(key, { $set: { status: "building", kind: "api-build", startedAt: new Date() } }, { upsert: true });
+		try {
+			const { templateId } = await buildE2bTemplate(apiKey, { name, dockerfile });
+			await col.updateOne(key, { $set: { status: "ready", templateId, recipe: name, bakedAt: new Date(), error: null } });
+			console.log(`[executor] E2B template build ready: ${name} → ${templateId}`);
+			// Named snapshots and API builds live on the SAME template entity in
+			// E2B — deleting the bake's snapshotId would delete the template we
+			// just built (verified live). So no delete: just mark the bake doc
+			// superseded so pickTemplate/UI know the durable build is canonical.
+			await col
+				.updateOne({ uid: job.uid, name, kind: "bake" }, { $set: { status: "superseded", supersededBy: templateId } })
+				.catch(swallow("executor", "op"));
+		} catch (e) {
+			await col
+				.updateOne(key, { $set: { status: "error", error: e instanceof Error ? e.message : String(e), finishedAt: new Date() } })
+				.catch(swallow("executor", "op"));
+			throw e;
 		}
 	}
 
@@ -1548,6 +1666,8 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 					onPlanSaved: (slug, markdown) => void savePlanFile(job.uid, job.sessionId, slug, markdown, job.runId).catch(swallow("executor", "op")),
 				}),
 				memoryWriteTool(this.db, job.uid, job.sessionId, job.runId, this.embedProvider, { repo: session.repo ?? undefined, branch: session.base }, this.memoryReport),
+				// fetch_url runs worker-side — readable text for URLs the user links.
+				...createFetchTools(),
 				// browser_use drives a UI sub-agent; skip in plan mode (read-only).
 				...(mode === "plan"
 					? []
@@ -2281,6 +2401,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 						isAborted: () => this.stopRequested,
 					}).filter((t) => t.name !== "save_plan"),
 					memoryWriteTool(this.db, job.uid, job.sessionId, sliceRunId, mem.embed, { repo: session.repo ?? undefined, branch: session.base }, sliceReport),
+					...createFetchTools(),
 				]) as Promise<never>,
 			emit: (e) => {
 				if (e.type === "run-finished") finishText.value = String(e.text ?? "");

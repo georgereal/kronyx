@@ -10,6 +10,7 @@ import { checksOnFinish, runChecks } from "../checks";
 import { E2bSandbox, sandboxBackend, sandboxEnabled } from "../sandbox/e2b";
 import { appendFact, createIdeRecallScorer, indexFile, loadMemoryContext, logEpisode } from "../agent/memory";
 import { createFileTools } from "../tools/fileTools";
+import { createFetchTools } from "../tools/fetchTools";
 import { insertMemoryEvent, openStore } from "../store";
 import { createIdeTools } from "./ideTools";
 import { autoApproveWrites, estimateCostUsd, implementPrompt, modelPricing, planDir, promptForApiKey, providerErrorMessage, readProviderSettings, resolveProvider, writeProviderValue } from "../config";
@@ -347,6 +348,7 @@ export class SessionController {
 								insertMemoryEvent(st, { op: String(d.op ?? "ide_context"), detail: d, session: this.name }, root),
 							),
 					}),
+					...createFetchTools(),
 				],
 				memoryContext: async (task, s) => [devContext(root), await loadMemoryContext(root, task, s)].filter(Boolean).join("\n\n"),
 				onMemoryFact: (fact) => appendFact(root, fact),

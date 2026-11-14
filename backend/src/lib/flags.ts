@@ -69,6 +69,7 @@ export const FLAGS = {
 	sliceFork: "sliceFork",
 	warmTemplates: "warmTemplates",
 	snapshotCheckpoints: "snapshotCheckpoints",
+	templateBuildApi: "templateBuildApi",
 } as const;
 
 /** Test/debug helper: drop the in-memory cache. */

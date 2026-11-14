@@ -6,6 +6,7 @@ import { insertPr, insertSandboxEvent, kvGet, kvSet, openStore } from "../store"
 import { deviceName, getDeviceId } from "../settingsSync";
 import { E2bSandbox, e2bApiKey, openPr } from "../sandbox/e2b";
 import { createRemoteFileTools } from "../tools/remoteFileTools";
+import { createFetchTools } from "../tools/fetchTools";
 import type { SandboxHandle } from "../sandbox/provider";
 import type { RunViewProvider, WebviewMessage } from "./runViewProvider";
 import type { SessionDeps } from "./sessionController";
@@ -517,7 +518,7 @@ export class CloudController {
 					},
 					setTimeout: (ms) => sbx.inner?.setTimeout?.(ms) ?? Promise.resolve(),
 				};
-				return Promise.resolve(createRemoteFileTools(live, REPO_DIR, { planDir: PLAN_DIR }));
+				return Promise.resolve([...createRemoteFileTools(live, REPO_DIR, { planDir: PLAN_DIR }), ...createFetchTools()]);
 			},
 			emit: (event) => {
 				this.surface.post(event);

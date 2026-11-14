@@ -905,14 +905,52 @@ tbody tr:hover {
 .ctx-bar.lg { display: block; width: 100%; height: 8px; margin-top: 6px; }
 
 /* Live activity line while a run is in progress */
+.run-panel {
+	padding: 0 4px 8px;
+}
 .run-status {
 	display: flex;
 	align-items: center;
 	gap: 8px;
-	padding: 2px 12px 8px;
+	padding: 2px 8px;
 	font-size: 12.5px;
 	color: var(--muted);
 	font-weight: 500;
+	background: none;
+	border: none;
+	cursor: pointer;
+	font-family: inherit;
+	text-align: left;
+	width: 100%;
+}
+.run-elapsed {
+	margin-left: auto;
+	font-weight: 400;
+	font-size: 11.5px;
+	font-variant-numeric: tabular-nums;
+}
+.run-caret {
+	font-size: 10px;
+	opacity: 0.7;
+}
+.run-inflight {
+	display: flex;
+	flex-direction: column;
+	gap: 3px;
+	padding: 4px 8px 4px 26px;
+}
+.run-inflight-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	font-size: 11.5px;
+	color: var(--muted);
+}
+.run-inflight-dur {
+	margin-left: auto;
+	font-variant-numeric: tabular-nums;
+	font-size: 11px;
+	opacity: 0.8;
 }
 .run-status .spark {
 	color: var(--accent);
