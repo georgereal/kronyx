@@ -139,10 +139,11 @@ export function createRecallTool(opts: RecallOptions = {}): AgentTool<RecallInpu
 				if (opts.scorer) {
 					const chunks: RecallChunk[] = messages.map((m, idx) => ({ idx, role: m.role, text: messageText(m) }));
 					const ranked = await opts.scorer(input.query, chunks).catch(() => undefined);
-					if (ranked?.length) {
+					// Drop out-of-range indices first so an all-invalid result falls back to keyword search.
+					const valid = (ranked ?? []).filter((h) => chunks[h.idx] !== undefined);
+					if (valid.length) {
 						return cap(
-							ranked
-								.filter((h) => chunks[h.idx] !== undefined)
+							valid
 								.slice(0, MAX_HITS)
 								.map(
 									(h) =>

@@ -142,6 +142,12 @@ export async function runJanitorSweep(db: Db): Promise<{ users: number; killed: 
 			(s) => `${s.uid}:${s.sessionId}`,
 		),
 	);
+	// Live runs also count as busy, so a queued/claimed/stopping run keeps its VM.
+	const liveRuns = await db
+		.collection("runs")
+		.find({ status: { $in: ["queued", "claimed", "running", "stopping"] } }, { projection: { uid: 1, sessionId: 1 } })
+		.toArray();
+	for (const r of liveRuns) busySessions.add(`${r.uid}:${r.sessionId}`);
 	// Idle pause — durable backstop for the in-process timer (dies on restarts).
 	const idleRows = await db
 		.collection("sandboxes")
@@ -178,14 +184,6 @@ export async function runJanitorSweep(db: Db): Promise<{ users: number; killed: 
 			paused++;
 		}
 	}
-	// Sessions with a live run — their sandbox is in use, even if the session
-	// hasn't been touched recently.
-	const busySessions = new Set<string>();
-	const liveRuns = await db
-		.collection("runs")
-		.find({ status: { $in: ["queued", "claimed", "running", "stopping"] } }, { projection: { uid: 1, sessionId: 1 } })
-		.toArray();
-	for (const r of liveRuns) busySessions.add(`${r.uid}:${r.sessionId}`);
 	// Policy kills — only driven by session inactivity, paused age, or a pending
 	// replacement kill. Never killed while a session is merely resting.
 	const rows: Record<string, any>[] = await db

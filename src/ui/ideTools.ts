@@ -331,8 +331,9 @@ export function createIdeTools(options: IdeToolOptions): AgentTool<any, string>[
 				});
 				return `Renamed to "${newName}" — ${edits.length} edit(s) in ${files.size} file(s):\n${edits.slice(0, MAX_REFS).join("\n")}`;
 			},
-			{
-				name: "code_action",
+		},
+		{
+			name: "code_action",
 			executionMode: "parallel",
 			description:
 				"Apply a code action suggested by the language server (refactor, quick-fix, or similar). " +
@@ -347,19 +348,19 @@ export function createIdeTools(options: IdeToolOptions): AgentTool<any, string>[
 			},
 			async execute(input: { path?: string; position: { line: number; character: number } }) {
 				const t0 = Date.now();
-				const uri = input.path ? uriFor(input.path) : undefined;
-				const prep = await exec<vscode.CodeAction[]>("vscode.executeCodeActionProvider", uri, new vscode.Position(input.position.line, input.position.character), vscode.CodeActionKind.All);
+				const uri = uriFor(String(input.path ?? ""));
+				const pos = new vscode.Position(input.position.line, input.position.character);
+				const prep = await exec<vscode.CodeAction[]>("vscode.executeCodeActionProvider", uri, new vscode.Range(pos, pos));
 				if (!prep) return "No code action provider or no actions returned.";
 				const actions = prep.slice(0, MAX_CODE_ACTIONS);
 				const out: string[] = [];
 				for (const a of actions) {
-					const kind = a.kind ? vscode.CodeActionKind[a.kind] : "";
-					out.push(`-${a.title} ${kind ? `[${kind}]` : ""}`);
+					const kind = a.kind?.value ?? "";
+					out.push(`-${a.title}${kind ? ` [${kind}]` : ""}`);
 					if (a.edit) {
-						const edits = a.edit.get(uri);
-						if (edits) {
+						for (const [u, edits] of a.edit.entries()) {
 							for (const e of edits) {
-								out.push(`  ${rel(uri)}:${e.range.start.line + 1}:${e.range.start.character + 1} ${e.newText?.slice(0, 80) ?? ""}`);
+								out.push(`  ${rel(u)}:${e.range.start.line + 1}:${e.range.start.character + 1} ${e.newText.slice(0, 80)}`);
 							}
 						}
 					}
@@ -414,7 +415,7 @@ export function createIdeTools(options: IdeToolOptions): AgentTool<any, string>[
 				if (!editor) return "No active editor.";
 				const doc = editor.document;
 				const sel = editor.selection;
-				const extend = Math.max(0, (input.extend ?? 5));
+				const extend = Math.min(10, Math.max(0, input.extend ?? 5));
 				const startLine = Math.max(0, sel.start.line - extend);
 				const endLine = Math.min(doc.lineCount - 1, sel.end.line + extend);
 				const selectedText = doc.getText(new vscode.Range(startLine, 0, endLine + 1, doc.lineAt(endLine).range.end.character));
@@ -459,7 +460,6 @@ export function createIdeTools(options: IdeToolOptions): AgentTool<any, string>[
 				options.report?.({ op: "ide_context", tool: "post_edit_diagnostics", path: input.path, newCount: newDiagnostics.length, resolvedCount: resolved.length, tookMs: Date.now() - t0 });
 				return report.join("\n") || "No diagnostic changes.";
 			},
-		},
 		},
 		];
 }

@@ -90,6 +90,46 @@ describe("recall_context", () => {
 		expect(out).toContain("FULL-OUTPUT-xyz");
 	});
 
+	it("drops scorer hits with out-of-range indices", async () => {
+		const scored = createRecallTool({
+			scorer: async () => [
+				{ idx: 99, score: 0.99 },
+				{ idx: 2, score: 0.5 },
+			],
+		});
+		const out = await Promise.resolve(scored.execute({ query: "anything" }, ctxWith(transcript)));
+		expect(out).not.toContain("message #99");
+		expect(out).toContain("message #2");
+		expect(out).toContain("0.50");
+	});
+
+	it("falls back to keyword search when every scorer hit is out of range", async () => {
+		const scored = createRecallTool({ scorer: async () => [{ idx: 50, score: 0.9 }] });
+		const out = await Promise.resolve(scored.execute({ query: "tokenizer" }, ctxWith(transcript)));
+		expect(out).toContain("tokenizer code");
+		expect(out).not.toContain("message #50");
+	});
+
+	it("caps semantic results at the max hit count", async () => {
+		const many = Array.from({ length: 12 }, (_, i) => msg("assistant", [{ type: "text", text: `chunk ${i}` }]));
+		const scored = createRecallTool({
+			scorer: async () => many.map((_, idx) => ({ idx, score: 1 - idx / 100 })),
+		});
+		const out = await Promise.resolve(scored.execute({ query: "chunk" }, ctxWith(many)));
+		expect(out.match(/^--- message #/gm)?.length).toBe(5);
+		expect(out).toContain("message #4");
+		expect(out).not.toContain("message #5 ");
+	});
+
+	it("truncates long semantic snippets to the snippet bound", async () => {
+		const long = [msg("assistant", [{ type: "text", text: "x".repeat(5_000) }])];
+		const scored = createRecallTool({ scorer: async () => [{ idx: 0, score: 0.7 }] });
+		const out = await Promise.resolve(scored.execute({ query: "x" }, ctxWith(long)));
+		// body is bounded to 2*SNIPPET_RADIUS + 800 = 1200 chars; header adds a short line
+		expect(out).toContain("x".repeat(1_200));
+		expect(out).not.toContain("x".repeat(1_201));
+	});
+
 	it("renders keyword snippets without JSON escapes", async () => {
 		const multi = [msg("assistant", [{ type: "text", text: "first line\nsecond \"quoted\" tokenizer line" }])];
 		const out = await Promise.resolve(tool.execute({ query: "tokenizer" }, ctxWith(multi)));
