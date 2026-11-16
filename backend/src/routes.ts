@@ -58,6 +58,8 @@ import * as runsH from "./handlers/runs";
 import * as sess from "./handlers/sessions";
 import * as misc from "./handlers/misc";
 import * as tmpl from "./handlers/templates";
+import * as mem from "./handlers/memories";
+import * as modelsH from "./handlers/models";
 
 export const routes: Route[] = makeRoutes([
 	["GET", "/api/me", core.me],
@@ -69,6 +71,13 @@ export const routes: Route[] = makeRoutes([
 	["GET", "/api/usage", core.usage],
 	["GET", "/api/compactions", core.compactions],
 	["GET", "/api/memory", core.memory],
+	["POST", "/api/memories", mem.createMemory],
+	["PATCH", "/api/memories/:id", mem.updateMemory],
+	["DELETE", "/api/memories/:id", mem.deleteMemory],
+	["POST", "/api/memories/import", mem.importMemories],
+	["POST", "/api/memories/recall", mem.recallMemories],
+	["GET", "/api/memories/export", mem.exportMemories],
+	["GET", "/api/models/pricing", modelsH.modelPricing],
 	["GET", "/api/ide", core.ide],
 	["POST", "/api/ingest", core.ingest],
 	["GET", "/api/github/repos", gh.repos],
@@ -87,11 +96,16 @@ export const routes: Route[] = makeRoutes([
 	["POST", "/api/runs/:id/stop", runsH.stopRun],
 	["POST", "/api/runs/:id/permissions/:permId", runsH.decidePermission],
 	["GET", "/api/sandboxes", runsH.listSandboxes],
+	["GET", "/api/sandboxes/:id", runsH.getSandbox],
 	["DELETE", "/api/sandboxes/:id", runsH.deleteSandbox],
 	["POST", "/api/sandboxes/:id/pause", runsH.pauseSandbox],
+	["POST", "/api/sandboxes/:id/resume", runsH.resumeSandbox],
+	["POST", "/api/sandboxes/:id/snapshot", runsH.snapshotSandbox],
 	["GET", "/api/templates", tmpl.listTemplates],
 	["POST", "/api/templates/bake", tmpl.bakeTemplate],
+	["POST", "/api/templates/scan", tmpl.scanTemplate],
 	["POST", "/api/templates/build", tmpl.buildTemplate],
+	["POST", "/api/templates/map", tmpl.mapTemplate],
 	["DELETE", "/api/templates/:name", tmpl.deleteTemplate],
 	["GET", "/api/sessions", sess.listSessions],
 	["POST", "/api/sessions", sess.createSession],

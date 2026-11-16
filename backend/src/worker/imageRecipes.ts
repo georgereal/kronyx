@@ -14,6 +14,10 @@ export interface ImageRecipe {
 	/** Non-zero exit fails the bake. */
 	verify?: string;
 	timeoutMs?: number;
+	/** Catalog metadata for the Templates UI. */
+	base?: string;
+	tools?: string[];
+	description?: string;
 }
 
 export const IMAGE_RECIPES: Record<string, ImageRecipe> = {
@@ -32,5 +36,8 @@ export const IMAGE_RECIPES: Record<string, ImageRecipe> = {
 		].join(" && "),
 		verify: `python3 -c "import browser_use, playwright; print('ok')"`,
 		timeoutMs: 25 * 60_000,
+		base: "stock e2b",
+		tools: ["Chromium", "Playwright", "browser-use", "xvfb", "Qt libs"],
+		description: "Browser automation + GUI apps — powers the browser_use tool and post-run screenshots.",
 	},
 };

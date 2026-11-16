@@ -16,7 +16,7 @@ import { fetchModels, type ModelOption } from "../lib/models";
 import { getCache } from "./cache";
 import { recordSandboxEvent } from "../lib/sandboxEvents";
 import { listPlans, loadPlan, savePlanFile } from "../lib/planStore";
-import { FLAGS, flag } from "../lib/flags";
+import { FLAGS, flag, flagOff } from "../lib/flags";
 import { githubPat, loadUserSettings, resolveProvider, type UserSettings } from "./settings";
 import { IMAGE_RECIPES } from "./imageRecipes";
 import { buildE2bTemplate } from "../lib/e2bTemplateBuild";
@@ -67,6 +67,13 @@ export interface CloudJob {
 	planSlug?: string | null;
 	/** Image recipe key (kind: "bake") or template name (kind: "template-build"). */
 	recipe?: string;
+	/** Inline recipe from the UI wizard (kind: "bake") — wins over `recipe`. */
+	customRecipe?: { imageName: string; commands: string; verify?: string; timeoutMs?: number };
+	/** Repo-scoped bake: clone this repo before running the recipe → kronyx-repo-<key>. */
+	repo?: string;
+	installationId?: number;
+	/** Generated Dockerfile (kind: "template-build") — wins over the bundled one. */
+	dockerfile?: string;
 }
 
 interface SessionDoc {
@@ -341,12 +348,15 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	 * signal and a hard timeout. The underlying promise keeps running — if it
 	 * eventually produces a SandboxCore we close it so no VM leaks untracked.
 	 */
-	private raceStop<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+	private raceStop<T>(p: Promise<T>, ms: number, label: string, sessionSandboxId?: string): Promise<T> {
 		return new Promise<T>((resolve, reject) => {
 			const fail = (err: Error) => {
 				clearTimeout(timer);
 				p.then((v) => {
-					if (v instanceof SandboxCore) void v.close().catch(swallow("executor", "op"));
+					// Close only a genuinely new VM — when ensureSandbox reused the
+					// session's warm sandbox it returns the same id, and killing it
+					// here would orphan the session's worktree for no reason.
+					if (v instanceof SandboxCore && v.sandboxId !== sessionSandboxId) void v.close().catch(swallow("executor", "op"));
 				}).catch(() => {});
 				reject(err);
 			};
@@ -1054,14 +1064,14 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	private static templateCache = new Map<string, { at: number; list: TemplateInfo[] }>();
 	private templates: TemplateInfo[] = [];
 
-	private async liveTemplates(provider: SandboxProvider, creds: ProviderCreds): Promise<TemplateInfo[]> {
+	private async liveTemplates(provider: SandboxProvider, creds: ProviderCreds, force = false): Promise<TemplateInfo[]> {
 		if (!provider.listTemplates) return [];
 		const key = String(creds.secrets.e2bApiKey ?? "").slice(-12) || provider.name;
 		const hit = E2bOrchestratedExecutor.templateCache.get(key);
-		if (hit && Date.now() - hit.at < 10 * 60_000) return hit.list;
+		if (!force && hit && Date.now() - hit.at < 10 * 60_000) return hit.list;
 		// Shared cache — template catalogs rarely change; other workers hit this.
 		const cache = await getCache().catch(swallow("executor", "op", undefined));
-		const shared = (await cache?.get(`templates:${key}`).catch(() => undefined)) as TemplateInfo[] | undefined;
+		const shared = force ? undefined : ((await cache?.get(`templates:${key}`).catch(() => undefined)) as TemplateInfo[] | undefined);
 		if (shared?.length) {
 			E2bOrchestratedExecutor.templateCache.set(key, { at: Date.now(), list: shared });
 			return shared;
@@ -1086,7 +1096,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	}
 
 	/**
-	 * Warm per-repo boot (flags.warmTemplates): an E2B snapshot baked with the
+	 * Warm per-repo boot (on by default; feature_flags.enabled=false disables):
 	 * repo cloned + deps installed. `Sandbox.create({template: snapshotId})`
 	 * boots straight onto the baked disk — cold start skips clone/install.
 	 * Returns a ready snapshotId (<24h old) or kicks a background bake and
@@ -1094,8 +1104,9 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	 */
 	private async warmSnapshotFor(session: SessionDoc, settings: UserSettings, creds: ProviderCreds): Promise<string | null> {
 		if (!session.repo) return null;
-		const on = await flag(this.db, { uid: this.sink.uid, repo: session.repo, sessionId: session.sessionId }, FLAGS.warmTemplates);
-		if (!on) return null;
+		// On by default — warm snapshots are the core speedup, not an
+		// experiment. Admins can still disable via feature_flags.enabled=false.
+		if (await flagOff(this.db, FLAGS.warmTemplates)) return null;
 		const key = createHash("sha256").update(`${this.sink.uid}:${session.repo}`).digest("hex").slice(0, 16);
 		const col = this.db.collection("repo_templates");
 		const doc = await col.findOne({ key }).catch(swallow("executor", "op", null));
@@ -1112,6 +1123,9 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			if (decision.action === "skip") dbg("executor", `warm bake skipped for ${session.repo}: ${decision.reason}`);
 			return null;
 		}
+		await this.sink
+			.emit({ type: "info", key: "sandbox", text: `No ready warm snapshot for ${session.repo} — baking one in the background; this run boots a template` })
+			.catch(swallow("executor", "op"));
 		await col
 			.updateOne(
 				{ key },
@@ -1119,7 +1133,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				{ upsert: true },
 			)
 			.catch(swallow("executor", "op"));
-		void this.bakeWarmSnapshot(key, session, settings, creds, doc?.snapshotId as string | undefined).catch(async (e) => {
+		void this.bakeWarmSnapshot(key, session, settings, creds, doc?.snapshotId as string | undefined, (doc as { template?: string } | null)?.template).catch(async (e) => {
 			console.log(`[executor] warm snapshot bake failed for ${session.repo}:`, e);
 			await col
 				.updateOne({ key }, { $set: { status: "failed", error: String(e).slice(0, 300), updatedAt: new Date(), failedAt: new Date() } })
@@ -1152,11 +1166,13 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	/** Bake a repo snapshot: stock VM → clone → best-effort dep install →
 	 *  persistent filesystem snapshot → kill. Runs outside the job's lifecycle
 	 *  (fire-and-forget) — no secrets are baked, the clone is unauthenticated. */
-	private async bakeWarmSnapshot(key: string, session: SessionDoc, settings: UserSettings, creds: ProviderCreds, prevSnapshotId?: string): Promise<void> {
+	private async bakeWarmSnapshot(key: string, session: SessionDoc, settings: UserSettings, creds: ProviderCreds, prevSnapshotId?: string, repoTemplate?: string): Promise<void> {
 		const col = this.db.collection("repo_templates");
 		const bake = new SandboxCore();
-		// Bake from the user's cloud.template so the warm VM matches the project's base.
-		await bake.create({ creds, provider: "e2b", template: String(settings.data.e2bTemplate ?? "") || undefined, timeoutMs: 30 * 60_000 });
+		// Bake from the repo's designated template (else user's cloud.template)
+		// so the warm VM layers repo state onto the project's toolchain image.
+		const base = repoTemplate || String(settings.data.e2bTemplate ?? "") || undefined;
+		await bake.create({ creds, provider: "e2b", template: base, timeoutMs: 30 * 60_000 });
 		// Register the bake VM so it's janitor-visible if the worker dies
 		// mid-bake (otherwise it's an untracked orphan).
 		const bakeId = bake.sandboxId;
@@ -1189,7 +1205,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			// existing snapshot template; fs mode since boots are cold anyway.
 			const snapshotId = await bake.checkpoint({ mode: "filesystem", name: `kronyx-repo-${key}` });
 			if (!snapshotId) throw new Error("checkpoint returned no snapshot id");
-			await col.updateOne({ key }, { $set: { status: "ready", snapshotId, depsOk, depsHash, updatedAt: new Date(), failedAt: null } }).catch(swallow("executor", "op"));
+			await col.updateOne({ key }, { $set: { status: "ready", snapshotId, depsOk, depsHash, baseTemplate: base, updatedAt: new Date(), failedAt: null } }).catch(swallow("executor", "op"));
 			console.log(`[executor] warm snapshot ready for ${session.repo}: ${snapshotId}`);
 			// Delete the superseded snapshot so rebakes don't accumulate.
 			if (prevSnapshotId && prevSnapshotId !== snapshotId) await bake.deleteSnapshot(prevSnapshotId).catch(swallow("executor", "op", false));
@@ -1213,49 +1229,79 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	 * for browser_use without the e2b CLI). Status lives in `image_bakes`.
 	 */
 	async bakeImage(job: CloudJob): Promise<void> {
-		const recipe = IMAGE_RECIPES[job.recipe ?? "browser"];
+		const recipe = job.customRecipe ?? IMAGE_RECIPES[job.recipe ?? "browser"];
 		if (!recipe) throw new Error(`unknown image recipe: ${job.recipe}`);
-		const col = this.db.collection("image_bakes");
-		const key = { uid: job.uid, name: recipe.imageName, kind: "bake" };
+		const repoKey = job.repo ? createHash("sha256").update(`${job.uid}:${job.repo}`).digest("hex").slice(0, 16) : null;
+		const imageName = repoKey ? `kronyx-repo-${repoKey}` : recipe.imageName;
+		const col = this.db.collection(repoKey ? "repo_templates" : "image_bakes");
+		const key = repoKey ? { key: repoKey } : { uid: job.uid, name: imageName, kind: "bake" };
 		const settings = await loadUserSettings(this.db, job.uid);
 		const provider = getProvider("e2b");
 		const creds: ProviderCreds = { secrets: settings.secrets, data: settings.data };
 		const credErr = provider.validate(creds);
 		if (credErr) throw new Error(credErr);
 
+		// Repo-scoped bakes boot from the repo's designated template so the
+		// warm snapshot layers repo state onto its toolchain image.
+		const prevDoc = repoKey ? ((await col.findOne(key).catch(swallow("executor", "op", null))) as { template?: string; snapshotId?: string } | null) : null;
 		const bake = new SandboxCore();
-		await bake.create({ creds, provider: "e2b", timeoutMs: 45 * 60_000 });
+		await bake.create({ creds, provider: "e2b", template: prevDoc?.template || undefined, timeoutMs: 45 * 60_000 });
 		const bakeId = bake.sandboxId;
 		if (bakeId)
 			await this.db
 				.collection("sandboxes")
-				.insertOne({ uid: job.uid, sandboxId: bakeId, provider: "e2b", state: "running", reason: `image-bake:${recipe.imageName}`, at: new Date() })
+				.insertOne({ uid: job.uid, sandboxId: bakeId, provider: "e2b", state: "running", reason: `image-bake:${imageName}`, at: new Date() })
 				.catch(swallow("executor", "op"));
 		try {
-			const r = await bake.runIn("/", recipe.commands, recipe.timeoutMs ?? 20 * 60_000);
+			if (job.repo) {
+				const token = typeof job.installationId === "number" ? await installationToken(job.installationId).catch(swallow("executor", "op", "")) : "";
+				await bake.cloneRepo(`https://github.com/${job.repo}`, token, REPO_DIR);
+				// Scrub the token-bearing remote URL before snapshotting.
+				await bake.runIn(REPO_DIR, `git remote set-url origin ${JSON.stringify(`https://github.com/${job.repo}`)}`, 15_000).catch(swallow("executor", "op"));
+			}
+			const r = await bake.runIn(job.repo ? REPO_DIR : "/", recipe.commands, recipe.timeoutMs ?? 20 * 60_000);
 			if (r.exitCode !== 0) throw new Error(`recipe failed (exit ${r.exitCode}): ${(r.stderr || r.stdout).slice(-600)}`);
 			if (recipe.verify) {
-				const v = await bake.runIn("/", recipe.verify, 60_000);
+				const v = await bake.runIn(job.repo ? REPO_DIR : "/", recipe.verify, 60_000);
 				if (v.exitCode !== 0) throw new Error(`verify failed: ${(v.stderr || v.stdout).slice(-400)}`);
+			}
+			let depsHash: string | undefined;
+			if (job.repo) {
+				const manifests: Record<string, string> = {};
+				for (const f of DEP_FILES) {
+					const m = await bake.runIn(REPO_DIR, `cat ${f}`, 15_000).catch(() => null);
+					if (m?.exitCode === 0) manifests[f] = m.stdout;
+				}
+				depsHash = depsFingerprint(manifests);
 			}
 			// Named fs-only snapshot — re-bakes with the same name supersede the
 			// old one, and the name resolves as a Sandbox.create template.
-			const snapshotId = await bake.checkpoint({ mode: "filesystem", name: recipe.imageName });
+			const snapshotId = await bake.checkpoint({ mode: "filesystem", name: imageName });
 			if (!snapshotId) throw new Error("checkpoint returned no snapshot id");
-			const prev = await col.findOne(key).catch(swallow("executor", "op", null));
+			const prev = prevDoc ?? (await col.findOne(key).catch(swallow("executor", "op", null)));
 			await col.updateOne(
 				key,
-				{
-					$set: { snapshotId, recipe: job.recipe ?? "browser", status: "ready", bakedAt: new Date(), error: null, kind: "bake" },
-					$setOnInsert: { createdAt: new Date() },
-				},
+				repoKey
+					? {
+							$set: { status: "ready", snapshotId, depsOk: true, depsHash, uid: job.uid, repo: job.repo, baseTemplate: prevDoc?.template, updatedAt: new Date(), failedAt: null },
+							$setOnInsert: { createdAt: new Date() },
+						}
+					: {
+							$set: { snapshotId, recipe: job.recipe ?? "custom", status: "ready", bakedAt: new Date(), error: null, kind: "bake" },
+							$setOnInsert: { createdAt: new Date() },
+						},
 				{ upsert: true },
 			);
-			console.log(`[executor] image bake ready: ${recipe.imageName} → ${snapshotId}`);
+			console.log(`[executor] image bake ready: ${imageName} → ${snapshotId}`);
 			if (prev?.snapshotId && prev.snapshotId !== snapshotId) await bake.deleteSnapshot(prev.snapshotId).catch(swallow("executor", "op", false));
 		} catch (e) {
 			await col
-				.updateOne(key, { $set: { status: "error", error: e instanceof Error ? e.message : String(e), finishedAt: new Date() } })
+				.updateOne(
+					key,
+					repoKey
+						? { $set: { status: "failed", error: e instanceof Error ? e.message : String(e), failedAt: new Date(), updatedAt: new Date() } }
+						: { $set: { status: "error", error: e instanceof Error ? e.message : String(e), finishedAt: new Date() } },
+				)
 				.catch(swallow("executor", "op"));
 			throw e;
 		} finally {
@@ -1285,7 +1331,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		// dist/index.js → backend/dist/../e2b-template — one level up from the bundle.
 		// FROM e2bdev/base is correct for v3: fromDockerfile() serializes it as
 		// fromImage "e2bdev/base", same as the SDK's own Template().base().
-		const dockerfile = await readFile(new URL("../e2b-template/Dockerfile", import.meta.url), "utf8");
+		const dockerfile = job.dockerfile ?? (await readFile(new URL("../e2b-template/Dockerfile", import.meta.url), "utf8"));
 		await col.updateOne(key, { $set: { status: "building", kind: "api-build", startedAt: new Date() } }, { upsert: true });
 		try {
 			const { templateId } = await buildE2bTemplate(apiKey, { name, dockerfile });
@@ -1324,7 +1370,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		// cached 10 min, so this is usually a map read.
 		this.templates = await this.liveTemplates(provider, creds);
 		const sbx = new SandboxCore();
-		sbx.onLifecycle = (event, sandboxId) => {
+		sbx.onLifecycle = (event, sandboxId, extra) => {
 			const state =
 				event === "pause"
 					? "paused"
@@ -1338,181 +1384,353 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				provider: providerName,
 				event,
 				state,
+				...(extra?.snapshotId ? { snapshotId: String(extra.snapshotId) } : {}),
 			});
+			// Terminal states are sticky: a late event (e.g. the provider pause
+			// that lands after we marked the VM replaced) must not resurrect it.
 			void this.db
 				.collection("sandboxes")
 				.updateOne(
 					{ uid: this.sink.uid, sandboxId },
-					{
-						$set: { uid: this.sink.uid, sessionId: session.sessionId, sandboxId, provider: providerName, event, ...(state ? { state } : {}), at: new Date() },
-						$setOnInsert: { createdAt: new Date() },
-					},
+					[
+						{
+							$set: {
+								uid: this.sink.uid, sessionId: session.sessionId, sandboxId, provider: providerName, event, at: new Date(),
+								...(state ? { state: { $cond: [{ $in: ["$state", ["dead", "replaced"]] }, "$state", state] } } : {}),
+								createdAt: { $ifNull: ["$createdAt", "$$NOW"] },
+							},
+						},
+					],
 					{ upsert: true },
 				)
 				.catch(swallow("executor", "op"));
 		};
 		sbx.setIdlePause(Number(process.env.SANDBOX_IDLE_PAUSE_MINUTES) || 15);
-		// Session → sandbox is a relational link: reuse until dead, then replace.
-		// Providers without reconnect (e.g. vercel — ephemeral) always create fresh.
+		// Boot ladder — the first step that yields a live VM wins:
+		//   1. reuse the session's sandbox (connect/probe, then the resume
+		//      ladder: memory → disk-only → blind disk resume)
+		//   2. restore the session WIP disk snapshot (full worktree)
+		//   3. create from the ordered template chain (base = last resort)
+		// Providers without reconnect (e.g. vercel — ephemeral) skip to 3.
 		const oldId = session.sandboxId;
-		if (oldId && provider.capabilities.reconnect) {
-			// Retry connect before concluding it's dead — transient API/network
-			// blips must not churn sandboxes.
-			let connected = false;
-			for (let attempt = 0; attempt < 4 && !connected; attempt++) {
-				if (attempt > 0) await new Promise((r) => setTimeout(r, 1500 * attempt));
-				connected = !!(await sbx.connect(oldId, creds, providerName));
-			}
-			if (connected) {
-				// connect() returning a handle proves nothing — a VM at
-				// end-of-life can accept the handshake then die under load.
-				// A VM chewing detached leftovers from a stopped run looks the
-				// same, so the probe gets slack, one zombie sweep, and a retry
-				// before we condemn it — a wrong verdict costs the worktree.
-				const alive = async () =>
-					sbx
-						.runIn("/", "echo ok", 30_000)
-						.then((r) => r.stdout.includes("ok"))
-						.catch(() => false);
-				if (!(await alive())) {
-					await sbx
-						.runIn("/", `for p in $(pgrep -f '/tmp/kronyx-cmd-' 2>/dev/null); do kill -KILL -"$p" 2>/dev/null; done; pkill -f 'kronyx_browser_use' 2>/dev/null; true`, 20_000)
-						.catch(swallow("executor", "op"));
-					await new Promise((r) => setTimeout(r, 5000));
-				}
-				if (await alive()) {
-					await sbx.keepalive(60);
-					dbg("sandbox", "reused", { sandboxId: oldId });
-					await this.sink.emit({ type: "info", text: `Reused warm sandbox ${oldId}` });
-					return sbx;
-				}
-				dbg("sandbox", "connected but unresponsive", { sandboxId: oldId });
-			}
-			dbg("sandbox", "unreachable after retries", { sandboxId: oldId });
-			// Resume ladder before condemning the VM: a paused (or paused-with-
-			// dead-agent) sandbox can still cold-boot from its disk snapshot —
-			// the repo AND worktree survive where a kill+reclone loses
-			// uncommitted work. Strictly a rescue: worst case is today's path.
-			if (provider.capabilities.resume) {
-				const info = await provider.getInfoById?.(oldId, creds).catch(() => null);
-				if (info?.state === "paused") {
-					// envdUnresponsiveAtPause → memory restore would 409; go
-					// straight to the disk-only cold boot.
-					const modes: { memory?: boolean }[] = info.envdUnresponsiveAtPause ? [{ memory: false }] : [{}, { memory: false }];
-					for (const mode of modes) {
-						const h = await sbx.resume(oldId, creds, mode).catch(() => null);
-						if (!h) continue;
-						const ok = await sbx.runIn("/", "echo ok", 30_000).then((r) => r.stdout.includes("ok")).catch(() => false);
-						if (!ok) continue;
-						await sbx.keepalive(60);
-						dbg("sandbox", mode.memory === false ? "resumed disk-only" : "resumed", { sandboxId: oldId });
-						await this.sink.emit({
-							type: "info",
-							text: mode.memory === false ? `Resumed sandbox ${oldId} from disk (cold boot — worktree preserved)` : `Resumed paused sandbox ${oldId}`,
-						});
-						return sbx;
-					}
-				} else if (!info) {
-					// Probe failed transiently — the sandbox may still be
-					// paused and resumable. A blind disk-only resume is cheap
-					// insurance: it cold-boots from disk if a snapshot exists
-					// and fails fast otherwise.
-					const h = await sbx.resume(oldId, creds, { memory: false }).catch(() => null);
-					if (h) {
-						const ok = await sbx.runIn("/", "echo ok", 30_000).then((r) => r.stdout.includes("ok")).catch(() => false);
-						if (ok) {
-							await sbx.keepalive(60);
-							await this.sink.emit({ type: "info", text: `Resumed sandbox ${oldId} from disk (probe had failed)` });
-							return sbx;
-						}
-					}
-				}
-			}
+		if (oldId && provider.capabilities.reconnect && (await this.reuseSandbox(sbx, session, oldId, provider, providerName, creds))) {
+			return sbx;
 		}
-		// Snapshot recovery: a WIP-checkpointed session whose VM is dead can
-		// boot a NEW sandbox straight from the last disk snapshot — full
-		// worktree (incl. node_modules/untracked) intact, no reclone.
-		if (provider.capabilities.snapshot && session.lastSnapshotId) {
-			const snapId = session.lastSnapshotId;
-			try {
-				await sbx.create({ creds, provider: providerName, template: snapId, timeoutMs: 60 * 60_000 });
-				const ok = await sbx.runIn(REPO_DIR, "git status >/dev/null 2>&1 && echo ok", 20_000).then((r) => r.stdout.includes("ok")).catch(() => false);
+		if (provider.capabilities.snapshot && session.lastSnapshotId && (await this.restoreSnapshot(sbx, session, providerName, creds, oldId))) {
+			return sbx;
+		}
+		const { templates, warmId, strict } = await this.bootTemplates(session, settings, opts, provider, creds);
+		await this.createSandbox(sbx, session, provider, providerName, creds, templates, warmId, strict, oldId);
+		return sbx;
+	}
+
+	/** Record boot provenance — what the VM booted FROM — as a `boot` event in
+	 *  sandbox_events and on the sandbox row, so the list/detail views can show
+	 *  "warm snapshot" vs "durable template" vs "base" instead of inferring it
+	 *  from opaque template names. */
+	private async recordBoot(session: SessionDoc, sandboxId: string, source: string, template?: string, snapshotId?: string): Promise<void> {
+		void recordSandboxEvent(this.db, {
+			uid: this.sink.uid,
+			sandboxId,
+			sessionId: session.sessionId,
+			event: "boot",
+			source,
+			...(template ? { template } : {}),
+			...(snapshotId ? { snapshotId } : {}),
+		});
+		await this.db
+			.collection("sandboxes")
+			.updateOne(
+				{ uid: this.sink.uid, sandboxId },
+				{ $set: { uid: this.sink.uid, sandboxId, sessionId: session.sessionId, source, at: new Date() }, $setOnInsert: { createdAt: new Date() } },
+				{ upsert: true },
+			)
+			.catch(swallow("executor", "op"));
+	}
+
+	/** Flag a dead VM for the janitor (the single owner of kills) and link it
+	 *  to its successor. `detach` also clears sessionId — used when the old
+	 *  VM was proven unreachable rather than cleanly replaced. */
+	private async markReplaced(oldId: string, newId: string | undefined, reason: string, detach = false): Promise<void> {
+		await this.db
+			.collection("sandboxes")
+			.updateOne(
+				{ uid: this.sink.uid, sandboxId: oldId },
+				{ $set: { state: "replaced", replacedBy: newId, killPending: true, reason, replacedAt: new Date(), ...(detach ? { sessionId: null } : {}) } },
+			)
+			.catch(swallow("executor", "op"));
+	}
+
+	/** Reuse the session's existing VM: connect + probe, then the resume
+	 *  ladder before condemning it — a paused (or paused-with-dead-agent)
+	 *  sandbox can still cold-boot from its disk snapshot, keeping the repo
+	 *  AND worktree where a kill+reclone loses uncommitted work. */
+	private async reuseSandbox(sbx: SandboxCore, session: SessionDoc, oldId: string, provider: SandboxProvider, providerName: string, creds: ProviderCreds): Promise<boolean> {
+		// Retry connect before concluding it's dead — transient API/network
+		// blips must not churn sandboxes.
+		let connected = false;
+		for (let attempt = 0; attempt < 4 && !connected; attempt++) {
+			if (attempt > 0) await new Promise((r) => setTimeout(r, 1500 * attempt));
+			connected = !!(await sbx.connect(oldId, creds, providerName));
+		}
+		if (connected) {
+			// connect() returning a handle proves nothing — a VM at
+			// end-of-life can accept the handshake then die under load.
+			// A VM chewing detached leftovers from a stopped run looks the
+			// same, so the probe gets slack, one zombie sweep, and a retry
+			// before we condemn it — a wrong verdict costs the worktree.
+			const alive = async () =>
+				sbx
+					.runIn("/", "echo ok", 30_000)
+					.then((r) => r.stdout.includes("ok"))
+					.catch(() => false);
+			if (!(await alive())) {
+				await sbx
+					.runIn("/", `for p in $(pgrep -f '/tmp/kronyx-cmd-' 2>/dev/null); do kill -KILL -"$p" 2>/dev/null; done; pkill -f 'kronyx_browser_use' 2>/dev/null; true`, 20_000)
+					.catch(swallow("executor", "op"));
+				await new Promise((r) => setTimeout(r, 5000));
+			}
+			if (await alive()) {
+				await sbx.keepalive(60);
+				dbg("sandbox", "reused", { sandboxId: oldId });
+				await this.sink.emit({ type: "info", key: "sandbox", text: `Reused warm sandbox ${oldId}` });
+				await this.recordBoot(session, oldId, "connect");
+				return true;
+			}
+			dbg("sandbox", "connected but unresponsive", { sandboxId: oldId });
+		}
+		dbg("sandbox", "unreachable after retries", { sandboxId: oldId });
+		if (!provider.capabilities.resume) return false;
+		let info = await provider.getInfoById?.(oldId, creds).catch(() => null);
+		// A VM mid-pause still reports "running" while connect already
+		// fails — wait out the transition and re-probe once so a pausing
+		// sandbox gets the resume ladder instead of a pointless recreate.
+		if (info?.state === "running") {
+			await new Promise((r) => setTimeout(r, 5000));
+			info = (await provider.getInfoById?.(oldId, creds).catch(() => null)) ?? info;
+		}
+		if (info?.state === "paused") {
+			// envdUnresponsiveAtPause → memory restore would 409; go
+			// straight to the disk-only cold boot.
+			const modes: { memory?: boolean }[] = info.envdUnresponsiveAtPause ? [{ memory: false }] : [{}, { memory: false }];
+			for (const mode of modes) {
+				const h = await sbx.resume(oldId, creds, mode).catch(() => null);
+				if (!h) continue;
+				const ok = await sbx.runIn("/", "echo ok", 30_000).then((r) => r.stdout.includes("ok")).catch(() => false);
+				if (!ok) continue;
+				await sbx.keepalive(60);
+				dbg("sandbox", mode.memory === false ? "resumed disk-only" : "resumed", { sandboxId: oldId });
+				await this.sink.emit({
+					type: "info",
+					key: "sandbox",
+					text: mode.memory === false ? `Resumed sandbox ${oldId} from disk (cold boot — worktree preserved)` : `Resumed paused sandbox ${oldId}`,
+				});
+				await this.recordBoot(session, oldId, mode.memory === false ? "resume-disk" : "resume");
+				return true;
+			}
+		} else if (!info) {
+			// Probe failed transiently — the sandbox may still be
+			// paused and resumable. A blind disk-only resume is cheap
+			// insurance: it cold-boots from disk if a snapshot exists
+			// and fails fast otherwise.
+			const h = await sbx.resume(oldId, creds, { memory: false }).catch(() => null);
+			if (h) {
+				const ok = await sbx.runIn("/", "echo ok", 30_000).then((r) => r.stdout.includes("ok")).catch(() => false);
 				if (ok) {
 					await sbx.keepalive(60);
-					if (oldId) {
-						await this.db
-							.collection("sandboxes")
-							.updateOne(
-								{ uid: this.sink.uid, sandboxId: oldId },
-								{ $set: { state: "replaced", replacedBy: sbx.sandboxId, killPending: true, reason: "snapshot-restore", replacedAt: new Date() } },
-							)
-							.catch(swallow("executor", "op"));
-					}
-					session.cloned = true;
-					await this.sink.patchSession({ sandboxId: sbx.sandboxId, cloned: true });
-					await this.db
-						.collection("sessions")
-						.updateOne({ uid: this.sink.uid, sessionId: session.sessionId }, { $addToSet: { sandboxIds: sbx.sandboxId } })
-						.catch(swallow("executor", "op"));
-					await this.sink.emit({ type: "info", text: `Restored session from disk snapshot ${snapId.slice(0, 12)}…` });
-					return sbx;
+					await this.sink.emit({ type: "info", key: "sandbox", text: `Resumed sandbox ${oldId} from disk (probe had failed)` });
+					await this.recordBoot(session, oldId, "resume-blind");
+					return true;
 				}
-				await sbx.close().catch(swallow("executor", "op"));
-			} catch {
-				// Stale/deleted snapshot — clear it and fall through to a fresh
-				// create (the warm-template/reclone paths still apply).
 			}
-			session.lastSnapshotId = undefined;
-			await this.sink.patchSession({ lastSnapshotId: null });
 		}
-		// Template resolution (only when a VM is actually created — warm
-		// reconnects above never reach this): switch override > session
-		// template > LLM pick > user's e2bTemplate default > stock base.
-		let template = opts.template ?? session.template ?? undefined;
-		if (!template && this.templates.length && opts.llm && opts.task) {
+		return false;
+	}
+
+	/** Boot a NEW sandbox from the session's WIP disk checkpoint — full
+	 *  worktree (incl. node_modules/untracked) intact, no reclone. Clears
+	 *  lastSnapshotId and returns false on a stale/deleted snapshot. */
+	private async restoreSnapshot(sbx: SandboxCore, session: SessionDoc, providerName: string, creds: ProviderCreds, oldId?: string): Promise<boolean> {
+		const snapId = session.lastSnapshotId!;
+		try {
+			await sbx.create({ creds, provider: providerName, template: snapId, timeoutMs: 60 * 60_000 });
+			const ok = await sbx.runIn(REPO_DIR, "git status >/dev/null 2>&1 && echo ok", 20_000).then((r) => r.stdout.includes("ok")).catch(() => false);
+			if (!ok) {
+				await sbx.close().catch(swallow("executor", "op"));
+			} else {
+				await sbx.keepalive(60);
+				if (oldId) await this.markReplaced(oldId, sbx.sandboxId, "snapshot-restore");
+				session.cloned = true;
+				await this.sink.patchSession({ sandboxId: sbx.sandboxId, cloned: true });
+				await this.db
+					.collection("sessions")
+					.updateOne({ uid: this.sink.uid, sessionId: session.sessionId }, { $addToSet: { sandboxIds: sbx.sandboxId } })
+					.catch(swallow("executor", "op"));
+				await this.sink.emit({ type: "info", key: "sandbox", text: `Restored session from disk snapshot ${snapId.slice(0, 12)}…` });
+				await this.recordBoot(session, sbx.sandboxId ?? "", "wip", undefined, snapId);
+				return true;
+			}
+		} catch {
+			// Stale/deleted snapshot — clear it and fall through to a fresh
+			// create (the warm-template/reclone paths still apply).
+		}
+		session.lastSnapshotId = undefined;
+		await this.sink.patchSession({ lastSnapshotId: null });
+		return false;
+	}
+
+	/** Ordered, deduped template candidates for a cold create:
+	 *  explicit override > repo warm snapshot > repo's designated template >
+	 *  session template > LLM pick > settings default. Named templates are
+	 *  resolved against the live catalog (empty catalog → trust the name —
+	 *  the fetch may have failed transiently); a name that doesn't resolve
+	 *  warns and drops out. The warm snapshot id skips validation — it's an
+	 *  id, not an alias. */
+	private async bootTemplates(
+		session: SessionDoc,
+		settings: UserSettings,
+		opts: { template?: string; llm?: ProviderSettings; task?: string },
+		provider: SandboxProvider,
+		creds: ProviderCreds,
+	): Promise<{ templates: string[]; warmId: string | null; strict: boolean }> {
+		let warmId: string | null = null;
+		let repoTemplate: string | undefined;
+		const repoKey = session.repo ? createHash("sha256").update(`${this.sink.uid}:${session.repo}`).digest("hex").slice(0, 16) : undefined;
+		if (!opts.template && provider.name === "e2b" && provider.capabilities.snapshot) {
+			// Warm per-repo snapshot (default-on): a baked VM image with
+			// the repo cloned + deps installed — skips clone/install entirely.
+			warmId = await this.warmSnapshotFor(session, settings, creds).catch(swallow("executor", "op", null));
+		}
+		// Looked up even when a warm snapshot exists: a warm boot that fails
+		// (snapshot vanished provider-side) must retry this durable repo
+		// image — not skip to session/base.
+		if (!opts.template && repoKey) {
+			repoTemplate = ((await this.db.collection("repo_templates").findOne({ key: repoKey }).catch(swallow("executor", "op", null))) as { template?: string } | null)?.template;
+		}
+		let llmPick: string | null = null;
+		if (!opts.template && !warmId && !repoTemplate && !session.template && this.templates.length && opts.llm && opts.task) {
 			const picked = await pickTemplate(opts.llm, opts.task, this.templates);
 			if (picked) {
-				template = picked;
+				llmPick = picked;
 				await this.sink.patchSession({ template: picked });
 				await this.sink.emit({ type: "info", text: `Picked sandbox template "${picked}" for this task` });
 			}
 		}
-		// Warm per-repo snapshot (flags.warmTemplates): a baked VM image with the
-		// repo cloned + deps installed — cold start skips clone/install entirely.
-		// Only applies when no template was explicitly picked; the baked image
-		// IS the base template plus repo state.
-		let warmId: string | null = null;
-		if (!template && provider.name === "e2b" && provider.capabilities.snapshot) {
-			warmId = await this.warmSnapshotFor(session, settings, creds).catch(swallow("executor", "op", null));
-			if (warmId) template = warmId;
+		const settingsDefault = String(settings.data.e2bTemplate ?? "") || undefined;
+		// An explicit per-run template is authoritative (switch_environment /
+		// Composer field): it is the ONLY candidate — no silent downgrade to
+		// session/base, the create error propagates to the caller.
+		const strict = !!opts.template;
+		const candidates = strict ? [opts.template] : [opts.template, warmId, repoTemplate, session.template, llmPick, settingsDefault];
+		const templates: string[] = [];
+		const seen = new Set<string>();
+		for (const cand of candidates) {
+			if (!cand || seen.has(cand)) continue;
+			if (cand === warmId) {
+				seen.add(cand);
+				templates.push(cand);
+				continue;
+			}
+			let name = cand;
+			if (this.templates.length) {
+				const resolved = resolveTemplateName(cand, this.templates);
+				if (!resolved) {
+					if (strict) {
+						// Catalog caches up to 10min — a just-built template may
+						// legitimately be missing. Refresh once; genuinely absent
+						// → throw loudly. Creating a bad name would surface as a
+						// quota-looking error and kill an innocent paused VM.
+						const fresh = await this.liveTemplates(provider, creds, true);
+						if (fresh.length) this.templates = fresh;
+						const retry = resolveTemplateName(cand, this.templates);
+						if (!retry) throw new Error(`Template "${cand}" not found in the provider catalog`);
+						name = retry;
+						if (seen.has(name)) continue;
+						seen.add(name);
+						templates.push(name);
+					} else {
+						await this.sink.emit({ type: "info", key: "sandbox", text: `Template "${cand}" is unavailable — falling back` }).catch(swallow("executor", "op"));
+					}
+					continue;
+				}
+				name = resolved;
+				if (seen.has(name)) continue;
+			}
+			seen.add(name);
+			templates.push(name);
 		}
-		template ??= String(settings.data.e2bTemplate ?? "") || undefined;
-		// Don't persist a warm snapshot id as the session template — snapshots
-		// expire; the session template must stay a named template.
-		if (template && template !== warmId) session.template = template;
+		return { templates, warmId, strict };
+	}
+
+	/** Walk the template candidates until one boots; stock base (undefined)
+	 *  is appended as the last resort. Only reached after reuse + snapshot
+	 *  restore both failed, so any oldId here is proven dead → replaced.
+	 *  Unresolvable names were filtered in bootTemplates, so reaching the
+	 *  quota path means a genuine create failure — safe to free a paused VM. */
+	private async createSandbox(
+		sbx: SandboxCore,
+		session: SessionDoc,
+		provider: SandboxProvider,
+		providerName: string,
+		creds: ProviderCreds,
+		templates: string[],
+		warmId: string | null,
+		strict: boolean,
+		oldId?: string,
+	): Promise<void> {
+		const warn = (text: string) => void this.sink.emit({ type: "info", key: "sandbox", text }).catch(swallow("executor", "op"));
+		// Provider errors are undifferentiated blobs — classify the create
+		// failure so a missing/invalid template NEVER reaches the quota path
+		// (killing an innocent paused VM for a name problem). Loose match:
+		// e2b phrases it "template not found"/404 on snapshot ids.
+		const isTemplateMiss = (e: unknown) => {
+			const m = String(e instanceof Error ? e.message : e).toLowerCase();
+			return /not.?found|does not exist|unknown|invalid|404/.test(m) && /template|snapshot|image|sandbox/.test(m);
+		};
+		let template: string | undefined;
 		// Provider-side auto-pause: on timeout the VM snapshots instead of
 		// dying — durable across worker restarts (our in-process idle timer
 		// isn't). autoResume wakes the paused VM on inbound traffic.
-		const autoPause = provider.capabilities.autoPause === true
-			? await flag(this.db, { uid: this.sink.uid, repo: session.repo, template, sessionId: session.sessionId }, FLAGS.sandboxAutoPause)
-			: false;
-		try {
-			await sbx.create({ creds, provider: providerName, template, timeoutMs: 60 * 60_000, autoPause, autoResume: autoPause });
-		} catch (createErr) {
-			// A warm snapshot can vanish server-side between bake and boot —
-			// retry once on the stock template before treating it as quota.
-			if (warmId) {
-				warmId = null;
-				template = undefined;
-				try {
-					await sbx.create({ creds, provider: providerName, timeoutMs: 60 * 60_000, autoPause, autoResume: autoPause });
-					createErr = null;
-				} catch {
-					// fall through to the quota path with the new error
+		let autoPause = false;
+		let created = false;
+		let createErr: unknown;
+		const list: (string | undefined)[] = strict ? templates : [...templates, undefined];
+		for (let i = 0; i < list.length; i++) {
+			const cand = list[i];
+			template = cand;
+			// Reaching the appended base after candidate failures is worth a
+			// session note — the user asked for a named image, not stock.
+			if (cand === undefined && i > 0) warn("Named templates unavailable — booting stock base image");
+			autoPause = provider.capabilities.autoPause === true
+				? await flag(this.db, { uid: this.sink.uid, repo: session.repo, template: cand, sessionId: session.sessionId }, FLAGS.sandboxAutoPause)
+				: false;
+			try {
+				await sbx.create({ creds, provider: providerName, template: cand, timeoutMs: 60 * 60_000, autoPause, autoResume: autoPause });
+				created = true;
+				break;
+			} catch (e) {
+				createErr = e;
+				if (strict && isTemplateMiss(e)) {
+					throw new Error(`Template "${cand}" not found provider-side — check the name in Settings / Templates`);
+				}
+				if (i < list.length - 1) warn(`Sandbox create failed on "${cand}" — trying next fallback`);
+				// A warm snapshot that's gone provider-side must not be served
+				// by decideWarm forever — mark the repo doc stale so the next
+				// run rebakes instead of retrying a dead id each time.
+				if (cand === warmId && session.repo) {
+					const key = createHash("sha256").update(`${this.sink.uid}:${session.repo}`).digest("hex").slice(0, 16);
+					await this.db
+						.collection("repo_templates")
+						.updateOne({ key }, { $set: { status: "stale", snapshotId: null, failedAt: new Date(), error: "snapshot vanished provider-side", updatedAt: new Date() } })
+						.catch(swallow("executor", "op"));
 				}
 			}
-			if (createErr && provider.name !== "e2b") throw createErr;
-			if (createErr) {
+		}
+		if (!created) {
+			// A name-resolution failure must never masquerade as quota — killing
+			// a paused VM wouldn't help and the retry would fail identically.
+			if (isTemplateMiss(createErr)) throw createErr;
+			if (provider.name !== "e2b") throw createErr;
 			const oldestPaused = await this.db
 				.collection("sandboxes")
 				.findOne({ uid: this.sink.uid, state: "paused" }, { sort: { at: 1 } })
@@ -1526,25 +1744,21 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				{ $set: { killPending: true, reason: "quota-fallback" } },
 			).catch(swallow("executor", "op"));
 			await provider.killById(pausedId, creds).catch(swallow("executor", "op"));
-			await sbx.create({ creds, provider: providerName, template, timeoutMs: 60 * 60_000, autoPause, autoResume: autoPause });
-			}
+			await sbx.create({ creds, provider: providerName, template, timeoutMs: 60 * 60_000, autoPause, autoResume: autoPause }).catch(() => {
+				throw createErr instanceof Error ? createErr : new Error(String(createErr));
+			});
 		}
+		// Don't persist a warm snapshot id as the session template — snapshots
+		// expire; the session template must stay a named template.
+		if (template && template !== warmId) session.template = template;
 		await sbx.keepalive(60);
 		const newId = sbx.sandboxId;
 		// Persist the provider-verified template identity — the requested name
 		// is what we asked for; getInfo reports what actually booted.
 		const createdInfo = newId ? await provider.getInfoById?.(newId, creds).catch(() => null) : null;
-		// Old sandbox proven unreachable after retries — flag it for the janitor,
-		// the single owner of kills.
-		if (oldId) {
-			await this.db
-				.collection("sandboxes")
-				.updateOne(
-					{ uid: this.sink.uid, sandboxId: oldId },
-					{ $set: { state: "replaced", replacedBy: newId, killPending: true, reason: "unreachable", replacedAt: new Date() } },
-				)
-				.catch(swallow("executor", "op"));
-		}
+		// Old sandbox proven unreachable after retries — disassociate it from
+		// the session; it shows up as an orphan in the janitor.
+		if (oldId) await this.markReplaced(oldId, newId, "unreachable", true);
 		await this.db
 			.collection("sandboxes")
 			.updateOne(
@@ -1556,15 +1770,19 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		// A new sandbox is empty — clone state must reset with it. A warm
 		// snapshot boot is the exception: the repo is baked onto the disk, so
 		// `cloned` stays true (ensureRepoReady probes .git before trusting it).
-		const preCloned = !!warmId;
+		const preCloned = warmId != null && template === warmId;
 		await this.sink.patchSession({ sandboxId: newId, cloned: preCloned });
 		await this.db
 			.collection("sessions")
 			.updateOne({ uid: this.sink.uid, sessionId: session.sessionId }, { $addToSet: { sandboxIds: newId } })
 			.catch(swallow("executor", "op"));
 		session.cloned = preCloned;
-		await this.sink.emit({ type: "info", text: preCloned ? `Created sandbox ${newId} from warm snapshot (repo pre-cloned)` : `Created sandbox ${newId}` });
-		return sbx;
+		const bootDesc = preCloned ? "warm snapshot (repo pre-cloned)" : template ? `template: ${template}` : "base image";
+		await this.sink.emit({ type: "info", key: "sandbox", text: `Created sandbox ${newId} — ${bootDesc}` });
+		if (newId) {
+			const source = warmId != null && template === warmId ? "warm" : template ? "template" : "base";
+			await this.recordBoot(session, newId, source, source === "template" ? template : undefined, source === "warm" ? warmId! : undefined);
+		}
 	}
 
 	/** Shared "repo exists, valid, and on the session branch" — used by
@@ -1707,8 +1925,8 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		}
 		const mode: AgentMode =
 			job.mode === "plan" ? "plan" : session.securityProfile === "bypass" ? "bypass" : "smart";
-		await this.sink.emit({ type: "cloud-status", text: "Starting sandbox…" });
-		let sbx = await this.raceStop(this.ensureSandbox(session, settings, { llm: provider, task: job.task }), SANDBOX_START_MS, "Sandbox start");
+		await this.sink.emit({ type: "cloud-status", key: "sandbox", text: session.sandboxId ? `Connecting to your sandbox ${session.sandboxId}…` : "Creating a new sandbox…" });
+		let sbx = await this.raceStop(this.ensureSandbox(session, settings, { llm: provider, task: job.task }), SANDBOX_START_MS, "Sandbox start", session.sandboxId);
 		this.activeSession = session;
 		this.startSandboxKeepalive(sbx);
 		this.throwIfStopped();
@@ -1949,7 +2167,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				session.sandboxId = undefined;
 				session.cloned = false;
 				await this.sink.patchSession({ sandboxId: null, cloned: false });
-				const next = await this.raceStop(this.ensureSandbox(session, settings), SANDBOX_START_MS, "Sandbox start");
+				const next = await this.raceStop(this.ensureSandbox(session, settings), SANDBOX_START_MS, "Sandbox start", session.sandboxId);
 				setSbx(next);
 				this.startSandboxKeepalive(next);
 				await this.ensureRepoReady(session, next, token);
@@ -2705,7 +2923,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		// that expires, and every fetch/push below (plus the agent's own git
 		// commands) hits the stale URL.
 		if (session.repo && token) {
-			await this.sink.emit({ type: "cloud-status", text: `Refreshing git credentials and syncing ${session.branch ?? base}…` });
+			await this.sink.emit({ type: "cloud-status", key: "branch", text: `Syncing branch ${session.branch ?? base}…` });
 			await this.syncGhAuth(sbx, session.repo, token);
 		}
 		this.throwIfStopped();
@@ -2738,7 +2956,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			await this.sink.patchSession({ branch, startRef: branch });
 			session.branch = branch;
 			session.startRef = branch;
-			await this.sink.emit({ type: "info", text: `Created branch ${branch}` });
+			await this.sink.emit({ type: "info", key: "branch", text: `Created branch ${branch}` });
 			// Push immediately — the branch should be visible on the remote from
 			// the first tool call, not only at PR time. Non-fatal on failure.
 			const p = await sbx
@@ -2802,7 +3020,10 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		if (!branch) return;
 		await sbx.runIn(REPO_DIR, "git fetch origin", 60_000).catch(swallow("executor", "op"));
 		const remote = await sbx.runIn(REPO_DIR, `git rev-parse --verify origin/${branch} 2>/dev/null`).catch(swallow("executor", "op"));
-		if (!remote || remote.exitCode !== 0) return; // no remote branch yet
+		if (!remote || remote.exitCode !== 0) {
+			await this.sink.emit({ type: "info", key: "branch", text: `Branch ${branch} ready` });
+			return; // no remote branch yet
+		}
 		const [aheadR, behindR] = await Promise.all([
 			sbx.runIn(REPO_DIR, `git rev-list --count origin/${branch}..HEAD`).catch(swallow("executor", "op")),
 			sbx.runIn(REPO_DIR, `git rev-list --count HEAD..origin/${branch}`).catch(swallow("executor", "op")),
@@ -2810,6 +3031,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		const ahead = Number(aheadR?.stdout.trim()) || 0;
 		const behind = Number(behindR?.stdout.trim()) || 0;
 		if (behind === 0) {
+			await this.sink.emit({ type: "info", key: "branch", text: `Branch ${branch} up to date` });
 			if (ahead > 0) await this.sink.emit({ type: "info", text: `${ahead} unpushed commit(s) will be pushed at the end of this run.` });
 			return; // clean or strictly ahead — nothing to pull
 		}
@@ -2833,7 +3055,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			// Strictly behind — pull latest.
 			await stash();
 			const r = await sbx.runIn(REPO_DIR, `git reset --hard origin/${branch}`).catch(swallow("executor", "op"));
-			if (r?.exitCode === 0) await this.sink.emit({ type: "cloud-status", text: `Synced to origin/${branch} (${behind} commit(s)).` });
+			if (r?.exitCode === 0) await this.sink.emit({ type: "cloud-status", key: "branch", text: `Synced to origin/${branch} (${behind} commit(s)).` });
 			await unstash();
 			return;
 		}
@@ -2848,7 +3070,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 					(stashed ? " Uncommitted changes are preserved in `git stash`." : ""),
 			);
 		}
-		await this.sink.emit({ type: "cloud-status", text: `Rebased ${ahead} commit(s) onto origin/${branch}.` });
+		await this.sink.emit({ type: "cloud-status", key: "branch", text: `Rebased ${ahead} commit(s) onto origin/${branch}.` });
 		await unstash();
 	}
 
@@ -2887,7 +3109,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		session.sandboxId = undefined;
 		session.cloned = false;
 		await this.sink.patchSession({ sandboxId: null, cloned: false, template: req.template });
-		const next = await this.raceStop(this.ensureSandbox(session, settings, { template: req.template }), SANDBOX_START_MS, "Sandbox start");
+		const next = await this.raceStop(this.ensureSandbox(session, settings, { template: req.template }), SANDBOX_START_MS, "Sandbox start", session.sandboxId);
 		if (session.repo && token) {
 			const defaultBranch = await next.cloneRepo(`https://github.com/${session.repo}`, token, REPO_DIR);
 			await this.sink.patchSession({ cloned: true, ...(defaultBranch ? { base: defaultBranch } : {}) });
@@ -2902,7 +3124,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		setSbx(next);
 		live.handle = next.inner!;
 		await old.close().catch(swallow("executor", "op"));
-		await this.sink.emit({ type: "cloud-status", text: `Switched to "${req.template}" — resuming on the new VM` });
+		await this.sink.emit({ type: "cloud-status", key: "sandbox", text: `Switched to "${req.template}" — resuming on the new VM` });
 		return (
 			`Switched to "${req.template}". You are now on a fresh VM: the repo is recloned at ${REPO_DIR} ` +
 				`on branch ${session.branch ?? session.base}, and your pushed work is there. ` +
@@ -3180,7 +3402,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	/** Open a PR for the session branch (explicit user action — not automatic). */
 	private async openPrJob(job: CloudJob, session: SessionDoc, settings: UserSettings): Promise<void> {
 		dbg("run", "openPrJob", { runId: job.runId, branch: session.branch, base: session.base });
-		let sbx = await this.raceStop(this.ensureSandbox(session, settings), SANDBOX_START_MS, "Sandbox start");
+		let sbx = await this.raceStop(this.ensureSandbox(session, settings), SANDBOX_START_MS, "Sandbox start", session.sandboxId);
 		this.startSandboxKeepalive(sbx);
 		const token = await this.githubToken(session, settings);
 		this.sink.mask(token);
@@ -3199,7 +3421,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		if (!job.planSlug) throw new Error("No plan on this job.");
 		const plan = await loadPlan(this.db, job.uid, job.sessionId, job.planSlug);
 		if (!plan) throw new Error("Plan not found.");
-		let sbx = await this.raceStop(this.ensureSandbox(session, settings), SANDBOX_START_MS, "Sandbox start");
+		let sbx = await this.raceStop(this.ensureSandbox(session, settings), SANDBOX_START_MS, "Sandbox start", session.sandboxId);
 		this.startSandboxKeepalive(sbx);
 		const token = await this.githubToken(session, settings);
 		this.sink.mask(token);
@@ -3219,7 +3441,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				session.sandboxId = undefined;
 				session.cloned = false;
 				await this.sink.patchSession({ sandboxId: null, cloned: false });
-				sbx = await this.raceStop(this.ensureSandbox(session, settings), SANDBOX_START_MS, "Sandbox start");
+				sbx = await this.raceStop(this.ensureSandbox(session, settings), SANDBOX_START_MS, "Sandbox start", session.sandboxId);
 				this.startSandboxKeepalive(sbx);
 			}
 		}

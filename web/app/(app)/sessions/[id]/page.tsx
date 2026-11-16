@@ -115,9 +115,18 @@ export default function SessionView() {
 	})();
 	// Latest run's setup/lifecycle events — surfaced as a top strip so clone,
 	// credential refresh, branch sync, push, and PR steps are always visible.
-	const lifecycle = events
-		.filter((e) => ["info", "cloud-status", "setup", "check"].includes(e.event.type))
-		.slice(-8);
+	const lifecycleRaw = events.filter(
+		(e) =>
+			["info", "cloud-status", "setup", "check"].includes(e.event.type) &&
+			!(e.event.type === "check" && String(e.event.command ?? "").startsWith("preflight:")),
+	);
+	// Keyed events repaint in place ("Creating a sandbox…" → "Created sandbox
+	// X") — keep only the latest occurrence per key.
+	const lastByKey = new Map<string, number>();
+	lifecycleRaw.forEach((e, i) => {
+		if (typeof e.event.key === "string") lastByKey.set(e.event.key, i);
+	});
+	const lifecycle = lifecycleRaw.filter((e, i) => typeof e.event.key !== "string" || lastByKey.get(e.event.key) === i).slice(-8);
 	// Minimap navigator: one right-edge tick per user message (run-started
 	// events), click scrolls to that bubble; active tick follows scroll.
 	const userMsgs = ordered.filter((e) => e.event.type === "run-started");
@@ -136,7 +145,7 @@ export default function SessionView() {
 		onScroll();
 		window.addEventListener("scroll", onScroll, { passive: true });
 		return () => window.removeEventListener("scroll", onScroll);
-		// eslint-disable-next-line react-hooks/exhaustive-deps
+		// deps: re-subscribe only when the message count changes, not on every render.
 	}, [userMsgs.length]);
 	// Session preflight — sandbox / repo / auth / model readiness, fetched once
 	// on load and after each refresh-triggering action.
@@ -147,7 +156,8 @@ export default function SessionView() {
 			.then(async (r) => (r.ok ? r.json() : { ready: false, checks: [{ name: "preflight", ok: false, detail: `HTTP ${r.status}` }] }))
 			.then((body) => setPreflight(body as typeof preflight))
 			.catch((err) => setPreflight({ ready: false, checks: [{ name: "preflight", ok: false, detail: String(err).slice(0, 80) }] }));
-	}, [user, id, session?.sessionId]);
+		// latestRun?.runId: re-check readiness on each new task, not just load.
+	}, [user, id, session?.sessionId, latestRun?.runId]);
 
 	// Clear "PR queued" once the PR link actually lands.
 	useEffect(() => {
@@ -482,6 +492,11 @@ export default function SessionView() {
 									{String(e.event.text ?? e.event.command ?? "")}
 									{e.event.type === "check" && e.event.output ? ` — ${String(e.event.output)}` : ""}
 								</span>
+								{e.at && (
+									<span style={{ fontSize: 10, opacity: 0.55, flexShrink: 0, marginLeft: "auto" }}>
+										{new Date(e.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+									</span>
+								)}
 							</div>
 						))}
 						{halted && (

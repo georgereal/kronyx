@@ -117,10 +117,11 @@ export async function runJanitorSweep(db: Db): Promise<{ users: number; killed: 
 		.find({ "settings.secrets": { $exists: true } })
 		.toArray() as unknown as { _id: string; settings?: { secrets?: Record<string, string>; data?: Record<string, unknown> } }[];
 	const cutoff = Date.now() - MAX_MINUTES * 60_000;
-	const SESSION_IDLE_KILL_MIN = Number(process.env.SESSION_IDLE_KILL_MINUTES || 24 * 60);
-	const PAUSED_KILL_MIN = Number(process.env.PAUSED_KILL_MINUTES || 48 * 60);
-	const idleCutoff = new Date(Date.now() - SESSION_IDLE_KILL_MIN * 60_000);
-	const pausedCutoff = new Date(Date.now() - PAUSED_KILL_MIN * 60_000);
+	// Kill policy: a sandbox attached to a session is never killed for age —
+	// idle running VMs get paused above, paused VMs cost nothing and may be
+	// resumed months later. Kills happen only when the executor proved the VM
+	// unreachable (killPending) or the row is orphaned (no session association).
+	// SESSION_IDLE_KILL_MINUTES / PAUSED_KILL_MINUTES are retired.
 	const credsFor = (uid: string): ProviderCreds => {
 		const u = users.find((x) => x._id === uid);
 		return { secrets: u?.settings?.secrets ?? {}, data: u?.settings?.data ?? {} };
@@ -195,23 +196,23 @@ export async function runJanitorSweep(db: Db): Promise<{ users: number; killed: 
 			paused++;
 		}
 	}
-	// Policy kills — only driven by session inactivity, paused age, or a pending
-	// replacement kill. Never killed while a session is merely resting.
+	// Policy kills — only orphan rows (no session association) or killPending
+	// (executor-proven unreachable / quota fallback). Never killed while a
+	// session is merely resting, however long it's been.
 	const rows: Record<string, any>[] = await db
 		.collection("sandboxes")
-		.find({ $or: [{ killPending: true }, { state: { $in: ["active", "running", "paused"] } }] })
+		.find({ $or: [{ killPending: true }, { sessionId: null }, { state: { $in: ["active", "running", "paused"] } }] })
 		.toArray();
 	for (const row of rows) {
 		const session = row.sessionId
 			? await db.collection("sessions").findOne({ uid: row.uid, sessionId: row.sessionId })
 			: null;
-		const sessionIdle = !session?.updatedAt || new Date(session.updatedAt) < idleCutoff;
-		const pausedLong = row.state === "paused" && row.at && new Date(row.at) < pausedCutoff;
-		// Never kill the sandbox of a session with a live run — a long run may
-		// not touch session.updatedAt for hours. Unreachable (killPending) VMs are
-		// dead weight regardless of the run, so those still get cleaned up.
-		if (!row.killPending && row.sessionId && busySessions.has(`${row.uid}:${row.sessionId}`)) continue;
-		if (!row.killPending && !sessionIdle && !pausedLong) continue;
+		// Orphans need a 60-min grace — in-flight warm bakes register with no
+		// sessionId and a 30-min E2B timeout; killing them at the next sweep
+		// would abort the bake. After the grace the VM has self-destructed
+		// anyway, so this only cleans up the row.
+		const orphaned = !session && (!row.at || new Date(row.at).getTime() < Date.now() - 60 * 60_000);
+		if (!row.killPending && !orphaned) continue;
 		// Provider truth before any kill: a "gone" VM only needs the row marked;
 		// a "running" VM mislabeled paused (resumed between sweeps) must never be
 		// killed by a stale pausedLong verdict.
@@ -237,7 +238,7 @@ export async function runJanitorSweep(db: Db): Promise<{ users: number; killed: 
 				(await db.collection("sessions").countDocuments({ uid: row.uid, sessionId: row.sessionId, activeRunId: { $ne: null } })) > 0;
 			if (live) continue;
 		}
-		const reason = row.reason ?? (row.killPending ? "unreachable" : pausedLong ? "paused-48h" : "session-idle");
+		const reason = row.reason ?? (row.killPending ? "unreachable" : "orphaned");
 		if (await kill(row.uid, String(row.sandboxId), typeof row.provider === "string" ? row.provider : undefined)) {
 			console.log(`[janitor] killed ${row.sandboxId} (${reason})`);
 			await db

@@ -11,6 +11,11 @@ export interface SandboxEventInput {
 	reason?: string;
 	device?: string;
 	runId?: string;
+	snapshotId?: string;
+	/** Boot provenance: what the VM booted from ("warm" | "wip" | "template" |
+	 *  "base" | "connect" | "resume" | "resume-disk" | "resume-blind"). */
+	source?: string;
+	template?: string;
 	at?: Date;
 }
 

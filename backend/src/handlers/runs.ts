@@ -193,3 +193,84 @@ export async function pauseSandbox(req: Request, p: Record<string, string>): Pro
 	await recordSandboxEvent(db, { uid, sandboxId: p.id, provider: provider.name, event: "pause", state: "paused", reason: "manual" });
 	return json({ ok: true });
 }
+
+/** GET /api/sandboxes/:id — detail view: row + lifecycle events + linked
+ *  session + live provider state. */
+export async function getSandbox(req: Request, p: Record<string, string>): Promise<Response> {
+	const uid = await authenticate(req);
+	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
+	const { db, provider } = await rowProvider(uid, p.id);
+	const row = await db.collection("sandboxes").findOne({ uid, sandboxId: p.id }, { sort: { at: -1 } });
+	if (!row) return json({ error: "not_found" }, { status: 404 });
+	const [events, session] = await Promise.all([
+		db.collection("sandbox_events").find({ uid, sandboxId: p.id }).sort({ at: 1 }).limit(300).toArray(),
+		row.sessionId
+			? db
+					.collection("sessions")
+					.findOne(
+						{ uid, sessionId: row.sessionId },
+						{ projection: { sessionId: 1, title: 1, repo: 1, branch: 1, prUrl: 1, template: 1, provider: 1 } },
+					)
+			: null,
+	]);
+	const creds = await userCreds(uid);
+	const live = provider.validate(creds) ? null : ((await provider.getInfoById?.(p.id, creds).catch(swallow("runs", "op", null))) ?? null);
+	return json({
+		sandbox: { ...row, _id: undefined },
+		events: events.map((e) => ({ ...e, _id: undefined })),
+		session: session ? { ...session, _id: undefined } : null,
+		live,
+	});
+}
+
+/** POST /api/sandboxes/:id/resume — manual resume of a paused sandbox. */
+export async function resumeSandbox(req: Request, p: Record<string, string>): Promise<Response> {
+	const uid = await authenticate(req);
+	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
+	const { db, provider } = await rowProvider(uid, p.id);
+	if (!provider.capabilities.resume || !provider.resume) return json({ error: "resume_unsupported", provider: provider.name }, { status: 400 });
+	const creds = await userCreds(uid);
+	const err = provider.validate(creds);
+	if (err) return json({ error: "no_credentials", detail: err }, { status: 400 });
+	const info = await provider.getInfoById?.(p.id, creds).catch(swallow("runs", "op", null));
+	if (info?.state === "gone") return json({ error: "sandbox_gone" }, { status: 410 });
+	// envdUnresponsiveAtPause → memory restore 409s; disk-only cold boot keeps
+	// the worktree. Fall back to it on a plain resume failure too.
+	const modes: { memory?: boolean }[] = info?.envdUnresponsiveAtPause ? [{ memory: false }] : [{}, { memory: false }];
+	for (const mode of modes) {
+		const h = await provider.resume(p.id, creds, mode).catch(swallow("runs", "op", null));
+		if (!h) continue;
+		await db
+			.collection("sandboxes")
+			.updateOne({ uid, sandboxId: p.id }, { $set: { state: "running", reason: null, at: new Date() } });
+		await recordSandboxEvent(db, {
+			uid, sandboxId: p.id, provider: provider.name,
+			event: mode.memory === false ? "resume-disk" : "resume", state: "running", reason: "manual",
+		});
+		return json({ ok: true });
+	}
+	return json({ ok: false }, { status: 502 });
+}
+
+/** POST /api/sandboxes/:id/snapshot — manual filesystem checkpoint; the
+ *  snapshot id is recorded on the event and the sandbox doc. */
+export async function snapshotSandbox(req: Request, p: Record<string, string>): Promise<Response> {
+	const uid = await authenticate(req);
+	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
+	const { db, provider } = await rowProvider(uid, p.id);
+	if (!provider.capabilities.snapshot || !provider.checkpointById) return json({ error: "snapshot_unsupported", provider: provider.name }, { status: 400 });
+	const creds = await userCreds(uid);
+	const err = provider.validate(creds);
+	if (err) return json({ error: "no_credentials", detail: err }, { status: 400 });
+	const body = (await req.json().catch(() => ({}))) as { name?: string };
+	const name = String(body.name ?? "").trim().slice(0, 60) || undefined;
+	const snapshotId = await provider.checkpointById(p.id, creds, { mode: "filesystem", name }).catch(swallow("runs", "op", null));
+	if (!snapshotId) return json({ ok: false }, { status: 502 });
+	await db
+		.collection("sandboxes")
+		.updateOne({ uid, sandboxId: p.id }, { $push: { snapshots: { snapshotId, name: name ?? null, at: new Date() } } as never });
+	await recordSandboxEvent(db, {
+		uid, sandboxId: p.id, provider: provider.name, event: "checkpoint", reason: "manual", snapshotId,
+	});
+	return json({ ok: true, snapshotId });
+}

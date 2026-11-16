@@ -62,6 +62,12 @@ export async function flag(db: Db, ctx: FlagCtx, key: string): Promise<boolean> 
 	return bucket(key, ctx.uid ?? ctx.sessionId ?? "anon") < pct;
 }
 
+/** Inverse of flag() for default-on features: true only when explicitly disabled. */
+export async function flagOff(db: Db, key: string): Promise<boolean> {
+	const doc = (await loadFlags(db)).get(key);
+	return doc?.enabled === false;
+}
+
 /** Flag keys used by the worker sandbox lifecycle. */
 export const FLAGS = {
 	sandboxAutoPause: "sandboxAutoPause",

@@ -16,7 +16,7 @@ export class SandboxCore {
 	private onPause: (() => void) | undefined;
 	private idleMinutes = 0;
 	/** Lifecycle reporter — callers wire this to persistence (sqlite or Mongo). */
-	onLifecycle: ((event: string, sandboxId: string) => void) | undefined;
+	onLifecycle: ((event: string, sandboxId: string, extra?: Record<string, unknown>) => void) | undefined;
 
 	protected report(event: string): void {
 		const id = this.sandboxId;
@@ -150,7 +150,7 @@ export class SandboxCore {
 		const id = this.sandboxId;
 		if (!id || !this.provider.capabilities.snapshot || !this.provider.checkpointById) return null;
 		const snap = await this.provider.checkpointById(id, this.creds, opts);
-		if (snap) this.report("checkpoint");
+		if (snap) this.onLifecycle?.("checkpoint", id, { snapshotId: snap });
 		return snap;
 	}
 

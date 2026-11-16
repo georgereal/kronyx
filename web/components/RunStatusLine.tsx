@@ -3,17 +3,18 @@
 import { useEffect, useMemo, useState } from "react";
 import type { RunEvent } from "@/lib/types";
 
-const VERBS = ["Exploring", "Investigating", "Pondering", "Analyzing", "Navigating", "Thinking", "Tinkering"];
-
-/** Map a tool call to a fitting verb — feels tied to real work. */
+/** Map a tool call to the activity it's actually performing — the status
+ *  word should describe real work, never a decorative verb. */
 function verbForTool(name: string): string {
-	if (/read|search|grep|find|list|symbol|definition|reference|declaration|hover|hierarchy|open|glob/i.test(name)) return "Exploring";
-	if (/investigate|inspect|diagnos/i.test(name)) return "Investigating";
-	if (/write|edit|patch|rename|apply|create|delete|move/i.test(name)) return "Tinkering";
-	if (/command|bash|shell|terminal|run/i.test(name)) return "Navigating";
-	if (/browser|screenshot|navigate|click/i.test(name)) return "Navigating";
-	if (/plan|decompose|memory|recall|remember/i.test(name)) return "Pondering";
-	if (/fetch/i.test(name)) return "Exploring";
+	if (/run_command|bash|shell|terminal|command/i.test(name)) return "Running commands";
+	if (/write|edit|patch|rename|apply|create|delete|move/i.test(name)) return "Editing files";
+	if (/read|open/i.test(name)) return "Reading";
+	if (/search|grep|find|list|glob|symbol|reference|definition|declaration|hover|hierarchy/i.test(name)) return "Searching";
+	if (/browser|screenshot|navigate|click/i.test(name)) return "Browsing";
+	if (/fetch/i.test(name)) return "Fetching";
+	if (/save_plan|plan|decompose/i.test(name)) return "Planning";
+	if (/memory|recall|remember/i.test(name)) return "Remembering";
+	if (/switch_environment/i.test(name)) return "Switching environment";
 	return "Working";
 }
 
@@ -96,21 +97,36 @@ export function RunStatusLine({ events, runId, stopping }: { events: RunEvent[];
 			}
 			if (ev.type === "tool-finished" || ev.type === "assistant-text") break;
 		}
-		// Verb from the newest in-flight tool (falls back to last activity).
+		// Status word from the newest real activity: an in-flight tool's
+		// action when one is running, otherwise the latest event kind —
+		// never a rotated decorative verb.
 		let word = "";
-		for (let i = evts.length - 1; i >= 0; i--) {
-			const ev = evts[i].event;
-			if (ev.type === "tool-started") {
-				word = verbForTool(String(ev.name ?? ""));
-				break;
-			}
-			if (ev.type === "reasoning" || ev.type === "reasoning-delta") {
-				word = "Thinking";
-				break;
-			}
-			if (ev.type === "mode-blocked") {
-				attention = true;
-				break;
+		const active = inflight[inflight.length - 1];
+		if (active) {
+			word = verbForTool(active.name);
+		} else {
+			for (let i = evts.length - 1; i >= 0; i--) {
+				const ev = evts[i].event;
+				if (ev.type === "reasoning" || ev.type === "reasoning-delta" || ev.type === "assistant-reasoning-delta") {
+					word = "Thinking";
+					break;
+				}
+				if (ev.type === "assistant-text" || ev.type === "assistant-text-delta" || ev.type === "assistant-delta" || ev.type === "assistant-message") {
+					word = "Responding";
+					break;
+				}
+				if (ev.type === "tool-finished" || ev.type === "tool-started") {
+					word = "Working";
+					break;
+				}
+				if (ev.type === "info" || ev.type === "setup" || ev.type === "cloud-status") {
+					word = "Setting up";
+					break;
+				}
+				if (ev.type === "mode-blocked") {
+					attention = true;
+					break;
+				}
 			}
 		}
 		const startedAt = evts.length ? Date.parse(String(evts[0].at ?? "")) || now : now;
@@ -126,7 +142,7 @@ export function RunStatusLine({ events, runId, stopping }: { events: RunEvent[];
 			</div>
 		);
 	}
-	const word = status.word || VERBS[tick % VERBS.length];
+	const word = status.word || "Working";
 	return (
 		<div className="run-panel">
 			<button className={`run-status${status.attention ? " attention" : ""}`} onClick={() => setOpen((v) => !v)}>

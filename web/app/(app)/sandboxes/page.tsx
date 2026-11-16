@@ -1,38 +1,48 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import { Empty } from "@/components/Empty";
 import { Skeleton } from "@/components/Skeleton";
+import { SandboxDetailPanel } from "@/components/SandboxDetailPanel";
+import { BOOT_SOURCE } from "@/lib/sandboxLifecycle";
+
+// Provider's stock/public images — used to label boot provenance on rows
+// written before `source` was recorded.
+const PUBLIC_TEMPLATES = new Set(["desktop", "code-interpreter-v1", "kernel-browser"]);
 import { apiFetch, useUser } from "@/lib/api";
 
 interface LiveVm { sandboxId: string; templateId?: string; state?: string; startedAt?: string }
-interface Hist { sandboxId?: string; device?: string; deviceId?: string; template?: string; templateId?: string; repo?: string; runId?: string; event?: string; state?: string; reason?: string; sessionId?: string; at?: string; createdAt?: string }
-interface SbxEvent { sandboxId?: string; sessionId?: string; provider?: string; event?: string; state?: string; reason?: string; device?: string; runId?: string; at?: string }
+interface Hist { sandboxId?: string; device?: string; deviceId?: string; template?: string; templateId?: string; repo?: string; runId?: string; event?: string; state?: string; source?: string; reason?: string; sessionId?: string; at?: string; createdAt?: string }
 interface ProviderStatus { name: string; configured: boolean; reason?: string }
-interface BakeDoc { name?: string; recipe?: string; status?: string; snapshotId?: string; templateId?: string; bakedAt?: string; error?: string; kind?: string }
-interface TemplatesRes { bakes: BakeDoc[]; templates: { id: string; names: string[]; public: boolean }[]; recipes: { key: string; imageName: string }[]; flags: { templateBuildApi: boolean } }
+interface BakeDoc { name?: string; recipe?: string; status?: string; snapshotId?: string; templateId?: string; bakedAt?: string; error?: string; kind?: string; source?: string; commands?: string; verify?: string; description?: string }
+interface RecipeMeta { key: string; imageName: string; base?: string; tools?: string[]; description?: string }
+interface RepoTemplateDoc { key?: string; repo?: string; status?: string; depsOk?: boolean; snapshotId?: string; updatedAt?: string; error?: string; template?: string; baseTemplate?: string }
+interface TemplatesRes { bakes: BakeDoc[]; repoTemplates?: RepoTemplateDoc[]; templates: { id: string; names: string[]; public: boolean }[]; recipes: RecipeMeta[]; flags: { templateBuildApi: boolean } }
 
 const fmt = (v?: string) => (v ? new Date(v).toLocaleString() : "—");
 
 export default function SandboxesPage() {
 	const user = useUser();
+	const router = useRouter();
 	const [live, setLive] = useState<LiveVm[]>([]);
 	const [history, setHistory] = useState<Hist[]>([]);
-	const [events, setEvents] = useState<SbxEvent[]>([]);
-	const [providers, setProviders] = useState<ProviderStatus[]>([]);
+
 	const [expanded, setExpanded] = useState<string | null>(null);
+	const [providers, setProviders] = useState<ProviderStatus[]>([]);
 	const [, setLiveEnabled] = useState(false);
 	const [loading, setLoading] = useState(true);
 	const [msg, setMsg] = useState("");
-	const [tab, setTab] = useState<"live" | "history" | "images">("live");
+	const [tab, setTab] = useState<"live" | "history" | "templates">("live");
+	const [tmplTab, setTmplTab] = useState<"all" | "mine" | "shared">("all");
 	const [imgs, setImgs] = useState<TemplatesRes | null>(null);
 
 	const load = async () => {
 		if (!user) return;
 		const res = await apiFetch("/api/sandboxes", user);
 		if (res.ok) {
-			const b = (await res.json()) as { live: LiveVm[]; history: Hist[]; events?: SbxEvent[]; providers?: ProviderStatus[]; liveEnabled: boolean };
-			setLive(b.live); setHistory(b.history); setEvents(b.events ?? []); setProviders(b.providers ?? []); setLiveEnabled(b.liveEnabled);
+			const b = (await res.json()) as { live: LiveVm[]; history: Hist[]; providers?: ProviderStatus[]; liveEnabled: boolean };
+			setLive(b.live); setHistory(b.history); setProviders(b.providers ?? []); setLiveEnabled(b.liveEnabled);
 		}
 		setLoading(false);
 	};
@@ -48,10 +58,12 @@ export default function SandboxesPage() {
 		setMsg(res.ok ? "Bake queued — a stock VM installs the recipe, then snapshots." : `Bake failed: ${res.status}`);
 		void loadTemplates();
 	};
-	const apiBuild = async () => {
+	const bakeCustom = async (r: { name: string; commands: string; verify?: string; repo?: string; installationId?: number; includeRepo?: boolean }) => {
 		if (!user) return;
-		const res = await apiFetch("/api/templates/build", user, { method: "POST", body: JSON.stringify({}) });
-		setMsg(res.ok ? "Template build queued via E2B API." : `Build failed: ${res.status === 403 ? "flag off" : res.status}`);
+		const res = await apiFetch("/api/templates/bake", user, { method: "POST", body: JSON.stringify(r) });
+		setMsg(res.ok ? (r.includeRepo ? `Warm bake queued for ${r.repo}.` : `Bake queued for "${r.name}".`) : `Bake failed: ${res.status}`);
+		setTab("templates");
+		setTmplTab("mine");
 		void loadTemplates();
 	};
 	const removeImage = async (name: string) => {
@@ -59,14 +71,17 @@ export default function SandboxesPage() {
 		await apiFetch(`/api/templates/${encodeURIComponent(name)}`, user, { method: "DELETE" });
 		void loadTemplates();
 	};
-	useEffect(() => { void load(); void loadTemplates(); /* eslint-disable-next-line */ }, [user]);
-	// Poll bake/build status while any image is in flight.
+	// deps: load once per user identity, not per render.
+	useEffect(() => { void load(); void loadTemplates(); }, [user]);
+	// Poll bake status while any image is in flight.
 	useEffect(() => {
-		const busy = imgs?.bakes.some((b) => b.status === "baking" || b.status === "building");
+		const busy =
+			imgs?.bakes.some((b) => b.status === "baking" || b.status === "building") ||
+			imgs?.repoTemplates?.some((r) => r.status === "building");
 		if (!busy) return;
 		const t = setInterval(() => void loadTemplates(), 5000);
 		return () => clearInterval(t);
-		// eslint-disable-next-line
+		// deps: poll toggles only on bake-in-flight transitions.
 	}, [imgs?.bakes.some((b) => b.status === "baking" || b.status === "building")]);
 
 	const stop = async (id: string) => {
@@ -76,7 +91,6 @@ export default function SandboxesPage() {
 		setMsg(res.ok ? "Killed." : "Kill failed.");
 		void load();
 	};
-
 	const pause = async (id: string) => {
 		if (!user) return;
 		setMsg(`Pausing ${id.slice(0, 8)}…`);
@@ -84,98 +98,130 @@ export default function SandboxesPage() {
 		setMsg(res.ok ? "Paused." : "Pause failed.");
 		void load();
 	};
+	const snapshot = async (id: string) => {
+		if (!user) return;
+		setMsg(`Snapshotting ${id.slice(0, 8)}…`);
+		const res = await apiFetch(`/api/sandboxes/${id}/snapshot`, user, { method: "POST", body: "{}" });
+		const b = res.ok ? await res.json().catch(() => null) : null;
+		setMsg(res.ok ? `Snapshot saved${b?.snapshotId ? ` (${String(b.snapshotId).slice(0, 16)}…)` : ""}.` : "Snapshot failed.");
+	};
+	const resume = async (id: string) => {
+		if (!user) return;
+		setMsg(`Resuming ${id.slice(0, 8)}…`);
+		const res = await apiFetch(`/api/sandboxes/${id}/resume`, user, { method: "POST" });
+		setMsg(res.ok ? "Resumed." : "Resume failed.");
+		void load();
+	};
 
-	if (!user) return null;
-	const liveRows = history.filter((h) => ["active", "running", "paused"].includes(h.state ?? ""));
-	const deadRows = history.filter((h) => !["active", "running", "paused"].includes(h.state ?? ""));
-	const eventsFor = (id?: string) => (id ? events.filter((e) => e.sandboxId === id) : []);
-
-	const eventDot = (e?: string) =>
-		e === "kill" || e === "stop" ? "var(--err)" : e === "pause" ? "var(--amber, #facc15)" : "var(--ok, #4ade80)";
-	const timeline = (list: SbxEvent[]) => (
-		<div style={{ display: "flex", flexDirection: "column", gap: 3, padding: "6px 0 4px" }}>
-			{list.map((e, i) => (
-				<div key={i} style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 11 }}>
-					<span style={{ color: eventDot(e.event) }}>●</span>
-					<span style={{ textTransform: "capitalize" }}>{e.event ?? e.state ?? "—"}</span>
-					{e.reason && <span className="muted">{e.reason}</span>}
-					{e.provider && <span className="muted">{e.provider}</span>}
-					{e.device && <span className="muted">{e.device}</span>}
-					{e.sessionId && <a className="muted mono" href={`/sessions/${e.sessionId}`}>{e.sessionId.slice(0, 8)}</a>}
-					<span className="muted" style={{ marginLeft: "auto" }}>{fmt(e.at)}</span>
-				</div>
-			))}
-			{!list.length && <div className="muted" style={{ fontSize: 11 }}>No events recorded yet.</div>}
+	const expandedPanel = (h: Hist) => (
+		<div style={{ padding: "10px 14px 12px" }} onClick={(e) => e.stopPropagation()}>
+			<SandboxDetailPanel id={h.sandboxId!} />
+			<a href={`/sandboxes/${h.sandboxId}`} className="muted" style={{ fontSize: 11, display: "inline-block", marginTop: 10 }}>
+				Open full details ›
+			</a>
 		</div>
 	);
 
+	if (!user) return null;
+	// Repo → durable template binding — pure master data, no rebake.
+	const mapRepo = async (repo: string, template: string | null) => {
+		await apiFetch("/api/templates/map", user, { method: "POST", body: JSON.stringify({ repo, template }) });
+		void loadTemplates();
+	};
+
+	// Boot provenance — recorded `source` wins; fall back to inferring from
+	// the template name for rows written before sources existed.
+	const bootSource = (h: Hist) => {
+		if (h.source) return BOOT_SOURCE[h.source] ?? h.source;
+		if (h.template?.startsWith("kronyx-repo-")) return "warm snapshot";
+		if (h.template?.startsWith("kronyx-wip-")) return "session checkpoint";
+		if (!h.template || h.template === "base") return "base image";
+		if (PUBLIC_TEMPLATES.has(h.template)) return "provider image";
+		return "durable template";
+	};
+
+	const liveRows = history.filter((h) => ["active", "running", "paused"].includes(h.state ?? ""));
+
+	const deadRows = history.filter((h) => !["active", "running", "paused"].includes(h.state ?? ""));
+	const myBakes = imgs?.bakes ?? [];
+	const shared = (imgs?.templates ?? []).filter((t) => t.public);
+	const catalogCount = myBakes.length + (imgs?.templates.length ?? 0);
+
 	return (
 		<div className="page">
-			<h1>Sandboxes</h1>
+			<div className="sbx-head" style={{ marginBottom: 14 }}>
+				<h1>Sandboxes</h1>
+				<div className="sub">Run, pause and manage agent sandboxes with full lifecycle control.</div>
+			</div>
 			{providers.length > 0 && (
-				<div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 14 }}>
+				<div className="sbx-providers" style={{ marginBottom: 16 }}>
 					{providers.map((p) => (
-						<span
-							key={p.name}
-							className="sess-chip"
-							title={p.configured ? `${p.name} enabled` : p.reason}
-							style={{ fontSize: 11, opacity: p.configured ? 1 : 0.6 }}
-						>
-							{p.name} · {p.configured ? "enabled" : "not configured"}
+						<span key={p.name} className={`chip ${p.configured ? "on" : "off"}`} title={p.configured ? `${p.name} enabled` : p.reason}>
+							<span className="dot" />{p.name} · {p.configured ? "enabled" : "not configured"}
 						</span>
 					))}
 				</div>
 			)}
-			<div className="stat-grid" style={{ marginBottom: 20 }}>
-				<div className="card" style={{ padding: 16 }}>
-					<div className="chart-title">Live</div>
-					<div style={{ fontSize: 28, fontWeight: 700 }}>{liveRows.length}</div>
-					<div className="muted" style={{ fontSize: 12 }}>{liveRows.filter((v) => v.state !== "paused").length} running · {liveRows.filter((v) => v.state === "paused").length} paused</div>
+			<div className="sbx-stats" style={{ marginBottom: 20 }}>
+				<div className="sbx-stat">
+					<div className="k">Live</div>
+					<div className="v">{liveRows.length}</div>
+					<div className="s">{liveRows.filter((v) => v.state !== "paused").length} running · {liveRows.filter((v) => v.state === "paused").length} paused</div>
 				</div>
-				<div className="card" style={{ padding: 16 }}>
-					<div className="chart-title">History</div>
-					<div style={{ fontSize: 28, fontWeight: 700 }}>{deadRows.length}</div>
-					<div className="muted" style={{ fontSize: 12 }}>dead / replaced</div>
+				<div className="sbx-stat">
+					<div className="k">History</div>
+					<div className="v">{deadRows.length}</div>
+					<div className="s">dead / replaced</div>
 				</div>
 			</div>
 
-			<div className="sess-tabs" style={{ marginBottom: 14 }}>
-				{(["live", "history", "images"] as const).map((t) => (
+			<div className="sbx-tabs" style={{ marginBottom: 14 }}>
+				{(["live", "history", "templates"] as const).map((t) => (
 					<button key={t} className={tab === t ? "active" : ""} onClick={() => setTab(t)}>
-						{t === "live" ? `Live (${liveRows.length})` : t === "history" ? `History (${deadRows.length})` : `Images (${imgs?.bakes.length ?? 0})`}
+						{t === "live" ? `Live (${liveRows.length})` : t === "history" ? `History (${deadRows.length})` : `Templates (${catalogCount})`}
 					</button>
 				))}
 			</div>
 
 			{loading && <Skeleton height={200} />}
-			{!loading && live.length === 0 && history.length === 0 && <Empty>No sandboxes yet — start a cloud session.</Empty>}
+			{!loading && live.length === 0 && history.length === 0 && tab !== "templates" && <Empty>No sandboxes yet — start a cloud session.</Empty>}
 
 			{tab === "live" && liveRows.length > 0 && (
 				<div className="card table-card">
-					<table>
-						<thead><tr><th>Sandbox</th><th>State</th><th>Session</th><th>Repo</th><th>Template</th><th>Created</th><th>Last event</th><th></th></tr></thead>
+					<table className="sbx-table">
+						<thead><tr><th>Sandbox</th><th>State</th><th>Session</th><th>Repo</th><th>Template</th><th>Created</th><th>Last event</th><th style={{ textAlign: "right" }}>Actions</th></tr></thead>
 						<tbody>
 							{liveRows.map((h, i) => (
-								<>
-									<tr key={i} onClick={() => setExpanded(expanded === h.sandboxId ? null : h.sandboxId!)} style={{ cursor: "pointer" }}>
-										<td className="mono">{expanded === h.sandboxId ? "▾" : "▸"} {(h.sandboxId ?? "").slice(0, 16)}</td>
-										<td><span className={`sess-pill ${h.state === "paused" ? "completed" : "running"}`}>{h.state}</span></td>
-										<td className="muted mono">{h.sessionId ? <a href={`/sessions/${h.sessionId}`}>{h.sessionId.slice(0, 8)}</a> : "—"}</td>
-										<td className="muted">{h.repo || "—"}</td>
-										<td className="muted" title={h.templateId ?? undefined}>{h.template ?? "—"}{h.templateId && h.template !== h.templateId ? <span className="muted" style={{ fontSize: 10 }}> ·{h.templateId.slice(0, 8)}</span> : null}</td>
-										<td className="muted">{fmt(h.createdAt)}</td>
-										<td className="muted">{fmt(h.at)}</td>
-										<td style={{ whiteSpace: "nowrap" }} onClick={(e) => e.stopPropagation()}>
-											{h.state !== "paused" && <button className="btn ghost sm" onClick={() => void pause(h.sandboxId!)}>Pause</button>}{" "}
-											<button className="btn danger sm" onClick={() => void stop(h.sandboxId!)}>Kill</button>
-										</td>
+								<Fragment key={i}>
+								<tr className="clickable" onClick={() => { window.location.href = `/sandboxes/${h.sandboxId}`; }}>
+									<td className="mono">
+										<span
+											style={{ cursor: "pointer", display: "inline-block", width: 14 }}
+											onClick={(e) => { e.stopPropagation(); setExpanded(expanded === h.sandboxId ? null : h.sandboxId!); }}
+										>
+											{expanded === h.sandboxId ? "▾" : "▸"}
+										</span>
+										{(h.sandboxId ?? "").slice(0, 16)}
+									</td>
+									<td><span className={`sbx-pill ${h.state ?? ""}`}>{h.state}</span></td>
+									<td className="muted mono" onClick={(e) => e.stopPropagation()}>{h.sessionId ? <a href={`/sessions/${h.sessionId}`}>{h.sessionId.slice(0, 8)}</a> : "—"}</td>
+									<td className="muted">{h.repo || "—"}</td>
+									<td className="muted" title={h.templateId ?? undefined}>{h.template ?? "—"}{h.templateId && <div className="sub2">·{h.templateId.slice(0, 10)}</div>}{bootSource(h) && <div className="sub2">{bootSource(h)}</div>}</td>
+									<td className="muted">{fmt(h.createdAt)}</td>
+									<td className="muted">{fmt(h.at)}</td>
+									<td style={{ whiteSpace: "nowrap", textAlign: "right" }} onClick={(e) => e.stopPropagation()}>
+										{h.state === "paused" && <button className="sbx-btn primary" onClick={() => void resume(h.sandboxId!)}>▶ Resume</button>}{" "}
+										{h.state !== "paused" && <button className="sbx-btn" onClick={() => void pause(h.sandboxId!)}>⏸ Pause</button>}{" "}
+										{h.state !== "paused" && <button className="sbx-btn" onClick={() => void snapshot(h.sandboxId!)}>⧉ Snapshot</button>}{" "}
+										<button className="sbx-btn danger" onClick={() => void stop(h.sandboxId!)}>Kill</button>
+									</td>
+								</tr>
+								{expanded === h.sandboxId && (
+									<tr>
+										<td colSpan={8} style={{ background: "var(--bg)", borderBottom: "1px solid var(--border)" }}>{expandedPanel(h)}</td>
 									</tr>
-									{expanded === h.sandboxId && (
-										<tr key={`${i}-ev`}>
-											<td colSpan={8} style={{ paddingLeft: 24, background: "var(--bg)" }}>{timeline(eventsFor(h.sandboxId))}</td>
-										</tr>
-									)}
-								</>
+								)}
+								</Fragment>
 							))}
 						</tbody>
 					</table>
@@ -185,93 +231,186 @@ export default function SandboxesPage() {
 
 			{tab === "history" && deadRows.length > 0 && (
 				<div className="card table-card">
-					<table>
+					<table className="sbx-table">
 						<thead><tr><th>Sandbox</th><th>State</th><th>Reason</th><th>Session</th><th>Repo</th><th>Template</th><th>Created</th><th>Last event</th></tr></thead>
 						<tbody>
 							{deadRows.map((h, i) => (
-								<>
-									<tr key={i} onClick={() => setExpanded(expanded === h.sandboxId ? null : h.sandboxId!)} style={{ cursor: "pointer" }}>
-										<td className="mono">{expanded === h.sandboxId ? "▾" : "▸"} {(h.sandboxId ?? "").slice(0, 16)}</td>
-										<td>{h.state ?? h.event ?? "—"}</td>
-										<td className="muted">{h.reason || "—"}</td>
-										<td className="muted mono">{h.sessionId ? <a href={`/sessions/${h.sessionId}`}>{h.sessionId.slice(0, 8)}</a> : h.device || "—"}</td>
-										<td className="muted">{h.repo || "—"}</td>
-										<td className="muted" title={h.templateId ?? undefined}>{h.template ?? "—"}{h.templateId && h.template !== h.templateId ? <span className="muted" style={{ fontSize: 10 }}> ·{h.templateId.slice(0, 8)}</span> : null}</td>
-										<td className="muted">{fmt(h.createdAt)}</td>
-										<td className="muted">{fmt(h.at)}</td>
+								<Fragment key={i}>
+								<tr className="clickable" onClick={() => { window.location.href = `/sandboxes/${h.sandboxId}`; }}>
+									<td className="mono">
+										<span
+											style={{ cursor: "pointer", display: "inline-block", width: 14 }}
+											onClick={(e) => { e.stopPropagation(); setExpanded(expanded === h.sandboxId ? null : h.sandboxId!); }}
+										>
+											{expanded === h.sandboxId ? "▾" : "▸"}
+										</span>
+										{(h.sandboxId ?? "").slice(0, 16)}
+									</td>
+									<td><span className={`sbx-pill ${h.state ?? ""}`}>{h.state ?? h.event ?? "—"}</span></td>
+									<td className="muted">{h.reason || "—"}</td>
+									<td className="muted mono" onClick={(e) => e.stopPropagation()}>{h.sessionId ? <a href={`/sessions/${h.sessionId}`}>{h.sessionId.slice(0, 8)}</a> : h.device || "—"}</td>
+									<td className="muted">{h.repo || "—"}</td>
+									<td className="muted" title={h.templateId ?? undefined}>{h.template ?? "—"}{bootSource(h) && <div className="sub2">{bootSource(h)}</div>}</td>
+									<td className="muted">{fmt(h.createdAt)}</td>
+									<td className="muted">{fmt(h.at)}</td>
+								</tr>
+								{expanded === h.sandboxId && (
+									<tr>
+										<td colSpan={8} style={{ background: "var(--bg)", borderBottom: "1px solid var(--border)" }}>{expandedPanel(h)}</td>
 									</tr>
-									{expanded === h.sandboxId && (
-										<tr key={`${i}-ev`}>
-											<td colSpan={8} style={{ paddingLeft: 24, background: "var(--bg)" }}>{timeline(eventsFor(h.sandboxId))}</td>
-										</tr>
-									)}
-								</>
+								)}
+								</Fragment>
 							))}
 						</tbody>
 					</table>
 				</div>
 			)}
-			{tab === "images" && (
+
+			{tab === "templates" && (
 				<>
+					<div style={{ display: "flex", gap: 8, marginBottom: 14, alignItems: "center", flexWrap: "wrap" }}>
+						<div className="sbx-tabs" style={{ marginBottom: 0 }}>
+							{(["all", "mine", "shared"] as const).map((t) => (
+								<button key={t} className={tmplTab === t ? "active" : ""} onClick={() => setTmplTab(t)}>
+									{t === "all" ? `All (${catalogCount})` : t === "mine" ? `My Templates (${myBakes.length})` : `Shared (${shared.length})`}
+								</button>
+							))}
+						</div>
+						<button className="sbx-btn primary" style={{ marginLeft: "auto" }} onClick={() => router.push("/sandboxes/templates/new")}>+ New Template</button>
+					</div>
+
 					<div className="card table-card">
-						<table>
-							<thead><tr><th>Image</th><th>Status</th><th>Type</th><th>Snapshot / template</th><th>Baked</th><th>Error</th><th></th></tr></thead>
+						<table className="sbx-table">
+							<thead><tr><th>Template</th><th>Base image</th><th>Tools / stack</th><th>Status</th><th>Snapshot</th><th style={{ textAlign: "right" }}></th></tr></thead>
 							<tbody>
-								{(imgs?.bakes ?? []).map((b, i) => (
-									<tr key={i}>
-										<td className="mono">{b.name ?? "—"}</td>
-										<td>
-											<span className={`sess-pill ${b.status === "ready" ? "completed" : b.status === "baking" || b.status === "building" ? "running" : b.status === "superseded" ? "queued" : "failed"}`}>
-												{b.status ?? "—"}
-											</span>
-										</td>
-										<td className="muted">{b.kind === "api-build" ? "template" : "snapshot"}</td>
-										<td className="muted mono" style={{ fontSize: 11 }}>{(b.snapshotId ?? b.templateId ?? "—").slice(0, 20)}</td>
-										<td className="muted">{fmt(b.bakedAt)}</td>
-										<td className="muted" style={{ fontSize: 11, maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={b.error}>{b.error || ""}</td>
-										<td><button className="btn danger sm" onClick={() => void removeImage(String(b.name))}>Delete</button></td>
-									</tr>
-								))}
-								{!(imgs?.bakes.length ?? 0) && (
-									<tr><td colSpan={7} className="muted" style={{ padding: 16 }}>No baked images yet — bake one below. Use its name in a session's template field.</td></tr>
+								{tmplTab !== "shared" && myBakes.map((b, i) => {
+									const recipe = imgs?.recipes.find((r) => r.imageName === b.name || r.key === b.recipe);
+									return (
+										<tr key={`b${i}`}>
+											<td>
+												<span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+													<span className="sbx-icon">{String(b.name ?? "?")[0].toUpperCase()}</span>
+													<span className="mono">{b.name ?? "—"}</span>
+													{b.source === "custom" && <span className="sbx-badge">Custom</span>}
+												</span>
+											</td>
+											<td className="muted">{recipe?.base ?? "stock e2b"}</td>
+											<td><ToolChips tools={recipe?.tools} fallback={b.source === "custom" ? "custom recipe" : b.recipe} /></td>
+											<td><span className={`sbx-pill ${b.status ?? ""}`}>{b.status ?? "—"}</span></td>
+											<td className="muted mono" style={{ fontSize: 11 }} title={b.error}>{(b.snapshotId ?? b.templateId ?? "—").slice(0, 20)}</td>
+											<td style={{ whiteSpace: "nowrap", textAlign: "right" }}>
+												{recipe && <button className="sbx-btn" disabled={b.status === "baking" || b.status === "building"} onClick={() => void bake(recipe.key)}>{b.status === "baking" || b.status === "building" ? "Baking…" : "Re-bake"}</button>}{" "}
+												{b.commands && <button className="sbx-btn" onClick={() => router.push(`/sandboxes/templates/new?edit=${encodeURIComponent(String(b.name))}`)}>Edit</button>}{" "}
+												<button className="sbx-btn danger" onClick={() => void removeImage(String(b.name))}>Delete</button>
+											</td>
+										</tr>
+									);
+								})}
+								{tmplTab !== "shared" && (imgs?.recipes ?? [])
+									.filter((r) => !myBakes.some((b) => b.name === r.imageName))
+									.map((r) => (
+										<tr key={r.key}>
+											<td>
+												<span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+													<span className="sbx-icon">{r.imageName[0].toUpperCase()}</span>
+													<span className="mono">{r.imageName}</span>
+													{r.key === "browser" && <span className="sbx-badge">Default</span>}
+												</span>
+											</td>
+											<td className="muted">{r.base ?? "stock e2b"}</td>
+											<td><ToolChips tools={r.tools} fallback={r.description} /></td>
+											<td className="muted">not baked</td>
+											<td className="muted">—</td>
+											<td style={{ textAlign: "right" }}><button className="sbx-btn" onClick={() => void bake(r.key)}>Bake</button></td>
+										</tr>
+									))}
+								{tmplTab !== "mine" && (imgs?.templates ?? [])
+									.filter((t) => tmplTab === "all" || t.public)
+									.map((t) => (
+										<tr key={t.id}>
+											<td>
+												<span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+													<span className="sbx-icon">{String(t.names[0] ?? t.id)[0].toUpperCase()}</span>
+													<span className="mono">{t.names[0] ?? t.id}</span>
+												</span>
+											</td>
+											<td className="muted" colSpan={2}>provider template{t.names.length > 1 ? ` (${t.names.slice(1).join(", ")})` : ""}</td>
+											<td className="muted">{t.public ? "shared" : "—"}</td>
+											<td className="muted mono" style={{ fontSize: 11 }}>{t.id.slice(0, 20)}</td>
+											<td></td>
+										</tr>
+									))}
+								{!myBakes.length && tmplTab === "mine" && (
+									<tr><td colSpan={6} className="muted" style={{ padding: 16 }}>No baked images yet — bake a builtin recipe or create a custom one.</td></tr>
 								)}
 							</tbody>
 						</table>
 					</div>
-					<div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
-						{(imgs?.recipes ?? []).map((r) => {
-							const b = imgs?.bakes.find((x) => x.name === r.imageName);
-							const busy = b?.status === "baking" || b?.status === "building";
-							return (
-								<button key={r.key} className="btn ghost sm" disabled={busy} onClick={() => void bake(r.key)}>
-									{busy ? `Baking ${r.imageName}…` : b?.status === "ready" ? `Re-bake ${r.imageName}` : `Bake ${r.imageName}`}
-								</button>
-							);
-						})}
-						{imgs?.flags.templateBuildApi && (
-							<button className="btn ghost sm" onClick={() => void apiBuild()}>Build via E2B API (beta)</button>
-						)}
-					</div>
-					<p className="muted" style={{ fontSize: 11.5, marginTop: 8 }}>
-						Baking boots a stock VM, installs the recipe, and saves a named snapshot — <span className="mono">browser</span> produces{" "}
-						<span className="mono">kronyx-browser</span> (Chromium + Playwright + browser-use) for the <span className="mono">browser_use</span>{" "}
-						tool. Set the image name in a session's template field to use it.
-					</p>
-					{(imgs?.templates.length ?? 0) > 0 && (
+					{(imgs?.repoTemplates ?? []).length > 0 && (
 						<>
-							<div className="chart-title" style={{ marginTop: 18 }}>Provider templates</div>
-							<div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-								{imgs!.templates.map((t) => (
-									<span key={t.id} className="sess-chip mono" style={{ fontSize: 11 }} title={t.id}>
-										{t.names[0] ?? t.id}
-									</span>
-								))}
+							<h3 style={{ fontSize: 13, margin: "18px 0 8px" }}>Repositories</h3>
+							<div className="card table-card">
+								<table className="sbx-table">
+									<thead><tr><th>Repo</th><th>Template</th><th>Warm status</th><th>Deps</th><th>Updated</th><th style={{ textAlign: "right" }}></th></tr></thead>
+									<tbody>
+										{(imgs?.repoTemplates ?? []).map((r) => (
+											<tr key={r.key}>
+												<td className="mono" style={{ fontSize: 12 }}>{r.repo ?? "—"}</td>
+												<td className="mono" style={{ fontSize: 11 }} title={r.baseTemplate ? `warm base: ${r.baseTemplate}` : undefined}>
+												{(() => {
+													const durable = Array.from(new Set(
+														[
+															...(imgs?.bakes ?? []).map((b) => String(b.name ?? "")),
+															...(imgs?.templates ?? []).flatMap((t) => t.names),
+														].filter((n) => n && !n.startsWith("kronyx-repo-") && !n.startsWith("kronyx-wip-")),
+													));
+													const opts = r.template && !durable.includes(r.template) ? [r.template, ...durable] : durable;
+													return (
+														<select
+															className="sbx-select"
+															value={r.template ?? ""}
+															onClick={(e) => e.stopPropagation()}
+															onChange={(e) => r.repo && void mapRepo(r.repo, e.target.value || null)}
+														>
+															<option value="">— none —</option>
+															{opts.map((n) => <option key={n} value={n}>{n}</option>)}
+														</select>
+													);
+												})()}
+											</td>
+												<td><span className={`sbx-pill ${r.status === "ready" ? "running" : r.status === "failed" ? "dead" : "paused"}`} title={r.error}>{r.status ?? "—"}</span></td>
+												<td className="muted">{r.depsOk === false ? "install failed" : "ok"}</td>
+												<td className="muted">{fmt(r.updatedAt)}</td>
+												<td style={{ textAlign: "right" }}>
+													<button className="sbx-btn" onClick={() => router.push(`/sandboxes/templates/new?repo=${encodeURIComponent(r.repo ?? "")}`)}>
+														{r.status === "building" ? "Building…" : "Re-bake"}
+													</button>
+												</td>
+											</tr>
+										))}
+									</tbody>
+								</table>
 							</div>
 						</>
 					)}
+					<p className="muted" style={{ fontSize: 11.5, marginTop: 8 }}>
+						My templates are named snapshots built in your account — set one as a session's template to boot from it.
+						Shared templates come from the provider catalog. Repositories are warm snapshots baked with the repo cloned and its recipe run.
+					</p>
 				</>
 			)}
 			{msg && <p className="muted" style={{ fontSize: 12, marginTop: 12 }}>{msg}</p>}
 		</div>
+	);
+}
+
+/** Tool/stack chips — first 3 + "+N" overflow. */
+function ToolChips({ tools, fallback }: { tools?: string[]; fallback?: string }) {
+	if (!tools?.length) return <span className="muted" style={{ fontSize: 11 }} title={fallback}>{fallback || "—"}</span>;
+	return (
+		<span className="sbx-tools" title={tools.join(" · ")}>
+			{tools.slice(0, 3).map((t) => <span key={t} className="t">{t}</span>)}
+			{tools.length > 3 && <span className="t">+{tools.length - 3}</span>}
+		</span>
 	);
 }

@@ -16,6 +16,7 @@ export interface UsageCall {
 	cacheRead: number;
 	cacheWrite?: number;
 	reasoningTokens?: number;
+	contextWindow?: number;
 	billedCostUsd?: number | null;
 	iteration?: number | null;
 	contextMsgs?: number | null;

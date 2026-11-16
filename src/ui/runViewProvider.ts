@@ -45,7 +45,7 @@ export interface ViewState {
 export type ViewEvent =
 	| RunViewEvent
 	| { type: "reset" }
-	| { type: "cloud-status"; text: string }
+	| { type: "cloud-status"; text: string; key?: string }
 	| { type: "setup"; step: number; label: string; state: "run" | "ok" | "fail"; detail?: string }
 	| { type: "setupStatus"; items: { key: string; label: string; ok: boolean; detail?: string; fixLabel?: string }[] }
 	| { type: "github-enable"; repo: string; url: string };

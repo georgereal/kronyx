@@ -39,7 +39,7 @@ export type RunViewEvent =
 	| { type: "assistant-delta"; text: string }
 	| { type: "reasoning-delta"; text: string }
 	| { type: "tool-output-delta"; text: string }
-	| { type: "info"; text: string; meta?: Record<string, unknown> }
+	| { type: "info"; text: string; key?: string; meta?: Record<string, unknown> }
 	| { type: "check"; command: string; ok: boolean; durationMs: number; output: string }
 	| { type: "plan-ready"; path: string }
 	| { type: "permission-request"; id: string; tool: string; path: string; command?: string; input?: unknown; diff?: string }

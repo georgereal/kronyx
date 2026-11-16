@@ -60,6 +60,46 @@ const CLAMPS: Record<string, { max: number; head: number; tail: number }> = {
 };
 const DEFAULT_CLAMP = { max: MAX_RESULT_CHARS, head: HEAD_CHARS, tail: TAIL_CHARS };
 
+export interface ContextLine {
+	role: string;
+	kind: "text" | "tool-call" | "tool-result" | "reasoning" | "attachment";
+	chars: number;
+	preview: string;
+}
+
+/** Bounded per-message digest for the compaction feed — enough for the UI's
+ *  before/after context comparison without persisting full contexts (~200KB+).
+ *  Elision markers compaction writes are text parts, so they show up inline. */
+export function previewMessages(msgs: readonly AgentMessage[], max = 60): ContextLine[] {
+	return msgs.slice(-max).map((m) => {
+		const kinds = new Set(m.content.map((p) => p.type));
+		const kind: ContextLine["kind"] = kinds.has("tool-result")
+			? "tool-result"
+			: kinds.has("tool-call")
+				? "tool-call"
+				: kinds.has("reasoning")
+					? "reasoning"
+					: kinds.has("image") || kinds.has("file") || kinds.has("media")
+						? "attachment"
+						: "text";
+		let text = "";
+		let chars = 0;
+		for (const p of m.content) {
+			const t =
+				p.type === "text" || p.type === "reasoning"
+					? String((p as { text?: string }).text ?? "")
+					: p.type === "tool-call"
+						? `${(p as { toolName?: string }).toolName ?? "tool"}(${JSON.stringify((p as { input?: unknown }).input ?? "").slice(0, 200)})`
+						: p.type === "tool-result"
+							? JSON.stringify((p as { output?: unknown }).output ?? "").slice(0, 200)
+							: `[${p.type}]`;
+			chars += t.length;
+			if (!text && t.trim()) text = t;
+		}
+		return { role: m.role, kind, chars, preview: text.slice(0, 160) };
+	});
+}
+
 /** Provider-specific tuning. Anthropic requires the thinking block that
  *  precedes a tool call to stay in the transcript; other providers never
  *  receive reasoning back, so pruning it unconditionally is free savings. */
@@ -451,6 +491,7 @@ export function createPrepareTurn(opts: PrepareTurnOptions = {}) {
 				provider: ctx.model.provider,
 				actualInputTokens: ctx.previousRequestInputTokens,
 				recap: summary,
+				contextPreview: { before: previewMessages(ctx.messages), after: previewMessages(mutable) },
 				estTokensBefore: estBefore,
 				estTokensAfter: est,
 			},

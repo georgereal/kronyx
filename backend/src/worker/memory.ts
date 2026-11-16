@@ -164,7 +164,7 @@ const EMBEDDING_DIMS = 1536;
 let dimsWarned = false;
 
 /** OpenAI-compatible /embeddings call (works on AI Gateway, OpenAI, OpenRouter). */
-async function embedText(provider: EmbedProvider, text: string, op?: string): Promise<number[] | undefined> {
+export async function embedText(provider: EmbedProvider, text: string, op?: string): Promise<number[] | undefined> {
 	const model = provider.embeddingModel ?? DEFAULT_EMBED_MODEL;
 	const t0 = Date.now();
 	const report = (ok: boolean, tokensIn = 0, error?: string) => {

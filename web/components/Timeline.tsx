@@ -51,6 +51,7 @@ type Item =
 			agentIndex?: number;
 	  }
 	| { kind: "perm"; permId: string; tool: string; path: string; command: string; input: unknown; decision?: string; key: string; runId?: string; seq?: number; agentIndex?: number }
+	| { kind: "preflight"; checks: RunEvent[]; key: string; runId?: string; seq?: number; agentIndex?: number }
 	| { kind: "event"; e: RunEvent; key: string };
 
 /**
@@ -136,13 +137,26 @@ function pair(items: Item[]): Item[] {
 	const out: Item[] = [];
 	const actions = new Map<string, Extract<Item, { kind: "action" }>>();
 	const perms = new Map<string, Extract<Item, { kind: "perm" }>>();
+	let openPreflight: Extract<Item, { kind: "preflight" }> | null = null;
 	for (const item of items) {
 		if (item.kind !== "event") {
+			openPreflight = null;
 			out.push(item);
 			continue;
 		}
 		const ev = item.e.event;
 		const ai = ev.agentIndex ?? 0;
+		// Contiguous run-preflight checks collapse into one grouped card —
+		// the status log already narrated this; a card per check is noise.
+		if (ev.type === "check" && String(ev.command ?? "").startsWith("preflight:")) {
+			if (!openPreflight || openPreflight.runId !== item.e.runId) {
+				openPreflight = { kind: "preflight", checks: [], key: item.key, runId: item.e.runId, seq: item.e.seq };
+				out.push(openPreflight);
+			}
+			openPreflight.checks.push(item.e);
+			continue;
+		}
+		openPreflight = null;
 		if (ev.type === "tool-started") {
 			const inp = (ev.input ?? {}) as Record<string, unknown>;
 			const a: Extract<Item, { kind: "action" }> = {
@@ -781,6 +795,30 @@ export function Timeline({
 			return <Terminal key={item.key} item={frozen && item.output === undefined ? { ...item, output: item.liveOutput ?? "" } : item} />;
 		}
 		if (item.kind === "perm") return <PermissionCard key={item.key} user={user} item={item} active={!!active && !lateAfter} />;
+		if (item.kind === "preflight") {
+			const ok = item.checks.filter((c) => c.event.ok !== false).length;
+			const allOk = ok === item.checks.length;
+			return (
+				<ActionCard
+					key={item.key}
+					icon={<span style={{ color: allOk ? "var(--ok)" : "var(--err)" }}>{allOk ? "✓" : "✗"}</span>}
+					title={<span className="muted">Environment checks</span>}
+					status={<span className={`act-pill ${allOk ? "ok" : "err"}`}>{ok}/{item.checks.length} passed</span>}
+					done
+					failed={!allOk}
+				>
+					<div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+						{item.checks.map((c, j) => (
+							<div key={j} className="muted" style={{ display: "flex", gap: 8, fontSize: 12 }}>
+								<span style={{ color: c.event.ok === false ? "var(--err)" : "var(--ok)" }}>{c.event.ok === false ? "✗" : "✓"}</span>
+								<span className="mono">{String(c.event.command ?? "").replace(/^preflight:\s*/, "")}</span>
+								{c.event.output ? <span style={{ opacity: 0.7 }}>— {String(c.event.output)}</span> : null}
+							</div>
+						))}
+					</div>
+				</ActionCard>
+			);
+		}
 		// Multi-agent orchestration events → dedicated cards.
 		const et = item.e.event.type;
 		if (et === "slice-status") return null;

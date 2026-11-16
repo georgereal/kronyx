@@ -207,6 +207,7 @@ export async function compactions(req: Request): Promise<Response> {
 			contextWindow: ev.contextWindow,
 			actualInputTokens: ev.actualInputTokens,
 			recap: typeof ev.recap === "string" ? ev.recap.slice(0, 20_000) : undefined,
+			contextPreview: ev.contextPreview,
 			estTokensBefore: ev.estTokensBefore,
 			estTokensAfter: ev.estTokensAfter,
 			stubbed: ev.stubbed,
@@ -383,7 +384,7 @@ export async function memory(req: Request): Promise<Response> {
 		.collection("memories")
 		.find({ uid })
 		.sort({ createdAt: -1 })
-		.limit(50)
+		.limit(500)
 		.project({ _id: 0, embedding: 0 })
 		.toArray()
 		.catch(swallow("memory", "op", [] as Record<string, unknown>[]));
