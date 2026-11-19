@@ -13,6 +13,59 @@ body {
 	display: none !important;
 }
 
+/* ---------- session tabs ---------- */
+
+.tabs {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	padding: 4px 8px;
+	border-bottom: 1px solid var(--vscode-sideBar-border, var(--vscode-panel-border, transparent));
+	overflow-x: auto;
+	flex-shrink: 0;
+}
+.tab-list {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	overflow-x: auto;
+}
+.tab {
+	font: inherit;
+	font-size: 0.85em;
+	color: var(--vscode-foreground);
+	background: transparent;
+	border: 1px solid transparent;
+	border-radius: 5px;
+	padding: 2px 8px;
+	cursor: pointer;
+	white-space: nowrap;
+	opacity: 0.75;
+}
+.tab:hover {
+	background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2));
+}
+.tab.active {
+	opacity: 1;
+	background: var(--vscode-input-background);
+	border-color: var(--vscode-input-border, var(--vscode-panel-border, transparent));
+}
+.tab-new {
+	font: inherit;
+	color: var(--vscode-foreground);
+	background: transparent;
+	border: none;
+	border-radius: 5px;
+	padding: 2px 7px;
+	cursor: pointer;
+	opacity: 0.75;
+	flex-shrink: 0;
+}
+.tab-new:hover {
+	background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2));
+	opacity: 1;
+}
+
 /* ---------- timeline ---------- */
 
 .timeline {

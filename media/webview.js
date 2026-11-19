@@ -20,6 +20,8 @@
 	const authBanner = /** @type {HTMLElement} */ (document.getElementById("authbanner"));
 	const authSignIn = /** @type {HTMLButtonElement} */ (document.getElementById("auth-signin"));
 	const authDismiss = /** @type {HTMLButtonElement} */ (document.getElementById("auth-dismiss"));
+	const tabList = /** @type {HTMLElement} */ (document.getElementById("tab-list"));
+	const tabNew = /** @type {HTMLButtonElement} */ (document.getElementById("tab-new"));
 	/** @type {Map<string, HTMLElement>} */
 	const tools = new Map();
 	let openToolCard = null;
@@ -35,6 +37,9 @@
 	let models = persisted.models || [];
 	/** @type {string[]} */
 	let recentModels = persisted.recentModels || [];
+	/** @type {string[]} */
+	let sessionTabs = [];
+	let activeSession = "";
 	if (persisted.draft) task.value = persisted.draft;
 
 	const MODES = [
@@ -76,6 +81,19 @@
 		if (text !== undefined) node.textContent = text;
 		return node;
 	};
+
+	const renderTabs = () => {
+		tabList.innerHTML = "";
+		for (const name of sessionTabs) {
+			const chip = el("button", "tab" + (name === activeSession ? " active" : ""), name);
+			chip.title = name;
+			chip.addEventListener("click", () => {
+				if (name !== activeSession) vscode.postMessage({ type: "switchSession", name });
+			});
+			tabList.appendChild(chip);
+		}
+	};
+	tabNew.addEventListener("click", () => vscode.postMessage({ type: "newSession" }));
 
 	// ---------- markdown ----------
 	const sanitizeMd = (html) => html.replace(/<(script|style|iframe|object|embed|form)[\s\S]*?<\/\1>/gi, "");
@@ -668,6 +686,11 @@
 				modelId = msg.modelId || modelId;
 				models = msg.models || models;
 				if (typeof msg.signedIn === "boolean") signedIn = msg.signedIn;
+				if (Array.isArray(msg.sessions)) {
+					sessionTabs = msg.sessions;
+					activeSession = msg.activeSession || activeSession;
+					renderTabs();
+				}
 				refreshAuthBanner();
 				refreshChips();
 				persist();

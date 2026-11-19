@@ -17,6 +17,7 @@ export type WebviewMessage =
 	| { type: "setModel"; modelId: string }
 	| { type: "attach"; kind: "file" | "directory" | "upload" }
 	| { type: "newSession" }
+	| { type: "switchSession"; name: string }
 	| { type: "openSettings" }
 	| { type: "review"; path: string }
 	| { type: "acceptChange"; path: string }
@@ -42,6 +43,9 @@ export interface ViewState {
 	cloudRepo?: string;
 	cloudBranch?: string;
 	cloudPr?: string;
+	/** Session tab strip: persisted session names + the active one. */
+	sessions?: string[];
+	activeSession?: string;
 }
 
 export type ViewEvent =
