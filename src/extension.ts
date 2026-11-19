@@ -463,8 +463,8 @@ export function activate(context: vscode.ExtensionContext): void {
 			vscode.commands.executeCommand(`${RunViewProvider.rightViewId}.focus`),
 		),
 		vscode.commands.registerCommand("kronyx.newSession", () => {
-			log("cmd", "kronyx.newSession — opening session tab");
-			return openSessionPanel(context, deps);
+			log("cmd", "kronyx.newSession — focusing right sidebar session view");
+			return vscode.commands.executeCommand("kronyx.focusRight");
 		}),
 		vscode.commands.registerCommand("kronyx.openSession", (name: string) => {
 			log("cmd", `openSession "${name}"`);
