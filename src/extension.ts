@@ -11,7 +11,7 @@ import { initLog, log } from "./log";
 import { refreshUserConfig, saveUserConfig, seedUserConfig, setUserConfigSavedListener, userConfigDir } from "./userConfig";
 import { SettingsSync, deviceName, getDeviceId } from "./settingsSync";
 import { loadSuite, runSuite, writeReport } from "./evals";
-import { appendEvent, clearEvents, insertApiCall, insertRun, insertTranscript, insertUsage, kvGet, kvSet, listEvents, listRuns, listTranscripts, latestSession, openStore, refreshStore, migrateLegacyStore, setStorageDir, setWasmDir, storeError } from "./store";
+import { appendEvent, clearEvents, insertApiCall, insertRun, insertTranscript, insertUsage, kvGet, kvSet, listEvents, listRuns, listSessions, listTranscripts, latestSession, openStore, refreshStore, migrateLegacyStore, setStorageDir, setWasmDir, storeError } from "./store";
 import { RunLock, type SessionDeps } from "./ui/sessionController";
 import { RunComments } from "./ui/comments";
 import { DiffReview, ORIGINAL_SCHEME } from "./ui/diffReview";
@@ -213,6 +213,16 @@ export function activate(context: vscode.ExtensionContext): void {
 			void storeRoot.then((root) => {
 				if (root) void openStore(root).then((d) => clearEvents(d, session, root));
 			});
+		},
+		listSessions: async () => {
+			const root = await storeRoot;
+			if (!root) return [];
+			const d = await openStore(root);
+			// Root-scoped first; fall back to unscoped like loadEvents — events
+			// may have been written under a different root value.
+			const rows = listSessions(d, 30, root);
+			const all = rows.length ? rows : listSessions(d, 30);
+			return all.filter((r) => !r.cloud).map((r) => ({ name: r.session, title: r.title }));
 		},
 		setStatus: (state) => setStatus(status, state),
 		syncSettings: () => settingsSync.pull(),

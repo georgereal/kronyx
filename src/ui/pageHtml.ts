@@ -21,6 +21,7 @@ export function renderPage(webview: vscode.Webview, extensionUri: vscode.Uri): s
   <button type="button" id="auth-signin">Sign in</button>
   <button type="button" id="auth-dismiss" class="auth-dismiss" title="Dismiss">&times;</button>
 </div>
+<div id="tabs" class="tabs"><span id="tab-list" class="tab-list"></span><button type="button" id="tab-new" class="tab-new" title="New session">+</button></div>
 <div id="timeline" class="timeline"><p class="empty">No runs yet. Describe a change below.</p></div>
 <div id="composer" class="composer">
   <textarea id="task" rows="3" placeholder="Ask, plan, or describe a change..."></textarea>

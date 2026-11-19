@@ -93,6 +93,8 @@ export interface SessionDeps {
 	saveTranscript?: (session: string, messages: readonly AgentMessage[]) => void;
 	loadTranscripts?: (session: string) => Promise<PriorTranscript[]>;
 	clearEvents: (session: string) => void;
+	/** Persisted local sessions (for the sidebar tab strip), most recent first. */
+	listSessions?: () => Promise<{ name: string; title: string }[]>;
 	setStatus: (state: "idle" | "running" | "failed") => void;
 	syncSettings?: () => Promise<void>;
 	refreshModels: () => Promise<void>;
@@ -198,6 +200,7 @@ export class SessionController {
 		this.deps.clearEvents(this.name);
 		this.surface.post({ type: "reset" });
 		this.deps.setStatus("idle");
+		void this.pushTabs();
 	}
 
 	/** Load a different persisted session into this surface (Agents view → open session). */
@@ -212,6 +215,15 @@ export class SessionController {
 		const evs = await this.deps.loadEvents(name);
 		evs.forEach((e) => this.surface.post(e));
 		this.deps.setStatus("idle");
+		void this.pushTabs();
+	}
+
+	/** Push the session tab-strip state (sidebar surfaces only). */
+	private async pushTabs(): Promise<void> {
+		if (!this.deps.isSidebar?.(this) || !this.deps.listSessions) return;
+		const entries = [{ name: this.name, title: this.name }, ...(await this.deps.listSessions())];
+		const sessions = entries.filter((s, i) => entries.findIndex((e) => e.name === s.name) === i).slice(0, 12);
+		this.surface.setState({ sessions, activeSession: this.name });
 	}
 
 	get isRunning(): boolean {
@@ -246,7 +258,6 @@ export class SessionController {
 				this.runner?.reset();
 				this.approveAll = false;
 				this.permittedTools.clear();
-				this.deps.clearEvents(this.name);
 				this.surface.post({ type: "reset" });
 				this.deps.setStatus("idle");
 				break;
@@ -262,6 +273,7 @@ export class SessionController {
 					this.deps.output.appendLine(`[store] replayed "${this.name}" with ${evs.length} event(s)`);
 				}
 				await this.deps.refreshModels();
+				void this.pushTabs();
 				break;
 			case "setMode":
 				this.deps.modeRef.current = message.mode;
@@ -297,6 +309,9 @@ export class SessionController {
 				} else {
 					await vscode.commands.executeCommand("kronyx.newSession");
 				}
+				break;
+			case "switchSession":
+				await this.openSession(message.name);
 				break;
 			case "runInTerminal": {
 				const terminal = vscode.window.createTerminal({ name: "Kronyx" });
@@ -523,6 +538,7 @@ export class SessionController {
 			this.runTask = event.task;
 			this.lastUsageAt = 0;
 			this.diagBaseline = diagCounts();
+			void this.pushTabs();
 		}
 		if (event.type === "run-finished") {
 			this.deps.setStatus("idle");
