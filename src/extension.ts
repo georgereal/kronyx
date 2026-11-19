@@ -218,9 +218,11 @@ export function activate(context: vscode.ExtensionContext): void {
 			const root = await storeRoot;
 			if (!root) return [];
 			const d = await openStore(root);
-			return listSessions(d, 30, root)
-				.filter((r) => !r.cloud)
-				.map((r) => r.session);
+			// Root-scoped first; fall back to unscoped like loadEvents — events
+			// may have been written under a different root value.
+			const rows = listSessions(d, 30, root);
+			const all = rows.length ? rows : listSessions(d, 30);
+			return all.filter((r) => !r.cloud).map((r) => ({ name: r.session, title: r.title }));
 		},
 		setStatus: (state) => setStatus(status, state),
 		syncSettings: () => settingsSync.pull(),

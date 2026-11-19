@@ -43,8 +43,8 @@ export interface ViewState {
 	cloudRepo?: string;
 	cloudBranch?: string;
 	cloudPr?: string;
-	/** Session tab strip: persisted session names + the active one. */
-	sessions?: string[];
+	/** Session tab strip: persisted sessions + the active one. */
+	sessions?: { name: string; title: string }[];
 	activeSession?: string;
 }
 

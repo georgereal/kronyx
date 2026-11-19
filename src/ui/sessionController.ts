@@ -93,8 +93,8 @@ export interface SessionDeps {
 	saveTranscript?: (session: string, messages: readonly AgentMessage[]) => void;
 	loadTranscripts?: (session: string) => Promise<PriorTranscript[]>;
 	clearEvents: (session: string) => void;
-	/** Persisted local session names (for the sidebar tab strip), most recent first. */
-	listSessions?: () => Promise<string[]>;
+	/** Persisted local sessions (for the sidebar tab strip), most recent first. */
+	listSessions?: () => Promise<{ name: string; title: string }[]>;
 	setStatus: (state: "idle" | "running" | "failed") => void;
 	syncSettings?: () => Promise<void>;
 	refreshModels: () => Promise<void>;
@@ -221,8 +221,8 @@ export class SessionController {
 	/** Push the session tab-strip state (sidebar surfaces only). */
 	private async pushTabs(): Promise<void> {
 		if (!this.deps.isSidebar?.(this) || !this.deps.listSessions) return;
-		const names = [this.name, ...(await this.deps.listSessions())];
-		const sessions = names.filter((s, i) => names.indexOf(s) === i).slice(0, 12);
+		const entries = [{ name: this.name, title: this.name }, ...(await this.deps.listSessions())];
+		const sessions = entries.filter((s, i) => entries.findIndex((e) => e.name === s.name) === i).slice(0, 12);
 		this.surface.setState({ sessions, activeSession: this.name });
 	}
 
@@ -258,7 +258,6 @@ export class SessionController {
 				this.runner?.reset();
 				this.approveAll = false;
 				this.permittedTools.clear();
-				this.deps.clearEvents(this.name);
 				this.surface.post({ type: "reset" });
 				this.deps.setStatus("idle");
 				break;

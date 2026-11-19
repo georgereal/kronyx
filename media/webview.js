@@ -37,7 +37,7 @@
 	let models = persisted.models || [];
 	/** @type {string[]} */
 	let recentModels = persisted.recentModels || [];
-	/** @type {string[]} */
+	/** @type {{name: string, title: string}[]} */
 	let sessionTabs = [];
 	let activeSession = "";
 	if (persisted.draft) task.value = persisted.draft;
@@ -84,11 +84,11 @@
 
 	const renderTabs = () => {
 		tabList.innerHTML = "";
-		for (const name of sessionTabs) {
-			const chip = el("button", "tab" + (name === activeSession ? " active" : ""), name);
-			chip.title = name;
+		for (const s of sessionTabs) {
+			const chip = el("button", "tab" + (s.name === activeSession ? " active" : ""), s.title || s.name);
+			chip.title = s.name;
 			chip.addEventListener("click", () => {
-				if (name !== activeSession) vscode.postMessage({ type: "switchSession", name });
+				if (s.name !== activeSession) vscode.postMessage({ type: "switchSession", name: s.name });
 			});
 			tabList.appendChild(chip);
 		}
