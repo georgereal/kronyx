@@ -200,6 +200,20 @@ export class SessionController {
 		this.deps.setStatus("idle");
 	}
 
+	/** Load a different persisted session into this surface (Agents view → open session). */
+	async openSession(name: string): Promise<void> {
+		if (this.name === name) return;
+		this.runner?.stop();
+		this.approveAll = false;
+		this.permittedTools.clear();
+		this.name = name;
+		this.replayed = true;
+		this.surface.post({ type: "reset" });
+		const evs = await this.deps.loadEvents(name);
+		evs.forEach((e) => this.surface.post(e));
+		this.deps.setStatus("idle");
+	}
+
 	get isRunning(): boolean {
 		return this.runner?.isRunning ?? false;
 	}

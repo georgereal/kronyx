@@ -41,11 +41,16 @@ export function focusSessionPanel(context: vscode.ExtensionContext, deps: Sessio
 
 /** Opens a chat session as an editor tab, grouped with the other session tabs. */
 export function openSessionPanel(context: vscode.ExtensionContext, deps: SessionDeps, sessionName?: string): SessionController {
-	// Instead of opening as an editor tab WebviewPanel, focus and use the right sidebar view
-	vscode.commands.executeCommand("kronyx.focusRight");
-	// Return a dummy/undefined controller as this function previously returned a SessionController
-	// but now the right-sidebar view controller manages itself
-	return undefined as unknown as SessionController;
+	counter += 1;
+	const name = sessionName ?? `Session ${counter}`;
+	const panel = vscode.window.createWebviewPanel(
+		"kronyx.session",
+		`Kronyx · ${name}`,
+		sessionColumn ?? (Math.min(vscode.window.tabGroups.all.length + 1, 9) as vscode.ViewColumn),
+		{ enableScripts: true, retainContextWhenHidden: true },
+	);
+	if (panels.size === 0) sessionColumn = panel.viewColumn;
+	return wire(context, deps, panel, name);
 }
 
 /** Opens a cloud session tab — the agent works in E2B and finishes with a PR. */

@@ -15,7 +15,7 @@ import { appendEvent, clearEvents, insertApiCall, insertRun, insertTranscript, i
 import { RunLock, type SessionDeps } from "./ui/sessionController";
 import { RunComments } from "./ui/comments";
 import { DiffReview, ORIGINAL_SCHEME } from "./ui/diffReview";
-import { focusSessionPanel, openCloudSessionPanel, openSessionPanel, registerSessionSerializer } from "./ui/sessionPanel";
+import { openCloudSessionPanel, openSessionPanel, registerSessionSerializer } from "./ui/sessionPanel";
 import { AgentsView } from "./ui/agentsView";
 import { checkCloudSetup } from "./ui/cloudController";
 import { openSettingsPage, openSettingsWindow, setProviderSavedListener } from "./ui/settingsPage";
@@ -32,6 +32,17 @@ let syncWorker: UsageSync | undefined; // usage sync worker (set in activate)
 let sidebarController: SessionController | undefined; // the canonical right-sidebar session
 let rightController: SessionController | undefined; // the session in the dedicated right window
 let gateSuppressed = false; // set briefly while reverting modelId
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** Preferred chat surface: the right-sidebar (or left) session view. Focuses the
+ * right view and waits briefly for its controller to resolve; falls back to an
+ * editor tab only if no session view can be resolved. */
+async function sessionSurface(context: vscode.ExtensionContext, deps: SessionDeps, newTabName?: string): Promise<SessionController> {
+	void vscode.commands.executeCommand(`${RunViewProvider.rightViewId}.focus`);
+	for (let i = 0; i < 50 && !(rightController ?? sidebarController); i++) await sleep(100);
+	return rightController ?? sidebarController ?? openSessionPanel(context, deps, newTabName);
+}
 
 export function activate(context: vscode.ExtensionContext): void {
 	const output = vscode.window.createOutputChannel("Kronyx");
@@ -462,13 +473,16 @@ export function activate(context: vscode.ExtensionContext): void {
 		vscode.commands.registerCommand("kronyx.focusRight", () =>
 			vscode.commands.executeCommand(`${RunViewProvider.rightViewId}.focus`),
 		),
-		vscode.commands.registerCommand("kronyx.newSession", () => {
-			log("cmd", "kronyx.newSession — focusing right sidebar session view");
-			return vscode.commands.executeCommand("kronyx.focusRight");
+		vscode.commands.registerCommand("kronyx.newSession", async () => {
+			log("cmd", "kronyx.newSession — new session in right sidebar");
+			const session = await sessionSurface(context, deps);
+			// Sidebar views start a fresh named session; a fallback editor tab is already new.
+			if (deps.isSidebar?.(session)) await session.handle({ type: "newSession" });
 		}),
-		vscode.commands.registerCommand("kronyx.openSession", (name: string) => {
+		vscode.commands.registerCommand("kronyx.openSession", async (name: string) => {
 			log("cmd", `openSession "${name}"`);
-			openSessionPanel(context, deps, name);
+			const session = await sessionSurface(context, deps, name);
+			if (deps.isSidebar?.(session)) await session.openSession(name);
 		}),
 		vscode.commands.registerCommand("kronyx.checkCloudSetup", () => checkCloudSetup(context)),
 		vscode.commands.registerCommand("kronyx.newCloudSession", (task?: string) =>
@@ -565,15 +579,14 @@ export function activate(context: vscode.ExtensionContext): void {
 			const task = await vscode.window.showInputBox({ title: "Kronyx: run task", prompt: "Describe the change" });
 			if (task) {
 				log("cmd", "kronyx.runTask — running task via session");
-				await vscode.commands.executeCommand(`${RunViewProvider.rightViewId}.focus`);
-				const session = sidebarController ?? rightController ?? focusSessionPanel(context, deps);
+				const session = await sessionSurface(context, deps);
 				await session.handle({ type: "run", task, mode: deps.modeRef.current });
 			}
 		}),
-		vscode.commands.registerCommand("kronyx.stop", () => (sidebarController ?? focusSessionPanel(context, deps)).handle({ type: "stop" })),
-		vscode.commands.registerCommand("kronyx.compactContext", () => (sidebarController ?? focusSessionPanel(context, deps)).handle({ type: "compact" })),
-		vscode.commands.registerCommand("kronyx.clearContext", () => (sidebarController ?? focusSessionPanel(context, deps)).handle({ type: "clearContext" })),
-		vscode.commands.registerCommand("kronyx.newTask", () => (sidebarController ?? focusSessionPanel(context, deps)).handle({ type: "new" })),
+		vscode.commands.registerCommand("kronyx.stop", async () => (await sessionSurface(context, deps)).handle({ type: "stop" })),
+		vscode.commands.registerCommand("kronyx.compactContext", async () => (await sessionSurface(context, deps)).handle({ type: "compact" })),
+		vscode.commands.registerCommand("kronyx.clearContext", async () => (await sessionSurface(context, deps)).handle({ type: "clearContext" })),
+		vscode.commands.registerCommand("kronyx.newTask", async () => (await sessionSurface(context, deps)).handle({ type: "new" })),
 		vscode.commands.registerCommand("kronyx.setApiKey", () => promptForApiKey(context.secrets)),
 		vscode.commands.registerCommand("kronyx.clearApiKey", async () => {
 			await clearApiKey(context.secrets);
