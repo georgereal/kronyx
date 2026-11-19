@@ -66,6 +66,83 @@ export class RunViewProvider implements vscode.WebviewViewProvider {
 
 	onMessage: (message: WebviewMessage) => void = () => {};
 
+  private sessions: Array<{ id: string; name: string; messages: string[] }> = [];
+  private activeSessionId: string | null = null;
+
+  private broadcastSessions() {
+    const msg = {
+      type: "updateSessions",
+      sessions: this.sessions,
+      activeSessionId: this.activeSessionId,
+    };
+    for (const webview of this.views) void webview.postMessage(msg);
+  }
+
+  private createSession() {
+    const newSession = {
+      id: (Math.random() + 1).toString(36).substring(7),
+      name: `Session ${this.sessions.length + 1}`,
+      messages: [],
+    };
+    this.sessions.push(newSession);
+    this.activeSessionId = newSession.id;
+    this.broadcastSessions();
+  }
+
+  private closeSession(sessionId: string) {
+    this.sessions = this.sessions.filter(s => s.id !== sessionId);
+    if (this.activeSessionId === sessionId) {
+      this.activeSessionId = this.sessions.length > 0 ? this.sessions[0].id : null;
+    }
+    this.broadcastSessions();
+  }
+
+  private switchSession(sessionId: string) {
+    if (this.sessions.find(s => s.id === sessionId)) {
+      this.activeSessionId = sessionId;
+      this.broadcastSessions();
+    }
+  }
+
+  resolveWebviewView(view: vscode.WebviewView): void {
+    const media = vscode.Uri.joinPath(this.extensionUri, "media");
+    view.webview.options = { enableScripts: true, localResourceRoots: [media] };
+    view.webview.html = renderPage(view.webview, this.extensionUri);
+
+    view.webview.onDidReceiveMessage((message: WebviewMessage) => {
+      switch (message.type) {
+        case "newSession":
+          this.createSession();
+          break;
+        case "closeSession":
+          this.closeSession(message.sessionId);
+          break;
+        case "switchSession":
+          this.switchSession(message.sessionId);
+          break;
+        // Additional message handling can be added here
+      }
+
+      this.onMessage(message);
+    });
+
+    this.attach(view.webview);
+    view.onDidDispose(() => this.detach(view.webview));
+  }
+
+  attach(webview: vscode.Webview): void {
+    this.views.add(webview);
+    if (this.sessions.length === 0) {
+      this.createSession();
+    } else {
+      this.broadcastSessions();
+    }
+  }
+
+  detach(webview: vscode.Webview): void {
+    this.views.delete(webview);
+  }
+
 	constructor(private readonly extensionUri: vscode.Uri) {}
 
 	resolveWebviewView(view: vscode.WebviewView): void {
