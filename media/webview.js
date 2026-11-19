@@ -3,6 +3,85 @@
 	// @ts-ignore acquireVsCodeApi is injected by VS Code
 	const vscode = acquireVsCodeApi();
 	const timeline = /** @type {HTMLElement} */ (document.getElementById("timeline"));
+const tabsContainer = document.getElementById("tabs-container");
+const newSessionButton = document.getElementById("new-session");
+
+let sessions = [];
+let activeSessionId = null;
+
+// Send message to extension
+function sendMessage(type, payload = {}) {
+	vscode.postMessage({ type, ...payload });
+}
+
+// Render the session tabs UI
+function renderTabs() {
+	tabsContainer.innerHTML = "";
+	for (const session of sessions) {
+		const tab = document.createElement("div");
+		tab.className = "tab" + (session.id === activeSessionId ? " active" : "");
+		tab.textContent = session.name || "(Unnamed)";
+
+		const closeBtn = document.createElement("button");
+		closeBtn.textContent = "×";
+		closeBtn.className = "tab-close";
+		closeBtn.title = "Close session";
+		closeBtn.addEventListener("click", (e) => {
+			e.stopPropagation();
+			sendMessage("closeSession", { sessionId: session.id });
+		});
+		tab.appendChild(closeBtn);
+
+		tab.addEventListener("click", () => {
+			if (session.id !== activeSessionId) {
+				activeSessionId = session.id;
+				sendMessage("switchSession", { sessionId: session.id });
+				renderTabs();
+				renderSessionContent();
+			}
+		});
+
+		tabsContainer.appendChild(tab);
+	}
+}
+
+// Render content for the active session
+function renderSessionContent() {
+	const session = sessions.find(s => s.id === activeSessionId);
+	timeline.innerHTML = "";
+
+	if (!session) {
+		timeline.innerHTML = "<p class=\"empty\">No sessions yet. Create a new chat session.</p>";
+		return;
+	}
+
+	// Render each message in session.messages
+	for (const msg of session.messages) {
+		const div = document.createElement("div");
+		div.textContent = msg;
+		timeline.appendChild(div);
+	}
+}
+
+// Add new session handler
+newSessionButton.addEventListener("click", () => {
+	sendMessage("newSession");
+});
+
+// Handle messages from extension
+window.addEventListener("message", event => {
+	const message = event.data;
+	if (message.type === "updateSessions") {
+		sessions = message.sessions || [];
+		activeSessionId = message.activeSessionId || (sessions[0]?.id || null);
+		renderTabs();
+		renderSessionContent();
+	}
+});
+
+// Initialize UI
+renderTabs();
+renderSessionContent();
 	const task = /** @type {HTMLTextAreaElement} */ (document.getElementById("task"));
 	const sendBtn = /** @type {HTMLButtonElement} */ (document.getElementById("send"));
 	const stopBtn = /** @type {HTMLButtonElement} */ (document.getElementById("stop"));
