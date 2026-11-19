@@ -219,10 +219,13 @@ export function activate(context: vscode.ExtensionContext): void {
 			if (!root) return [];
 			const d = await openStore(root);
 			// Root-scoped first; fall back to unscoped like loadEvents — events
-			// may have been written under a different root value.
-			const rows = listSessions(d, 30, root);
-			const all = rows.length ? rows : listSessions(d, 30);
-			return all.filter((r) => !r.cloud).map((r) => ({ name: r.session, title: r.title }));
+			// may have been written under a different root value. Filter cloud
+			// sessions before deciding: a scoped-only cloud hit must not block
+			// the fallback.
+			const local = (rows: { session: string; title: string; cloud: boolean }[]) => rows.filter((r) => !r.cloud);
+			const scoped = local(listSessions(d, 30, root));
+			const rows = scoped.length ? scoped : local(listSessions(d, 30));
+			return rows.map((r) => ({ name: r.session, title: r.title }));
 		},
 		setStatus: (state) => setStatus(status, state),
 		syncSettings: () => settingsSync.pull(),

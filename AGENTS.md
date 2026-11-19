@@ -40,3 +40,7 @@ Modes: `ask` = no sandbox (chat only); `plan` = read-only sandbox + `save_plan` 
 Browser/GUI: agent mode adds a `browser_use` tool (`src/tools/browserTools.ts` — browser-use + Playwright inside the sandbox, LLM creds via a 0600 env file). Post-run verify screenshots the booted app into `runs.screenshot` + a `ui-screenshot` event. Both need the custom E2B template in `backend/e2b-template/` (Chromium, browser-use, Qt libs like libgl1/xvfb for PyQt5); set it via the Composer template field. Stock template: tool reports "not installed", screenshot step skips. Qt tests: `QT_QPA_PLATFORM=offscreen`.
 
 Templates: the worker lists the account's usable E2B templates (`listTemplates` → public fleet + `e2b template build` customs) and the model picks one at cold start (`backend/src/worker/pickTemplate.ts`); priority = Composer field > LLM pick > `e2bTemplate` settings default > `base`. `switch_environment` (agent tool, `src/tools/envTools.ts`) swaps VM images mid-run — interim commit+push → recreate → reclone branch → continue (≤2/run); disabled via Settings → `sandboxAutoSwitch`.
+
+## Git workflow
+
+- Commit changes directly on the user's current checked-out branch (usually `main`) — do NOT create feature branches or PRs unless explicitly asked.
