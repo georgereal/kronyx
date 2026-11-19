@@ -18,6 +18,7 @@ export type WebviewMessage =
 	| { type: "attach"; kind: "file" | "directory" | "upload" }
 	| { type: "newSession" }
 	| { type: "switchSession"; name: string }
+	| { type: "closeSession"; name: string }
 	| { type: "openSettings" }
 	| { type: "review"; path: string }
 	| { type: "acceptChange"; path: string }
@@ -45,7 +46,18 @@ export interface ViewState {
 	cloudPr?: string;
 	/** Session tab strip: persisted sessions + the active one. */
 	sessions?: { name: string; title: string }[];
+	/** Stored sessions without an open tab — listed in the dropdown for reopening. */
+	moreSessions?: { name: string; title: string }[];
 	activeSession?: string;
+	workspaceName?: string;
+}
+
+export interface AttachmentPreview {
+	path: string;
+	name: string;
+	kind: "file" | "directory";
+	mime?: string;
+	dataUrl?: string;
 }
 
 export type ViewEvent =
@@ -112,6 +124,10 @@ export class RunViewProvider implements vscode.WebviewViewProvider {
 
 	insertMention(text: string): void {
 		for (const webview of this.views) void webview.postMessage({ type: "insertMention", text });
+	}
+
+	insertAttachment(attachment: AttachmentPreview): void {
+		for (const webview of this.views) void webview.postMessage({ type: "insertAttachment", attachment });
 	}
 
 	private postState(): void {

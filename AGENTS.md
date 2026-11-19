@@ -43,4 +43,4 @@ Templates: the worker lists the account's usable E2B templates (`listTemplates` 
 
 ## Git workflow
 
-- Commit changes directly on the user's current checked-out branch (usually `main`) — do NOT create feature branches or PRs unless explicitly asked.
+- Leave code changes uncommitted in the working tree — do NOT commit, create branches, or open PRs unless explicitly asked.

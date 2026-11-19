@@ -89,7 +89,12 @@ export function openCloudSessionPanel(context: vscode.ExtensionContext, deps: Se
 	panel.webview.html = renderCloudPage(panel.webview, context.extensionUri);
 	panel.webview.onDidReceiveMessage((message) => void controller.handle(message));
 	surface.attach(panel.webview);
-	surface.setState({ mode: deps.modeRef.current, modelId: deps.viewState.modelId, models: deps.viewState.models });
+	surface.setState({
+		mode: deps.modeRef.current,
+		modelId: deps.viewState.modelId,
+		models: deps.viewState.models,
+		workspaceName: vscode.workspace.workspaceFolders?.[0]?.name ?? "",
+	});
 	deps.surfaces.add(surface);
 	// Devin-style overlay: hide sidebars + panel so the agent page fills the
 	// window edge-to-edge (Zen Mode's centered layout leaves dead margins).
@@ -138,7 +143,12 @@ function wire(
 	panel.webview.html = renderPage(panel.webview, context.extensionUri);
 	panel.webview.onDidReceiveMessage((message) => void controller.handle(message));
 	surface.attach(panel.webview);
-	surface.setState({ mode: deps.modeRef.current, modelId: deps.viewState.modelId, models: deps.viewState.models });
+	surface.setState({
+		mode: deps.modeRef.current,
+		modelId: deps.viewState.modelId,
+		models: deps.viewState.models,
+		workspaceName: vscode.workspace.workspaceFolders?.[0]?.name ?? "",
+	});
 	deps.surfaces.add(surface);
 	panel.onDidDispose(() => {
 		panels.delete(panel);

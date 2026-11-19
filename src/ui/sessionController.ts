@@ -21,7 +21,7 @@ import type { ApiCallRow } from "../store";
 import * as git from "../git";
 import type { RunComments } from "./comments";
 import type { DiffReview } from "./diffReview";
-import type { ModelOption, RunViewProvider, WebviewMessage } from "./runViewProvider";
+import type { AttachmentPreview, ModelOption, RunViewProvider, WebviewMessage } from "./runViewProvider";
 
 const MENTION_TOTAL_CAP = 50 * 1024;
 
@@ -95,6 +95,8 @@ export interface SessionDeps {
 	clearEvents: (session: string) => void;
 	/** Persisted local sessions (for the sidebar tab strip), most recent first. */
 	listSessions?: () => Promise<{ name: string; title: string }[]>;
+	/** Per-workspace tab-strip state: last active session + open tab names. */
+	tabState?: { get(): { last?: string; tabs?: string[] }; set(v: { last?: string; tabs?: string[] }): void };
 	setStatus: (state: "idle" | "running" | "failed") => void;
 	syncSettings?: () => Promise<void>;
 	refreshModels: () => Promise<void>;
@@ -181,12 +183,20 @@ export class SessionController {
 	};
 	private sandbox: E2bSandbox | undefined;
 	private sandboxSynced = false;
+	private openTabs: string[] = [];
+
+	private rememberTabs(): void {
+		this.deps.tabState?.set({ last: this.name, tabs: [...this.openTabs] });
+	}
 
 	constructor(
 		public name: string,
 		private readonly surface: RunViewProvider,
 		private readonly deps: SessionDeps,
-	) {}
+	) {
+		this.openTabs = [...new Set(deps.tabState?.get().tabs ?? [])];
+		if (!this.openTabs.includes(this.name)) this.openTabs.push(this.name);
+	}
 
 	private static sessionCounter = 0;
 
@@ -195,11 +205,31 @@ export class SessionController {
 		this.runner?.reset();
 		this.approveAll = false;
 		this.permittedTools.clear();
-		SessionController.sessionCounter += 1;
-		this.name = `${this.name.replace(/ \d+$/, "")} ${SessionController.sessionCounter}`;
+		// Lowest unused N across open tabs and stored sessions — the static
+		// counter resets per window, which would otherwise collide with history.
+		const taken = new Set(this.openTabs);
+		for (const s of (await this.deps.listSessions?.()) ?? []) taken.add(s.name);
+		let n = SessionController.sessionCounter + 1;
+		while (taken.has(`Kronyx Local Session ${n}`)) n++;
+		SessionController.sessionCounter = n;
+		this.name = `Kronyx Local Session ${n}`;
+		this.openTabs.push(this.name);
 		this.deps.clearEvents(this.name);
 		this.surface.post({ type: "reset" });
 		this.deps.setStatus("idle");
+		this.rememberTabs();
+		void this.pushTabs();
+	}
+
+	/** Close a session tab — history stays in the store; the tab leaves the strip until reopened. */
+	async closeSession(name: string): Promise<void> {
+		if (name === this.name) {
+			const rest = this.openTabs.filter((n) => n !== name);
+			if (rest.length) await this.openSession(rest[rest.length - 1]);
+			else await this.startNewSession();
+		}
+		this.openTabs = this.openTabs.filter((n) => n !== name);
+		this.rememberTabs();
 		void this.pushTabs();
 	}
 
@@ -210,20 +240,31 @@ export class SessionController {
 		this.approveAll = false;
 		this.permittedTools.clear();
 		this.name = name;
+		if (!this.openTabs.includes(name)) this.openTabs.push(name);
 		this.replayed = true;
 		this.surface.post({ type: "reset" });
 		const evs = await this.deps.loadEvents(name);
 		evs.forEach((e) => this.surface.post(e));
 		this.deps.setStatus("idle");
+		this.rememberTabs();
 		void this.pushTabs();
 	}
 
 	/** Push the session tab-strip state (sidebar surfaces only). */
 	private async pushTabs(): Promise<void> {
 		if (!this.deps.isSidebar?.(this) || !this.deps.listSessions) return;
-		const entries = [{ name: this.name, title: this.name }, ...(await this.deps.listSessions())];
-		const sessions = entries.filter((s, i) => entries.findIndex((e) => e.name === s.name) === i).slice(0, 12);
-		this.surface.setState({ sessions, activeSession: this.name });
+		const stored = await this.deps.listSessions();
+		const titles = new Map(stored.map((s) => [s.name, s.title]));
+		// Chips = open tabs only (persisted even before their first run). Other
+		// stored sessions stay reachable through the dropdown, not as chips.
+		if (!this.openTabs.includes(this.name)) this.openTabs.push(this.name);
+		const tabs = [...new Set(this.openTabs)];
+		// Sessions with stored events keep open order; brand-new tabs (no events
+		// yet — a "temp" session) always pin to the far right.
+		const ordered = [...tabs.filter((n) => titles.has(n)), ...tabs.filter((n) => !titles.has(n))];
+		const sessions = ordered.slice(0, 12).map((n) => ({ name: n, title: titles.get(n) ?? n }));
+		const moreSessions = stored.filter((s) => !this.openTabs.includes(s.name)).slice(0, 20);
+		this.surface.setState({ sessions, moreSessions, activeSession: this.name });
 	}
 
 	get isRunning(): boolean {
@@ -312,6 +353,9 @@ export class SessionController {
 				break;
 			case "switchSession":
 				await this.openSession(message.name);
+				break;
+			case "closeSession":
+				await this.closeSession(message.name);
 				break;
 			case "runInTerminal": {
 				const terminal = vscode.window.createTerminal({ name: "Kronyx" });
@@ -843,7 +887,7 @@ export class SessionController {
 				})),
 				{ title: "Attach file", matchOnDescription: true },
 			);
-			if (picked) this.surface.insertMention(picked.label);
+			if (picked) await this.insertAttachmentPreview(picked.uri.fsPath, picked.label, "file");
 			return;
 		}
 		const picked = await vscode.window.showOpenDialog({
@@ -857,7 +901,46 @@ export class SessionController {
 		if (!target) return;
 		const rel = folder ? path.relative(folder.uri.fsPath, target.fsPath) : "";
 		const mention = rel && !rel.startsWith("..") ? rel.split(path.sep).join("/") : target.fsPath;
-		this.surface.insertMention(kind === "directory" ? `${mention}/` : mention);
+		await this.insertAttachmentPreview(
+			target.fsPath,
+			kind === "directory" ? `${mention}/` : mention,
+			kind === "directory" ? "directory" : "file",
+		);
+	}
+
+	private async insertAttachmentPreview(abs: string, mention: string, kind: AttachmentPreview["kind"]): Promise<void> {
+		const attachment: AttachmentPreview = {
+			path: mention,
+			name: path.basename(abs) || mention,
+			kind,
+		};
+		if (kind === "file") {
+			const mime = imageMime(abs);
+			if (mime) {
+				try {
+					const stat = await fs.stat(abs);
+					if (stat.size <= 4 * 1024 * 1024) {
+						attachment.mime = mime;
+						attachment.dataUrl = `data:${mime};base64,${(await fs.readFile(abs)).toString("base64")}`;
+					}
+				} catch {
+					// The mention remains usable even when a visual preview cannot be read.
+				}
+			}
+		}
+		this.surface.insertAttachment(attachment);
+	}
+}
+
+function imageMime(file: string): string | undefined {
+	switch (path.extname(file).toLowerCase()) {
+		case ".png": return "image/png";
+		case ".jpg":
+		case ".jpeg": return "image/jpeg";
+		case ".gif": return "image/gif";
+		case ".webp": return "image/webp";
+		case ".bmp": return "image/bmp";
+		default: return undefined;
 	}
 }
 

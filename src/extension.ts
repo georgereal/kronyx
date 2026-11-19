@@ -218,14 +218,17 @@ export function activate(context: vscode.ExtensionContext): void {
 			const root = await storeRoot;
 			if (!root) return [];
 			const d = await openStore(root);
-			// Root-scoped first; fall back to unscoped like loadEvents — events
-			// may have been written under a different root value. Filter cloud
-			// sessions before deciding: a scoped-only cloud hit must not block
-			// the fallback.
-			const local = (rows: { session: string; title: string; cloud: boolean }[]) => rows.filter((r) => !r.cloud);
-			const scoped = local(listSessions(d, 30, root));
-			const rows = scoped.length ? scoped : local(listSessions(d, 30));
-			return rows.map((r) => ({ name: r.session, title: r.title }));
+			// Workspace sessions first; fall back to all local sessions so history
+			// survives root changes (dev windows open different folders). Dedupe by
+			// session name — the same name can exist under multiple roots.
+			const local = (rows: { session: string; title: string; cloud: boolean }[]) =>
+				rows.filter((r) => !r.cloud).map((r) => ({ name: r.session, title: r.title }));
+			const merged = [...local(listSessions(d, 30, root)), ...local(listSessions(d, 30))];
+			return merged.filter((s, i) => merged.findIndex((e) => e.name === s.name) === i);
+		},
+		tabState: {
+			get: () => context.workspaceState.get<{ last?: string; tabs?: string[] }>("kronyx.sessionTabs", {}),
+			set: (v) => void context.workspaceState.update("kronyx.sessionTabs", v),
 		},
 		setStatus: (state) => setStatus(status, state),
 		syncSettings: () => settingsSync.pull(),
@@ -440,7 +443,7 @@ export function activate(context: vscode.ExtensionContext): void {
 						const d = root ? await openStore(root) : undefined;
 						const name =
 							(viewId === "kronyx.sessionView" ? root && latestSession(d, root) : undefined) ??
-							(viewId === "kronyx.sessionView" ? "Side Session" : "Right Session");
+							(viewId === "kronyx.sessionView" ? "Side Session" : deps.tabState?.get().last ?? "Kronyx Local Session");
 						const controller = new SessionController(name, surface, deps);
 						log("view", `${viewId} resolved — session "${name}"`);
 						if (viewId === "kronyx.sessionView") sidebarController = controller;
@@ -450,7 +453,12 @@ export function activate(context: vscode.ExtensionContext): void {
 							void controller.handle(m);
 						});
 						surface.attach(view.webview);
-						surface.setState({ mode: deps.modeRef.current, modelId: deps.viewState.modelId, models: deps.viewState.models });
+						surface.setState({
+							mode: deps.modeRef.current,
+							modelId: deps.viewState.modelId,
+							models: deps.viewState.models,
+							workspaceName: vscode.workspace.workspaceFolders?.[0]?.name ?? "",
+						});
 						output.appendLine(`[store] ${viewId} resolved session "${name}"`);
 						view.onDidDispose(() => {
 							deps.surfaces.delete(surface);

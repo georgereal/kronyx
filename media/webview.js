@@ -8,8 +8,9 @@
 	const stopBtn = /** @type {HTMLButtonElement} */ (document.getElementById("stop"));
 	const attachBtn = /** @type {HTMLButtonElement} */ (document.getElementById("attach"));
 	const cloudStatus = /** @type {HTMLElement} */ (document.getElementById("cloudstatus"));
-	const envLocal = /** @type {HTMLButtonElement} */ (document.getElementById("env-local"));
-	const envCloud = /** @type {HTMLButtonElement} */ (document.getElementById("env-cloud"));
+	const mentionBtn = /** @type {HTMLButtonElement} */ (document.getElementById("mention"));
+	const workspaceBtn = /** @type {HTMLButtonElement} */ (document.getElementById("workspace"));
+	const workspaceLabel = /** @type {HTMLElement} */ (document.getElementById("workspace-label"));
 	const modeBtn = /** @type {HTMLButtonElement} */ (document.getElementById("mode"));
 	const modelBtn = /** @type {HTMLButtonElement} */ (document.getElementById("model"));
 	const modeLabel = /** @type {HTMLElement} */ (document.getElementById("mode-label"));
@@ -22,8 +23,14 @@
 	const authDismiss = /** @type {HTMLButtonElement} */ (document.getElementById("auth-dismiss"));
 	const tabList = /** @type {HTMLElement} */ (document.getElementById("tab-list"));
 	const tabNew = /** @type {HTMLButtonElement} */ (document.getElementById("tab-new"));
+	const tabPrev = /** @type {HTMLButtonElement} */ (document.getElementById("tab-prev"));
+	const tabRight = /** @type {HTMLButtonElement} */ (document.getElementById("tab-right"));
+	const attachmentPreviews = /** @type {HTMLElement} */ (document.getElementById("attachment-previews"));
+	const activity = /** @type {HTMLElement} */ (document.getElementById("activity"));
 	/** @type {Map<string, HTMLElement>} */
 	const tools = new Map();
+	/** @type {Map<string, HTMLElement>} */
+	const attachments = new Map();
 	let openToolCard = null;
 	let usage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
 	let startedAt = 0;
@@ -39,6 +46,8 @@
 	let recentModels = persisted.recentModels || [];
 	/** @type {{name: string, title: string}[]} */
 	let sessionTabs = [];
+	/** @type {{name: string, title: string}[]} */
+	let moreTabs = [];
 	let activeSession = "";
 	if (persisted.draft) task.value = persisted.draft;
 
@@ -53,13 +62,6 @@
 	const persist = () => vscode.setState({ mode, modelId, models, recentModels, draft: task.value, authDismissed, cloudEnv });
 
 	let cloudEnv = persisted.cloudEnv === true;
-	const refreshEnv = () => {
-		envLocal.classList.toggle("active", !cloudEnv);
-		envCloud.classList.toggle("active", cloudEnv);
-	};
-	envLocal.addEventListener("click", () => { cloudEnv = false; refreshEnv(); persist(); });
-	envCloud.addEventListener("click", () => { cloudEnv = true; refreshEnv(); persist(); });
-	refreshEnv();
 
 	const persistedAuth = persisted.authDismissed === true;
 	let authDismissed = persistedAuth;
@@ -84,16 +86,58 @@
 
 	const renderTabs = () => {
 		tabList.innerHTML = "";
-		for (const s of sessionTabs) {
-			const chip = el("button", "tab" + (s.name === activeSession ? " active" : ""), s.title || s.name);
+		const labels = sessionTabs.map((s) => s.title || s.name);
+		const makeChip = (s, active) => {
+			const label = s.title || s.name;
+			// Disambiguate same-title sessions with the stored session name.
+			const text = labels.indexOf(label) !== labels.lastIndexOf(label) && s.title !== s.name ? `${label} · ${s.name}` : label;
+			const chip = el("button", "tab" + (active ? " active" : ""), text);
 			chip.title = s.name;
 			chip.addEventListener("click", () => {
 				if (s.name !== activeSession) vscode.postMessage({ type: "switchSession", name: s.name });
 			});
-			tabList.appendChild(chip);
-		}
+			const close = el("span", "tab-close", "×");
+			close.title = "Close session tab";
+			close.addEventListener("click", (e) => {
+				e.stopPropagation();
+				vscode.postMessage({ type: "closeSession", name: s.name });
+			});
+			chip.appendChild(close);
+			return chip;
+		};
+		// Tabs keep a stable left-to-right order; selection only changes which
+		// chip is active, never its position.
+		for (const s of sessionTabs) tabList.appendChild(makeChip(s, s.name === activeSession));
+		// Scroll the active chip into view; offer "»" when tabs overflow to the right.
+		const activeChip = tabList.querySelector(".tab.active");
+		if (activeChip) activeChip.scrollIntoView({ block: "nearest", inline: "nearest" });
+		tabRight.hidden = tabList.scrollWidth - tabList.scrollLeft <= tabList.clientWidth + 1;
 	};
+	tabRight.addEventListener("click", () => {
+		tabList.scrollTo({ left: tabList.scrollWidth, behavior: "smooth" });
+		tabRight.hidden = true;
+	});
+	tabList.addEventListener("scroll", () => {
+		tabRight.hidden = tabList.scrollWidth - tabList.scrollLeft <= tabList.clientWidth + 1;
+	});
 	tabNew.addEventListener("click", () => vscode.postMessage({ type: "newSession" }));
+	window.addEventListener("resize", renderTabs);
+	tabPrev.addEventListener("click", () => {
+		const item = (s) => ({
+			label: s.title || s.name,
+			desc: s.title && s.title !== s.name ? s.name : undefined,
+			checked: s.name === activeSession,
+			onPick: () => {
+				if (s.name !== activeSession) vscode.postMessage({ type: "switchSession", name: s.name });
+			},
+		});
+		openMenu(tabPrev, {
+			below: true,
+			items: sessionTabs.length || moreTabs.length
+				? [...sessionTabs.map(item), ...(moreTabs.length ? [{ header: "More sessions" }, ...moreTabs.map(item)] : [])]
+				: [{ label: "No sessions yet", disabled: true }],
+		});
+	});
 
 	// ---------- markdown ----------
 	const sanitizeMd = (html) => html.replace(/<(script|style|iframe|object|embed|form)[\s\S]*?<\/\1>/gi, "");
@@ -243,6 +287,7 @@
 		sendBtn.hidden = running;
 		stopBtn.hidden = !running;
 		task.disabled = running;
+		activity.classList.toggle("running", running);
 	};
 
 	const fmt = (n) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
@@ -255,6 +300,7 @@
 		const total = usage.inputTokens + usage.outputTokens;
 		const elapsed = startedAt ? ` · ${((Date.now() - startedAt) / 1000).toFixed(0)}s` : "";
 		status.textContent = (text === "Running..." && lastVerb ? lastVerb : text) + elapsed;
+		activity.title = status.textContent;
 		tokchip.hidden = total === 0;
 		if (total > 0) {
 			tokchip.textContent = `in ${fmt(usage.inputTokens)} · out ${fmt(usage.outputTokens)}` +
@@ -393,6 +439,9 @@
 		if (!text || sendBtn.hidden) return;
 		vscode.postMessage(cloudEnv ? { type: "runCloud", task: text, mode } : { type: "run", task: text, mode });
 		task.value = "";
+		attachments.clear();
+		attachmentPreviews.replaceChildren();
+		attachmentPreviews.hidden = true;
 		autogrow();
 	};
 
@@ -404,8 +453,7 @@
 	});
 	sendBtn.addEventListener("click", submit);
 	stopBtn.addEventListener("click", () => vscode.postMessage({ type: "stop" }));
-	document.getElementById("compact")?.addEventListener("click", () => vscode.postMessage({ type: "compact" }));
-	document.getElementById("clearctx")?.addEventListener("click", () => vscode.postMessage({ type: "clearContext" }));
+
 
 
 	// ---------- popup menu ----------
@@ -426,7 +474,7 @@
 
 	/**
 	 * @param {HTMLElement} anchor
-	 * @param {{search?: boolean, wide?: boolean, items: any[]}} config
+	 * @param {{search?: boolean, wide?: boolean, below?: boolean, items: any[]}} config
 	 * items: {header} | {icon, label, desc, checked, disabled, onPick}
 	 */
 	const openMenu = (anchor, config) => {
@@ -493,8 +541,13 @@
 		const rect = anchor.getBoundingClientRect();
 		const menuHeight = menu.offsetHeight;
 		menu.style.left = `${Math.max(4, rect.left)}px`;
-		menu.style.bottom = `${document.body.clientHeight - rect.top + 6}px`;
-		menu.style.top = "auto";
+		if (config.below) {
+			menu.style.top = `${rect.bottom + 6}px`;
+			menu.style.bottom = "auto";
+		} else {
+			menu.style.bottom = `${document.body.clientHeight - rect.top + 6}px`;
+			menu.style.top = "auto";
+		}
 		if (menu.offsetWidth + rect.left > document.body.clientWidth) {
 			menu.style.left = `${Math.max(4, document.body.clientWidth - menu.offsetWidth - 4)}px`;
 		}
@@ -667,9 +720,17 @@
 				{ icon: "›_", label: "Terminal", desc: "Coming soon", disabled: true },
 				{ icon: "◎", label: "Codemaps", desc: "Coming soon", disabled: true },
 				{ icon: "/", label: "Slash commands", desc: "Coming soon", disabled: true },
+				{ header: "Run target" },
+				{ icon: "⌂", label: "Local", desc: "Run in this workspace", checked: !cloudEnv, onPick: () => { cloudEnv = false; persist(); } },
+				{ icon: "☁", label: "Cloud", desc: "Run in an E2B sandbox", checked: cloudEnv, onPick: () => { cloudEnv = true; persist(); } },
+				{ header: "Context actions" },
+				{ icon: "≋", label: "Compact context", desc: "Next model turn", onPick: () => vscode.postMessage({ type: "compact" }) },
+				{ icon: "⌫", label: "Clear context", desc: "Next task starts fresh", onPick: () => vscode.postMessage({ type: "clearContext" }) },
 			],
 		});
 	});
+
+	mentionBtn.addEventListener("click", () => vscode.postMessage({ type: "attach", kind: "file" }));
 
 	refreshChips();
 	autogrow();
@@ -686,8 +747,13 @@
 				modelId = msg.modelId || modelId;
 				models = msg.models || models;
 				if (typeof msg.signedIn === "boolean") signedIn = msg.signedIn;
+				if (typeof msg.workspaceName === "string") {
+					workspaceLabel.textContent = msg.workspaceName;
+					workspaceBtn.hidden = !msg.workspaceName;
+				}
 				if (Array.isArray(msg.sessions)) {
 					sessionTabs = msg.sessions;
+					moreTabs = Array.isArray(msg.moreSessions) ? msg.moreSessions : [];
 					activeSession = msg.activeSession || activeSession;
 					renderTabs();
 				}
@@ -702,6 +768,41 @@
 				autogrow();
 				break;
 			}
+			case "insertAttachment": {
+				const a = msg.attachment;
+				if (!a?.path || attachments.has(a.path)) break;
+				const sep = task.value.length > 0 && !task.value.endsWith(" ") && !task.value.endsWith("\n") ? " " : "";
+				task.value += `${sep}@${a.path} `;
+				const card = el("div", `attachment-preview ${a.dataUrl ? "image" : "file"}`);
+				if (a.dataUrl) {
+					const image = document.createElement("img");
+					image.src = a.dataUrl;
+					image.alt = a.name;
+					card.appendChild(image);
+				} else {
+					card.appendChild(el("span", "attachment-file-icon", a.kind === "directory" ? "▱" : "⌑"));
+					card.appendChild(el("span", "attachment-name", a.name));
+				}
+				const remove = el("button", "attachment-remove", "×");
+				remove.type = "button";
+				remove.title = `Remove ${a.name}`;
+				remove.addEventListener("click", () => {
+					card.remove();
+					attachments.delete(a.path);
+					task.value = task.value.replace(`@${a.path} `, "").replace(`@${a.path}`, "");
+					attachmentPreviews.hidden = attachments.size === 0;
+					autogrow();
+					persist();
+				});
+				card.appendChild(remove);
+				attachments.set(a.path, card);
+				attachmentPreviews.appendChild(card);
+				attachmentPreviews.hidden = false;
+				task.focus();
+				autogrow();
+				persist();
+				break;
+			}
 			case "cloud-status":
 				cloudStatus.hidden = false;
 				cloudStatus.textContent = `☁ ${msg.text}`;
@@ -709,6 +810,9 @@
 			case "reset":
 				showEmpty();
 				tools.clear();
+				attachments.clear();
+				attachmentPreviews.replaceChildren();
+				attachmentPreviews.hidden = true;
 				usage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
 				setRunning(false);
 				stopTimer();
