@@ -8,6 +8,8 @@ import { RunStatusLine } from "@/components/RunStatusLine";
 import { ContextMeter } from "@/components/ContextMeter";
 import { Modal } from "@/components/Modal";
 import { PlanCard, Timeline } from "@/components/Timeline";
+import { MultiAgentPanel } from "@/components/MultiAgentPanel";
+import type { AgentFocus } from "@/lib/agentLanes";
 import { ProviderGate } from "@/components/ProviderGate";
 import { apiFetch, useUser } from "@/lib/api";
 import type { RunDoc, RunEvent, SessionDoc } from "@/lib/types";
@@ -41,6 +43,9 @@ export default function SessionView() {
 	const [submitted, setSubmitted] = useState<string | null>(null);
 	const [notFound, setNotFound] = useState(false);
 	const [stopPressed, setStopPressed] = useState<{ runId: string; seq: number } | null>(null);
+	// Per-agent drill-down — owned here so the multi-agent panel and the
+	// timeline's fan-out cards drive the same focused view.
+	const [agentFocus, setAgentFocus] = useState<AgentFocus | null>(null);
 	const evRef = useRef<Map<string, RunEvent>>(new Map());
 	const sseRef = useRef<EventSource | null>(null);
 	// Env picker — source of truth for the next task's start point (branch/PR
@@ -370,6 +375,17 @@ export default function SessionView() {
 		await apiFetch(`/api/runs/${latestRun.runId}/stop`, user, { method: "POST" });
 	};
 
+	const compactNow = async () => {
+		if (!user || !latestRun || !active) return;
+		await apiFetch(`/api/runs/${latestRun.runId}/compact`, user, { method: "POST" });
+	};
+
+	const clearContext = async () => {
+		if (!user || !session) return;
+		if (!window.confirm("Clear this session's context? The next message starts fresh — prior run summaries are carried forward, earlier details remain reachable via recall.")) return;
+		await apiFetch(`/api/sessions/${id}/clear`, user, { method: "POST" });
+	};
+
 	if (!user) return null;
 	if (notFound) return <div className="page">Session not found.</div>;
 
@@ -394,6 +410,10 @@ export default function SessionView() {
 					</span>
 				)}
 				<span className="cloud-badge">☁ Cloud Run</span>
+				{active && latestRun && (
+					<button className="btn sm" style={{ padding: "2px 8px" }} title="Compact context on the next model turn" onClick={() => void compactNow()}>⌗ Compact</button>
+				)}
+				<button className="btn sm" style={{ padding: "2px 8px" }} title="Clear context — next message starts fresh" onClick={() => void clearContext()}>⌫ Clear</button>
 				<button className="btn sm" style={{ padding: "2px 8px" }}>···</button>
 				<span className="avatar">{(user.email ?? "U")[0].toUpperCase()}</span>
 				{latestRun?.status === "queued" && (
@@ -449,7 +469,7 @@ export default function SessionView() {
 			</div>
 			<div style={{ display: "flex", gap: 16, marginTop: 6, fontSize: 11 }}>
 			{preflight && (
-				<details style={{ flex: "0 1 auto" }}>
+				<details className="env-panel-wrap" style={{ flex: "0 1 auto" }}>
 					<summary className="muted" style={{ cursor: "pointer" }}>
 						<span style={{ color: preflight.ready ? "var(--ok, #4ade80)" : "var(--amber, #facc15)" }}>
 							{preflight.ready ? "●" : "●"}
@@ -459,13 +479,30 @@ export default function SessionView() {
 							{preflight.ready ? "ready" : `${preflight.checks.filter((c) => !c.ok).map((c) => c.name).join(", ")} failing`}
 						</span>
 					</summary>
-					<div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 4 }}>
-						{preflight.checks.map((c) => (
-							<span key={c.name} className="sess-chip muted" style={{ color: c.ok ? "var(--ok, #4ade80)" : "var(--err)" }} title={c.detail}>
-								{c.ok ? "✓" : "✗"} {c.name}: {c.detail}
-							</span>
-						))}
-						{!preflight.ready && <span className="sess-chip" style={{ color: "var(--err)" }}>fix in Settings before running</span>}
+					<div className="env-panel">
+						<div className="env-grid">
+							<div className="env-cell">
+								<small>Sandbox</small>
+								<b>{session?.template || "base"}</b>
+							</div>
+							<div className="env-cell">
+								<small>Repository</small>
+								<b className="mono">{session?.repo || "—"}{session?.branch ? ` · ${session.branch}` : ""}</b>
+							</div>
+							<div className="env-cell">
+								<small>Mode</small>
+								<b style={{ textTransform: "capitalize" }}>{session?.securityProfile ?? "agent"}</b>
+							</div>
+						</div>
+						<div className="env-checks">
+							{preflight.checks.map((c) => (
+								<div key={c.name} className="env-check" style={{ color: c.ok ? "var(--ok, #4ade80)" : "var(--err)" }} title={c.detail}>
+									<span>{c.ok ? "✓" : "✗"}</span> {c.name}
+									<span className="muted"> — {c.detail}</span>
+								</div>
+							))}
+							{!preflight.ready && <div className="env-check" style={{ color: "var(--err)" }}>fix in Settings before running</div>}
+						</div>
 					</div>
 				</details>
 			)}
@@ -513,7 +550,8 @@ export default function SessionView() {
 			</div>
 			</div>
 			</div>
-			<div style={{ maxWidth: 860, margin: "0 auto" }}>
+			<div className="sess-body">
+			<div style={{ maxWidth: 860, margin: "0 auto", flex: "1 1 860px", minWidth: 0 }}>
 			{plansOpen && (
 				<Modal title="Plans" onClose={() => setPlansOpen(false)}>
 					<div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -539,6 +577,7 @@ export default function SessionView() {
 				</Modal>
 			)}
 			<Timeline user={user} sessionId={id} events={ordered} runs={runs} active={active} lateAfter={lateAfter}
+				focus={agentFocus} onFocusChange={setAgentFocus}
 				githubUrl={session?.prUrl ?? (session?.repo && session?.branch ? `https://github.com/${session.repo}/tree/${session.branch}` : undefined)} />
 			{userMsgs.length > 1 && (
 				<div className="msg-nav" role="navigation" aria-label="Jump to message">
@@ -580,6 +619,8 @@ export default function SessionView() {
 					currentBranch={session?.branch ?? undefined}
 				/>
 			</div>
+			</div>
+			<MultiAgentPanel events={ordered} runs={runs} focus={agentFocus} onSelect={setAgentFocus} />
 			</div>
 		</div>
 		</ProviderGate>

@@ -2,8 +2,8 @@ import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { IGNORED_DIRS } from "../tools/workspace";
-import type { ProviderCreds, SandboxHandle } from "./provider";
-import { SandboxCore, openPr } from "./sandboxCore";
+import type { ProviderCreds, SandboxHandle } from "../sandbox/provider";
+import { SandboxCore, openPr } from "../sandbox/sandboxCore";
 
 export { openPr };
 

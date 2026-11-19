@@ -2,10 +2,19 @@ import { Agent } from "@cline/agents";
 import type { AgentMessage, AgentRuntimeEvent, AgentTool, AgentToolResultPart } from "@cline/shared";
 import { createFileTools, type FileChangeKind, WRITE_TOOL_NAMES } from "../tools/fileTools";
 import { createFetchTools } from "../tools/fetchTools";
+import { createDispatchTool, DEFERRED_TOOLS } from "../tools/dispatchTools";
+import { createLoadSkillTool, parseSkill, skillsIndex } from "./skills";
+import { createExploreTool } from "../tools/exploreTools";
 import { buildSystemPrompt } from "./systemPrompt";
 import { createPrepareTurn, taskContextBudget } from "./compaction";
-import { createRecallTool, type PriorTranscript, type RecallScorer } from "./recall";
+import { createRecallTool } from "./recall";
 import { countTokens } from "./tokenize";
+import { ToolPipeline } from "./pipeline";
+import { createRepeatGuard } from "./guards/repeatGuard";
+import { createPermissionGuard } from "./guards/permissionGuard";
+import { createSavePlanGuard, createWriteModeGuard } from "./guards/modeGuard";
+import { createApprovalGuard } from "./guards/approvalGuard";
+import type { ApprovalsProvider, EventsProvider, FilesProvider, MemoryProvider, RecallProvider, ResumeProvider, ToolsProvider, TranscriptsProvider } from "./seams";
 
 export interface ProviderSettings {
 	providerId: string;
@@ -75,34 +84,31 @@ export type RunViewEvent =
 export interface RunnerHost {
 	workspaceRoot: string;
 	isDirty: (absPath: string) => boolean;
-	confirmWrite: (toolName: string, input: unknown) => Promise<boolean>;
 	relativePath: (absPath: string) => string;
-	onBeforeWrite?: (absPath: string, before: string | null) => void;
-	execCommand?: (command: string) => Promise<string | null>;
-	createTools?: () => Promise<AgentTool<any, string>[]>;
 	currentMode: () => AgentMode;
 	emit: (event: RunViewEvent) => void;
 	/** Directory for save_plan output; defaults to ".kronyx/plans" (relative to workspaceRoot for local tools, absolute for remote). */
 	planDir?: string;
-	/** Extra system-prompt context (memory recall); omit outside the extension. */
-	memoryContext?: (task: string, settings: ProviderSettings) => Promise<string>;
 	/** Environment descriptor for the system prompt, e.g. "the user's VS Code workspace". */
 	environment?: string;
 	/** Diagnostic sink; optional outside the extension. */
 	log?: (tag: string, message: string) => void;
-	/** Persist a durable fact for memory_write; omit outside the extension. */
-	onMemoryFact?: (fact: string) => Promise<void>;
-	/** Set false to omit the recall_context tool (e.g. tool-less ask runs). */
-	enableRecall?: boolean;
-	/** Rule-file permission check (see agent/permissions.ts). Runs before mode defaults:
-	 *  "deny" skips the call, "allow" bypasses prompting, "ask"/undefined → normal flow. */
-	checkPermission?: (toolName: string, input: unknown) => Promise<"allow" | "ask" | "deny" | undefined>;
-	/** Persisted transcripts of earlier runs, exposed to the recall_context tool. */
-	priorTranscripts?: () => readonly PriorTranscript[];
-	/** Semantic ranker for recall_context queries (embeddings); keyword search is the fallback. */
-	recallScorer?: RecallScorer;
-	/** Called after each run with the canonical transcript for cold-recall persistence. */
-	saveTranscript?: (messages: readonly AgentMessage[]) => void;
+	/** Tool provider seam: the agent's full tool set. Default: local file + fetch tools. */
+	tools?: ToolsProvider;
+	/** Approval seam: rule check + interactive confirm for writes. */
+	approvals?: ApprovalsProvider;
+	/** Memory seam: prompt context + durable fact persistence. */
+	memory?: MemoryProvider;
+	/** Recall seam: prior transcripts + semantic scorer for recall_context. */
+	recall?: RecallProvider;
+	/** Transcript seam: canonical transcript persistence after each run. */
+	transcripts?: TranscriptsProvider;
+	/** Files seam: pre-write snapshots + host-side command execution. */
+	files?: FilesProvider;
+	/** Events seam: durable KronyxEvent record sink (canonical run log). */
+	events?: EventsProvider;
+	/** Resume seam: seed messages from a prior run's durable log. */
+	resume?: ResumeProvider;
 }
 
 const HANDOFF_FRACTION = 0.4;
@@ -128,6 +134,8 @@ export class AgentRunner {
 	/** Live budget holder — prepareTurn ratchets this toward the model's real
 	 *  window; usage events stamp it so the UI meter tracks the ratchet. */
 	private budgetRef = { current: 0 };
+	/** Set by requestCompact(); consumed by prepareTurn → hard compaction next turn. */
+	private forceCompactRef = { current: false };
 	private digests: RunDigest[] = [];
 	private readonly toolStarts = new Map<string, number>();
 
@@ -161,6 +169,25 @@ export class AgentRunner {
 	stop(): void {
 		this.stopRequested = true;
 		this.agent?.abort("Stopped by user");
+	}
+
+	/** Manual "compact now": the next model turn runs the hard-tier compaction
+	 *  (same path as provider overflow). Returns false when nothing is loaded —
+	 *  there's no context to compact before the first turn of a run. */
+	requestCompact(): boolean {
+		if (!this.agent || !this.running) return false;
+		this.forceCompactRef.current = true;
+		this.host.emit({ type: "info", text: "Context compaction requested — applies on the next model turn." });
+		return true;
+	}
+
+	/** Drop the live agent; run digests carry forward so the next task seeds a
+	 *  fresh agent (soft clear — same as the automatic handoff, on demand). */
+	clearContext(): boolean {
+		if (this.running || !this.agent) return false;
+		this.agent = undefined;
+		this.host.emit({ type: "info", text: "Context cleared — the next task starts fresh, carrying run summaries forward." });
+		return true;
 	}
 
 	/** True when the live transcript is large enough that a fresh digest-seeded agent is cheaper than full continuity. */
@@ -215,11 +242,19 @@ export class AgentRunner {
 				// New Agent = new prepareTurn closure seeded from budgetRef — a
 				// reused agent keeps its ratcheted budget instead of resetting.
 				this.budgetRef.current = this.contextBudget;
-				agent = await this.createAgent(settings, task, this.seedMessages());
+				let initial = this.seedMessages();
+				// Resume seam: a prior run's durable log beats digest seeds.
+				const resumed = await this.host.resume?.resumeLog?.();
+				if (resumed?.length) {
+					initial = resumed;
+					this.host.events?.record({ type: "resumed-from-log", messages: resumed.length });
+				}
+				for (const m of initial ?? []) this.host.events?.record({ type: "agent-message", message: m });
+				agent = await this.createAgent(settings, task, initial);
 			}
 			this.agent = agent;
 			const result = await agent.run(task);
-			this.host.saveTranscript?.(agent.snapshot().messages);
+			this.host.transcripts?.save(agent.snapshot().messages);
 			if (result.status === "failed") {
 				this.host.emit({ type: "run-failed", error: result.error?.message ?? "Run failed" });
 			} else {
@@ -239,20 +274,35 @@ export class AgentRunner {
 	}
 
 	private async createAgent(settings: ProviderSettings, task: string, initialMessages?: AgentMessage[]): Promise<Agent> {
-		const recentCalls: string[] = [];
-		let modeWarned = false;
-		const tools = this.host.createTools
-			? await this.host.createTools()
+		const pipeline = new ToolPipeline();
+		pipeline.pre(
+			createRepeatGuard({
+				onLoopDetected: (tool, count) => this.host.emit({ type: "loop-detected", tool, count }),
+				onStop: () => this.stop(),
+			}),
+		);
+		pipeline.pre(createSavePlanGuard(this.host.currentMode));
+		if (this.host.approvals?.check) pipeline.pre(createPermissionGuard(this.host.approvals.check));
+		pipeline.pre(
+			createWriteModeGuard({
+				currentMode: this.host.currentMode,
+				writeTools: WRITE_TOOL_NAMES,
+				onModeBlocked: (mode) => this.host.emit({ type: "mode-blocked", mode }),
+			}),
+		);
+		pipeline.pre(createApprovalGuard(this.host.approvals));
+		const tools = this.host.tools
+			? await this.host.tools()
 			: [
 					...createFileTools({
 						root: this.host.workspaceRoot,
 						isDirty: this.host.isDirty,
 						onFileChanged: (abs, kind, stats) =>
 							this.host.emit({ type: "file-changed", path: this.host.relativePath(abs), kind, ...stats }),
-						onBeforeWrite: this.host.onBeforeWrite,
-						execCommand: this.host.execCommand,
+						onBeforeWrite: this.host.files?.onBeforeWrite,
+						execCommand: this.host.files?.execCommand,
 						planDir: this.host.planDir ? () => this.host.planDir! : undefined,
-						onMemoryFact: this.host.onMemoryFact,
+						onMemoryFact: this.host.memory?.onFact,
 					}),
 					...createFetchTools(),
 				];
@@ -268,6 +318,27 @@ export class AgentRunner {
 				: tools;
 		const execTools = (list: AgentTool<any, string>[]) =>
 			allowParallel ? list : list.map((t) => (t.executionMode === "parallel" ? { ...t, executionMode: "sequential" as const } : t));
+		// Deferred tools (browser_use, switch_environment, fetch_url) stay out of
+		// the per-request schemas; the model reaches them through use_tool.
+		const deferred = visible.filter((t) => DEFERRED_TOOLS.has(t.name));
+		// Repo skills: index into the prompt, bodies behind load_skill.
+		const skills = (
+			((await this.host.files?.listSkillFiles?.().catch(() => [])) ?? []) as { path: string; content: string }[]
+		).map((f) => parseSkill(f.path, f.content));
+		if (skills.length) deferred.push(createLoadSkillTool(skills));
+		const loaded = visible.filter((t) => !DEFERRED_TOOLS.has(t.name));
+		// aroundTool listeners wrap the tool body at registration time — the
+		// agent loop exposes before/after hooks but no around-execution hook.
+		const wrapAround = (list: AgentTool<any, string>[]): AgentTool<any, string>[] =>
+			list.map((t) =>
+				t.execute
+					? {
+							...t,
+							execute: (input: any, ctx: Parameters<NonNullable<typeof t.execute>>[1]) =>
+								pipeline.runAround({ name: t.name, input }, async () => t.execute!(input, ctx)),
+						}
+					: t,
+			);
 		return new Agent({
 			providerId: settings.providerId,
 			modelId: settings.modelId,
@@ -276,15 +347,22 @@ export class AgentRunner {
 			systemPrompt: buildSystemPrompt(
 				this.host.workspaceRoot,
 				mode,
-				(await this.host.memoryContext?.(task, settings)) ?? "",
+				(await this.host.memory?.context?.(task, settings)) ?? "",
 				this.host.environment,
+				skillsIndex(skills),
 			),
-			tools: [
-				...execTools(visible),
-				...(this.host.enableRecall === false
+			tools: wrapAround([
+				...execTools(loaded),
+				...(deferred.length ? [createDispatchTool(deferred)] : []),
+				createExploreTool({
+					settings,
+					tools: visible,
+					onEvent: (text) => this.host.emit({ type: "info", text }),
+				}),
+				...(this.host.recall?.enabled === false
 					? []
-					: execTools([createRecallTool({ priorTranscripts: this.host.priorTranscripts, scorer: this.host.recallScorer })])),
-			],
+					: execTools([createRecallTool({ priorTranscripts: this.host.recall?.transcripts, scorer: this.host.recall?.scorer })])),
+			]),
 			maxIterations: settings.maxIterations,
 			...(settings.maxTokens ? { modelOptions: { maxTokens: settings.maxTokens } } : {}),
 			toolExecution: "sequential",
@@ -292,63 +370,32 @@ export class AgentRunner {
 				contextWindow: settings.contextWindow,
 				contextBudget: this.contextBudget,
 				budgetRef: this.budgetRef,
+				forceCompactRef: this.forceCompactRef,
 				maxTokens: settings.maxTokens,
 				providerId: settings.providerId,
 				modelId: settings.modelId,
 				summarize: settings.baseUrl
 					? (messages) => summarizeMessages(settings, messages)
 					: undefined,
-				onCompact: (s) => this.host.log?.("agent", `compaction ${JSON.stringify(s)}`),
+				onCompact: (s) => {
+					this.host.log?.("agent", `compaction ${JSON.stringify(s)}`);
+					this.host.events?.record({ type: "compaction", stats: s });
+				},
 			}),
 			...(initialMessages?.length ? { initialMessages } : {}),
 			hooks: {
 				beforeTool: async ({ tool, input }) => {
-					// Repetition guard: nudge at 3 identical calls, hard-stop at 5.
-					const sig = tool.name + ":" + JSON.stringify(input ?? {}).replace(/\s+/g, "");
-					recentCalls.push(sig);
-					if (recentCalls.length > 12) recentCalls.shift();
-					const dupes = recentCalls.filter((s) => s === sig).length;
-					if (dupes >= 5) {
-						this.host.emit({ type: "loop-detected", tool: tool.name, count: dupes });
-						this.stop();
-						return { skip: true, reason: `Stopped: this exact action was attempted ${dupes} times without progress.` };
+					const verdict = await pipeline.runPre({ name: tool.name, input });
+					if (verdict.kind === "deny") return { skip: true, reason: verdict.reason };
+					if (verdict.kind === "ask") {
+						// Chain tail with no approval resolution — same as a denial.
+						return { skip: true, reason: "This action needs approval but no approval channel answered." };
 					}
-					if (dupes >= 3) {
-						return {
-							skip: true,
-							reason: `You already ran this exact action ${dupes} times without fixing the problem. Change approach — different command, different file, or re-read the relevant code.`,
-						};
-					}
-					const mode = this.host.currentMode();
-					// save_plan is the single write permitted in Plan mode.
-					if (tool.name === "save_plan") {
-						return mode === "plan" ? undefined : { skip: true, reason: "Plans are saved in Plan mode only." };
-					}
-					// Rule-file permissions: deny short-circuits, allow bypasses the prompt.
-					const rule = await this.host.checkPermission?.(tool.name, input);
-					if (rule === "deny") {
-						return { skip: true, reason: `Denied by permissions rules — ${tool.name} is not allowed here. Choose a different approach.` };
-					}
-					if (rule === "allow") return undefined;
-					// file_editor's read commands never need write permission.
-					if (tool.name === "file_editor") {
-						const cmd = (input as { command?: string })?.command;
-						if (cmd === "view" || cmd === "symbols") return undefined;
-					}
-					if (!WRITE_TOOL_NAMES.has(tool.name)) return undefined;
-					if (mode === "ask" || mode === "plan") {
-						if (!modeWarned) {
-							modeWarned = true;
-							this.host.emit({ type: "mode-blocked", mode });
-						}
-						return {
-							skip: true,
-							reason: `Writes are disabled in ${mode} mode. Ask the user to switch to Code or Smart mode.`,
-						};
-					}
-					if (mode === "smart" || mode === "bypass") return undefined;
-					const allowed = await this.host.confirmWrite(tool.name, input);
-					return allowed ? undefined : { skip: true, reason: "The user denied this change." };
+					return undefined;
+				},
+				afterTool: async ({ tool, input, result }) => {
+					const out = await pipeline.runPost({ name: tool.name, input }, result);
+					return out === result ? undefined : { result: out };
 				},
 				onEvent: (event) => this.forward(event),
 			},
@@ -356,6 +403,15 @@ export class AgentRunner {
 	}
 
 	private forward(event: AgentRuntimeEvent): void {
+		switch (event.type) {
+			// Canonical transcript commits → durable record. message-added covers
+			// user inputs and tool-result messages; assistant-message covers the
+			// model's replies (dedupe by id in deriveMessages).
+			case "message-added":
+			case "assistant-message":
+				this.host.events?.record({ type: "agent-message", message: event.message });
+				break;
+		}
 		switch (event.type) {
 			case "assistant-message": {
 				const reasoning = event.message.content

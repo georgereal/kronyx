@@ -11,5 +11,5 @@
 		"types": ["node"]
 	},
 	"include": ["src/**/*.ts", "../src/agent/**/*.ts", "../src/sandbox/sandboxCore.ts", "../src/tools/**/*.ts", "../src/diff/**/*.ts"],
-	"exclude": ["../src/agent/memory.ts"]
+	"exclude": ["../src/ui/memory.ts"]
 }

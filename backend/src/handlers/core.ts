@@ -5,6 +5,7 @@ import { cert, getApps, initializeApp, type App } from "firebase-admin/app";
 import { authenticate, mintApiKey, resolveApiKey } from "../lib/apiKeys";
 import { verifyRequest } from "../lib/firebaseAdmin";
 import { getDb } from "../lib/mongo";
+import { loadDump } from "../lib/dumpStore";
 import { json } from "../routes";
 
 function adminApp(): App {
@@ -180,7 +181,7 @@ export async function compactions(req: Request): Promise<Response> {
 		.find(filter)
 		.sort({ ingestedAt: -1 })
 		.limit(limit)
-		.project({ _id: 0, runId: 1, sessionId: 1, ingestedAt: 1, event: 1 })
+		.project({ _id: 0, runId: 1, sessionId: 1, ingestedAt: 1, seq: 1, event: 1 })
 		.toArray();
 	const runIds = [...new Set(rows.map((r) => String(r.runId)))];
 	const runs = await db
@@ -196,6 +197,8 @@ export async function compactions(req: Request): Promise<Response> {
 			at: r.ingestedAt,
 			runId: r.runId,
 			sessionId: r.sessionId,
+			seq: r.seq,
+			hasDump: typeof ev.dumpRef === "string",
 			agentIndex: ev.agentIndex ?? 0,
 			task: (run as { task?: string }).task,
 			model: ev.model ?? (run as { modelId?: string }).modelId,
@@ -213,6 +216,8 @@ export async function compactions(req: Request): Promise<Response> {
 			stubbed: ev.stubbed,
 			clamped: ev.clamped,
 			superseded: ev.superseded,
+			deduped: ev.deduped,
+			summaryBlocks: ev.summaryBlocks,
 			callsElided: ev.callsElided,
 			reasoningPruned: ev.reasoningPruned,
 			attachmentsStubbed: ev.attachmentsStubbed,
@@ -220,6 +225,28 @@ export async function compactions(req: Request): Promise<Response> {
 		};
 	});
 	return json({ items });
+}
+
+/** GET /api/compactions/:runId/:seq — one compaction's full before/after
+ *  context dump (gzipped file on the backend host via dumpStore). */
+export async function compactionDetail(req: Request, p: Record<string, string>): Promise<Response> {
+	const uid = await authenticate(req);
+	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
+	const db = await getDb();
+	const row = await db.collection("run_events").findOne(
+		{ uid, runId: p.runId, seq: Number(p.seq), "event.type": "compaction" },
+		{ projection: { _id: 0, event: 1 } },
+	);
+	if (!row) return json({ error: "not found" }, { status: 404 });
+	const ev = (row.event ?? {}) as Record<string, unknown>;
+	const dump = typeof ev.dumpRef === "string" ? await loadDump(uid, ev.dumpRef as string) : null;
+	return json({
+		dump,
+		contextPreview: ev.contextPreview,
+		recap: ev.recap,
+		estTokensBefore: ev.estTokensBefore,
+		estTokensAfter: ev.estTokensAfter,
+	});
 }
 
 /**

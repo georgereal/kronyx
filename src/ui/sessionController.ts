@@ -7,10 +7,12 @@ import { readGlobalModePermissions, readGlobalPermissions } from "../permStore";
 import type { PriorTranscript } from "../agent/recall";
 import type { AgentMessage } from "@cline/shared";
 import { checksOnFinish, runChecks } from "../checks";
-import { E2bSandbox, sandboxBackend, sandboxEnabled } from "../sandbox/e2b";
-import { appendFact, createIdeRecallScorer, indexFile, loadMemoryContext, logEpisode } from "../agent/memory";
+import { E2bSandbox, sandboxBackend, sandboxEnabled } from "./e2b";
+import { appendFact, createIdeRecallScorer, indexFile, loadMemoryContext, logEpisode } from "./memory";
 import { createFileTools } from "../tools/fileTools";
 import { createFetchTools } from "../tools/fetchTools";
+import { createMcpTools, type McpServerConfig } from "../tools/mcpTools";
+import { userConfig } from "../userConfig";
 import { insertMemoryEvent, openStore } from "../store";
 import { createIdeTools } from "./ideTools";
 import { autoApproveWrites, estimateCostUsd, implementPrompt, modelPricing, planDir, promptForApiKey, providerErrorMessage, readProviderSettings, resolveProvider, writeProviderValue } from "../config";
@@ -145,6 +147,18 @@ function diagCounts(): { errors: number; warnings: number } {
 /** Owns one session surface (sidebar view or editor tab): runner, messages, git hooks. */
 export class SessionController {
 	private runner: AgentRunner | undefined;
+	/** MCP connections are per-session: config change rebuilds on next runner. */
+	private mcp: { key: string; tools: import("@cline/shared").AgentTool<any, string>[] } | undefined;
+
+	private async mcpTools(): Promise<import("@cline/shared").AgentTool<any, string>[]> {
+		const servers = userConfig().mcpServers as McpServerConfig[] | undefined;
+		if (!servers?.length) return [];
+		const key = JSON.stringify(servers);
+		if (this.mcp?.key !== key) {
+			this.mcp = { key, tools: (await createMcpTools({ servers, log: (m) => log("mcp", m) })).tools };
+		}
+		return this.mcp.tools;
+	}
 	private runnerRoot: string | undefined;
 	private approveAll = false;
 	private changedPaths = new Set<string>();
@@ -199,6 +213,12 @@ export class SessionController {
 				this.runner?.stop();
 				for (const p of this.pendingPermissions.values()) p.resolve("deny");
 				this.pendingPermissions.clear();
+				break;
+			case "compact":
+				if (!this.runner?.requestCompact()) this.deps.output.appendLine("[ctx] no running agent to compact");
+				break;
+			case "clearContext":
+				if (!this.runner?.clearContext()) this.deps.output.appendLine("[ctx] nothing to clear (agent idle or absent)");
 				break;
 			case "permissionResponse": {
 				const p = this.pendingPermissions.get(message.id);
@@ -323,11 +343,13 @@ export class SessionController {
 				relativePath: (abs) => path.relative(root, abs).split(path.sep).join("/"),
 				isDirty: (abs) =>
 					vscode.workspace.textDocuments.some((doc) => doc.isDirty && doc.uri.fsPath === abs),
-				confirmWrite: (toolName, input) => this.confirmWrite(root, toolName, input),
-				checkPermission: async (toolName, input) => evaluate(this.permLayers, toolName, input, this.deps.modeRef.current),
+				approvals: {
+					confirm: (toolName, input) => this.confirmWrite(root, toolName, input),
+					check: async (toolName, input) => evaluate(this.permLayers, toolName, input, this.deps.modeRef.current),
+				},
 				currentMode: () => this.deps.modeRef.current,
 				planDir: planDir(),
-				createTools: async () => [
+				tools: async () => [
 					...createFileTools({
 						root,
 						isDirty: (abs) => vscode.workspace.textDocuments.some((doc) => doc.isDirty && doc.uri.fsPath === abs),
@@ -349,22 +371,42 @@ export class SessionController {
 							),
 					}),
 					...createFetchTools(),
+					...(await this.mcpTools()),
 				],
-				memoryContext: async (task, s) => [devContext(root), await loadMemoryContext(root, task, s)].filter(Boolean).join("\n\n"),
-				onMemoryFact: (fact) => appendFact(root, fact),
-				log: (tag, message) => log(tag, message),
-				onBeforeWrite: (abs, before) => this.deps.diffReview.record(abs, before),
-				execCommand: (command) => this.execCommand(command),
-				priorTranscripts: () => this.transcripts,
-				recallScorer: async (query, chunks) => {
-					const s = await readProviderSettings(this.deps.context.secrets);
-					return s ? createIdeRecallScorer(root, s.baseUrl, s.apiKey)(query, chunks) : undefined;
+				memory: {
+					context: async (task, s) => [devContext(root), await loadMemoryContext(root, task, s)].filter(Boolean).join("\n\n"),
+					onFact: (fact) => appendFact(root, fact),
 				},
-				saveTranscript: (messages) => {
-					this.transcripts = [...this.transcripts, { label: `run ${this.transcripts.length + 1}`, messages }].slice(-5);
-					this.deps.saveTranscript?.(this.name, messages);
+				log: (tag, message) => log(tag, message),
+				files: {
+					onBeforeWrite: (abs, before) => this.deps.diffReview.record(abs, before),
+					execCommand: (command) => this.execCommand(command),
+					listSkillFiles: async () => {
+						const dir = path.join(root, ".kronyx", "skills");
+						const out: { path: string; content: string }[] = [];
+						for (const sub of await fs.readdir(dir).catch(() => [] as string[])) {
+							const p = path.join(dir, sub, "SKILL.md");
+							const content = await fs.readFile(p, "utf8").catch(() => null);
+							if (content !== null) out.push({ path: `.kronyx/skills/${sub}/SKILL.md`, content });
+						}
+						return out;
+					},
+				},
+				recall: {
+					transcripts: () => this.transcripts,
+					scorer: async (query, chunks) => {
+						const s = await readProviderSettings(this.deps.context.secrets);
+						return s ? createIdeRecallScorer(root, s.baseUrl, s.apiKey)(query, chunks) : undefined;
+					},
+				},
+				transcripts: {
+					save: (messages) => {
+						this.transcripts = [...this.transcripts, { label: `run ${this.transcripts.length + 1}`, messages }].slice(-5);
+						this.deps.saveTranscript?.(this.name, messages);
+					},
 				},
 				emit: (event) => this.onEvent(event),
+				events: { record: (e) => this.deps.persistEvent(this.name, e as Parameters<RunViewProvider["post"]>[0]) },
 			});
 			void this.deps.loadDigest?.(this.name).then((d) => this.runner?.setRunDigests(d));
 			void this.deps.loadTranscripts?.(this.name).then((t) => {

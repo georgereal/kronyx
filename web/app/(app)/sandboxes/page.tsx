@@ -58,14 +58,6 @@ export default function SandboxesPage() {
 		setMsg(res.ok ? "Bake queued — a stock VM installs the recipe, then snapshots." : `Bake failed: ${res.status}`);
 		void loadTemplates();
 	};
-	const bakeCustom = async (r: { name: string; commands: string; verify?: string; repo?: string; installationId?: number; includeRepo?: boolean }) => {
-		if (!user) return;
-		const res = await apiFetch("/api/templates/bake", user, { method: "POST", body: JSON.stringify(r) });
-		setMsg(res.ok ? (r.includeRepo ? `Warm bake queued for ${r.repo}.` : `Bake queued for "${r.name}".`) : `Bake failed: ${res.status}`);
-		setTab("templates");
-		setTmplTab("mine");
-		void loadTemplates();
-	};
 	const removeImage = async (name: string) => {
 		if (!user || !confirm(`Delete image ${name}? Its snapshot is removed too.`)) return;
 		await apiFetch(`/api/templates/${encodeURIComponent(name)}`, user, { method: "DELETE" });

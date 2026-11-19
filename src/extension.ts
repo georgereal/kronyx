@@ -98,7 +98,7 @@ export function activate(context: vscode.ExtensionContext): void {
 		const root = await storeRoot;
 		const settings = root ? await readProviderSettings(context.secrets) : undefined;
 		if (!root || !settings?.apiKey) return;
-		const { embeddingModel, indexWorkspace } = await import("./agent/memory");
+		const { embeddingModel, indexWorkspace } = await import("./ui/memory");
 		if (embeddingModel()) void indexWorkspace(root, settings.baseUrl, settings.apiKey, (l) => output.appendLine(l));
 	})();
 	const diffReview = new DiffReview();
@@ -287,7 +287,7 @@ export function activate(context: vscode.ExtensionContext): void {
 			if (!folder) return void vscode.window.showErrorMessage("Kronyx: open a folder first.");
 			const settings = await readProviderSettings(context.secrets);
 			if (!settings) return void vscode.window.showErrorMessage("Kronyx: provider settings unavailable.");
-			const { embeddingModel, indexWorkspace } = await import("./agent/memory");
+			const { embeddingModel, indexWorkspace } = await import("./ui/memory");
 			if (!embeddingModel()) {
 				return void vscode.window.showInformationMessage(
 					"Kronyx: set kronyx.memory.embeddingModel first (e.g. text-embedding-3-small).",
@@ -571,6 +571,8 @@ export function activate(context: vscode.ExtensionContext): void {
 			}
 		}),
 		vscode.commands.registerCommand("kronyx.stop", () => (sidebarController ?? focusSessionPanel(context, deps)).handle({ type: "stop" })),
+		vscode.commands.registerCommand("kronyx.compactContext", () => (sidebarController ?? focusSessionPanel(context, deps)).handle({ type: "compact" })),
+		vscode.commands.registerCommand("kronyx.clearContext", () => (sidebarController ?? focusSessionPanel(context, deps)).handle({ type: "clearContext" })),
 		vscode.commands.registerCommand("kronyx.newTask", () => (sidebarController ?? focusSessionPanel(context, deps)).handle({ type: "new" })),
 		vscode.commands.registerCommand("kronyx.setApiKey", () => promptForApiKey(context.secrets)),
 		vscode.commands.registerCommand("kronyx.clearApiKey", async () => {

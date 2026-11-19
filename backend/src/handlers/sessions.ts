@@ -128,6 +128,19 @@ export async function getSession(req: Request, p: Record<string, string>): Promi
 	});
 }
 
+/** POST /api/sessions/:id/clear — flag the session for a context reset; the
+ *  worker drops the cached agent on the next job (digests carry forward). */
+export async function clearSession(req: Request, p: Record<string, string>): Promise<Response> {
+	const uid = await authenticate(req);
+	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
+	const db = await getDb();
+	const res = await db
+		.collection("sessions")
+		.updateOne({ uid, sessionId: p.id }, { $set: { clearRequested: true, updatedAt: new Date() } });
+	if (!res.matchedCount) return json({ error: "not_found" }, { status: 404 });
+	return json({ ok: true });
+}
+
 /** POST /api/sessions/:id/messages */
 export async function postMessage(req: Request, p: Record<string, string>): Promise<Response> {
 	const uid = await authenticate(req);

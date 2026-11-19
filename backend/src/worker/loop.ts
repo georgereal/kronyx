@@ -126,7 +126,11 @@ async function runJob(job: CloudJob): Promise<void> {
 	};
 	const stopCheck = setInterval(() => {
 		void (async () => {
-			const run = await db.collection("runs").findOne({ uid: job.uid, runId: job.runId });
+			const run = await db.collection("runs").findOne({ uid: job.uid, runId: job.runId }, { projection: { control: 1 } });
+			if (run?.control === "compact_requested") {
+				await db.collection("runs").updateOne({ uid: job.uid, runId: job.runId }, { $unset: { control: "" } }).catch(swallow("loop", "op"));
+				executor.requestCompact();
+			}
 			if (run?.control === "stop_requested" && !stopped) {
 				stopped = true;
 				log(`stop requested for ${job.runId}`);

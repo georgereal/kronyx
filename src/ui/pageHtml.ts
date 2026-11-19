@@ -33,6 +33,8 @@ export function renderPage(webview: vscode.Webview, extensionUri: vscode.Uri): s
     <span class="spacer"></span>
     <span id="tokchip" class="tok" title="Tokens in / out" hidden></span>
     <button type="button" id="model" class="chip model-chip" title="Model"><span class="chip-text" id="model-label">Model</span><span class="caret">&#9662;</span></button>
+    <button type="button" id="compact" class="send-btn" title="Compact context now (next model turn)">&#8786;</button>
+    <button type="button" id="clearctx" class="send-btn" title="Clear context — next task starts fresh">&#9003;</button>
     <button type="button" id="send" class="send-btn" title="Run (Enter)">&#8593;</button>
     <button type="button" id="stop" class="send-btn stop" title="Stop" hidden>&#9632;</button>
   </div>

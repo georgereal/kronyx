@@ -94,3 +94,23 @@ describe("ruleFor", () => {
 		expect(ruleFor("memory_write", { fact: "x" })).toBe("memory_write");
 	});
 });
+
+describe("mcp tools", () => {
+	it("server-level rules gate every tool on that server", () => {
+		const l = layers({ project: { ...empty, deny: ["mcp_github"] } });
+		expect(evaluate(l, "mcp_github_create_issue", {})).toBe("deny");
+		expect(evaluate(l, "mcp_other_create_issue", {})).toBeUndefined();
+	});
+
+	it("mcp_* gates all MCP tools; subtool globs match the subtool name", () => {
+		const l = layers({ project: { ...empty, deny: ["mcp_*"], ask: ["mcp_github(create_*)"] } });
+		expect(evaluate(l, "mcp_github_get_issue", {})).toBe("deny"); // mcp_* wins inside the layer
+		const l2 = layers({ project: { ...empty, ask: ["mcp_github(create_*)"] } });
+		expect(evaluate(l2, "mcp_github_create_issue", {})).toBe("ask");
+		expect(evaluate(l2, "mcp_github_get_issue", {})).toBeUndefined();
+	});
+
+	it("ruleFor produces server(subtool) form", () => {
+		expect(ruleFor("mcp_github_create_issue", {})).toBe("mcp_github(create_issue)");
+	});
+});

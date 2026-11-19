@@ -8,6 +8,8 @@ export type { AgentMode, ModelOption };
 export type WebviewMessage =
 	| { type: "run"; task: string; mode: AgentMode }
 	| { type: "stop" }
+	| { type: "compact" }
+	| { type: "clearContext" }
 	| { type: "new" }
 	| { type: "setApiKey" }
 	| { type: "requestState" }

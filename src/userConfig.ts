@@ -2,6 +2,7 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ProviderProfile } from "./config";
+import type { McpServerConfig } from "./tools/mcpTools";
 
 /** User-level provider config shared across every VS Code/Devin window and profile. */
 export interface UserProviderConfig {
@@ -10,6 +11,8 @@ export interface UserProviderConfig {
 	modelId?: string;
 	profiles?: ProviderProfile[];
 	activeProfile?: string;
+	/** MCP servers to expose to the agent (`mcp_<server>_<tool>`). */
+	mcpServers?: McpServerConfig[];
 }
 
 let cached: UserProviderConfig | undefined;

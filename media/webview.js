@@ -386,6 +386,8 @@
 	});
 	sendBtn.addEventListener("click", submit);
 	stopBtn.addEventListener("click", () => vscode.postMessage({ type: "stop" }));
+	document.getElementById("compact")?.addEventListener("click", () => vscode.postMessage({ type: "compact" }));
+	document.getElementById("clearctx")?.addEventListener("click", () => vscode.postMessage({ type: "clearContext" }));
 
 
 	// ---------- popup menu ----------

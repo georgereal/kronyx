@@ -55,7 +55,7 @@ export async function runSuite(
 			workspaceRoot: root,
 			relativePath: (abs) => path.relative(root, abs).split(path.sep).join("/"),
 			isDirty: () => false,
-			confirmWrite: async () => true,
+			approvals: { confirm: async () => true },
 			currentMode: () => "bypass",
 			planDir: `${root}/.kronyx/plans`,
 			emit: (event) => {

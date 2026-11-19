@@ -100,6 +100,88 @@ export function previewMessages(msgs: readonly AgentMessage[], max = 60): Contex
 	});
 }
 
+/** Full-fidelity capture of a projected request — the actual part contents,
+ *  not digests. Persisted (gzipped, file-backed) alongside each compaction
+ *  event so the dashboard can diff what compaction changed. */
+export interface ContextDumpPart {
+	type: string;
+	toolName?: string;
+	toolCallId?: string;
+	isError?: boolean;
+	text: string;
+	truncated?: boolean;
+}
+
+export interface ContextDumpLine {
+	idx: number;
+	role: string;
+	kind: ContextLine["kind"];
+	chars: number;
+	estTokens: number;
+	parts: ContextDumpPart[];
+}
+
+/** Tool calls/results are what compaction actually rewrites — keep them fat;
+ *  prose and reasoning rarely matter for the diff, so cap tighter. */
+const DUMP_PART_CAP: Partial<Record<string, number>> = { "tool-call": 8_000, "tool-result": 8_000 };
+const DUMP_PART_DEFAULT_CAP = 2_000;
+const DUMP_TOTAL_CAP = 1_000_000;
+
+function dumpMessages(messages: readonly AgentMessage[]): ContextDumpLine[] {
+	const lines: ContextDumpLine[] = messages.map((m, idx) => {
+		const parts: ContextDumpPart[] = m.content.map((p) => {
+			const base: ContextDumpPart = { type: p.type, text: "" };
+			let raw = "";
+			if (p.type === "text" || p.type === "reasoning") {
+				raw = String((p as { text?: string }).text ?? "");
+			} else if (p.type === "tool-call") {
+				base.toolName = (p as { toolName?: string }).toolName;
+				base.toolCallId = (p as { toolCallId?: string }).toolCallId;
+				raw = JSON.stringify((p as { input?: unknown }).input ?? null);
+			} else if (p.type === "tool-result") {
+				base.toolName = (p as { toolName?: string }).toolName;
+				base.toolCallId = (p as { toolCallId?: string }).toolCallId;
+				base.isError = (p as { isError?: boolean }).isError;
+				const out = (p as { output?: unknown }).output;
+				raw = typeof out === "string" ? out : JSON.stringify(out ?? null);
+			} else {
+				raw = `[${p.type}]`;
+			}
+			const cap = DUMP_PART_CAP[p.type] ?? DUMP_PART_DEFAULT_CAP;
+			base.truncated = raw.length > cap;
+			base.text = base.truncated ? `${raw.slice(0, cap)}\n…[${raw.length - cap} chars elided]` : raw;
+			return base;
+		});
+		const kinds = new Set(m.content.map((p) => p.type));
+		const kind: ContextLine["kind"] = kinds.has("tool-result")
+			? "tool-result"
+			: kinds.has("tool-call")
+				? "tool-call"
+				: kinds.has("reasoning")
+					? "reasoning"
+					: kinds.has("image") || kinds.has("file") || kinds.has("media")
+						? "attachment"
+						: "text";
+		const chars = parts.reduce((n, p) => n + p.text.length, 0);
+		return { idx, role: m.role, kind, chars, estTokens: countTokens(JSON.stringify(m.content)), parts };
+	});
+	// Whole-dump cap: strip part text oldest-first (line digests survive).
+	let total = JSON.stringify(lines).length;
+	if (total > DUMP_TOTAL_CAP) {
+		for (const line of lines) {
+			for (const p of line.parts) {
+				if (total <= DUMP_TOTAL_CAP) break;
+				if (!p.text) continue;
+				total -= p.text.length;
+				p.text = `[${p.type} content dropped — dump size cap]`;
+				p.truncated = true;
+				total += p.text.length;
+			}
+		}
+	}
+	return lines;
+}
+
 /** Provider-specific tuning. Anthropic requires the thinking block that
  *  precedes a tool call to stay in the transcript; other providers never
  *  receive reasoning back, so pruning it unconditionally is free savings. */
@@ -113,7 +195,9 @@ export interface CompactStats {
 	attachmentsStubbed: number;
 	callsElided: number;
 	superseded: number;
+	deduped: number;
 	summarized: boolean;
+	summaryBlocks: number;
 	estTokensBefore: number;
 	estTokensAfter: number;
 	forced: boolean;
@@ -147,10 +231,25 @@ export interface PrepareTurnOptions {
 	 */
 	summarize?: (messages: readonly AgentMessage[]) => Promise<string | undefined>;
 	onCompact?: (stats: CompactStats) => void;
+	/** Live flag: set externally (manual "compact now") to force a hard-tier
+	 *  compaction on the next turn. Consumed and cleared on use. */
+	forceCompactRef?: { current: boolean };
 }
 
-const stubText = (part: AgentToolResultPart) =>
-	`[output elided by context compaction — call recall_context with toolCallId "${part.toolCallId}" to retrieve]`;
+/** Outputs shorter than this are cheaper kept than stubbed — and the stub
+ *  would erase the signal anyway ("No matches." IS the answer). */
+const STUB_MIN_CHARS = 120;
+/** Marker for "this output is already a stub" — lets re-passes skip it. */
+const STUB_MARKER = "elided by context compaction";
+
+/** Content-aware stub: the gist (first ~80 chars of real output) survives, so
+ *  the model keeps the "what did it find" signal without the bulk. */
+const stubText = (part: AgentToolResultPart): string => {
+	const gist = resultText(part).replace(/\s+/g, " ").trim().slice(0, 80);
+	return `[output elided by context compaction${gist ? ` — "${gist}${resultText(part).replace(/\s+/g, " ").trim().length > 80 ? "…" : ""}"` : ""} — recall_context toolCallId "${part.toolCallId}"]`;
+};
+
+const isStub = (part: AgentToolResultPart): boolean => resultText(part).includes(STUB_MARKER);
 
 const resultText = (part: AgentToolResultPart): string =>
 	typeof part.output === "string" ? part.output : JSON.stringify(part.output ?? "");
@@ -337,20 +436,53 @@ export function createPrepareTurn(opts: PrepareTurnOptions = {}) {
 			const part = mutable[c.mi].content[c.pi] as AgentToolResultPart;
 			const r = rank(c, i);
 			if (r !== 1 && !(r === 0 && resultText(part).length > 1000)) return;
+			if (resultText(part).length < STUB_MIN_CHARS || isStub(part)) return;
 			const stub = stubText(part);
-			if (typeof part.output === "string" && part.output === stub) return;
 			saved += Math.max(0, countTokens(resultText(part)) - countTokens(stub));
 			mutable[c.mi].content[c.pi] = { ...part, output: stub };
 			superseded++;
 		});
 
+		// Dedupe identical outputs regardless of input (same page fetched twice,
+		// loop-guard retries hitting the same error, repeated "no results") —
+		// supersession only catches same tool+input. Newest copy stays verbatim;
+		// earlier copies get a pointer stub naming the surviving toolCallId.
+		let deduped = 0;
+		const byOutput = new Map<string, number[]>();
+		candidates.forEach((c, i) => {
+			const part = mutable[c.mi].content[c.pi] as AgentToolResultPart;
+			const text = resultText(part);
+			if (text.length < STUB_MIN_CHARS || isStub(part)) return;
+			const sig = `${part.toolName}|${text.trim().toLowerCase().replace(/\s+/g, " ").slice(0, 400)}|${text.length >> 10}`;
+			const list = byOutput.get(sig);
+			if (list) list.push(i);
+			else byOutput.set(sig, [i]);
+		});
+		for (const idxs of byOutput.values()) {
+			if (idxs.length < 2) continue;
+			const keep = candidates[idxs[idxs.length - 1]];
+			const keepId = (mutable[keep.mi].content[keep.pi] as AgentToolResultPart).toolCallId;
+			for (const i of idxs.slice(0, -1)) {
+				const c = candidates[i];
+				const part = mutable[c.mi].content[c.pi] as AgentToolResultPart;
+				const stub = `[output identical to toolCallId "${keepId}" — ${idxs.length - 1} earlier cop${idxs.length > 2 ? "ies" : "y"} elided by context compaction; recall_context to retrieve]`;
+				saved += Math.max(0, countTokens(resultText(part)) - countTokens(stub));
+				mutable[c.mi].content[c.pi] = { ...part, output: stub };
+				deduped++;
+			}
+		}
+
 		const estNow = Math.max(estBefore - saved, 0);
 		growth = Math.min(64_000, Math.max(4_000, 0.7 * growth + 0.3 * (prevEst < 0 ? 0 : Math.max(0, estBefore - prevEst))));
 		prevEst = estBefore;
-		const forced = ctx.overflowRecovery === true;
+		// Manual compact requests take the same hard-tier path as provider
+		// overflow — but only real rejections teach us the provider's ceiling.
+		const manual = opts.forceCompactRef?.current === true;
+		if (manual && opts.forceCompactRef) opts.forceCompactRef.current = false;
+		const forced = ctx.overflowRecovery === true || manual;
 		// The provider just rejected for context size — that IS the real
 		// ceiling; learn it (85% margin) so we stop overflowing every turn.
-		if (forced && ctx.previousRequestInputTokens) {
+		if (ctx.overflowRecovery === true && ctx.previousRequestInputTokens) {
 			learnedCeiling = Math.floor(ctx.previousRequestInputTokens * 0.85);
 			if (learnedCeiling < budget) setBudget(learnedCeiling);
 		}
@@ -401,49 +533,65 @@ export function createPrepareTurn(opts: PrepareTurnOptions = {}) {
 				if (c.r === 2) break; // soft tier: errors + superseded only
 			} else if (est <= target) break;
 			const part = mutable[c.mi].content[c.pi] as AgentToolResultPart;
+			if (resultText(part).length < STUB_MIN_CHARS || isStub(part)) continue;
 			const stub = stubText(part);
-			if (typeof part.output === "string" && part.output === stub) continue;
 			est -= Math.max(0, countTokens(resultText(part)) - countTokens(stub));
 			mutable[c.mi].content[c.pi] = { ...part, output: stub };
 			stubbed++;
 		}
 
-		// Still over target after mechanical trims: while the budget is below
-		// the real ceiling, ratchet it (fill-anchored — next est sits at ~55%
-		// of the new budget) instead of discarding context. The LLM summary is
-		// reserved for when the ceiling itself is reached. ceilingNow folds in
+		// Still over target after mechanical trims. Summary-first at the hard
+		// tier: old turns carry decisions/state, not serialized history — chunked
+		// LLM briefs replace them (task message pinned, recent window verbatim,
+		// recall_context is the escape hatch). When no summarizer is available,
+		// the budget ratchets instead of discarding context. ceilingNow folds in
 		// a ceiling learned THIS pass — `ceiling`/`window` above are stale then.
 		let summarized = false;
 		let ratcheted = false;
+		let summaryBlocks = 0;
 		let summary: string | undefined;
 		const ceilingNow = Math.min(ceiling, learnedCeiling ?? Number.MAX_SAFE_INTEGER);
-		if (!soft && est > target && window < ceilingNow) {
-			setBudget(Math.min(ceilingNow, Math.max(budget, Math.ceil(est / TARGET_FRACTION))));
-			ratcheted = true;
-		} else if (!soft && opts.summarize && est > target && mutable.length > KEEP_RECENT_MESSAGES) {
+		const SUMMARY_CHUNK = 20;
+		const SUMMARY_MAX_CHUNKS = 3;
+		if (!soft && opts.summarize && mutable.length - KEEP_RECENT_MESSAGES > 4) {
 			const prefix = mutable.slice(0, mutable.length - KEEP_RECENT_MESSAGES);
 			// The task message (first user turn) survives verbatim — a good
 			// compaction is a brief for future work, not a summary of the task.
 			const pinTask = prefix[0]?.role === "user" ? 1 : 0;
-			summary = prefix.length > pinTask ? await opts.summarize(prefix.slice(pinTask)).catch(() => undefined) : undefined;
-			if (summary) {
-				mutable.splice(pinTask, prefix.length - pinTask, {
-					id: `compact-${Date.now()}`,
-					role: "user",
-					content: [
-						{
-							type: "text",
-							text: `[Earlier turns in this task were summarized by context compaction — details retrievable with recall_context]\n\n${summary}`,
-						},
-					],
-					createdAt: Date.now(),
-				});
+			const blocks: { start: number; end: number; text: string }[] = [];
+			for (let s = pinTask; s < prefix.length && blocks.length < SUMMARY_MAX_CHUNKS; s += SUMMARY_CHUNK) {
+				const end = Math.min(prefix.length, s + SUMMARY_CHUNK);
+				const text = await opts.summarize(prefix.slice(s, end)).catch(() => undefined);
+				if (text) blocks.push({ start: s, end, text });
+			}
+			if (blocks.length) {
+				// Splice newest-first so earlier indexes stay valid.
+				for (let b = blocks.length - 1; b >= 0; b--) {
+					const { start, end, text } = blocks[b];
+					mutable.splice(start, end - start, {
+						id: `compact-${Date.now()}-${b}`,
+						role: "user",
+						content: [
+							{
+								type: "text",
+								text: `[Turns ${start + 1}–${end} of this task were summarized by context compaction — details retrievable with recall_context]\n\n${text}`,
+							},
+						],
+						createdAt: Date.now(),
+					});
+				}
 				summarized = true;
+				summaryBlocks = blocks.length;
+				summary = blocks.map((b) => b.text).join("\n\n");
 				est = estimateTokens(mutable, ctx.systemPrompt, ctx.tools);
 			}
 		}
+		if (!summarized && !soft && est > target && window < ceilingNow) {
+			setBudget(Math.min(ceilingNow, Math.max(budget, Math.ceil(est / TARGET_FRACTION))));
+			ratcheted = true;
+		}
 
-		if (!stubbed && !clamped && !reasoningPruned && !attachmentsStubbed && !callsElided && !superseded && !summarized && !ratcheted)
+		if (!stubbed && !clamped && !reasoningPruned && !attachmentsStubbed && !callsElided && !superseded && !deduped && !summarized && !ratcheted)
 			return undefined;
 		const stats: CompactStats = {
 			stubbed,
@@ -452,7 +600,9 @@ export function createPrepareTurn(opts: PrepareTurnOptions = {}) {
 			attachmentsStubbed,
 			callsElided,
 			superseded,
+			deduped,
 			summarized,
+			summaryBlocks,
 			estTokensBefore: estBefore,
 			estTokensAfter: est,
 			forced,
@@ -465,11 +615,12 @@ export function createPrepareTurn(opts: PrepareTurnOptions = {}) {
 		ctx.emitStatusNotice?.(
 			`context compacted: ${stubbed ? `stubbed ${stubbed} tool result(s), ` : ""}` +
 				`${superseded ? `elided ${superseded} stale result(s), ` : ""}` +
+				`${deduped ? `deduped ${deduped} identical output(s), ` : ""}` +
 				`${callsElided ? `elided ${callsElided} tool-call input(s), ` : ""}` +
 				`${clamped ? `clamped ${clamped} large output(s), ` : ""}` +
 				`${reasoningPruned ? `pruned ${reasoningPruned} reasoning part(s), ` : ""}` +
 				`${attachmentsStubbed ? `stubbed ${attachmentsStubbed} attachment(s), ` : ""}` +
-				`${summarized ? "summarized oldest turns, " : ""}` +
+				`${summarized ? `summarized oldest turns into ${summaryBlocks} brief(s), ` : ""}` +
 				`(~${Math.round(estBefore / 1000)}k → ~${Math.round(est / 1000)}k est. tokens)`,
 			{
 				kind: "context_compaction",
@@ -479,7 +630,9 @@ export function createPrepareTurn(opts: PrepareTurnOptions = {}) {
 				attachmentsStubbed,
 				callsElided,
 				superseded,
+				deduped,
 				summarized,
+				summaryBlocks,
 				forced,
 				soft,
 				contextBudget: window,
@@ -492,6 +645,7 @@ export function createPrepareTurn(opts: PrepareTurnOptions = {}) {
 				actualInputTokens: ctx.previousRequestInputTokens,
 				recap: summary,
 				contextPreview: { before: previewMessages(ctx.messages), after: previewMessages(mutable) },
+				contextDump: { before: dumpMessages(ctx.messages), after: dumpMessages(mutable) },
 				estTokensBefore: estBefore,
 				estTokensAfter: est,
 			},

@@ -120,10 +120,13 @@ export function globToRe(glob: string, isPath: boolean): RegExp {
 	return new RegExp(`^${re}$`);
 }
 
-/** One rule: "tool" or "tool(glob)". */
+/** One rule: "tool" or "tool(glob)". The tool part accepts `*`/`?` globs
+ *  (e.g. `mcp_*` to gate every MCP tool). */
 function ruleMatches(rule: string, toolName: string, target: string): boolean {
-	const m = /^([\w-]+)(?:\((.*)\))?$/.exec(rule.trim());
-	if (!m || m[1] !== toolName) return false;
+	const m = /^([\w*?-]+)(?:\((.*)\))?$/.exec(rule.trim());
+	if (!m) return false;
+	const nameHit = m[1].includes("*") || m[1].includes("?") ? globToRe(m[1], false).test(toolName) : m[1] === toolName;
+	if (!nameHit) return false;
 	if (m[2] === undefined) return true; // whole-tool rule
 	return globToRe(m[2], PATH_TOOLS.has(toolName)).test(target);
 }
@@ -144,24 +147,41 @@ const matchLayer = (rules: PermissionRules, toolName: string, target: string): P
  * rule matches (caller falls back to mode defaults).
  */
 export function evaluate(layers: PermissionLayers, toolName: string, input: unknown, mode?: string): PermissionDecision {
-	const target = ruleTarget(toolName, input);
-	if (matchList(layers.global.deny, toolName, target)) return "deny";
+	let target = ruleTarget(toolName, input);
+	let ruleName = toolName;
+	// MCP tools are named `mcp_<server>_<tool>` — rules match the server as the
+	// tool (`mcp_github`, `mcp_*`) and the subtool as the target glob, so
+	// `mcp_github(create_*)` means "any create_* tool on the github server".
+	if (toolName.startsWith("mcp_")) {
+		const rest = toolName.slice(4);
+		const sep = rest.indexOf("_");
+		if (sep > 0) {
+			ruleName = `mcp_${rest.slice(0, sep)}`;
+			target = rest.slice(sep + 1);
+		}
+	}
+	if (matchList(layers.global.deny, ruleName, target)) return "deny";
 	for (const rules of [layers.local, layers.project]) {
-		const d = matchLayer(rules, toolName, target);
+		const d = matchLayer(rules, ruleName, target);
 		if (d !== undefined) return d;
 	}
 	const modeRules = mode ? layers.modes?.[modeKey(mode)] : undefined;
 	if (modeRules) {
-		const d = matchLayer(modeRules, toolName, target);
+		const d = matchLayer(modeRules, ruleName, target);
 		if (d !== undefined) return d;
 	}
-	if (matchList(layers.global.allow, toolName, target)) return "allow";
-	if (matchList(layers.global.ask, toolName, target)) return "ask";
+	if (matchList(layers.global.allow, ruleName, target)) return "allow";
+	if (matchList(layers.global.ask, ruleName, target)) return "ask";
 	return undefined;
 }
 
 /** The narrowest useful rule for a "always allow this" card action. */
 export function ruleFor(toolName: string, input: unknown): string {
+	if (toolName.startsWith("mcp_")) {
+		const rest = toolName.slice(4);
+		const sep = rest.indexOf("_");
+		if (sep > 0) return `mcp_${rest.slice(0, sep)}(${rest.slice(sep + 1)})`;
+	}
 	const target = ruleTarget(toolName, input);
 	return target ? `${toolName}(${target})` : toolName;
 }

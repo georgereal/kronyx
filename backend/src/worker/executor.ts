@@ -3,12 +3,15 @@ import { readFile } from "node:fs/promises";
 import type { Db } from "mongodb";
 import { dbg, swallow } from "../lib/log";
 import { AgentRunner, type AgentMode, type ProviderSettings, type RunViewEvent } from "../../../src/agent/runner";
+import { deriveMessages, type KronyxEvent } from "../../../src/agent/events";
 import { getProvider, type ProviderCreds, type SandboxHandle, type SandboxProvider } from "../../../src/sandbox/provider";
 import { SandboxCore, openPr } from "../../../src/sandbox/sandboxCore";
+import { isSandboxDeath } from "../../../src/sandbox/errors";
 import { createRemoteFileTools } from "../../../src/tools/remoteFileTools";
 import { createFetchTools } from "../../../src/tools/fetchTools";
 import { BROWSER_DRIVER, BROWSER_DRIVER_PATH, SCREENSHOT_PATH, createBrowserTools } from "../../../src/tools/browserTools";
 import { createEnvTools } from "../../../src/tools/envTools";
+import { createMcpTools, type McpServerConfig, type McpToolSet } from "../../../src/tools/mcpTools";
 import { isAgentCliTemplate, resolveTemplateName, type TemplateInfo } from "../../../src/sandbox/templateCatalog";
 import { pickTemplate } from "./pickTemplate";
 import { installationToken } from "../lib/githubApp";
@@ -16,6 +19,7 @@ import { fetchModels, type ModelOption } from "../lib/models";
 import { getCache } from "./cache";
 import { recordSandboxEvent } from "../lib/sandboxEvents";
 import { listPlans, loadPlan, savePlanFile } from "../lib/planStore";
+import { newDumpRef, saveDump } from "../lib/dumpStore";
 import { FLAGS, flag, flagOff } from "../lib/flags";
 import { githubPat, loadUserSettings, resolveProvider, type UserSettings } from "./settings";
 import { IMAGE_RECIPES } from "./imageRecipes";
@@ -113,12 +117,6 @@ const slugify = (s: string) => {
 	return (words.length ? words : s.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)).slice(0, 6).join("-").slice(0, 32).replace(/-+$/g, "") || "run";
 };
 
-/** The VM is gone (EOL/killed) — distinct from a task error; the tail retries on a fresh VM. */
-const isSandboxDeath = (err: unknown): boolean => {
-	const m = err instanceof Error ? err.message : String(err);
-	return /sandbox (was )?not found|connection to sandbox|killed or reached its|sandbox died/i.test(m);
-};
-
 /** Executor that orchestrates the agent loop on the worker with remote file tools in E2B. */
 /** Live routing for a cached runner — rebound to the current run's job/sink. */
 interface RunnerRoute {
@@ -136,6 +134,12 @@ interface LiveSlot {
 	handle?: SandboxHandle;
 	/** Set on user stop — delegatingHandle refuses all further commands. */
 	stopped?: boolean;
+	/** Set when a tool call rejects with a sandbox-death signature — the
+	 *  side-channel the executor recovers from (thrown tool errors reach the
+	 *  agent as tool-result text, so the run can't rely on the throw alone). */
+	dead?: unknown;
+	/** Called the moment death is detected — aborts the in-flight run. */
+	onDead?: (err: unknown) => void;
 	/** Rebound per run — browser screenshots emit on the current run's sink. */
 	onScreenshot?: (dataUrl: string, label?: string) => void;
 	/** Set by the switch_environment tool while a swap is in flight (dedup). */
@@ -146,26 +150,38 @@ interface LiveSlot {
 	templates?: TemplateInfo[];
 }
 
-const delegatingHandle = (live: LiveSlot): SandboxHandle => ({
+export const delegatingHandle = (live: LiveSlot): SandboxHandle => {
+	/** A rejected call with a death signature latches the slot — every later
+	 *  call fails fast and the executor's onDead hook stops the run. */
+	const died = (err: unknown): never => {
+		if (isSandboxDeath(err)) {
+			live.dead = err;
+			live.stopped = true;
+			live.onDead?.(err);
+		}
+		throw err;
+	};
+	return {
 	get id() {
 		return live.handle?.id ?? "";
 	},
 	run: (command, opts) => {
 		if (live.stopped) return Promise.resolve({ exitCode: 130, stdout: "", stderr: "interrupted" });
-		return live.handle ? live.handle.run(command, opts) : Promise.reject(new Error("Sandbox handle not bound."));
+		return live.handle ? live.handle.run(command, opts).catch(died) : Promise.reject(new Error("Sandbox handle not bound."));
 	},
 	readFile: (path) => {
 		if (live.stopped) return Promise.reject(new Error("Sandbox stopped."));
-		return live.handle ? live.handle.readFile(path) : Promise.reject(new Error("Sandbox handle not bound."));
+		return live.handle ? live.handle.readFile(path).catch(died) : Promise.reject(new Error("Sandbox handle not bound."));
 	},
 	writeFile: async (path, content) => {
 			if (live.stopped) throw new Error("Sandbox stopped.");
 			if (!live.handle) throw new Error("Sandbox handle not bound.");
-			return live.handle.writeFile(path, content);
+			return live.handle.writeFile(path, content).catch(died);
 		},
 	setTimeout: (timeoutMs) => live.handle?.setTimeout?.(timeoutMs) ?? Promise.resolve(),
 	interrupt: () => live.handle?.interrupt?.() ?? Promise.resolve(),
-});
+	};
+};
 
 export class E2bOrchestratedExecutor implements RunExecutor {
 	private runner: AgentRunner | undefined;
@@ -196,6 +212,47 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	>();
 	/** Live slice agents of a multi run — requestStop fans out to all of them. */
 	private sliceAgents: { runner: AgentRunner; live: LiveSlot }[] = [];
+	/** MCP toolsets shared process-wide — server connections persist across
+	 *  jobs like the runner cache; keyed by config so edits respawn. */
+	private static mcpCache = new Map<string, { set: McpToolSet; secrets: Set<string>; lastUsedAt: number }>();
+	private static readonly MCP_CACHE_MAX = 10;
+
+	/** MCP servers from user settings → agent tools. Runs on the worker host
+	 *  (not inside E2B) — tools see the host, not the cloned repo. */
+	private async mcpToolsFor(settings: UserSettings): Promise<import("@cline/shared").AgentTool<any, string>[]> {
+		const servers = (settings.data.mcpServers ?? []) as McpServerConfig[];
+		if (!servers.length) return [];
+		const key = JSON.stringify(servers);
+		let entry = E2bOrchestratedExecutor.mcpCache.get(key);
+		if (!entry) {
+			const secrets = new Set<string>();
+			const set = await createMcpTools({
+				servers,
+				onSecret: (v) => secrets.add(v),
+				log: (m) => dbg("mcp", m),
+			});
+			entry = { set, secrets, lastUsedAt: Date.now() };
+			E2bOrchestratedExecutor.mcpCache.set(key, entry);
+			if (E2bOrchestratedExecutor.mcpCache.size > E2bOrchestratedExecutor.MCP_CACHE_MAX) {
+				let oldestKey: string | undefined;
+				let oldestAt = Infinity;
+				for (const [k, e] of E2bOrchestratedExecutor.mcpCache) {
+					if (e.lastUsedAt < oldestAt) {
+						oldestAt = e.lastUsedAt;
+						oldestKey = k;
+					}
+				}
+				if (oldestKey && oldestKey !== key) {
+					const old = E2bOrchestratedExecutor.mcpCache.get(oldestKey);
+					E2bOrchestratedExecutor.mcpCache.delete(oldestKey);
+					void old?.set.close().catch(() => {});
+				}
+			}
+		}
+		entry.lastUsedAt = Date.now();
+		for (const s of entry.secrets) this.sink.mask(s);
+		return entry.set.tools;
+	}
 	/** The run's current sandbox (rebound on switch_environment) + its keepalive. */
 	private activeSbx: SandboxCore | undefined;
 	private keepaliveTimer: ReturnType<typeof setInterval> | undefined;
@@ -307,6 +364,13 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		// leftovers are killed and uncommitted work is checkpointed to the
 		// session branch so a later sandbox death can't lose it.
 		setTimeout(() => void this.stopCleanup(sbx, session).catch(swallow("executor", "op")), 1500);
+	}
+
+	/** Manual compact (POST /api/runs/:id/compact → control flag polled by the
+	 *  worker loop): applies on each agent's next model turn. */
+	requestCompact(): void {
+		this.runner?.requestCompact();
+		for (const s of this.sliceAgents) s.runner.requestCompact();
 	}
 
 	/** Post-interrupt housekeeping: kill detached agent processes (setsid'd
@@ -591,12 +655,27 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		}
 		const cached = E2bOrchestratedExecutor.runnerCache.get(key);
 		if (cached) {
+			// Manual "clear context" (POST /api/sessions/:id/clear) — drop the live
+			// agent so this run starts fresh, digests still carried forward.
+			if ((session as { clearRequested?: boolean }).clearRequested) {
+				void this.db
+					.collection("sessions")
+					.updateOne({ uid: job.uid, sessionId: job.sessionId }, { $unset: { clearRequested: "" } })
+					.catch(swallow("executor", "op"));
+				cached.runner.clearContext();
+			}
 			cached.lastUsedAt = now;
 			cached.live.stopped = false; // new run — clear a previous stop
 			cached.route.job = job;
 			cached.route.sink = this.sink;
 			cached.route.track = (e) => this.trackUsage(e, job);
 			return { runner: (this.runner = cached.runner), live: (this.live = cached.live) };
+		}
+		if ((session as { clearRequested?: boolean }).clearRequested) {
+			void this.db
+				.collection("sessions")
+				.updateOne({ uid: job.uid, sessionId: job.sessionId }, { $unset: { clearRequested: "" } })
+				.catch(swallow("executor", "op"));
 		}
 		const transcripts: PriorTranscript[] = await loadTranscripts(this.db, job.uid, job.sessionId).catch(swallow("executor", "op", []));
 		// Reloaded lazily (60s) — runs finished during this warm session must be
@@ -626,17 +705,54 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		const route: RunnerRoute = { job, sink: this.sink, track: (e) => this.trackUsage(e, job) };
 		let permLayers: PermissionLayers | undefined;
 		const runner = new AgentRunner({
+			events: {
+				// Durable record → run_events (same collection, distinct types).
+				record: (e) => void this.sink.emit(e as Record<string, unknown>),
+			},
+			resume: {
+				// Worker restart / job re-claim mid-run: rebuild the transcript from
+				// this run's durable agent-message records instead of starting blank.
+				resumeLog: async () => {
+					const docs = await this.db
+						.collection("run_events")
+						.find({ uid: job.uid, runId: job.runId, type: "agent-message" })
+						.sort({ seq: 1 })
+						.toArray()
+						.catch(swallow("executor", "op", []));
+					const msgs = deriveMessages(docs as unknown as KronyxEvent[]);
+					return msgs.length ? msgs : undefined;
+				},
+			},
 			workspaceRoot: kind === "ask" ? "(none)" : REPO_DIR,
 			relativePath: (abs) => abs.replace(`${REPO_DIR}/`, ""),
 			isDirty: () => false,
-			confirmWrite: async (toolName, input) => {
-				if (kind === "ask") return false;
-				if (session.securityProfile !== "controlled") return true;
-				return this.awaitPermission(job, toolName, input);
+			approvals: {
+				confirm: async (toolName, input) => {
+					if (kind === "ask") return false;
+					if (session.securityProfile !== "controlled") return true;
+					return this.awaitPermission(job, toolName, input);
+				},
+				check: async (toolName, input) => {
+					// Lazy-load once per runner: global rules from the user's synced
+					// settings (data.permissions object or permissionsJson string);
+					// project rules from the repo's own clone.
+					if (!permLayers) {
+						const settings = await loadUserSettings(this.db, job.uid).catch(() => undefined);
+						const raw = settings?.data.permissions ?? settings?.data.permissionsJson;
+						const global = typeof raw === "string" ? parsePermissionsText(raw) : parsePermissions(raw);
+						const modes = parseModePermissions(raw);
+						const project = sandbox
+							? parsePermissionsText((await sandbox.readFile(`${REPO_DIR}/.kronyx/permissions.json`).catch(() => null)) ?? "")
+							: { allow: [] as string[], ask: [] as string[], deny: [] as string[] };
+						permLayers = { global, project, local: { allow: [], ask: [], deny: [] }, modes };
+					}
+					return evaluate(permLayers, toolName, input, job.mode);
+				},
 			},
 			currentMode: () => mode,
 			planDir: kind === "ask" ? undefined : PLAN_DIR,
-			memoryContext: async (task) => {
+			memory: {
+				context: async (task) => {
 				const sessCache = await getCache().catch(() => undefined);
 				const sessKey = `sessiondoc:${job.sessionId}`;
 				const fresh = ((await sessCache?.get(sessKey).catch(() => undefined)) ??
@@ -661,46 +777,53 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 							.catch(swallow("executor", "op"));
 				}
 				return sessionMemoryContext({ ...session, ...fresh } as SessionDoc, planSlugs, mem);
+				},
 			},
-			recallScorer: embed ? createRecallScorer(embed, this.memoryReport) : undefined,
-			checkPermission: async (toolName, input) => {
-				// Lazy-load once per runner: global rules from the user's synced
-				// settings (data.permissions object or permissionsJson string);
-				// project rules from the repo's own clone.
-				if (!permLayers) {
-					const settings = await loadUserSettings(this.db, job.uid).catch(() => undefined);
-					const raw = settings?.data.permissions ?? settings?.data.permissionsJson;
-					const global = typeof raw === "string" ? parsePermissionsText(raw) : parsePermissions(raw);
-					const modes = parseModePermissions(raw);
-					const project = sandbox
-						? parsePermissionsText((await sandbox.readFile(`${REPO_DIR}/.kronyx/permissions.json`).catch(() => null)) ?? "")
-						: { allow: [] as string[], ask: [] as string[], deny: [] as string[] };
-					permLayers = { global, project, local: { allow: [], ask: [], deny: [] }, modes };
-				}
-				return evaluate(permLayers, toolName, input, job.mode);
+			recall: {
+				scorer: embed ? createRecallScorer(embed, this.memoryReport) : undefined,
+				transcripts: () => {
+					if (Date.now() - transcriptBox.at > 60_000) {
+						transcriptBox.at = Date.now();
+						void loadTranscripts(this.db, job.uid, job.sessionId)
+							.then((t) => {
+								transcriptBox.list = t;
+							})
+							.catch(swallow("executor", "op"));
+					}
+					return transcriptBox.list;
+				},
 			},
-			priorTranscripts: () => {
-				if (Date.now() - transcriptBox.at > 60_000) {
-					transcriptBox.at = Date.now();
-					void loadTranscripts(this.db, job.uid, job.sessionId)
-						.then((t) => {
-							transcriptBox.list = t;
-						})
-						.catch(swallow("executor", "op"));
-				}
-				return transcriptBox.list;
-			},
-			saveTranscript: (messages: readonly AgentMessage[]) => {
-				const j = route.job ?? job;
-				transcriptBox.at = 0; // next recall reloads — this run just landed in the store
-				this.pendingSaves.push(saveTranscript(this.db, j.uid, j.sessionId, j.runId, messages).catch(swallow("executor", "op")));
+			transcripts: {
+				save: (messages: readonly AgentMessage[]) => {
+					const j = route.job ?? job;
+					transcriptBox.at = 0; // next recall reloads — this run just landed in the store
+					this.pendingSaves.push(saveTranscript(this.db, j.uid, j.sessionId, j.runId, messages).catch(swallow("executor", "op")));
+				},
 			},
 			environment:
 				kind === "ask"
 					? "a cloud chat session with no repository attached — answer from the user's message, attached files and session context"
 					: "an E2B cloud sandbox",
+			files: {
+				// Repo skills ship with the clone — read them through this.live so a
+				// recreated VM (mid-run death, switch_environment) keeps working.
+				listSkillFiles: async () => {
+					const h = kind === "ask" ? undefined : this.live?.handle;
+					if (!h) return [];
+					const ls = await h
+						.run("ls .kronyx/skills/*/SKILL.md 2>/dev/null", { cwd: REPO_DIR, timeoutMs: 15_000 })
+						.catch(swallow("executor", "op", null));
+					if (!ls || ls.exitCode !== 0) return [];
+					const out: { path: string; content: string }[] = [];
+					for (const rel of ls.stdout.split("\n").map((l) => l.trim()).filter(Boolean)) {
+						const content = await h.readFile(`${REPO_DIR}/${rel}`).catch(swallow("executor", "op", null));
+						if (content) out.push({ path: rel, content });
+					}
+					return out;
+				},
+			},
 			log: (tag, msg) => console.log(`[${tag}] ${msg}`),
-			createTools: makeTools as () => Promise<never>,
+			tools: makeTools as () => Promise<never>,
 			emit: (e) => {
 				if (e.type !== "assistant-delta" && e.type !== "reasoning-delta") dbg("run", e.type, e);
 				if (e.type === "run-finished" || e.type === "run-failed") {
@@ -751,8 +874,13 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		const meta = (e as { meta?: Record<string, unknown> & { kind?: string } }).meta;
 		if (e.type === "info" && meta?.kind === "context_compaction") {
 			this.lastCompaction = meta as { estTokensBefore?: number; estTokensAfter?: number };
+			// The projected before/after context is too bulky for a run_events
+			// doc — gzip it to disk (planStore convention) and keep a pointer.
+			const { contextDump, ...rest } = meta;
+			const dumpRef = contextDump ? newDumpRef(job.runId) : undefined;
+			if (contextDump && dumpRef) void saveDump(job.uid, dumpRef, contextDump).catch(swallow("executor", "op"));
 			// Flat first-class event — the /api/compactions feed queries these.
-			void this.sink.emit({ type: "compaction", ...meta }, agentIndex ? { agentIndex } : undefined);
+			void this.sink.emit({ type: "compaction", ...rest, ...(dumpRef ? { dumpRef } : {}) }, agentIndex ? { agentIndex } : undefined);
 		}
 		let L = this.usageLedgers.get(agentIndex);
 		if (!L) {
@@ -2008,13 +2136,12 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		const { provider, token, atts, mode } = ctx;
 		let sbx = ctx.sbx;
 		this.throwIfStopped();
-		const { runner, live } = await this.ensureRunner(job, session, "sandboxed", mode, () =>
-			Promise.resolve([
+		const { runner, live } = await this.ensureRunner(job, session, "sandboxed", mode, async () => [
 				...createRemoteFileTools(delegatingHandle(live), REPO_DIR, {
 					planDir: PLAN_DIR,
 					onCommandOutput: (chunk) => this.queueToolOutput(chunk),
 					onFileChanged: (rel, kind, stats) => this.emitLiveFileChanged(rel, kind, stats),
-					isAborted: () => this.stopRequested,
+					isAborted: () => this.stopRequested || !!live.dead,
 					// Persist the plan server-side the moment it's saved — capturePlan's
 					// run-end sweep can't help if the VM dies or the run is stopped.
 					onPlanSaved: (slug, markdown) => void savePlanFile(job.uid, job.sessionId, slug, markdown, job.runId).catch(swallow("executor", "op")),
@@ -2065,7 +2192,10 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 								}
 							},
 						})),
-			]),
+				// MCP servers (user settings) — host stdio + remote URL; failures
+				// contribute zero tools rather than killing the run.
+				...(await this.mcpToolsFor(settings)),
+			],
 			sbx,
 		);
 		// Rebind the handle AFTER runner selection — cached agents call through it.
@@ -2105,8 +2235,40 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				: undefined;
 		try {
 			this.throwIfStopped();
-			await runner.run(this.taskWithInline(job.task, atts), provider);
+			// Mid-run VM death: delegatingHandle latches live.dead + calls onDead —
+			// stopping the agent promptly instead of letting it flail against a
+			// ghost VM. One recreate+resume retry, same contract as runTail.
+			live.onDead = () => this.runner?.stop();
+			let resumed = false;
+			for (;;) {
+				live.dead = undefined;
+				await runner.run(
+					resumed
+						? "The sandbox VM running your tools died and was recreated — the repository was re-cloned to your session branch, but any uncommitted changes were lost. Check the current state (git status, the files you were editing) and continue the task."
+						: this.taskWithInline(job.task, atts),
+					provider,
+				);
+				if (!live.dead || resumed || this.stopRequested) break;
+				resumed = true;
+				await this.sink.emit({
+					type: "info",
+					text: "Sandbox died mid-run — recreating the VM and resuming (uncommitted changes were lost).",
+				});
+				await this.sink.emit({ type: "sandbox-recreated", reason: "mid-run" } as Record<string, unknown>).catch(swallow("executor", "op"));
+				// Drop the dead id so ensureSandbox creates instead of reconnecting.
+				session.sandboxId = undefined;
+				session.cloned = false;
+				await this.sink.patchSession({ sandboxId: null, cloned: false });
+				const next = await this.raceStop(this.ensureSandbox(session, settings), SANDBOX_START_MS, "Sandbox start", session.sandboxId);
+				sbx = next;
+				this.activeSbx = next;
+				this.startSandboxKeepalive(next);
+				await this.ensureRepoReady(session, next, token);
+				live.handle = next.inner!;
+				live.stopped = false;
+			}
 		} finally {
+			live.onDead = undefined;
 			if (tokenRefresh) clearInterval(tokenRefresh);
 		}
 		this.throwIfStopped();
@@ -2163,6 +2325,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 					type: "info",
 					text: "Sandbox died during the run tail — recreating and resuming from the pushed branch (uncommitted changes were lost).",
 				});
+				await this.sink.emit({ type: "sandbox-recreated", reason: "run-tail" } as Record<string, unknown>).catch(swallow("executor", "op"));
 				// Drop the dead id so ensureSandbox creates instead of reconnecting.
 				session.sandboxId = undefined;
 				session.cloned = false;
@@ -2226,6 +2389,14 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				type: "info",
 				text: `${droppedSlices.length} proposed slice${droppedSlices.length > 1 ? "s" : ""} couldn't run in a bounded worktree (${[...new Set(droppedSlices.map((d) => d.reason))].join(", ")}) — the merge coordinator will handle that work.`,
 			});
+
+		// Visible plan card before fan-out — the planner call is silent
+		// otherwise, so the first thing the user sees would be the slice list
+		// with no "here's the plan" step in between.
+		await this.sink.emit(
+			{ type: "multi-plan", steps: slices.map((s) => ({ index: s.index, title: s.title, task: s.task.slice(0, 300) })) },
+			{ agentIndex: 0 },
+		);
 
 		const sliceRows = slices.map((s) => ({ index: s.index, title: s.title, status: "queued", summary: "" }));
 		await this.sink.emit({ type: "fanout", slices: slices.map((s) => ({ index: s.index, title: s.title, owns: s.owns })) }, { agentIndex: 0 });
@@ -2402,6 +2573,9 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		const results: { index: number; title: string; status: "merged" | "resolved" | "failed"; detail?: string }[] = [];
 		const depLines: string[] = [];
 		const seenDepLines = new Set<string>();
+		// Final coordinator text — mined for the NEXT STEPS section that
+		// lands on the changes card.
+		let lastCoordText = "";
 
 		/** One coordinator invocation — resolves conflicts or applies deferred
 		 *  manifest changes. Returns false when the pass itself errored.
@@ -2433,6 +2607,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			} finally {
 				this.sliceAgents = this.sliceAgents.filter((a) => a.runner !== coordinator);
 				this.finishedSliceRunners.push({ runner: coordinator, agentIndex: 0 });
+				if (coordFinish.value) lastCoordText = coordFinish.value;
 				await patchSliceRun(0, {
 					status: this.stopRequested ? "stopped" : coordErr ? "failed" : "done",
 					finishedAt: new Date(),
@@ -2582,8 +2757,28 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 					...droppedSlices.map((d) => `- ${d.title}: ${d.task}`),
 				);
 			parts.push("When done, ensure `git add -A` covers your changes — do NOT commit, push, or change branches.");
+			parts.push(
+				"End your final message with a `NEXT STEPS:` line followed by up to 5 `- ` bullet suggestions for follow-up work (tests, docs, refactors, verification). Write `NEXT STEPS: none` if nothing is worth suggesting.",
+			);
 			await runCoordinator(parts.join("\n"), droppedSlices.length > 0);
 		}
+		// Next steps: parsed from the coordinator's NEXT STEPS trailer. When no
+		// coordinator pass ran, fall back to mining slice summaries — several
+		// agents naturally end with suggested follow-ups.
+		const nextSteps = (() => {
+			const pool = [lastCoordText, ...[...sliceState.values()].map((s) => s.summary)];
+			for (const text of pool) {
+				const m = /NEXT STEPS:\s*([\s\S]*)$/im.exec(text ?? "");
+				if (!m) continue;
+				const steps = m[1]
+					.split("\n")
+					.map((l) => l.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, "").trim())
+					.filter((l) => l && !/^none\.?$/i.test(l))
+					.slice(0, 6);
+				if (steps.length) return steps;
+			}
+			return [] as string[];
+		})();
 		await sealMerge();
 		await this.sink.emit({ type: "fanin", results }, { agentIndex: 0 });
 		// One-line outcome for the timeline — the fanin card shows detail, this
@@ -2593,6 +2788,51 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			type: "info",
 			text: `Fan-in complete: ${cnt("merged")} merged, ${cnt("resolved")} resolved, ${cnt("failed")} failed${droppedSlices.length ? `, ${droppedSlices.length} deferred to coordinator` : ""}.`,
 		});
+
+		// Combined diff of the merged session branch vs base — powers the
+		// "changes applied" summary card + combined-diff viewer in the UI.
+		try {
+			const base = String(session.base || "main");
+			const mb = await sbx
+				// Fetch first — single-branch clones and PR startRefs may not have
+				// origin/<base> locally, which would degrade to a bogus HEAD~1 diff.
+				.runIn(REPO_DIR, `git fetch -q origin ${JSON.stringify(base)} 2>/dev/null; git merge-base HEAD ${JSON.stringify(`origin/${base}`)} 2>/dev/null || git rev-parse HEAD~1`, 45_000)
+				.catch(swallow("executor", "op"));
+			const mbSha = mb?.stdout.trim().split("\n")[0] ?? "";
+			if (mb?.exitCode === 0 && mbSha) {
+				// --no-renames: renamed files become D+A pairs, keeping the
+				// name-status/numstat path keys aligned (rename brace syntax
+				// otherwise mis-keys the numstat lookup and skews the counts).
+				const [ns, stat, patch, num] = await Promise.all([
+					sbx.runIn(REPO_DIR, `git diff --name-status --no-renames ${mbSha} HEAD`, 30_000).catch(swallow("executor", "op")),
+					sbx.runIn(REPO_DIR, `git diff --stat --no-renames ${mbSha} HEAD | tail -1`, 30_000).catch(swallow("executor", "op")),
+					sbx.runIn(REPO_DIR, `git diff --no-renames ${mbSha} HEAD`, 60_000).catch(swallow("executor", "op")),
+					sbx.runIn(REPO_DIR, `git diff --numstat --no-renames ${mbSha} HEAD`, 30_000).catch(swallow("executor", "op")),
+				]);
+				const adds: Record<string, { added: number; removed: number }> = {};
+				for (const l of (num?.stdout ?? "").split("\n")) {
+					const parts = l.trim().split("\t");
+					if (parts.length >= 3) adds[parts[parts.length - 1]] = { added: parts[0] === "-" ? 0 : +parts[0], removed: parts[1] === "-" ? 0 : +parts[1] };
+				}
+				const files: { path: string; status: string; added: number; removed: number }[] = [];
+				for (const l of (ns?.stdout ?? "").split("\n")) {
+					const parts = l.trim().split("\t");
+					if (parts.length >= 2 && /^[AMDRT]/.test(parts[0])) {
+						const path = parts[parts.length - 1];
+						files.push({ path, status: parts[0][0], added: adds[path]?.added ?? 0, removed: adds[path]?.removed ?? 0 });
+					}
+				}
+				const fullDiff = patch?.stdout ?? "";
+				const diff = fullDiff.slice(0, 200_000);
+				if (files.length || diff || nextSteps.length)
+					await this.sink.emit(
+						{ type: "combined-diff", base, stat: stat?.stdout.trim() ?? "", files, diff, truncated: fullDiff.length > diff.length, nextSteps },
+						{ agentIndex: 0 },
+					);
+			}
+		} catch {
+			// Best-effort — the fan-in summary above still stands on its own.
+		}
 
 		// Delete merged part branches on the remote — their commits are
 		// reachable through the merge commits on session.branch. Failed
@@ -2718,12 +2958,28 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		 *  events page can attribute them to the right sub-agent. */
 		const sliceReport = (d: Record<string, unknown>) => void this.sink.emit({ type: "memory", ...d }, { agentIndex });
 		const runner = new AgentRunner({
+			events: {
+				record: (e) => void this.sink.emit(e as Record<string, unknown>, { agentIndex }),
+			},
 			workspaceRoot: dir,
 			relativePath: (abs) => abs.replace(`${dir}/`, ""),
 			isDirty: () => false,
-			confirmWrite: async (toolName, input) => {
-				if (session.securityProfile !== "controlled") return true;
-				return this.awaitPermission(job, toolName, input);
+			approvals: {
+				confirm: async (toolName, input) => {
+					if (session.securityProfile !== "controlled") return true;
+					return this.awaitPermission(job, toolName, input);
+				},
+				check: async (toolName, input) => {
+					if (!permLayers) {
+						const settings = await loadUserSettings(this.db, job.uid).catch(() => undefined);
+						const raw = settings?.data.permissions ?? settings?.data.permissionsJson;
+						const global = typeof raw === "string" ? parsePermissionsText(raw) : parsePermissions(raw);
+						const modes = parseModePermissions(raw);
+						const project = parsePermissionsText((await sbx.readFile(`${dir}/.kronyx/permissions.json`).catch(() => null)) ?? "");
+						permLayers = { global, project, local: { allow: [], ask: [], deny: [] }, modes };
+					}
+					return evaluate(permLayers, toolName, input, "agent");
+				},
 			},
 			currentMode: () => mode,
 			// Identical env string across slices → identical system-prompt
@@ -2735,7 +2991,8 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			// Slice tasks differ from job.task — re-search per slice and record
 			// the actually-injected ids on the slice's own run doc so outcome
 			// credit attributes to this slice, not the parent.
-			memoryContext: async (task) => {
+			memory: {
+				context: async (task) => {
 				const recalled =
 					task === job.task
 						? mem.baseMemories
@@ -2750,25 +3007,19 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 						)
 						.catch(swallow("executor", "op"));
 				return sessionMemoryContext(session as SessionDoc & { mode?: string }, mem.planSlugs, recalled);
+				},
 			},
-			recallScorer: mem.embed ? createRecallScorer(mem.embed, sliceReport) : undefined,
-			priorTranscripts: () => mem.transcripts,
+			recall: {
+				scorer: mem.embed ? createRecallScorer(mem.embed, sliceReport) : undefined,
+				transcripts: () => mem.transcripts,
+			},
 			log: (tag, msg) => console.log(`[slice${agentIndex}:${tag}] ${msg}`),
-			checkPermission: async (toolName, input) => {
-				if (!permLayers) {
-					const settings = await loadUserSettings(this.db, job.uid).catch(() => undefined);
-					const raw = settings?.data.permissions ?? settings?.data.permissionsJson;
-					const global = typeof raw === "string" ? parsePermissionsText(raw) : parsePermissions(raw);
-					const modes = parseModePermissions(raw);
-					const project = parsePermissionsText((await sbx.readFile(`${dir}/.kronyx/permissions.json`).catch(() => null)) ?? "");
-					permLayers = { global, project, local: { allow: [], ask: [], deny: [] }, modes };
-				}
-				return evaluate(permLayers, toolName, input, "agent");
+			transcripts: {
+				save: (messages) => {
+					this.pendingSaves.push(saveTranscript(this.db, job.uid, job.sessionId, job.runId, messages, agentIndex).catch(swallow("executor", "op")));
+				},
 			},
-			saveTranscript: (messages) => {
-				this.pendingSaves.push(saveTranscript(this.db, job.uid, job.sessionId, job.runId, messages, agentIndex).catch(swallow("executor", "op")));
-			},
-			createTools: () =>
+			tools: () =>
 				Promise.resolve([
 					// save_plan is runner-gated to plan mode anyway — dropping it here
 					// keeps a dead tool out of the slice schema.

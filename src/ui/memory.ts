@@ -1,8 +1,8 @@
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { chunkTextInfo, contentHash, cosine, topK as topKOf } from "./vector";
-import type { RecallScorer } from "./recall";
+import { chunkTextInfo, contentHash, cosine, topK as topKOf } from "../agent/vector";
+import type { RecallScorer } from "../agent/recall";
 
 /** Recall ranking knobs, aligned with the backend scorer (backend/src/worker/memory.ts). */
 const RECALL_CHUNK_CHARS = 1500;

@@ -101,6 +101,19 @@ export async function stopRun(req: Request, p: Record<string, string>): Promise<
 	return json({ ok: true });
 }
 
+/** POST /api/runs/:id/compact — request a manual context compaction; the
+ *  worker's control poll applies it on the agent's next model turn. */
+export async function compactRun(req: Request, p: Record<string, string>): Promise<Response> {
+	const uid = await authenticate(req);
+	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
+	const db = await getDb();
+	const res = await db
+		.collection("runs")
+		.updateOne({ uid, runId: p.id, status: { $in: ["running", "claimed", "stopping"] } }, { $set: { control: "compact_requested", updatedAt: new Date() } });
+	if (!res.matchedCount) return json({ error: "no active run" }, { status: 409 });
+	return json({ ok: true });
+}
+
 /** POST /api/runs/:id/permissions/:permId — resolves a pending worker approval. */
 export async function decidePermission(req: Request, p: Record<string, string>): Promise<Response> {
 	const uid = await authenticate(req);

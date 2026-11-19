@@ -14,7 +14,7 @@ const MAX_DIAG_PER_FILE = 10;
 const TRUNC_MARKER = "...";
 const MAX_HOVER_CHARS = 1_500;
 
-async function withTimeout<T>(p: Promise<T> | Thenable<T>, what: string): Promise<T | undefined> {
+async function withTimeout<T>(p: Promise<T> | Thenable<T>, _what: string): Promise<T | undefined> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
 		return await Promise.race([

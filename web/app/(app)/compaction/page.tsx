@@ -10,11 +10,16 @@ import { apiFetch, useUser } from "@/lib/api";
 import { RangePicker } from "@/lib/usage";
 
 interface ContextLine { role: string; kind: string; chars: number; preview: string }
+interface DumpPart { type: string; toolName?: string; toolCallId?: string; isError?: boolean; text: string; truncated?: boolean }
+interface DumpLine { idx: number; role: string; kind: string; chars: number; estTokens: number; parts: DumpPart[] }
+interface Dump { before?: DumpLine[]; after?: DumpLine[] }
 
 interface Item {
 	at: string;
 	runId: string;
 	sessionId: string;
+	seq?: number;
+	hasDump?: boolean;
 	agentIndex?: number;
 	task?: string;
 	model?: string;
@@ -32,6 +37,8 @@ interface Item {
 	stubbed?: number;
 	clamped?: number;
 	superseded?: number;
+	deduped?: number;
+	summaryBlocks?: number;
 	callsElided?: number;
 	reasoningPruned?: number;
 	attachmentsStubbed?: number;
@@ -47,34 +54,96 @@ function breakdown(i: Item): string {
 	const parts: string[] = [];
 	if (i.stubbed) parts.push(`${i.stubbed} stub`);
 	if (i.superseded) parts.push(`${i.superseded} superseded`);
+	if (i.deduped) parts.push(`${i.deduped} dedup`);
 	if (i.clamped) parts.push(`${i.clamped} clamp`);
 	if (i.callsElided) parts.push(`${i.callsElided} elided`);
 	if (i.reasoningPruned) parts.push(`${i.reasoningPruned} reasoning`);
 	if (i.attachmentsStubbed) parts.push(`${i.attachmentsStubbed} attach`);
-	if (i.summarized) parts.push("recap");
+	if (i.summarized) parts.push(i.summaryBlocks && i.summaryBlocks > 1 ? `${i.summaryBlocks} briefs` : "recap");
 	return parts.join(" · ") || "—";
 }
 
 const kindColor = (k: string) =>
 	k === "tool-result" ? "var(--ok)" : k === "tool-call" ? "var(--accent)" : k === "reasoning" ? "#a78bfa" : k === "attachment" ? "var(--warn)" : "var(--muted)";
 
-function ContextPanel({ title, tokens, lines, fallback }: { title: string; tokens?: number; lines?: ContextLine[]; fallback?: React.ReactNode }) {
+const partHead = (p: DumpPart) =>
+	[p.type, p.toolName, p.toolCallId ? `#${p.toolCallId}` : "", p.isError ? "error" : "", p.truncated ? "truncated" : ""].filter(Boolean).join(" · ");
+
+/** Full before/after context explorer — each message line expands to its real
+ *  part contents. `changed` marks lines whose content differs between sides. */
+function ContextExplorer({ title, tokens, lines, preview, changed, onlyChanged, search, kindF, fallback }: {
+	title: string;
+	tokens?: number;
+	lines?: DumpLine[];
+	preview?: ContextLine[];
+	changed?: Set<number>;
+	onlyChanged?: boolean;
+	search: string;
+	kindF: string;
+	fallback?: React.ReactNode;
+}) {
+	const [open, setOpen] = useState<number | null>(null);
+	const shown = (lines ?? []).filter(
+		(l) =>
+			(!kindF || l.kind === kindF) &&
+			(!search || l.parts.some((p) => p.text.toLowerCase().includes(search))) &&
+			(!onlyChanged || changed?.has(l.idx)),
+	);
+	// No dump loaded (old event or fetch pending) — render the digest lines.
+	if (!lines?.length) {
+		return (
+			<div className="cmp-panel">
+				<div className="cmp-panel-head">
+					<span>{title}</span>
+					{tokens != null && <span className="sess-pill completed">{tokens.toLocaleString()} tokens</span>}
+				</div>
+				<div className="cmp-lines">
+					{preview?.length
+						? preview.map((l, i) => (
+								<div key={i} className="cmp-line">
+									<span className="ln">{i + 1}</span>
+									<span className="kind" style={{ color: kindColor(l.kind) }}>{l.role}·{l.kind}</span>
+									<span className="txt">{l.preview || "…"}</span>
+								</div>
+							))
+						: fallback ?? <div className="muted" style={{ fontSize: 11, padding: 8 }}>No context data stored for this compaction.</div>}
+				</div>
+			</div>
+		);
+	}
 	return (
 		<div className="cmp-panel">
 			<div className="cmp-panel-head">
 				<span>{title}</span>
+				<span className="muted" style={{ fontSize: 10.5 }}>{shown.length}/{lines.length} msgs</span>
 				{tokens != null && <span className="sess-pill completed">{tokens.toLocaleString()} tokens</span>}
 			</div>
 			<div className="cmp-lines">
-				{lines?.length
-					? lines.map((l, i) => (
-							<div key={i} className="cmp-line">
-								<span className="ln">{i + 1}</span>
+				{shown.map((l) => {
+					const isOpen = open === l.idx;
+					const diff = changed?.has(l.idx);
+					return (
+						<div key={l.idx} className={`cmp-line-wrap${diff ? " changed" : ""}`}>
+							<div className="cmp-line" style={{ cursor: "pointer" }} onClick={() => setOpen(isOpen ? null : l.idx)}>
+								<span className="ln">{isOpen ? "▾" : "▸"} {l.idx + 1}</span>
 								<span className="kind" style={{ color: kindColor(l.kind) }}>{l.role}·{l.kind}</span>
-								<span className="txt">{l.preview || "…"}</span>
+								<span className="txt">{l.parts.find((p) => p.text.trim())?.text.slice(0, 160) || "…"}</span>
+								<span className="muted" style={{ flex: "none", fontSize: 9.5 }}>{fmtTok(l.estTokens)}</span>
 							</div>
-						))
-					: fallback ?? <div className="muted" style={{ fontSize: 11, padding: 8 }}>No context preview stored for this compaction.</div>}
+							{isOpen && (
+								<div className="cmp-parts">
+									{l.parts.map((p, pi) => (
+										<div key={pi} className={`cmp-part${p.isError ? " err" : ""}`}>
+											<div className="cmp-part-head">{partHead(p)}</div>
+											<pre>{p.text || "(empty)"}</pre>
+										</div>
+									))}
+								</div>
+							)}
+						</div>
+					);
+				})}
+				{!shown.length && <div className="muted" style={{ fontSize: 11, padding: 8 }}>No lines match the current filters.</div>}
 			</div>
 		</div>
 	);
@@ -86,6 +155,11 @@ export default function CompactionPage() {
 	const [items, setItems] = useState<Item[]>([]);
 	const [loading, setLoading] = useState(true);
 	const [expanded, setExpanded] = useState<number | null>(null);
+	const [dump, setDump] = useState<Dump | null>(null);
+	const [dumpLoading, setDumpLoading] = useState(false);
+	const [kindF, setKindF] = useState("");
+	const [dSearch, setDSearch] = useState("");
+	const [changedOnly, setChangedOnly] = useState(false);
 	const [groupBy, setGroupBy] = useState<"model" | "tier">("model");
 	const [f, setF] = useState({ q: "", model: "", tier: "", trigger: "", result: "" });
 	const [copied, setCopied] = useState(false);
@@ -155,6 +229,37 @@ export default function CompactionPage() {
 		setCopied(true);
 		setTimeout(() => setCopied(false), 1500);
 	};
+
+	const openRow = (i: Item, idx: number) => {
+		if (expanded === idx) {
+			setExpanded(null);
+			return;
+		}
+		setExpanded(idx);
+		setDump(null);
+		setDSearch("");
+		setKindF("");
+		setChangedOnly(false);
+		if (i.hasDump && i.seq != null && user) {
+			setDumpLoading(true);
+			void apiFetch(`/api/compactions/${i.runId}/${i.seq}`, user)
+				.then(async (r) => (r.ok ? ((await r.json()) as { dump?: Dump }).dump ?? null : null))
+				.then((d) => setDump(d))
+				.finally(() => setDumpLoading(false));
+		}
+	};
+
+	// before→after is an in-place transform in the same message order — flag
+	// lines whose content differs (spliced-in summaries show as new lines).
+	const changed = new Set<number>();
+	if (dump?.before && dump.after) {
+		const bMap = new Map(dump.before.map((l) => [l.idx, l]));
+		for (const a of dump.after) {
+			const b = bMap.get(a.idx);
+			if (!b || JSON.stringify(b.parts) !== JSON.stringify(a.parts)) changed.add(a.idx);
+		}
+		for (const b of dump.before) if (!dump.after.some((a) => a.idx === b.idx)) changed.add(b.idx);
+	}
 
 	return (
 		<>
@@ -256,7 +361,7 @@ export default function CompactionPage() {
 								const open = expanded === idx;
 								return (
 									<>
-										<tr key={idx} onClick={() => setExpanded(open ? null : idx)} style={{ cursor: "pointer" }}>
+										<tr key={idx} onClick={() => openRow(i, idx)} style={{ cursor: "pointer" }}>
 											<td className="muted">{open ? "▾" : "▸"}</td>
 											<td className="muted" style={{ whiteSpace: "nowrap" }}>{fmt(i.at)}</td>
 											<td className="muted mono" onClick={(e) => e.stopPropagation()}>
@@ -297,20 +402,49 @@ export default function CompactionPage() {
 																<div key={k} className="sbx-kv"><span className="k">{k}</span><span className="mono" style={{ fontSize: 11 }}>{String(v).slice(0, 90)}</span></div>
 															))}
 														</div>
-														<ContextPanel title="Before Compaction" tokens={i.estTokensBefore} lines={i.contextPreview?.before} />
 														<div>
-															<ContextPanel
+															<div className="chart-title" style={{ marginBottom: 8 }}>Context Explorer {dumpLoading && <span className="muted" style={{ fontWeight: 400 }}>(loading dump…)</span>}</div>
+															<div className="cmp-toolbar">
+																<input placeholder="Search dump content…" value={dSearch} onChange={(e) => setDSearch(e.target.value)} />
+																<select value={kindF} onChange={(e) => setKindF(e.target.value)}>
+																	<option value="">All kinds</option>
+																	<option value="text">text</option>
+																	<option value="tool-call">tool-call</option>
+																	<option value="tool-result">tool-result</option>
+																	<option value="reasoning">reasoning</option>
+																	<option value="attachment">attachment</option>
+																</select>
+																{changed.size > 0 && (
+																	<button className={`sbx-btn${changedOnly ? " active" : ""}`} onClick={() => setChangedOnly(!changedOnly)}>
+																		Δ {changed.size} changed
+																	</button>
+																)}
+															</div>
+															<ContextExplorer title="Before Compaction" tokens={i.estTokensBefore} lines={dump?.before} preview={i.contextPreview?.before} changed={changed} onlyChanged={changedOnly} search={dSearch.toLowerCase()} kindF={kindF} />
+														</div>
+														<div>
+															<div className="chart-title" style={{ margin: "34px 0 8px", visibility: "hidden" }}>&nbsp;</div>
+															<ContextExplorer
 																title="After Compaction"
 																tokens={i.estTokensAfter}
-																lines={i.contextPreview?.after}
+																lines={dump?.after}
+																preview={i.contextPreview?.after}
+																changed={changed}
+																onlyChanged={changedOnly}
+																search={dSearch.toLowerCase()}
+																kindF={kindF}
 																fallback={
 																	i.recap ? (
 																		<pre style={{ margin: 0, padding: 10, whiteSpace: "pre-wrap", fontSize: 11.5, fontFamily: "inherit" }}>{i.recap}</pre>
-																	) : (
-																		<div className="muted" style={{ fontSize: 11, padding: 8 }}>No recap or preview — stub/clamp-only compaction.</div>
-																	)
+																	) : undefined
 																}
 															/>
+															{i.recap && (
+																<div className="cmp-panel" style={{ marginTop: 10 }}>
+																	<div className="cmp-panel-head"><span>Compaction Recap</span></div>
+																	<pre style={{ margin: 0, padding: 10, whiteSpace: "pre-wrap", fontSize: 11.5, fontFamily: "inherit" }}>{i.recap}</pre>
+																</div>
+															)}
 															<div style={{ display: "flex", gap: 6, marginTop: 10 }}>
 																<Link href={`/runs/${i.runId}`}><button className="sbx-btn">▶ View run</button></Link>
 																<Link href={`/runs/${i.runId}#timeline`}><button className="sbx-btn">🔍 Inspect details</button></Link>

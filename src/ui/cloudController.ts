@@ -4,9 +4,11 @@ import { AgentRunner, type AgentMode, type ProviderSettings } from "../agent/run
 import { estimateCostUsd, modelPricing, providerErrorMessage, resolveProvider, writeProviderValue } from "../config";
 import { insertPr, insertSandboxEvent, kvGet, kvSet, openStore } from "../store";
 import { deviceName, getDeviceId } from "../settingsSync";
-import { E2bSandbox, e2bApiKey, openPr } from "../sandbox/e2b";
+import { E2bSandbox, e2bApiKey, openPr } from "./e2b";
 import { createRemoteFileTools } from "../tools/remoteFileTools";
 import { createFetchTools } from "../tools/fetchTools";
+import { createMcpTools, type McpServerConfig } from "../tools/mcpTools";
+import { userConfig } from "../userConfig";
 import type { SandboxHandle } from "../sandbox/provider";
 import type { RunViewProvider, WebviewMessage } from "./runViewProvider";
 import type { SessionDeps } from "./sessionController";
@@ -68,6 +70,18 @@ export async function checkCloudSetup(context: vscode.ExtensionContext): Promise
 }
 
 export class CloudController {
+	/** MCP connections run on this host (not inside E2B); rebuilt on config change. */
+	private mcp: { key: string; tools: import("@cline/shared").AgentTool<any, string>[] } | undefined;
+
+	private async mcpTools(): Promise<import("@cline/shared").AgentTool<any, string>[]> {
+		const servers = userConfig().mcpServers as McpServerConfig[] | undefined;
+		if (!servers?.length) return [];
+		const key = JSON.stringify(servers);
+		if (this.mcp?.key !== key) {
+			this.mcp = { key, tools: (await createMcpTools({ servers, log: (m) => log("mcp", m) })).tools };
+		}
+		return this.mcp.tools;
+	}
 	private readonly sandbox = new E2bSandbox();
 	private state: CloudState = {};
 	private runner: AgentRunner | undefined;
@@ -499,12 +513,12 @@ export class CloudController {
 			workspaceRoot: REPO_DIR,
 			relativePath: (abs) => abs.replace(`${REPO_DIR}/`, ""),
 			isDirty: () => false,
-			confirmWrite: async () => true,
+			approvals: { confirm: async () => true },
 			currentMode: (): AgentMode => (modeRef.current === "code" ? "smart" : modeRef.current),
 			planDir: PLAN_DIR,
 			environment: "an E2B cloud sandbox",
 			log: (tag, message) => log(tag, message),
-			createTools: () => {
+			tools: async () => {
 				// Tools outlive any single handle (pause/resume/recreate replaces
 				// sbx.inner) — resolve it per call or they hit a ghost sandbox.
 				const live: SandboxHandle = {
@@ -518,7 +532,7 @@ export class CloudController {
 					},
 					setTimeout: (ms) => sbx.inner?.setTimeout?.(ms) ?? Promise.resolve(),
 				};
-				return Promise.resolve([...createRemoteFileTools(live, REPO_DIR, { planDir: PLAN_DIR }), ...createFetchTools()]);
+				return [...createRemoteFileTools(live, REPO_DIR, { planDir: PLAN_DIR }), ...createFetchTools(), ...(await this.mcpTools())];
 			},
 			emit: (event) => {
 				this.surface.post(event);

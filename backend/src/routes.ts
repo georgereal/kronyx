@@ -60,6 +60,7 @@ import * as misc from "./handlers/misc";
 import * as tmpl from "./handlers/templates";
 import * as mem from "./handlers/memories";
 import * as modelsH from "./handlers/models";
+import * as wh from "./handlers/webhooks";
 
 export const routes: Route[] = makeRoutes([
 	["GET", "/api/me", core.me],
@@ -70,6 +71,7 @@ export const routes: Route[] = makeRoutes([
 	["PUT", "/api/settings", core.putSettings],
 	["GET", "/api/usage", core.usage],
 	["GET", "/api/compactions", core.compactions],
+	["GET", "/api/compactions/:runId/:seq", core.compactionDetail],
 	["GET", "/api/memory", core.memory],
 	["POST", "/api/memories", mem.createMemory],
 	["PATCH", "/api/memories/:id", mem.updateMemory],
@@ -94,6 +96,7 @@ export const routes: Route[] = makeRoutes([
 	["GET", "/api/runs/:id/report", runsH.runReport],
 	["GET", "/api/runs/:id", runsH.getRun],
 	["POST", "/api/runs/:id/stop", runsH.stopRun],
+	["POST", "/api/runs/:id/compact", runsH.compactRun],
 	["POST", "/api/runs/:id/permissions/:permId", runsH.decidePermission],
 	["GET", "/api/sandboxes", runsH.listSandboxes],
 	["GET", "/api/sandboxes/:id", runsH.getSandbox],
@@ -113,6 +116,7 @@ export const routes: Route[] = makeRoutes([
 	["DELETE", "/api/sessions/:id", sess.deleteSession],
 	["GET", "/api/sessions/:id/usage", sess.sessionUsage],
 	["POST", "/api/sessions/:id/messages", sess.postMessage],
+	["POST", "/api/sessions/:id/clear", sess.clearSession],
 	["GET", "/api/sessions/:id/events", sess.sessionEvents],
 	["POST", "/api/sessions/:id/plans/:slug/push", sess.pushPlan],
 	["POST", "/api/sessions/:id/pr", sess.openSessionPr],
@@ -123,4 +127,9 @@ export const routes: Route[] = makeRoutes([
 	["GET", "/api/cron/janitor", misc.janitor],
 	["GET", "/api/mcp", misc.mcp],
 	["POST", "/api/mcp", misc.mcp],
+	["POST", "/api/webhook-rules", wh.createRule],
+	["GET", "/api/webhook-rules", wh.listRules],
+	["DELETE", "/api/webhook-rules/:id", wh.deleteRule],
+	["POST", "/api/webhooks/github", wh.githubWebhook],
+	["POST", "/api/webhooks/:ruleId", wh.fireRule],
 ]);

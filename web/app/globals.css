@@ -1028,6 +1028,87 @@ tbody tr:hover {
 .agent-card .agent-vitals { font-size: 10.5px; margin-top: 3px; }
 .focus-live { font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40%; }
 
+/* Session body: timeline column + persistent multi-agent side panel. */
+.sess-body { display: flex; gap: 16px; align-items: flex-start; justify-content: center; }
+.ma-panel {
+	width: 264px; flex: 0 0 264px; position: sticky; top: 16px;
+	border: 1px solid var(--border); border-radius: 10px;
+	background: var(--panel); padding: 12px 12px 10px; font-size: 12px;
+}
+.ma-panel-head { font-weight: 600; font-size: 13px; }
+.ma-panel-sub { display: block; font-weight: 400; font-size: 11px; margin-top: 1px; }
+.ma-progress { margin: 10px 0 8px; font-size: 11px; }
+.ma-progress-bar { height: 4px; border-radius: 2px; background: var(--border); overflow: hidden; margin-top: 4px; }
+.ma-progress-fill { height: 100%; background: var(--accent); border-radius: 2px; transition: width .3s; }
+.ma-run-chip {
+	float: right; font-size: 10px; font-weight: 500; color: var(--accent);
+	border: 1px solid var(--accent); border-radius: 999px; padding: 1px 8px;
+}
+.ma-elapsed { font-size: 10.5px; margin-top: 8px; }
+.ma-rows { display: flex; flex-direction: column; gap: 2px; }
+.ma-coord { border-top: 1px solid var(--border); margin-top: 6px; padding-top: 6px; }
+.ma-row {
+	display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+	background: none; border: none; border-radius: 7px; padding: 5px 6px;
+	font: inherit; color: inherit; cursor: pointer;
+}
+.ma-row:hover { background: var(--surface-2, rgba(255, 255, 255, 0.05)); }
+.ma-row.on { background: var(--surface-2, rgba(255, 255, 255, 0.07)); outline: 1px solid var(--accent); }
+.ma-row-icon { width: 18px; text-align: center; flex: none; font-size: 12px; }
+.ma-row-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.ma-row-title { display: flex; align-items: center; gap: 6px; font-weight: 500; font-size: 12px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.ma-row-title .slice-pill { margin-left: auto; flex: none; }
+.ma-row-act { font-size: 10.5px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.ma-row-meta { display: flex; flex-direction: column; align-items: flex-end; font-size: 10px; flex: none; }
+.ma-row-tok { opacity: 0.7; }
+@media (max-width: 1100px) {
+	.sess-body { flex-direction: column; }
+	.ma-panel { width: 100%; flex: none; max-width: 860px; margin: 0 auto; position: static; }
+}
+
+/* Fan-in card: per-slice outcome line + combined diff toggle. */
+.fanin-sum { display: block; font-weight: 400; font-size: 11px; margin-top: 1px; }
+.ma-diff { margin-top: 8px; border-top: 1px solid var(--border); padding-top: 6px; }
+.ma-diff > summary { font-size: 12px; cursor: pointer; color: var(--accent); padding: 2px 0; }
+
+/* Multi-plan card: numbered plan steps shown before the fan-out card. */
+.plan-step { display: flex; align-items: baseline; gap: 8px; padding: 3px 0; }
+.plan-step-n { color: var(--muted); flex: none; font-size: 12px; }
+.plan-step .fanout-title { flex: none; }
+.plan-step-task { font-size: 11.5px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+
+/* Fan-in "detailed report": one block per slice. */
+.fanin-report { padding: 5px 0; border-bottom: 1px solid var(--border); }
+.fanin-report:last-child { border-bottom: 0; }
+.fanin-report-head { display: flex; align-items: baseline; gap: 8px; }
+.fanin-report-meta { font-size: 11px; margin-left: auto; flex: none; }
+.fanin-report-sum { font-size: 11.5px; margin-top: 2px; padding-left: 24px; }
+
+/* Next-steps list on the changes card. */
+.next-steps { margin: 4px 0 2px; padding-left: 18px; font-size: 12px; display: flex; flex-direction: column; gap: 3px; }
+
+/* "Changes applied" summary card. */
+.changes-card {
+	border: 1px solid var(--border); border-left: 3px solid var(--green, #4ade80);
+	border-radius: 8px; background: var(--panel); padding: 10px 14px; font-size: 12.5px;
+}
+.changes-chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0; }
+.changes-chip { border: 1px solid var(--border); border-radius: 999px; padding: 2px 10px; font-size: 11.5px; }
+.changes-stat { font-size: 11px; margin: 4px 0 2px; }
+.changes-files { display: flex; flex-direction: column; gap: 2px; font-size: 11.5px; padding: 6px 0; max-height: 240px; overflow-y: auto; }
+.changes-file { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.changes-st { font-weight: 700; display: inline-block; width: 12px; }
+.changes-st.st-A { color: var(--green, #4ade80); }
+.changes-st.st-M { color: var(--accent); }
+.changes-st.st-D { color: var(--red, #f87171); }
+.fanout-ico { width: 16px; text-align: center; flex: none; font-size: 12px; color: var(--muted); }
+
+/* Focused per-agent view: outputs file list. */
+.focus-outputs { margin: 4px 0 10px; border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; font-size: 12px; }
+.focus-outputs > summary { font-weight: 600; cursor: pointer; padding: 2px 0; }
+.focus-out { padding: 2px 0 2px 4px; }
+.focus-out > summary { cursor: pointer; font-size: 11.5px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+
 /* Sub-agent task card — assigned slice prompt, distinct from user bubbles. */
 .agent-task-card {
 	background: var(--surface, rgba(255, 255, 255, 0.03));
@@ -1269,6 +1350,16 @@ tbody tr:hover {
 .cmp-bar-row .track { height: 10px; border-radius: 5px; background: var(--bg); border: 1px solid var(--border); overflow: hidden; }
 .cmp-bar-row .fill { display: block; height: 100%; background: var(--accent); border-radius: 5px; }
 .cmp-bar-row .val { color: var(--muted); font-size: 10.5px; }
+.cmp-toolbar { display: flex; gap: 8px; margin-bottom: 8px; }
+.cmp-toolbar input { flex: 1; min-width: 0; }
+.cmp-line-wrap.changed > .cmp-line { background: color-mix(in srgb, var(--warn) 10%, transparent); }
+.cmp-parts { border-top: 1px solid var(--border); margin: 2px 10px 6px 28px; }
+.cmp-part { margin-top: 6px; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
+.cmp-part.err { border-color: color-mix(in srgb, var(--warn) 50%, transparent); }
+.cmp-part-head { padding: 4px 8px; font-size: 9.5px; font-family: ui-monospace, "SF Mono", Menlo, monospace; color: var(--muted); background: var(--bg); border-bottom: 1px solid var(--border); }
+.cmp-part pre { margin: 0; padding: 8px; font-size: 10.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; max-height: 320px; overflow-y: auto; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+.cmp-line-wrap.changed > .cmp-line .ln::after { content: " Δ"; color: var(--warn); }
+.sbx-btn.active { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); border-color: var(--accent); }
 @media (max-width: 1100px) { .cmp-detail { grid-template-columns: 1fr; } }
 
 /* ---- usage page ---- */
@@ -1316,3 +1407,75 @@ tbody tr:hover {
 .sbx-tools .t i { font-style: normal; color: var(--muted); }
 .wiz-spinner { width: 38px; height: 38px; margin: 0 auto; border-radius: 50%; border: 3px solid var(--border); border-top-color: var(--acc); animation: wiz-spin 0.9s linear infinite; }
 @keyframes wiz-spin { to { transform: rotate(360deg); } }
+
+/* ---------- worked turn groups (session timeline) ---------- */
+details.worked > summary { list-style: none; }
+details.worked > summary::-webkit-details-marker { display: none; }
+details.worked.live > .worked-head { color: var(--fg); }
+.worked-head .act-stat { margin-left: 0; }
+.worked-stats { margin-left: auto; display: inline-flex; gap: 10px; font-weight: 400; font-size: 11px; overflow: hidden; white-space: nowrap; }
+.worked-body .term, .worked-body .filediff, .worked-body .act, .worked-body .ev, .worked-body .step-note { margin: 4px 0; }
+
+/* Mid-run narration — small muted note between steps. */
+.step-note { font-size: 12.5px; color: var(--muted); padding: 2px 4px 2px 12px; border-left: 2px solid var(--border); margin: 6px 0; }
+.step-note .md p { margin: 2px 0; }
+
+/* Terminal cards */
+.term .caret { width: 12px; color: var(--muted); flex: none; }
+.term.failed { border-color: rgba(214, 123, 123, 0.45); }
+.term-ok { color: var(--ok); font-weight: 600; }
+.term-out-wrap { position: relative; }
+.term-out-wrap .btn { position: absolute; top: 6px; right: 8px; padding: 2px 8px; }
+
+/* File diff cards (clickable head) */
+.filediff.failed { border-color: rgba(214, 123, 123, 0.45); }
+button.filediff-head { display: flex; align-items: center; gap: 8px; width: 100%; border: 0; color: var(--fg); cursor: pointer; text-align: left; }
+button.filediff-head:hover { background: var(--panel-2); }
+.filediff .caret { width: 12px; color: var(--muted); flex: none; }
+.fd-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.worked-wrap { margin: 8px 0; }
+.worked-wrap .worked { margin: 0; }
+.worked-wrap .worked-note { margin: 4px 0 0; }
+.worked-note .md { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.worked-done { display: flex; align-items: center; gap: 12px; font-size: 12px; padding: 2px 4px 2px 14px; margin: 4px 0 0; overflow: hidden; white-space: nowrap; }
+.worked-done-item { overflow: hidden; text-overflow: ellipsis; }
+
+/* ---------- numbered step cards ---------- */
+.step { display: flex; gap: 10px; margin: 8px 0; }
+.step-rail { flex: none; width: 22px; display: flex; flex-direction: column; align-items: center; }
+.step-rail::after { content: ""; flex: 1; width: 1px; background: var(--border); margin-top: 4px; }
+.step-num { flex: none; width: 20px; height: 20px; border-radius: 50%; border: 1px solid var(--border-strong); background: var(--panel); color: var(--muted); font-size: 11px; display: flex; align-items: center; justify-content: center; }
+.step-card { flex: 1; min-width: 0; border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel); overflow: hidden; }
+.step-achieved { display: flex; align-items: center; gap: 14px; padding: 8px 12px; font-size: 12.5px; overflow: hidden; white-space: nowrap; border-bottom: 1px solid var(--border); }
+.step-card .worked { margin: 0; border: 0; border-radius: 0; }
+.step-card .worked-note { margin: 0; border-left: 0; border-top: 1px solid var(--border); padding: 8px 12px; }
+.step-card .worked-done { margin: 0; }
+
+/* ---------- term output label ---------- */
+.term-label { flex: none; font-size: 11px; }
+.term-out-label { padding: 6px 12px 0; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; }
+
+/* ---------- split diff ---------- */
+.fd-seg { flex: none; display: inline-flex; border: 1px solid var(--border-strong); border-radius: 6px; overflow: hidden; font-size: 10.5px; }
+.fd-seg-btn { padding: 1px 8px; color: var(--muted); cursor: pointer; }
+.fd-seg-btn.on { background: var(--panel-2); color: var(--fg); }
+.fd-split { display: flex; flex-direction: column; }
+.fd-srow { display: flex; }
+.fd-srow.fd-s-hunk .fd-code { color: var(--muted); font-style: italic; padding: 0 12px; width: 100%; }
+.fd-scol { flex: 1; min-width: 0; display: flex; align-items: baseline; border-right: 1px solid var(--border); }
+.fd-scol:last-child { border-right: 0; }
+.fd-scol.fd-empty { background: rgba(255,255,255,0.02); }
+
+/* ---------- env panel ---------- */
+.env-panel { border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel); margin-top: 6px; padding: 10px 12px; min-width: 320px; }
+.env-grid { display: flex; gap: 24px; flex-wrap: wrap; margin-bottom: 8px; }
+.env-cell small { display: block; font-size: 10.5px; color: var(--muted); margin-bottom: 2px; }
+.env-cell b { font-size: 12px; font-weight: 600; }
+.env-checks { border-top: 1px solid var(--border); padding-top: 8px; display: flex; flex-direction: column; gap: 3px; }
+.env-check { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* User chat line — right-aligned accent bubble, distinct from agent output. */
+.user-msg-row { justify-content: flex-end; }
+.user-msg-row .avatar { background: var(--accent-soft); color: var(--accent); border: 1px solid rgba(86,139,128,0.45); }
+.user-msg-row .msg-time { align-self: center; }
+.user-bubble { background: var(--accent-soft); border: 1px solid rgba(86,139,128,0.4); color: var(--fg); }
