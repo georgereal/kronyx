@@ -1,5 +1,6 @@
 import { Agent } from "@cline/agents";
-import type { AgentMessage, AgentRuntimeEvent, AgentTool, AgentToolResultPart } from "@cline/shared";
+import { DEFAULT_MAX_IMAGE_DECODED_BYTES, SUPPORTED_IMAGE_MEDIA_TYPES } from "@cline/shared";
+import type { AgentImagePart, AgentMessage, AgentRuntimeEvent, AgentTool, AgentToolResultPart } from "@cline/shared";
 import { createFileTools, type FileChangeKind, WRITE_TOOL_NAMES } from "../tools/fileTools";
 import { createFetchTools } from "../tools/fetchTools";
 import { createDispatchTool, DEFERRED_TOOLS } from "../tools/dispatchTools";
@@ -8,7 +9,7 @@ import { createExploreTool } from "../tools/exploreTools";
 import { buildSystemPrompt } from "./systemPrompt";
 import { createPrepareTurn, taskContextBudget } from "./compaction";
 import { createRecallTool } from "./recall";
-import { countTokens } from "./tokenize";
+import { countMessageTokens } from "./tokenize";
 import { ToolPipeline } from "./pipeline";
 import { createRepeatGuard } from "./guards/repeatGuard";
 import { createPermissionGuard } from "./guards/permissionGuard";
@@ -34,16 +35,25 @@ export interface RunDigest {
 	summary: string;
 	filesChanged: string[];
 	at: number;
+	/** HEAD sha at the end of this run — used to verify the work is still in the tree after a restore. */
+	endSha?: string;
 }
 
 export type AgentMode = "code" | "smart" | "ask" | "plan" | "bypass";
+
+/** A user-attached file carried into the run; image/* bytes reach the model as image parts. */
+export interface RunnerAttachment {
+	filename: string;
+	mediaType: string;
+	data?: Uint8Array;
+}
 
 export type RunViewEvent =
 	| { type: "run-started"; task: string }
 	| { type: "assistant-text"; iteration: number; text: string }
 	| { type: "reasoning"; iteration: number; text: string; redacted?: boolean }
 	| { type: "tool-started"; id: string; name: string; input: unknown }
-	| { type: "tool-finished"; id: string; ok: boolean; output: string; durationMs: number }
+	| { type: "tool-finished"; id: string; name?: string; ok: boolean; output: string; durationMs: number }
 	| { type: "file-changed"; path: string; kind: FileChangeKind; added?: number; removed?: number; diff?: string }
 	| { type: "assistant-delta"; text: string }
 	| { type: "reasoning-delta"; text: string }
@@ -114,6 +124,28 @@ export interface RunnerHost {
 const HANDOFF_FRACTION = 0.4;
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const MAX_DIGESTS = 3;
+/** Modes where a run that ends with zero tool calls gets one "proceed" nudge. */
+const WRITE_MODES: ReadonlySet<AgentMode> = new Set(["code", "smart", "bypass"]);
+
+/** Supported, size-capped attachments → image parts on the task's user message. */
+function imageAttachmentParts(attachments: readonly RunnerAttachment[] | undefined): AgentImagePart[] {
+	const parts: AgentImagePart[] = [];
+	for (const a of attachments ?? []) {
+		if (!a.data?.byteLength || !(SUPPORTED_IMAGE_MEDIA_TYPES as readonly string[]).includes(a.mediaType)) continue;
+		if (a.data.byteLength > DEFAULT_MAX_IMAGE_DECODED_BYTES) continue;
+		parts.push({ type: "image", image: a.data, mediaType: a.mediaType });
+	}
+	return parts;
+}
+
+/** Image parts are bulky base64 — persisted transcripts/events keep a text marker instead. */
+function omitImageParts(messages: readonly AgentMessage[]): AgentMessage[] {
+	return messages.map((m) => ({
+		...m,
+		content: m.content.map((p) => (p.type === "image" ? { type: "text" as const, text: `[image attachment omitted (${p.mediaType ?? "image"})]` } : p)),
+	}));
+}
+
 const READ_ONLY_HIDDEN = new Set([
 	"write_file",
 	"edit_file",
@@ -137,6 +169,8 @@ export class AgentRunner {
 	/** Set by requestCompact(); consumed by prepareTurn → hard compaction next turn. */
 	private forceCompactRef = { current: false };
 	private digests: RunDigest[] = [];
+	/** Restore-reconciliation note seeded into a freshly created agent. */
+	private stateNote: string | undefined;
 	private readonly toolStarts = new Map<string, number>();
 
 	constructor(private readonly host: RunnerHost) {}
@@ -158,10 +192,16 @@ export class AgentRunner {
 		this.digests = digests.slice(-MAX_DIGESTS);
 	}
 
+	/** One-shot restore note — applied to the next freshly created agent's seed. */
+	setStateNote(note: string | undefined): void {
+		this.stateNote = note;
+	}
+
 	reset(): void {
 		this.agent?.abort("reset");
 		this.agent = undefined;
 		this.digests = [];
+		this.stateNote = undefined;
 	}
 
 	private stopRequested = false;
@@ -194,7 +234,7 @@ export class AgentRunner {
 	private shouldHandoff(settings: ProviderSettings): boolean {
 		if (!this.agent || this.digests.length === 0) return false;
 		const window = settings.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
-		return countTokens(JSON.stringify(this.agent.snapshot().messages)) > window * HANDOFF_FRACTION;
+		return countMessageTokens(this.agent.snapshot().messages) > window * HANDOFF_FRACTION;
 	}
 
 	private seedMessages(): AgentMessage[] | undefined {
@@ -218,7 +258,7 @@ export class AgentRunner {
 		];
 	}
 
-	async run(task: string, settings: ProviderSettings): Promise<void> {
+	async run(task: string, settings: ProviderSettings, attachments?: RunnerAttachment[]): Promise<void> {
 		if (this.running) throw new Error("A run is already in progress.");
 		this.running = true;
 		this.contextBudget = taskContextBudget(task, this.host.currentMode());
@@ -231,7 +271,7 @@ export class AgentRunner {
 			}
 			let agent = this.agent;
 			if (agent && this.shouldHandoff(settings)) {
-				const dropped = Math.round(countTokens(JSON.stringify(agent.snapshot().messages)) / 1000);
+				const dropped = Math.round(countMessageTokens(agent.snapshot().messages) / 1000);
 				this.host.emit({
 					type: "info",
 					text: `New task — carried ${this.digests.length} run summar${this.digests.length === 1 ? "y" : "ies"} forward (~${dropped}k tokens dropped from context)`,
@@ -249,12 +289,51 @@ export class AgentRunner {
 					initial = resumed;
 					this.host.events?.record({ type: "resumed-from-log", messages: resumed.length });
 				}
+				if (this.stateNote) {
+					// Attach to whichever seed won (digests or resume log) — the
+					// note describes the actual restored tree, not the history.
+					initial = [
+						...(initial ?? []),
+						{
+							id: `state-${Date.now()}`,
+							role: "user",
+							content: [{ type: "text" as const, text: this.stateNote }],
+							createdAt: Date.now(),
+						},
+					];
+					this.stateNote = undefined;
+				}
 				for (const m of initial ?? []) this.host.events?.record({ type: "agent-message", message: m });
 				agent = await this.createAgent(settings, task, initial);
 			}
 			this.agent = agent;
-			const result = await agent.run(task);
-			this.host.transcripts?.save(agent.snapshot().messages);
+			const beforeCount = agent.snapshot().messages.length;
+			// Image attachments ride as image parts on the task's user message —
+			// disk copies under .kronyx/attachments/ stay for tool-side inspection.
+			const images = imageAttachmentParts(attachments);
+			const input: string | AgentMessage = images.length
+				? {
+						id: `task-${Date.now()}`,
+						role: "user",
+						content: [{ type: "text", text: task }, ...images],
+						createdAt: Date.now(),
+					}
+				: task;
+			let result = await agent.run(input);
+			// A "completed" write-mode run with zero tool calls is almost always the
+			// model answering in prose instead of working — give it one nudge.
+			const toolCalls = result.messages
+				.slice(beforeCount)
+				.reduce((n, m) => n + m.content.filter((p) => p.type === "tool-call").length, 0);
+			if (result.status === "completed" && toolCalls === 0 && WRITE_MODES.has(this.host.currentMode())) {
+				this.host.emit({ type: "info", text: "Finished without using any tools — nudging the agent to proceed." });
+				result = await agent.continue(
+					"You ended the run without calling any tools or changing files. " +
+						"If the task asks for implementation or exploration, do it now using your tools. " +
+						"If you are blocked on something only the user can provide, state exactly what is missing.",
+				);
+			}
+			this.host.transcripts?.save(omitImageParts(agent.snapshot().messages));
 			if (result.status === "failed") {
 				this.host.emit({ type: "run-failed", error: result.error?.message ?? "Run failed" });
 			} else {
@@ -409,7 +488,7 @@ export class AgentRunner {
 			// model's replies (dedupe by id in deriveMessages).
 			case "message-added":
 			case "assistant-message":
-				this.host.events?.record({ type: "agent-message", message: event.message });
+				this.host.events?.record({ type: "agent-message", message: omitImageParts([event.message])[0] });
 				break;
 		}
 		switch (event.type) {
@@ -452,6 +531,7 @@ export class AgentRunner {
 				this.host.emit({
 					type: "tool-finished",
 					id: event.toolCall.toolCallId,
+					name: event.toolCall.toolName,
 					ok: !result?.isError,
 					output: stringify(result?.output),
 					durationMs: Date.now() - started,

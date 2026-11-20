@@ -24,3 +24,14 @@ export function isSandboxDeath(err: unknown): boolean {
 	const m = err instanceof Error ? err.message : String(err);
 	return DEATH_RE.test(m);
 }
+
+const UNRESPONSIVE_RE = /deadline_exceeded|the operation timed out|exceeding 'timeoutMs'|envd.*unresponsive|timed? ?out/i;
+
+/** The VM may be wedged (envd not answering) rather than dead — every call
+ *  times out but the disk is probably intact. Recoverable by disk-snapshot /
+ *  pause+resume, which can preserve the whole worktree. Always confirm with
+ *  a probe: one slow command's timeout isn't a wedged VM. */
+export function isSandboxUnresponsive(err: unknown): boolean {
+	const m = err instanceof Error ? err.message : String(err);
+	return UNRESPONSIVE_RE.test(m);
+}

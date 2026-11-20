@@ -99,6 +99,12 @@ export default function SessionView() {
 	const latestRun = mainRuns[mainRuns.length - 1];
 	const runOrder = new Map(runs.map((r, i) => [r.runId, i]));
 	const ordered = [...events].sort((a, b) => (runOrder.get(a.runId ?? "") ?? 0) - (runOrder.get(b.runId ?? "") ?? 0) || a.seq - b.seq);
+	// Composer @run picker: each run + its final summary text (from events or the doc).
+	const runSummary = new Map<string, string>();
+	for (const e of ordered) {
+		if (e.event.type === "run-finished" && e.runId) runSummary.set(e.runId, String((e.event as { text?: string }).text ?? ""));
+	}
+	const runRefs = [...mainRuns].reverse().map((r) => ({ runId: r.runId, title: r.task ?? r.runId, summary: r.summary ?? runSummary.get(r.runId) }));
 	const active = !!latestRun && ACTIVE.has(latestRun.status ?? "");
 	// Terminal events arrive over SSE ahead of the 4s runs poll — honor them so
 	// the status header doesn't lag a "Completed" card by a poll cycle.
@@ -344,7 +350,7 @@ export default function SessionView() {
 		};
 	}, [user, id, latestRun?.runId, active, pushEvents]);
 
-	const submit = async (task: string, attachmentIds: string[]) => {
+	const submit = async (task: string, attachmentIds: string[], refs?: { planSlug?: string }) => {
 		if (!user) return;
 		await apiFetch(`/api/sessions/${id}/messages`, user, {
 			method: "POST",
@@ -352,6 +358,7 @@ export default function SessionView() {
 				task,
 				mode,
 				attachmentIds,
+				planSlug: refs?.planSlug,
 				modelId: modelId || undefined,
 				profile: modelProfile || undefined,
 				repo: env?.repo || undefined,
@@ -609,7 +616,9 @@ export default function SessionView() {
 					user={user}
 					mode={mode}
 					onMode={setMode}
-					onSubmit={(t, a) => void submit(t, a)}
+					onSubmit={(t, a, refs) => void submit(t, a, refs)}
+					plans={plans.map((p) => p.slug)}
+					runRefs={runRefs}
 					onStop={() => void stop()}
 					running={active && !stopping}
 					stopping={stopping && !halted}

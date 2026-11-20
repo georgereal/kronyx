@@ -1,7 +1,7 @@
 "use client";
 
 import type { User } from "firebase/auth";
-import { Cpu, GitBranch, Paperclip, Plus, SendHorizontal, Settings2, Square, X } from "lucide-react";
+import { Cpu, GitBranch, Info, Paperclip, Plus, SendHorizontal, Settings2, Square, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { apiFetch } from "@/lib/api";
 import { Modal } from "@/components/Modal";
@@ -71,13 +71,15 @@ export function Composer({
 	onModel,
 	lockRepo,
 	currentBranch,
+	plans,
+	runRefs,
 }: {
 	user: User;
 	mode: Mode;
 	onMode: (m: Mode) => void;
 	env?: EnvState;
 	onEnv?: (e: EnvState) => void;
-	onSubmit: (task: string, attachmentIds: string[]) => void;
+	onSubmit: (task: string, attachmentIds: string[], refs?: { planSlug?: string }) => void;
 	onStop?: () => void;
 	running?: boolean;
 	/** Run is halting — show a disabled "stopping" state instead of a stop button. */
@@ -88,10 +90,14 @@ export function Composer({
 	lockRepo?: boolean;
 	/** Session's current work branch — enables the "keep branch" rebase option. */
 	currentBranch?: string;
+	/** Saved plan slugs — enables the @plan picker. */
+	plans?: string[];
+	/** Past runs (newest first) — enables the @run picker. */
+	runRefs?: { runId: string; title: string; summary?: string }[];
 }) {
 	const [text, setText] = useState("");
 	const [atts, setAtts] = useState<Attachment[]>([]);
-	const [menu, setMenu] = useState<"none" | "attach" | "env" | "model" | "slash" | "mode">("none");
+	const [menu, setMenu] = useState<"none" | "attach" | "env" | "model" | "slash" | "mode" | "mention" | "help">("none");
 	const [repos, setRepos] = useState<Repo[]>([]);
 	const [groups, setGroups] = useState<ModelGroup[]>([]);
 	const [modelId, setModelId] = useState("");
@@ -103,6 +109,13 @@ export function Composer({
 	const [envPage, setEnvPage] = useState<"menu" | "branch">("menu");
 	const [showAdvanced, setShowAdvanced] = useState(false);
 	const [prs, setPrs] = useState<Pr[]>([]);
+	const [mentionSource, setMentionSource] = useState<"plan" | "file" | "memory" | "run" | null>(null);
+	const [filePaths, setFilePaths] = useState<string[]>([]);
+	const [mems, setMems] = useState<{ memoryId: string; content: string; scope?: string }[]>([]);
+	const [mentionQuery, setMentionQuery] = useState("");
+	/** Picked memory ids → content, so submit can resolve tokens after the list refreshes. */
+	const pickedMems = useRef<Map<string, string>>(new Map());
+	const memTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 	const taRef = useRef<HTMLTextAreaElement>(null);
 	const fileRef = useRef<HTMLInputElement>(null);
 
@@ -148,23 +161,84 @@ export function Composer({
 		if (autoFocus) taRef.current?.focus();
 	}, [autoFocus]);
 
+	// @file picker — repo tree, fetched once per source open.
+	useEffect(() => {
+		if (menu !== "mention" || mentionSource !== "file" || !env?.repo || !env.installationId) return;
+		setFilePaths([]);
+		const ref = currentBranch || env.startRef || env.base;
+		const q = `?installationId=${env.installationId}&repo=${encodeURIComponent(env.repo)}&ref=${encodeURIComponent(ref)}`;
+		void apiFetch(`/api/github/tree${q}`, user)
+			.then(async (r) => (r.ok ? setFilePaths(((await r.json()) as { paths: string[] }).paths ?? []) : undefined))
+			.catch(() => {});
+	}, [menu, mentionSource, env?.repo, env?.installationId, env?.startRef, env?.base, currentBranch, user]);
+
+	// @memory picker — recent on open, recall-scored on search (debounced).
+	useEffect(() => {
+		if (menu !== "mention" || mentionSource !== "memory") return;
+		clearTimeout(memTimer.current);
+		memTimer.current = setTimeout(() => {
+			void apiFetch("/api/memories/recall", user, { method: "POST", body: JSON.stringify({ query: mentionQuery, repo: env?.repo || undefined, limit: 8 }) })
+				.then(async (r) => {
+					if (r.ok) setMems(((await r.json()) as { docs: { memoryId: string; content: string; scope?: string }[] }).docs ?? []);
+				})
+				.catch(() => {});
+		}, 250);
+		return () => clearTimeout(memTimer.current);
+	}, [menu, mentionSource, mentionQuery, env?.repo, user]);
+
 	const toggleMenu = (m: typeof menu) => {
 		setMenu((cur) => (cur === m ? "none" : m));
 		setEnvPage("menu");
+		setMentionSource(null);
+		setMentionQuery("");
 	};
 	const closeMenus = () => {
 		setMenu("none");
 		setEnvPage("menu");
+		setMentionSource(null);
+		setMentionQuery("");
 	};
+
+	/** Insert a mention token in place of the trailing `@` that opened the menu. */
+	const insertMention = (token: string) => {
+		setText((t) => `${t.replace(/@$/, "")}@${token} `);
+		closeMenus();
+		taRef.current?.focus();
+	};
+
+	const MENTION_RE = /@(plan|file|memory|run):(\S+)/g;
 
 	const submit = () => {
 		const task = text.trim();
 		if (!task || running) return;
 		if (modelId && env) localStorage.setItem("kronyx.modelId", modelId);
 		if (modelId) localStorage.setItem("kronyx.modelId", modelId);
-		onSubmit(task, atts.map((a) => a.attachmentId));
+		// Resolve mention tokens: @plan: → refs.planSlug (backend "Implement this
+		// plan"), @file: → a referenced-paths line, @memory:/@run: → context blocks.
+		let planSlug: string | undefined;
+		const files: string[] = [];
+		const memBlocks: string[] = [];
+		const runBlocks: string[] = [];
+		for (const m of task.matchAll(MENTION_RE)) {
+			const [, kind, id] = m;
+			if (kind === "plan") planSlug ??= id;
+			else if (kind === "file") files.push(id);
+			else if (kind === "memory") {
+				const content = pickedMems.current.get(id) ?? mems.find((x) => x.memoryId === id)?.content;
+				if (content) memBlocks.push(`- ${content}`);
+			} else {
+				const run = runRefs?.find((r) => r.runId === id || r.runId.startsWith(id));
+				if (run) runBlocks.push(`Run ${id} (${run.title})${run.summary ? `:\n${run.summary}` : ""}`);
+			}
+		}
+		let taskText = task.replace(MENTION_RE, (_m, kind, id) => (kind === "file" ? id : kind === "plan" ? `plan "${id}"` : "")).replace(/\s{2,}/g, " ").trim();
+		if (files.length) taskText += `\n\nReferenced files (read these): ${files.join(", ")}`;
+		if (memBlocks.length) taskText += `\n\nReferenced memories:\n${memBlocks.join("\n")}`;
+		if (runBlocks.length) taskText += `\n\nReferenced runs:\n${runBlocks.join("\n\n")}`;
+		onSubmit(taskText, atts.map((a) => a.attachmentId), planSlug ? { planSlug } : undefined);
 		setText("");
 		setAtts([]);
+		pickedMems.current.clear();
 	};
 
 	const onKey = (e: React.KeyboardEvent) => {
@@ -177,7 +251,18 @@ export function Composer({
 
 	const onChange = (v: string) => {
 		setText(v);
-		setMenu(v.startsWith("/") && !v.includes(" ") ? "slash" : menu === "slash" ? "none" : menu);
+		if (v.startsWith("/") && !v.includes(" ")) {
+			setMenu("slash");
+			return;
+		}
+		if (menu === "slash") setMenu("none");
+		if (/@$/.test(v)) {
+			setMenu("mention");
+			setMentionSource(null);
+			setMentionQuery("");
+		} else if (menu === "mention" && !mentionSource) {
+			setMenu("none");
+		}
 	};
 
 	const pickSlash = (c: (typeof SLASH_COMMANDS)[number]) => {
@@ -252,6 +337,95 @@ export function Composer({
 						</div>
 					</div>
 				)}
+				{menu === "mention" && (
+					<div className="pop" onClick={(e) => e.stopPropagation()} style={{ position: "absolute", marginTop: -6, minWidth: 300 }}>
+						{!mentionSource ? (
+							<>
+								<div className="pop-title">Reference…</div>
+								<button className="pop-item" onClick={() => plans?.length && setMentionSource("plan")} disabled={!plans?.length}>
+									<span style={{ flex: 1 }}>Plan</span>
+									<span className="right">{plans?.length ? `${plans.length} saved` : "none in this session"}</span>
+								</button>
+								<button className="pop-item" onClick={() => env?.repo && setMentionSource("file")} disabled={!env?.repo}>
+									<span style={{ flex: 1 }}>File</span>
+									<span className="right">{env?.repo ? env.repo : "select a repository"}</span>
+								</button>
+								<button className="pop-item" onClick={() => setMentionSource("memory")}>
+									<span style={{ flex: 1 }}>Memory</span>
+									<span className="right">saved memories</span>
+								</button>
+								<button className="pop-item" onClick={() => runRefs?.length && setMentionSource("run")} disabled={!runRefs?.length}>
+									<span style={{ flex: 1 }}>Run</span>
+									<span className="right">{runRefs?.length ? `${runRefs.length} in this session` : "none yet"}</span>
+								</button>
+							</>
+						) : (
+							<>
+								<button className="pop-item" onClick={() => { setMentionSource(null); setMentionQuery(""); }}>
+									<span className="muted" style={{ flex: 1 }}>← Reference</span>
+								</button>
+								<div className="pop-sep" />
+								<input
+									className="pop-search"
+									placeholder={mentionSource === "memory" ? "Search memories…" : "Filter…"}
+									value={mentionQuery}
+									onChange={(e) => setMentionQuery(e.target.value)}
+									autoFocus
+								/>
+								<div className="pop-scroll" style={{ maxHeight: 240 }}>
+									{mentionSource === "plan" &&
+										(plans ?? [])
+											.filter((s) => s.toLowerCase().includes(mentionQuery.toLowerCase()))
+											.map((s) => (
+												<button key={s} className="pop-item" onClick={() => insertMention(`plan:${s}`)}>
+													<span className="mono" style={{ flex: 1 }}>{s}</span>
+												</button>
+											))}
+									{mentionSource === "file" &&
+										(filePaths.length === 0 ? (
+											<div className="pop-item disabled">Loading files…</div>
+										) : (
+											filePaths
+												.filter((p) => p.toLowerCase().includes(mentionQuery.toLowerCase()))
+												.slice(0, 80)
+												.map((p) => (
+													<button key={p} className="pop-item" onClick={() => insertMention(`file:${p}`)}>
+														<span className="mono" style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis" }}>{p}</span>
+													</button>
+												))
+										))}
+									{mentionSource === "memory" &&
+										(mems.length === 0 ? (
+											<div className="pop-item disabled">No memories found</div>
+										) : (
+											mems.map((m) => (
+												<button
+													key={m.memoryId}
+													className="pop-item"
+													onClick={() => {
+														pickedMems.current.set(m.memoryId, m.content);
+														insertMention(`memory:${m.memoryId}`);
+													}}
+												>
+													<span style={{ flex: 1, fontSize: 11.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.content.slice(0, 80)}</span>
+													<span className="right muted">{m.scope ?? ""}</span>
+												</button>
+											))
+										))}
+									{mentionSource === "run" &&
+										(runRefs ?? [])
+											.filter((r) => `${r.title} ${r.runId}`.toLowerCase().includes(mentionQuery.toLowerCase()))
+											.map((r) => (
+												<button key={r.runId} className="pop-item" onClick={() => insertMention(`run:${r.runId}`)}>
+													<span style={{ flex: 1, fontSize: 11.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.title}</span>
+													<span className="right mono muted">{r.runId.slice(0, 8)}</span>
+												</button>
+											))}
+								</div>
+							</>
+						)}
+					</div>
+				)}
 				{atts.length > 0 && (
 					<div className="att-chips">
 						{atts.map((a) => (
@@ -271,6 +445,31 @@ export function Composer({
 							<Plus size={16} />
 						</button>
 						<input ref={fileRef} type="file" multiple hidden onChange={(e) => void upload(e.target.files)} />
+					</div>
+					<div className="anchor">
+						<button className="icon-btn" title="Shortcuts" onClick={() => toggleMenu("help")}>
+							<Info size={15} />
+						</button>
+						{menu === "help" && (
+							<Modal title="Shortcuts" onClose={closeMenus}>
+								<div className="pop-title">Mentions — type @ in the message</div>
+								<div className="pop-item disabled"><span className="mono" style={{ flex: 1 }}>@plan</span><span className="right">implement a saved plan</span></div>
+								<div className="pop-item disabled"><span className="mono" style={{ flex: 1 }}>@file</span><span className="right">reference a repo file</span></div>
+								<div className="pop-item disabled"><span className="mono" style={{ flex: 1 }}>@memory</span><span className="right">inject a saved memory</span></div>
+								<div className="pop-item disabled"><span className="mono" style={{ flex: 1 }}>@run</span><span className="right">reference a past run's summary</span></div>
+								<div className="pop-sep" />
+								<div className="pop-title">Commands — type / at the start</div>
+								{SLASH_COMMANDS.map((c) => (
+									<div key={c.name} className="pop-item disabled">
+										<span className="mono" style={{ flex: 1 }}>/{c.name}</span>
+										<span className="right">{c.desc}</span>
+									</div>
+								))}
+								<div className="pop-sep" />
+								<div className="pop-item disabled"><span style={{ flex: 1 }}>Attach files</span><span className="right">+ button — images go to the model</span></div>
+								<div className="pop-item disabled"><span style={{ flex: 1 }}>Environment / model</span><span className="right">⚙ and model buttons</span></div>
+							</Modal>
+						)}
 					</div>
 					{env && onEnv && (
 						<div className="anchor">

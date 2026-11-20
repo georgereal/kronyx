@@ -10,7 +10,7 @@ USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
 		libgl1 libegl1 libxkbcommon0 libxkbcommon-x11-0 libdbus-1-3 \
 		libfontconfig1 libglib2.0-0 libx11-6 libxext6 libxrender1 libsm6 \
-		xvfb python3-pip \
+		xvfb python3-pip ripgrep \
 	&& rm -rf /var/lib/apt/lists/*
 
 # Browser automation: browser-use drives the agent loop, playwright provides

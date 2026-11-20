@@ -1,7 +1,8 @@
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { AgentRunner, type AgentMode, type RunDigest } from "../agent/runner";
+import { AgentRunner, type AgentMode, type RunnerAttachment, type RunDigest } from "../agent/runner";
+import { acceptsImages, describeImages, pickVisionModel } from "../agent/vision";
 import { evaluate, parsePermissionsText, ruleFor, type PermissionLayers, type PermissionRules } from "../agent/permissions";
 import { readGlobalModePermissions, readGlobalPermissions } from "../permStore";
 import type { PriorTranscript } from "../agent/recall";
@@ -15,7 +16,7 @@ import { createMcpTools, type McpServerConfig } from "../tools/mcpTools";
 import { userConfig } from "../userConfig";
 import { insertMemoryEvent, openStore } from "../store";
 import { createIdeTools } from "./ideTools";
-import { autoApproveWrites, estimateCostUsd, implementPrompt, modelPricing, planDir, promptForApiKey, providerErrorMessage, readProviderSettings, resolveProvider, writeProviderValue } from "../config";
+import { autoApproveWrites, configuredModels, estimateCostUsd, implementPrompt, modelPricing, planDir, profiles, promptForApiKey, providerErrorMessage, readProviderSettings, resolveProvider, writeProviderValue } from "../config";
 import { log } from "../log";
 import type { ApiCallRow } from "../store";
 import * as git from "../git";
@@ -683,7 +684,37 @@ export class SessionController {
 				restored ? `${task}\n\nContext from the previous session in this tab:\n${restored}` : task,
 				this.runnerRoot ?? "",
 			);
-			await active.run(expanded, settings);
+			// Image @-mentions ride as image parts when the model can see them —
+			// otherwise offer to describe them with a vision-capable model.
+			const imageAtts = await collectImageMentions(task, this.runnerRoot ?? "");
+			let taskText = expanded;
+			let runnerAtts: RunnerAttachment[] = imageAtts;
+			if (imageAtts.length) {
+				const catalog = [...configuredModels(), ...profiles().flatMap((p) => p.models ?? [])];
+				const meta = catalog.find((m) => m.id === settings.modelId);
+				if (!acceptsImages(meta)) {
+					const visionId = pickVisionModel(catalog, settings.modelId);
+					if (visionId) {
+						const pick = await vscode.window.showInformationMessage(
+							`${settings.modelId} can't view images. Describe ${imageAtts.length} attached image(s) with ${visionId} and pass the context to the agent?`,
+							"Use fallback",
+							"Send without images",
+						);
+						if (pick === "Use fallback") {
+							const desc = await describeImages({
+								baseUrl: settings.baseUrl,
+								apiKey: settings.apiKey,
+								modelId: visionId,
+								task,
+								images: imageAtts.map((a) => ({ filename: a.filename, mime: a.mediaType, data: a.data! })),
+							});
+							if (desc) taskText = `Attached image descriptions (via ${visionId}):\n${desc}\n\n${taskText}`;
+						}
+						runnerAtts = [];
+					}
+				}
+			}
+			await active.run(taskText, settings, runnerAtts);
 		} finally {
 			this.deps.runLock.release(this.name);
 		}
@@ -930,6 +961,24 @@ export class SessionController {
 		}
 		this.surface.insertAttachment(attachment);
 	}
+}
+
+/** `@path` mention tokens pointing at image files → runner attachments (≤4MB each). */
+async function collectImageMentions(task: string, root: string): Promise<RunnerAttachment[]> {
+	const out: RunnerAttachment[] = [];
+	for (const token of new Set([...task.matchAll(/@(\S+)/g)].map((m) => m[1]))) {
+		const abs = path.isAbsolute(token) ? token : path.resolve(root, token);
+		const mime = imageMime(abs);
+		if (!mime) continue;
+		try {
+			const stat = await fs.stat(abs);
+			if (stat.size > 4 * 1024 * 1024) continue;
+			out.push({ filename: path.basename(abs), mediaType: mime, data: await fs.readFile(abs) });
+		} catch {
+			// Unresolvable mention — left as text for expandMentions.
+		}
+	}
+	return out;
 }
 
 function imageMime(file: string): string | undefined {

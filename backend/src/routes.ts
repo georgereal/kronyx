@@ -61,6 +61,7 @@ import * as tmpl from "./handlers/templates";
 import * as mem from "./handlers/memories";
 import * as modelsH from "./handlers/models";
 import * as wh from "./handlers/webhooks";
+import * as toolsH from "./handlers/tools";
 
 export const routes: Route[] = makeRoutes([
 	["GET", "/api/me", core.me],
@@ -85,6 +86,8 @@ export const routes: Route[] = makeRoutes([
 	["GET", "/api/github/repos", gh.repos],
 	["GET", "/api/github/branches", gh.branches],
 	["GET", "/api/github/prs", gh.prs],
+	["GET", "/api/github/tree", gh.tree],
+	["GET", "/api/tools/stats", toolsH.toolStats],
 	["POST", "/api/github/token", gh.token],
 	["POST", "/api/github/create-repo", gh.createRepo],
 	["POST", "/api/github/resolve", gh.resolve],

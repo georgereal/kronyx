@@ -2,11 +2,12 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import type { Db } from "mongodb";
 import { dbg, swallow } from "../lib/log";
-import { AgentRunner, type AgentMode, type ProviderSettings, type RunViewEvent } from "../../../src/agent/runner";
+import { AgentRunner, type AgentMode, type ProviderSettings, type RunnerAttachment, type RunViewEvent } from "../../../src/agent/runner";
+import { acceptsImages, describeImages, pickVisionModel } from "../../../src/agent/vision";
 import { deriveMessages, type KronyxEvent } from "../../../src/agent/events";
 import { getProvider, type ProviderCreds, type SandboxHandle, type SandboxProvider } from "../../../src/sandbox/provider";
 import { SandboxCore, openPr } from "../../../src/sandbox/sandboxCore";
-import { isSandboxDeath } from "../../../src/sandbox/errors";
+import { isSandboxDeath, isSandboxUnresponsive } from "../../../src/sandbox/errors";
 import { createRemoteFileTools } from "../../../src/tools/remoteFileTools";
 import { createFetchTools } from "../../../src/tools/fetchTools";
 import { BROWSER_DRIVER, BROWSER_DRIVER_PATH, SCREENSHOT_PATH, createBrowserTools } from "../../../src/tools/browserTools";
@@ -151,13 +152,27 @@ interface LiveSlot {
 }
 
 export const delegatingHandle = (live: LiveSlot): SandboxHandle => {
+	/** Consecutive deadline/timeout rejects — one slow command isn't a dead
+	 *  VM, but sustained unresponsiveness means envd is wedged. */
+	let unresponsive = 0;
+	const latch = (err: unknown) => {
+		live.dead = err;
+		live.stopped = true;
+		live.onDead?.(err);
+	};
 	/** A rejected call with a death signature latches the slot — every later
-	 *  call fails fast and the executor's onDead hook stops the run. */
-	const died = (err: unknown): never => {
-		if (isSandboxDeath(err)) {
-			live.dead = err;
-			live.stopped = true;
-			live.onDead?.(err);
+	 *  call fails fast and the executor's onDead hook stops the run. Wedged
+	 *  VMs (deadline_exceeded on everything) latch after 3 consecutive
+	 *  failures, confirmed by a probe before condemning — the recovery path
+	 *  can still preserve the disk. */
+	const died = async (err: unknown): Promise<never> => {
+		if (isSandboxDeath(err)) latch(err);
+		else if (isSandboxUnresponsive(err) && ++unresponsive >= 3) {
+			const ok = live.handle
+				? await live.handle.run("echo ok", { cwd: "/", timeoutMs: 20_000 }).then(() => true).catch(() => false)
+				: false;
+			if (ok) unresponsive = 0;
+			else latch(err);
 		}
 		throw err;
 	};
@@ -167,16 +182,32 @@ export const delegatingHandle = (live: LiveSlot): SandboxHandle => {
 	},
 	run: (command, opts) => {
 		if (live.stopped) return Promise.resolve({ exitCode: 130, stdout: "", stderr: "interrupted" });
-		return live.handle ? live.handle.run(command, opts).catch(died) : Promise.reject(new Error("Sandbox handle not bound."));
+		return live.handle
+			? live.handle.run(command, opts).then((r) => {
+					unresponsive = 0;
+					return r;
+				}, died)
+			: Promise.reject(new Error("Sandbox handle not bound."));
 	},
 	readFile: (path) => {
 		if (live.stopped) return Promise.reject(new Error("Sandbox stopped."));
-		return live.handle ? live.handle.readFile(path).catch(died) : Promise.reject(new Error("Sandbox handle not bound."));
+		return live.handle
+			? live.handle.readFile(path).then((r) => {
+					unresponsive = 0;
+					return r;
+				}, died)
+			: Promise.reject(new Error("Sandbox handle not bound."));
 	},
 	writeFile: async (path, content) => {
 			if (live.stopped) throw new Error("Sandbox stopped.");
 			if (!live.handle) throw new Error("Sandbox handle not bound.");
-			return live.handle.writeFile(path, content).catch(died);
+			return live.handle.writeFile(path, content).then(
+				(r) => {
+					unresponsive = 0;
+					return r;
+				},
+				died,
+			);
 		},
 	setTimeout: (timeoutMs) => live.handle?.setTimeout?.(timeoutMs) ?? Promise.resolve(),
 	interrupt: () => live.handle?.interrupt?.() ?? Promise.resolve(),
@@ -261,6 +292,8 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	/** Per-run outcome rollup for the run-completed event. */
 	private lastPrUrl: string | undefined;
 	private lastPushed = false;
+	/** HEAD sha captured at run end — stamped onto this run's digests in afterRun. */
+	private lastHeadSha: string | undefined;
 	private readonly runChecks: { command: string; ok: boolean }[] = [];
 	/** Last context-compaction stats — folded into the run-completed rollup. */
 	private lastCompaction: { estTokensBefore?: number; estTokensAfter?: number } | undefined;
@@ -844,8 +877,10 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				void route.sink?.emit(e);
 			},
 		});
-		const sessionDoc = session as SessionDoc & { digests?: import("../../../src/agent/runner").RunDigest[] };
+		const sessionDoc = session as SessionDoc & { digests?: import("../../../src/agent/runner").RunDigest[]; stateNote?: string };
 		if (sessionDoc.digests?.length) runner.setRunDigests(sessionDoc.digests);
+		runner.setStateNote(sessionDoc.stateNote);
+		sessionDoc.stateNote = undefined;
 		if (E2bOrchestratedExecutor.runnerCache.size >= E2bOrchestratedExecutor.MAX_CACHED) {
 			let oldestKey: string | undefined;
 			let oldestAt = Infinity;
@@ -1058,7 +1093,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		// Events must land before terminal status — SSE reads run status to close.
 		await this.sink.drain().catch(swallow("executor", "op"));
 		if (this.runner?.runDigests.length) {
-			const digests = this.runner.runDigests.map((d) => ({ ...d, runId: job.runId }));
+			const digests = this.runner.runDigests.map((d) => ({ ...d, runId: job.runId, endSha: d.endSha ?? this.lastHeadSha }));
 			await recordDigests(this.db, job.uid, job.sessionId, digests).catch(swallow("executor", "op"));
 		}
 		// Multi-agent: each slice/coordinator runner has its own digests —
@@ -1073,12 +1108,34 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 					.catch(swallow("executor", "op", null))) as { digests?: ProvenDigest[] } | null)?.digests ?? []);
 			const all: ProvenDigest[] = [
 				...prior,
-				...this.finishedSliceRunners.flatMap((s) => s.runner.runDigests.map((d) => ({ ...d, runId: job.runId, agentIndex: s.agentIndex })) as ProvenDigest[]),
+				...this.finishedSliceRunners.flatMap((s) => s.runner.runDigests.map((d) => ({ ...d, runId: job.runId, agentIndex: s.agentIndex, endSha: d.endSha ?? this.lastHeadSha })) as ProvenDigest[]),
 			];
 			// Scale the cap with agent count — MAX_DIGESTS would truncate all but
 			// the last few slices' digests, losing most of what just happened.
 			const cap = prior.length + this.finishedSliceRunners.length + 3;
 			await recordDigests(this.db, job.uid, job.sessionId, all, cap).catch(swallow("executor", "op"));
+		}
+		// Tool telemetry rollup — feeds /api/tools/stats and per-run UI.
+		const toolEvents = await this.db
+			.collection("run_events")
+			.find({ uid: job.uid, runId: job.runId, "event.type": "tool-finished" })
+			.project({ "event.name": 1, "event.ok": 1, "event.durationMs": 1 })
+			.toArray()
+			.catch(swallow("executor", "op", [] as { event?: { name?: string; ok?: boolean; durationMs?: number } }[]));
+		if (toolEvents.length) {
+			const byTool: Record<string, { calls: number; fails: number; totalMs: number }> = {};
+			let failures = 0;
+			for (const e of toolEvents) {
+				const ev = e.event ?? {};
+				const s = (byTool[String(ev.name ?? "unknown")] ??= { calls: 0, fails: 0, totalMs: 0 });
+				s.calls++;
+				if (ev.ok === false) {
+					s.fails++;
+					failures++;
+				}
+				s.totalMs += Number(ev.durationMs) || 0;
+			}
+			await this.sink.patchRun({ toolStats: { calls: toolEvents.length, failures, byTool } }).catch(swallow("executor", "op"));
 		}
 	}
 
@@ -1109,6 +1166,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		this.lastRunSummary = "";
 		this.lastPrUrl = undefined;
 		this.lastPushed = false;
+		this.lastHeadSha = undefined;
 		this.runChecks.length = 0;
 		this.lastCompaction = undefined;
 		try {
@@ -1158,11 +1216,58 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		}));
 	}
 
-	private taskWithInline(task: string, atts: { filename: string; text?: string }[]): string {
+	private taskWithInline(task: string, atts: { filename: string; mime?: string; text?: string }[], location?: string): string {
+		// Every attachment is named so the model knows it exists — binary files
+		// (images) also reach it as image parts via RunnerAttachment.
+		const manifest = atts.length
+			? `\n\nUser attachments${location ? ` (saved under ${location})` : ""}: ${atts.map((a) => `${a.filename} (${a.mime ?? "file"})`).join(", ")}`
+			: "";
 		const inline = atts.filter((a) => a.text && a.text.length <= INLINE_TEXT_LIMIT);
-		if (!inline.length) return task;
+		if (!inline.length) return task + manifest;
 		const blocks = inline.map((a) => `--- attached file: ${a.filename} ---\n${a.text}\n--- end ${a.filename} ---`);
-		return `${task}\n\nAttached context:\n${blocks.join("\n\n")}`;
+		return `${task}${manifest}\n\nAttached context:\n${blocks.join("\n\n")}`;
+	}
+
+	private runnerAttachments(atts: { filename: string; mime: string; data?: Buffer }[]): RunnerAttachment[] {
+		return atts.map((a) => ({ filename: a.filename, mediaType: a.mime, data: a.data }));
+	}
+
+	/**
+	 * Vision fallback: the coding model can't view images and attachments
+	 * include some — ask the user (approval card) to describe them with a
+	 * cheap vision-capable model, then inject the description as text.
+	 * Returns the description block, or undefined (capable model / no vision
+	 * model in the catalog / declined / describe failed).
+	 */
+	private async maybeDescribeImages(
+		job: CloudJob,
+		provider: ProviderSettings,
+		atts: { filename: string; mime: string; data?: Buffer }[],
+	): Promise<string | undefined> {
+		const imgs = atts.filter((a) => a.mime.startsWith("image/") && a.data?.byteLength);
+		if (!imgs.length || acceptsImages(this.modelMeta)) return undefined;
+		const models = await fetchModels(provider.baseUrl, provider.apiKey).catch(swallow("executor", "op", []));
+		const visionId = pickVisionModel(models, provider.modelId);
+		if (!visionId) return undefined;
+		const ok = await this.awaitPermission(job, "vision_fallback", {
+			command: `describe ${imgs.length} attached image(s) with ${visionId} — ${provider.modelId} cannot view images`,
+			path: imgs.map((i) => i.filename).join(", "),
+		});
+		if (!ok) return undefined;
+		await this.sink
+			.emit({ type: "info", text: `Describing ${imgs.length} attached image(s) with ${visionId}…` })
+			.catch(swallow("executor", "op"));
+		const desc = await describeImages({
+			baseUrl: provider.baseUrl,
+			apiKey: provider.apiKey,
+			modelId: visionId,
+			task: job.task,
+			images: imgs.map((i) => ({ filename: i.filename, mime: i.mime, data: i.data! })),
+		});
+		await this.sink
+			.emit({ type: "info", text: desc ? "Image descriptions added to context." : "Image description failed — continuing without it." })
+			.catch(swallow("executor", "op"));
+		return desc ? `Attached image descriptions (via ${visionId}):\n${desc}` : undefined;
 	}
 
 	/** Ask mode: no sandbox, no repo — chat with memory_write only, attachments inlined. */
@@ -1184,7 +1289,9 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		);
 		this.throwIfStopped();
 		await this.sink.emit({ type: "cloud-status", text: "Contacting model…" });
-		await runner.run(this.taskWithInline(job.task, atts), s);
+		const described = await this.maybeDescribeImages(job, s, atts);
+		const askAtts = described ? this.runnerAttachments(atts).filter((a) => !a.mediaType.startsWith("image/")) : this.runnerAttachments(atts);
+		await runner.run(`${described ? `${described}\n\n` : ""}${this.taskWithInline(job.task, atts)}`, s, askAtts);
 		await this.afterRun(job);
 	}
 
@@ -1656,6 +1763,24 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				await this.recordBoot(session, oldId, mode.memory === false ? "resume-disk" : "resume");
 				return true;
 			}
+		} else if (info?.state === "running" && provider.pauseById) {
+			// envd wedged but the VM is alive at the infra level: pausing
+			// writes a disk snapshot, and a memory:false resume cold-boots
+			// it — the worktree survives where a recreate would lose
+			// uncommitted work.
+			if (await provider.pauseById(oldId, creds).catch(() => false)) {
+				const h = await sbx.resume(oldId, creds, { memory: false }).catch(() => null);
+				if (h) {
+					const ok = await sbx.runIn("/", "echo ok", 30_000).then((r) => r.stdout.includes("ok")).catch(() => false);
+					if (ok) {
+						await sbx.keepalive(60);
+						dbg("sandbox", "wedged VM paused + disk-resumed", { sandboxId: oldId });
+						await this.sink.emit({ type: "info", key: "sandbox", text: `Sandbox ${oldId} was unresponsive — cold-booted from its disk snapshot (worktree preserved)` });
+						await this.recordBoot(session, oldId, "resume-disk");
+						return true;
+					}
+				}
+			}
 		} else if (!info) {
 			// Probe failed transiently — the sandbox may still be
 			// paused and resumable. A blind disk-only resume is cheap
@@ -1673,6 +1798,32 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			}
 		}
 		return false;
+	}
+
+	/** Best-effort preservation of a wedged-but-alive VM (envd dead, disk
+	 *  intact): a filesystem checkpoint is an infra-level call that doesn't
+	 *  need envd, and pausing makes the resume ladder's disk-only cold boot
+	 *  available. Returns true when something was preserved — the caller
+	 *  should then KEEP session.sandboxId so ensureSandbox's boot ladder
+	 *  (resume → snapshot restore → create) can recover the worktree. */
+	private async rescueWedgedSandbox(session: SessionDoc, settings: UserSettings, sandboxId: string): Promise<boolean> {
+		const providerName = session.provider ?? String(settings.data.sandboxProvider ?? "e2b");
+		const provider = getProvider(providerName);
+		const creds: ProviderCreds = { secrets: settings.secrets, data: settings.data };
+		let preserved = false;
+		if (provider.checkpointById) {
+			const snap = await provider.checkpointById(sandboxId, creds, { mode: "filesystem", name: `kronyx-wip-${session.sessionId}` }).catch(swallow("executor", "op", null));
+			if (snap) {
+				session.lastSnapshotId = snap;
+				await this.sink.patchSession({ lastSnapshotId: snap });
+				preserved = true;
+			}
+		}
+		if (provider.pauseById && (await provider.pauseById(sandboxId, creds).catch(swallow("executor", "op", false)))) {
+			// Paused → reuseSandbox's disk-only resume can cold-boot the worktree.
+			preserved = true;
+		}
+		return preserved;
 	}
 
 	/** Boot a NEW sandbox from the session's WIP disk checkpoint — full
@@ -2002,7 +2153,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 						await this.sink.emit({ type: "info", text: "Stashed changes couldn't be auto-restored after the branch switch — kept in `git stash`." });
 				}
 			}
-			await this.reconcileBranch(session, sbx);
+			await this.reconcileBranch(undefined, session, sbx, false);
 		}
 		// Stamp the repo the VM actually cloned — like templateId, the remote
 		// URL is the truth; session.repo is only what we asked for.
@@ -2054,7 +2205,11 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		const mode: AgentMode =
 			job.mode === "plan" ? "plan" : session.securityProfile === "bypass" ? "bypass" : "smart";
 		await this.sink.emit({ type: "cloud-status", key: "sandbox", text: session.sandboxId ? `Connecting to your sandbox ${session.sandboxId}…` : "Creating a new sandbox…" });
+		const prevSandboxId = session.sandboxId;
 		let sbx = await this.raceStop(this.ensureSandbox(session, settings, { llm: provider, task: job.task }), SANDBOX_START_MS, "Sandbox start", session.sandboxId);
+		// Warm = same VM reconnected with its clone intact — its worktree is
+		// authoritative continuity state; remote-newer syncs must ask first.
+		const warmSandbox = !!prevSandboxId && sbx.sandboxId === prevSandboxId && !!session.cloned;
 		this.activeSession = session;
 		this.startSandboxKeepalive(sbx);
 		this.throwIfStopped();
@@ -2102,7 +2257,9 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		}
 
 		if (mode !== "plan") {
-			await this.ensureBranch(job, session, sbx, token, provider);
+			await this.ensureBranch(job, session, sbx, token, provider, warmSandbox);
+			await this.reconcileRestoredState(job, session, sbx);
+			await this.kickstartDeps(session, sbx);
 			await this.preflight(job, session, sbx, token, settings);
 		} else if (!session.branch) {
 			// Plan mode with no work branch: nothing checks the repo out to the
@@ -2239,26 +2396,43 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			// stopping the agent promptly instead of letting it flail against a
 			// ghost VM. One recreate+resume retry, same contract as runTail.
 			live.onDead = () => this.runner?.stop();
+			const described = await this.maybeDescribeImages(job, provider, atts);
+			const tailAtts = described ? this.runnerAttachments(atts).filter((a) => !a.mediaType.startsWith("image/")) : this.runnerAttachments(atts);
 			let resumed = false;
+			let preservedWorktree = false;
 			for (;;) {
 				live.dead = undefined;
 				await runner.run(
 					resumed
-						? "The sandbox VM running your tools died and was recreated — the repository was re-cloned to your session branch, but any uncommitted changes were lost. Check the current state (git status, the files you were editing) and continue the task."
-						: this.taskWithInline(job.task, atts),
+						? preservedWorktree
+							? "The sandbox VM running your tools stopped responding and was recovered — its disk was preserved, so the worktree (including uncommitted changes) should be intact. Check git status and the files you were editing, then continue the task."
+							: "The sandbox VM running your tools died and was recreated — the repository was re-cloned to your session branch, but any uncommitted changes were lost. Check the current state (git status, the files you were editing) and continue the task."
+						: `${described ? `${described}\n\n` : ""}${this.taskWithInline(job.task, atts, `${ATTACH_DIR}/`)}`,
 					provider,
+					tailAtts,
 				);
 				if (!live.dead || resumed || this.stopRequested) break;
 				resumed = true;
+				// Wedged (envd dead, VM maybe alive): snapshot/pause first — the
+				// boot ladder can then resume the whole worktree instead of
+				// recloning and losing uncommitted work.
+				const wedged = !isSandboxDeath(live.dead) && isSandboxUnresponsive(live.dead);
+				preservedWorktree = !!(wedged && session.sandboxId && (await this.rescueWedgedSandbox(session, settings, session.sandboxId)));
 				await this.sink.emit({
 					type: "info",
-					text: "Sandbox died mid-run — recreating the VM and resuming (uncommitted changes were lost).",
+					text: preservedWorktree
+						? "Sandbox stopped responding — preserved its disk; attempting resume with the worktree intact."
+						: wedged
+							? "Sandbox stopped responding — recreating the VM (uncommitted changes were lost)."
+							: "Sandbox died mid-run — recreating the VM and resuming (uncommitted changes were lost).",
 				});
 				await this.sink.emit({ type: "sandbox-recreated", reason: "mid-run" } as Record<string, unknown>).catch(swallow("executor", "op"));
-				// Drop the dead id so ensureSandbox creates instead of reconnecting.
-				session.sandboxId = undefined;
-				session.cloned = false;
-				await this.sink.patchSession({ sandboxId: null, cloned: false });
+				if (!preservedWorktree) {
+					// Drop the dead id so ensureSandbox creates instead of reconnecting.
+					session.sandboxId = undefined;
+					session.cloned = false;
+					await this.sink.patchSession({ sandboxId: null, cloned: false });
+				}
 				const next = await this.raceStop(this.ensureSandbox(session, settings), SANDBOX_START_MS, "Sandbox start", session.sandboxId);
 				sbx = next;
 				this.activeSbx = next;
@@ -2272,6 +2446,10 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			if (tokenRefresh) clearInterval(tokenRefresh);
 		}
 		this.throwIfStopped();
+		// HEAD now = the point this run's work rests on; afterRun stamps it
+		// onto the run's digests so a later restore can verify ancestry.
+		const head = await sbx.runIn(REPO_DIR, "git rev-parse HEAD", 15_000).catch(swallow("executor", "op"));
+		if (head?.stdout.trim()) this.lastHeadSha = head.stdout.trim();
 		await this.afterRun(job);
 
 		if (mode === "plan") {
@@ -2320,16 +2498,31 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				}
 				return;
 			} catch (err) {
-				if (attempt > 0 || !isSandboxDeath(err) || this.stopRequested) throw err;
+				const hardDead = isSandboxDeath(err);
+				// A wedged VM (envd unresponsive) throws deadline_exceeded, which
+				// isn't a death signature — probe before condemning it; one
+				// transient gateway timeout isn't a dead VM.
+				const wedged =
+					!hardDead &&
+					isSandboxUnresponsive(err) &&
+					!(await sbx.runIn("/", "echo ok", 20_000).then((r) => r.stdout.includes("ok")).catch(() => false));
+				if (attempt > 0 || !(hardDead || wedged) || this.stopRequested) throw err;
+				const preserved = !!(wedged && session.sandboxId && (await this.rescueWedgedSandbox(session, settings, session.sandboxId)));
 				await this.sink.emit({
 					type: "info",
-					text: "Sandbox died during the run tail — recreating and resuming from the pushed branch (uncommitted changes were lost).",
+					text: preserved
+						? "Sandbox stopped responding — preserved its disk; resuming with the worktree intact."
+						: wedged
+							? "Sandbox stopped responding during the run tail — recreating and resuming from the pushed branch (uncommitted changes were lost)."
+							: "Sandbox died during the run tail — recreating and resuming from the pushed branch (uncommitted changes were lost).",
 				});
 				await this.sink.emit({ type: "sandbox-recreated", reason: "run-tail" } as Record<string, unknown>).catch(swallow("executor", "op"));
-				// Drop the dead id so ensureSandbox creates instead of reconnecting.
-				session.sandboxId = undefined;
-				session.cloned = false;
-				await this.sink.patchSession({ sandboxId: null, cloned: false });
+				if (!preserved) {
+					// Drop the dead id so ensureSandbox creates instead of reconnecting.
+					session.sandboxId = undefined;
+					session.cloned = false;
+					await this.sink.patchSession({ sandboxId: null, cloned: false });
+				}
 				const next = await this.raceStop(this.ensureSandbox(session, settings), SANDBOX_START_MS, "Sandbox start", session.sandboxId);
 				setSbx(next);
 				this.startSandboxKeepalive(next);
@@ -2374,7 +2567,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			)
 			.catch(swallow("executor", "op"));
 
-		const planned = await this.planSlices(job, provider, sbx, this.taskWithInline(job.task, atts));
+		const planned = await this.planSlices(job, provider, sbx, this.taskWithInline(job.task, atts, `${ATTACH_DIR}/`));
 		const slices = planned?.slices;
 		if (!planned || !slices || slices.length < 2) {
 			await this.sink.emit({
@@ -3168,7 +3361,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		return slugify(session.repo?.split("/")[1] ?? "run");
 	}
 
-	private async ensureBranch(job: CloudJob, session: SessionDoc, sbx: SandboxCore, token: string, provider?: ProviderSettings): Promise<void> {
+	private async ensureBranch(job: CloudJob, session: SessionDoc, sbx: SandboxCore, token: string, provider?: ProviderSettings, warm = false): Promise<void> {
 		const base = session.base ?? "main";
 		// Refresh the remote credential up front — the clone URL embeds a token
 		// that expires, and every fetch/push below (plus the agent's own git
@@ -3220,7 +3413,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		// Reconcile local branch vs origin/<branch> BEFORE any work:
 		// ahead/behind counts decide — pull clean, keep unpushed commits,
 		// rebase divergence now, or stop and ask the user.
-		await this.reconcileBranch(session, sbx);
+		await this.reconcileBranch(job, session, sbx, warm);
 		this.throwIfStopped();
 		const behind = await sbx.driftBehind(REPO_DIR, base);
 		if (behind > 0) {
@@ -3266,7 +3459,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	}
 
 	/** Bring the sandbox's branch in line with origin before a run starts. */
-	private async reconcileBranch(session: SessionDoc, sbx: SandboxCore): Promise<void> {
+	private async reconcileBranch(job: CloudJob | undefined, session: SessionDoc, sbx: SandboxCore, warm: boolean): Promise<void> {
 		const branch = session.branch;
 		if (!branch) return;
 		await sbx.runIn(REPO_DIR, "git fetch origin", 60_000).catch(swallow("executor", "op"));
@@ -3287,6 +3480,27 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			return; // clean or strictly ahead — nothing to pull
 		}
 		const dirty = (await sbx.runIn(REPO_DIR, "git status --porcelain").catch(swallow("executor", "op")))?.stdout.trim() !== "";
+		// Warm sandbox + remote commits the sandbox lacks = someone pushed
+		// outside this session (GitHub UI, another machine, a merged PR).
+		// The live worktree is the continuity state — ask before overwriting
+		// it instead of silently reset --hard / rebasing remote commits in.
+		if (warm && job) {
+			const ok = await this.awaitPermission(job, "branch_sync", {
+				branch,
+				ahead,
+				behind,
+				dirty,
+				command: `origin/${branch} is ${behind} commit(s) ahead of this sandbox (local: ${ahead} unpushed${dirty ? ", uncommitted changes" : ""}) — sync remote changes in?`,
+			});
+			if (!ok) {
+				await this.sink.emit({
+					type: "info",
+					key: "branch",
+					text: `Continuing on the sandbox's local state — ${behind} remote commit(s) on origin/${branch} not synced.`,
+				});
+				return;
+			}
+		}
 		// Uncommitted leftovers (usually crash debris) are stashed before a
 		// sync, then restored — never silently orphaned in `git stash`.
 		let stashed = false;
@@ -3323,6 +3537,122 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		}
 		await this.sink.emit({ type: "cloud-status", key: "branch", text: `Rebased ${ahead} commit(s) onto origin/${branch}.` });
 		await unstash();
+	}
+
+	/**
+	 * Kick off dependency install in the background, matched to the repo's
+	 * stack. node_modules & co. aren't in the checkout, so bare `npx tsc`
+	 * downloads packages on every call — a detached install is usually done
+	 * by the time the agent reaches for the toolchain. /tmp/kronyx-deps.done
+	 * gates it to once per VM; warm sandboxes keep their installed tree.
+	 */
+	private async kickstartDeps(session: SessionDoc, sbx: SandboxCore): Promise<void> {
+		if (!session.repo) return;
+		const probe = await sbx
+			.runIn(
+				REPO_DIR,
+				"test -f /tmp/kronyx-deps.done && echo DONE; test -d node_modules && echo HAS_NM; ls package.json package-lock.json pnpm-lock.yaml yarn.lock bun.lock bun.lockb requirements.txt go.mod Cargo.toml Gemfile 2>/dev/null",
+				20_000,
+			)
+			.catch(swallow("executor", "op"));
+		const out = probe?.stdout ?? "";
+		if (out.includes("DONE")) return;
+		const has = (f: string) => out.split("\n").includes(f);
+		let cmd = "";
+		let tool = "";
+		if (has("package.json") && !out.includes("HAS_NM")) {
+			if (has("pnpm-lock.yaml") || has("bun.lock") || has("bun.lockb") || has("yarn.lock")) {
+				cmd = has("pnpm-lock.yaml") ? "pnpm install --frozen-lockfile" : has("yarn.lock") ? "yarn install --frozen-lockfile" : "bun install";
+				tool = cmd.split(" ")[0];
+			} else {
+				cmd = has("package-lock.json") ? "npm ci" : "npm install";
+				tool = "npm";
+			}
+		} else if (has("requirements.txt")) {
+			cmd = "pip3 install -r requirements.txt";
+			tool = "pip3";
+		} else if (has("go.mod")) {
+			cmd = "go mod download";
+			tool = "go";
+		} else if (has("Cargo.toml")) {
+			cmd = "cargo fetch";
+			tool = "cargo";
+		} else if (has("Gemfile")) {
+			cmd = "bundle install";
+			tool = "bundle";
+		}
+		if (!cmd) return;
+		const present = await sbx.runIn("/", `command -v ${tool} >/dev/null 2>&1 && echo yes`, 15_000).catch(swallow("executor", "op"));
+		if (!present?.stdout.includes("yes")) return;
+		// Swap first: small-VM OOM (tsc/esbuild/npm concurrent) wedges envd and
+		// looks like a dead sandbox. Best-effort — root or passwordless sudo only.
+		const swap =
+			"(sudo -n sh -c 'fallocate -l 2G /swapfile 2>/dev/null && chmod 600 /swapfile && mkswap /swapfile >/dev/null 2>&1 && swapon /swapfile' || sh -c 'fallocate -l 2G /swapfile 2>/dev/null && chmod 600 /swapfile && mkswap /swapfile >/dev/null 2>&1 && swapon /swapfile' || true) 2>/dev/null";
+		await sbx
+			.runIn(REPO_DIR, `setsid bash -c ${JSON.stringify(`${swap}; ${cmd} > /tmp/kronyx-deps.log 2>&1; echo $? > /tmp/kronyx-deps.exit; touch /tmp/kronyx-deps.done`)} >/dev/null 2>&1 < /dev/null &`, 15_000)
+			.catch(swallow("executor", "op"));
+		await this.sink.emit({ type: "cloud-status", text: `Installing dependencies in the background: ${cmd}` });
+	}
+
+	/**
+	 * Restore-point reconciliation: verify the worktree against digest history.
+	 * Cold restores land wherever origin/<branch> points — commits made by
+	 * earlier runs may be missing (revert/reset) or external commits may have
+	 * landed. Missing asks stay relevant: report them, and when the new task
+	 * doesn't already cover them, ask whether to re-apply.
+	 */
+	private async reconcileRestoredState(job: CloudJob, session: SessionDoc, sbx: SandboxCore): Promise<void> {
+		const digests = ((session as { digests?: ProvenDigest[] }).digests ?? []).filter((d) => d.endSha);
+		if (!digests.length) return;
+		const headR = await sbx.runIn(REPO_DIR, "git rev-parse HEAD", 15_000).catch(swallow("executor", "op"));
+		const head = headR?.stdout.trim();
+		if (!head) return;
+		const ancestor = async (sha: string) => {
+			const r = await sbx.runIn(REPO_DIR, `git merge-base --is-ancestor ${JSON.stringify(sha)} HEAD`, 20_000).catch(swallow("executor", "op"));
+			return r?.exitCode === 0;
+		};
+		// Commits that landed outside the session (GitHub UI, another machine)
+		// show as the branch being ahead of the newest known endSha.
+		const newest = digests.reduce((a, b) => (a.at > b.at ? a : b));
+		if (await ancestor(newest.endSha!)) {
+			const ahead = await sbx.runIn(REPO_DIR, `git rev-list --count ${JSON.stringify(newest.endSha!)}..HEAD`, 20_000).catch(swallow("executor", "op"));
+			const n = Number(ahead?.stdout.trim()) || 0;
+			if (n > 0)
+				await this.sink.emit({ type: "info", text: `${n} commit(s) landed on ${session.branch} outside this session since the last run.` });
+		}
+		const missing = [] as ProvenDigest[];
+		for (const d of digests) if (!(await ancestor(d.endSha!))) missing.push(d);
+		if (!missing.length) return;
+		const list = missing.map((d) => `'${d.task.slice(0, 80)}'${d.filesChanged.length ? ` (files: ${d.filesChanged.slice(0, 6).join(", ")})` : ""}`).join("; ");
+		await this.sink.emit({
+			type: "info",
+			text: `Restored at ${head.slice(0, 7)} — work from earlier run(s) is not in this tree: ${list}. Those changes are missing unless re-applied.`,
+		});
+		// Skip the approval card when the new task already covers every missing
+		// ask — overlap by shared file paths or significant task words.
+		const words = new Set(
+			job.task.toLowerCase().split(/[^a-z0-9_/.-]+/i).filter((w) => w.length >= 4),
+		);
+		const covered = (d: ProvenDigest) =>
+			d.filesChanged.some((f) => job.task.includes(f)) ||
+			d.task.toLowerCase().split(/[^a-z0-9_/.-]+/i).filter((w) => w.length >= 4 && words.has(w)).length >= 3;
+		const uncovered = missing.filter((d) => !covered(d));
+		let reapply = false;
+		if (uncovered.length) {
+			reapply = await this.awaitPermission(job, "restore_missing", {
+				missing: missing.map((d) => ({ task: d.task.slice(0, 160), files: d.filesChanged })),
+				command: `Work from earlier run(s) is missing from this restore (${uncovered.map((d) => `'${d.task.slice(0, 60)}'`).join(", ")}). Re-apply those changes?`,
+			});
+		}
+		// Hand the next agent the verdict: uncovered+allowed asks are required
+		// work; the rest are informational so it doesn't assume they exist.
+		const note =
+			`Restore check: this worktree was restored at commit ${head.slice(0, 7)}. ` +
+			`The following earlier asks' changes are NOT in the current tree: ${list}. ` +
+			(reapply
+				? "The user asked to re-apply them — treat them as required outstanding work."
+				: "Do not assume they are implemented; re-read files before relying on them and mention the gap to the user if relevant.");
+		(session as { stateNote?: string }).stateNote = note;
 	}
 
 	/**
@@ -3423,9 +3753,19 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		} else if (cmd) {
 			await this.sink.emit({ type: "cloud-status", text: `Verifying: ${cmd}` });
 			const r = await sbx.runIn(REPO_DIR, cmd, 300_000).catch(swallow("executor", "op"));
-			const ok = !!r && r.exitCode === 0;
+			// stderr first — the failure reason lives there; stdout is the
+			// npm/pytest banner that made every failed check look empty.
+			const combined = `${r?.stderr ?? ""}\n${r?.stdout ?? ""}`.trim();
+			let ok = !!r && r.exitCode === 0;
+			let output = combined.slice(0, 1000);
+			// A repo with a test script but no test files (vitest exits 1)
+			// reports a red check on every run — that's a skip, not a failure.
+			if (!ok && /no test files|no tests? found|0 tests? (found|ran)/i.test(combined)) {
+				ok = true;
+				output = "skipped — no test files";
+			}
 			this.runChecks.push({ command: cmd, ok });
-			await this.sink.emit({ type: "check", command: cmd, ok, durationMs: 0, output: (r?.stdout || r?.stderr || "").slice(0, 1000) });
+			await this.sink.emit({ type: "check", command: cmd, ok, durationMs: 0, output });
 			results.push(`${cmd} → ${ok ? "passed" : "failed"}`);
 		}
 		const smoke = await this.bootSmoke(sbx, probe.stdout).catch(swallow("executor", "bootSmoke", "smoke: skipped (error)"));
@@ -3630,6 +3970,16 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				await this.sink.emit({ type: "info", text: `Branch pushed: ${session.branch} — no PR (no distinct base branch).` });
 				return;
 			}
+		}
+		// Net-diff guard: commits may exist yet change nothing vs base (a run
+		// that reverted earlier work). An empty diff must not open/update a PR.
+		await sbx.runIn(REPO_DIR, `git fetch origin ${JSON.stringify(session.base)}`, 60_000).catch(swallow("executor", "op"));
+		const netDiff = await sbx
+			.runIn(REPO_DIR, `git diff --quiet origin/${session.base}...HEAD`, 30_000)
+			.catch(swallow("executor", "op"));
+		if (netDiff?.exitCode === 0) {
+			await this.sink.emit({ type: "info", text: `Branch has no net changes vs ${session.base} — skipping PR.` });
+			return;
 		}
 		dbg("run", "openPr", { runId: job.runId, repo: session.repo, head: session.branch, base: session.base });
 		const pr = await openPr(

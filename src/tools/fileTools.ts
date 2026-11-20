@@ -296,7 +296,7 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 	};
 
 	const searchFiles: AgentTool<
-		{ pattern: string; path?: string; regex?: boolean; file_glob?: string; max_results?: number },
+		{ pattern: string; path?: string; regex?: boolean; context_lines?: number; file_glob?: string; max_results?: number },
 		string
 	> = {
 		name: "search_files",
@@ -308,6 +308,7 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 				pattern: { type: "string", description: "Text or regular expression to find." },
 				path: { type: "string", description: "Folder to search, relative to the root. Defaults to the root." },
 				regex: { type: "boolean", description: "Treat pattern as a regular expression. Defaults to false." },
+				context_lines: { type: "integer", minimum: 0, description: "Lines of context around each match (shown with '-' instead of ':')." },
 				file_glob: { type: "string", description: "Only search files whose path matches this glob, e.g. '**/*.ts'." },
 				max_results: { type: "integer", minimum: 1, description: "Maximum matches. Defaults to 100." },
 			},
@@ -315,9 +316,18 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 		},
 		async execute(input) {
 			const abs = guard.resolve(input.path ?? ".");
-			const matcher = input.regex ? new RegExp(input.pattern) : undefined;
+			// Invalid regex falls back to literal search instead of throwing.
+			let matcher: RegExp | undefined;
+			if (input.regex) {
+				try {
+					matcher = new RegExp(input.pattern);
+				} catch {
+					matcher = undefined;
+				}
+			}
 			const glob = input.file_glob ? globToRegExp(input.file_glob) : undefined;
 			const limit = input.max_results ?? 100;
+			const ctx = Math.min(20, Math.max(0, Math.floor(input.context_lines ?? 0)));
 			const results: string[] = [];
 			for await (const entry of walk(abs, true)) {
 				if (entry.dir) continue;
@@ -328,11 +338,16 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 				const buffer = await fs.readFile(entry.path);
 				if (buffer.includes(0)) continue;
 				const lines = normalizeEol(buffer.toString("utf8")).split("\n");
+				const printed = new Set<number>();
 				for (let i = 0; i < lines.length; i++) {
 					const hit = matcher ? matcher.test(lines[i]) : lines[i].includes(input.pattern);
 					if (!hit) continue;
-					results.push(`${rel}:${i + 1}: ${lines[i].trim().slice(0, 300)}`);
-					if (results.length >= limit) return `${results.join("\n")}\n... stopped at ${limit} matches.`;
+					for (let j = Math.max(0, i - ctx); j <= Math.min(lines.length - 1, i + ctx); j++) {
+						if (printed.has(j)) continue;
+						printed.add(j);
+						results.push(`${rel}:${j + 1}${j === i ? ":" : "-"} ${lines[j].trim().slice(0, 300)}`);
+						if (results.length >= limit) return `${results.join("\n")}\n... stopped at ${limit} matches.`;
+					}
 				}
 			}
 			return results.length > 0 ? results.join("\n") : "No matches.";

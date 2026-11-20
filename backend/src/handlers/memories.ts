@@ -182,12 +182,22 @@ export async function recallMemories(req: Request): Promise<Response> {
 	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
 	const b = (await req.json().catch(() => null)) as { query?: string; repo?: string; limit?: number } | null;
 	const query = String(b?.query ?? "").trim();
-	if (!query) return json({ error: "query required" }, { status: 400 });
-	const provider = await embedder(uid);
 	const db = await getDb();
+	const limit = Math.min(50, Number(b?.limit) || 10);
+	if (!query) {
+		// No query → most recent active memories (the composer's @memory picker).
+		const docs = await db
+			.collection("memories")
+			.find({ uid, status: "active" })
+			.sort({ createdAt: -1 })
+			.limit(limit)
+			.project({ memoryId: 1, content: 1, scope: 1, repo: 1, branch: 1, status: 1 })
+			.toArray();
+		return json({ tookMs: 0, embedded: false, docs: docs.map((m) => ({ ...m, _id: undefined, repo: m.repo ?? null, branch: m.branch ?? null, score: null })) });
+	}
+	const provider = await embedder(uid);
 	const t0 = Date.now();
 	const docs = await searchMemories(db, uid, "manual-recall", query, provider, b?.repo, undefined, "manual-recall").catch(swallow("memories", "op", []));
-	const limit = Math.min(50, Number(b?.limit) || 10);
 	return json({
 		tookMs: Date.now() - t0,
 		embedded: !!provider,

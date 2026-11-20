@@ -51,8 +51,28 @@ export interface RemoteToolOptions {
  * matching engine.
  */
 export function createRemoteFileTools(sandbox: SandboxHandle, workdir: string, opts: RemoteToolOptions = {}): AgentTool<any, string>[] {
-	const run = (command: string): Promise<{ exitCode: number; stdout: string; stderr: string }> =>
+	const runOnce = (command: string): Promise<{ exitCode: number; stdout: string; stderr: string }> =>
 		sandbox.run(command, { cwd: workdir, timeoutMs: 60_000 });
+	// deadline_exceeded is a transient provider/gateway timeout — retry once
+	// instead of surfacing it as a tool error the model must route around.
+	const run = async (command: string) => {
+		try {
+			return await runOnce(command);
+		} catch (e) {
+			if (!/deadline_exceeded|timed?\s*out|timeout/i.test(String(e))) throw e;
+			await new Promise((r) => setTimeout(r, 2000));
+			return runOnce(command);
+		}
+	};
+
+	// Single-quote escape — double quotes leave $vars/backticks expanded.
+	const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+
+	// ripgrep when present: gitignore-aware, faster, saner output. Stock
+	// templates may lack it — detect once and fall back to grep/find.
+	let rgProbe: Promise<boolean> | undefined;
+	const rgAvailable = (): Promise<boolean> =>
+		(rgProbe ??= run("command -v rg >/dev/null 2>&1").then((r) => r.exitCode === 0).catch(() => false));
 
 	// Agents sometimes pass absolute paths — resolve them instead of
 	// double-prefixing workdir ("/home/user/repo//home/user/repo/x" → 404).
@@ -268,11 +288,22 @@ export function createRemoteFileTools(sandbox: SandboxHandle, workdir: string, o
 			},
 		},
 		async execute(input) {
-			const depth = input.recursive ? "" : " -maxdepth 1";
 			const limit = input.max_entries ?? 500;
+			// rg --files honors .gitignore — the right answer for recursive lists.
+			if (input.recursive && (await rgAvailable())) {
+				const r = await run(`rg --files ${q(input.path ?? ".")} 2>/dev/null | head -${limit}`);
+				if (r.exitCode <= 1) {
+					const lines = r.stdout
+						.split("\n")
+						.filter(Boolean)
+						.map((l) => l.replace(/^\.\//, ""));
+					return lines.slice(0, limit).join("\n") || "Empty.";
+				}
+			}
+			const depth = input.recursive ? "" : " -maxdepth 1";
 			// One round trip: -printf marks dirs with a trailing slash.
 			const r = await run(
-				`find "${input.path ?? "."}"${depth} \\( -name .git -o -name node_modules -o -name dist \\) -prune -o \\( -type d -printf '%p/\\n' -o -type f -print \\) | head -${limit}`,
+				`find ${q(input.path ?? ".")}${depth} \\( -name .git -o -name node_modules -o -name dist -o -name .next -o -name build -o -name coverage -o -name .turbo \\) -prune -o \\( -type d -printf '%p/\\n' -o -type f -print \\) | head -${limit}`,
 			);
 			if (r.exitCode !== 0 && !r.stdout.trim()) {
 				return `Error listing files: ${(r.stderr || `exit ${r.exitCode}`).slice(0, 300)}`;
@@ -285,28 +316,56 @@ export function createRemoteFileTools(sandbox: SandboxHandle, workdir: string, o
 		},
 	};
 
-	const searchFiles: AgentTool<{ pattern: string; path?: string; file_glob?: string; max_results?: number }, string> = {
+	const searchFiles: AgentTool<
+		{ pattern: string; path?: string; file_glob?: string; context_lines?: number; regex?: boolean; case_sensitive?: boolean; max_results?: number },
+		string
+	> = {
 		name: "search_files",
 		executionMode: "parallel",
-		description: "Search file contents. Returns matching lines as path:line: text.",
+		description:
+			"Search file contents (ripgrep when available — respects .gitignore). Returns matching lines as path:line: text.",
 		inputSchema: {
 			type: "object",
 			properties: {
-				pattern: { type: "string", description: "Text or regular expression to find." },
+				pattern: { type: "string", description: "Text or regular expression (ERE syntax) to find." },
 				path: { type: "string", description: "Folder to search, relative to the root. Defaults to the root." },
-				file_glob: { type: "string", description: "Only search files matching this glob, e.g. '**/*.ts'." },
+				file_glob: { type: "string", description: "Only search files matching this path glob, e.g. '**/*.ts' or 'src/ui/**'." },
+				context_lines: { type: "integer", minimum: 0, description: "Lines of context around each match." },
+				regex: { type: "boolean", description: "Treat pattern as a regular expression. Defaults to true; false searches literal text." },
+				case_sensitive: { type: "boolean", description: "Match case-sensitively. Defaults to true." },
 				max_results: { type: "integer", minimum: 1, description: "Maximum matches. Defaults to 100." },
 			},
 			required: ["pattern"],
 		},
 		async execute(input) {
 			const dir = input.path ?? ".";
-			const glob = input.file_glob ? `--include='${input.file_glob.replace(/\*\*\//, "")}'` : "";
 			const limit = input.max_results ?? 100;
-			const r = await run(
-				`grep -rIn ${glob} --exclude-dir=.git --exclude-dir=node_modules -- ${JSON.stringify(input.pattern)} "${dir}" 2>/dev/null | head -${limit}`,
-			);
-			// grep exits 1 on no matches; >1 means a real error (missing dir, bad flags).
+			const ctx = input.context_lines ? `-C ${Math.min(20, Math.max(0, Math.floor(input.context_lines)))}` : "";
+			// Models emit PCRE inline flags ((?i)pat) — strip and map to -i.
+			let ci = input.case_sensitive === false ? " -i" : "";
+			let pattern = input.pattern;
+			const inline = /^\(\?([imsx]+)\)/.exec(pattern);
+			if (inline) {
+				if (inline[1].includes("i")) ci = " -i";
+				pattern = pattern.slice(inline[0].length);
+			}
+			const wantLiteral = input.regex === false;
+			const useRg = await rgAvailable();
+			const build = (literal: boolean): string => {
+				const lit = literal || wantLiteral ? " -F" : "";
+				if (useRg)
+					return `rg -n --no-heading --color=never${ctx}${ci}${lit}${input.file_glob ? ` -g ${q(input.file_glob)}` : ""} -- ${q(pattern)} ${q(dir)} 2>/dev/null | head -${limit}`;
+				const flags = `-InE${ctx}${ci}${lit}`;
+				// grep --include matches basenames only — path globs (src/ui/**)
+				// need a find -path filter piped into grep.
+				if (input.file_glob?.includes("/"))
+					return `find ${q(dir)} -type f -path ${q(input.file_glob)} -print0 2>/dev/null | xargs -0r grep ${flags} -- ${q(pattern)} 2>/dev/null | head -${limit}`;
+				return `grep -r${flags}${input.file_glob ? ` --include=${q(input.file_glob)}` : ""} --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=dist --exclude-dir=.next -- ${q(pattern)} ${q(dir)} 2>/dev/null | head -${limit}`;
+			};
+			let r = await run(build(false));
+			// An invalid regex (e.g. a literal "foo(") retries as plain text
+			// instead of erroring — the model meant text, not syntax.
+			if (!wantLiteral && r.exitCode > 1 && /regex|regular expression|syntax/i.test(r.stderr)) r = await run(build(true));
 			if (r.exitCode > 1) return `Error searching: ${(r.stderr || `exit ${r.exitCode}`).slice(0, 300)}`;
 			const out = r.stdout
 				.split("\n")
@@ -348,7 +407,14 @@ export function createRemoteFileTools(sandbox: SandboxHandle, workdir: string, o
 				script,
 				`#!/bin/bash\necho $$ > ${JSON.stringify(pidF)}\ncd ${JSON.stringify(workdir)}\n{ ${input.command}\n} > ${JSON.stringify(logF)} 2>&1\necho $? > ${JSON.stringify(exitF)}\n`,
 			);
-			await sandbox.run(`setsid bash ${JSON.stringify(script)} >/dev/null 2>&1 < /dev/null &`, { cwd: "/", timeoutMs: 15_000 });
+			const spawn = () => sandbox.run(`setsid bash ${JSON.stringify(script)} >/dev/null 2>&1 < /dev/null &`, { cwd: "/", timeoutMs: 15_000 });
+			try {
+				await spawn();
+			} catch (e) {
+				if (!/deadline_exceeded|timed?\s*out|timeout/i.test(String(e))) throw e;
+				await new Promise((r) => setTimeout(r, 2000));
+				await spawn();
+			}
 			const budgetMs = Math.min(Math.max(input.timeout_seconds ?? 1800, 1), 3600) * 1000;
 			const deadline = Date.now() + budgetMs;
 			const poll = (cmd: string) => sandbox.run(cmd, { cwd: "/", timeoutMs: 15_000 }).catch(() => null);

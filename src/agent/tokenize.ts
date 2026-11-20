@@ -16,3 +16,25 @@ export function countTokens(text: string): number {
 		return Math.ceil(text.length / CHARS_PER_TOKEN);
 	}
 }
+
+/** Fixed estimate for an image/media part — provider-side image tokens are
+ *  resolution-based (~1–2k), never the raw byte count. Serializing a
+ *  Uint8Array would score every byte as JSON text (~6 chars each). */
+const IMAGE_PART_TOKEN_EST = 1_500;
+
+/** Token estimate for a message's content array, special-casing image/media parts. */
+export function countContentTokens(content: unknown): number {
+	if (!Array.isArray(content)) return countTokens(JSON.stringify(content));
+	let n = 0;
+	for (const p of content as { type?: string }[]) {
+		n += p?.type === "image" || p?.type === "media" ? IMAGE_PART_TOKEN_EST : countTokens(JSON.stringify(p));
+	}
+	return n;
+}
+
+/** Token estimate across a message list (same image-part handling). */
+export function countMessageTokens(messages: readonly { content?: unknown }[]): number {
+	let n = 0;
+	for (const m of messages) n += countContentTokens(m.content);
+	return n;
+}

@@ -4,7 +4,7 @@ import type {
 	AgentRuntimePrepareTurnResult,
 	AgentToolResultPart,
 } from "@cline/shared";
-import { countTokens } from "./tokenize";
+import { countContentTokens, countTokens } from "./tokenize";
 
 const SOFT_TRIGGER_FRACTION = 0.4;
 const TRIGGER_FRACTION = 0.7;
@@ -163,7 +163,7 @@ function dumpMessages(messages: readonly AgentMessage[]): ContextDumpLine[] {
 						? "attachment"
 						: "text";
 		const chars = parts.reduce((n, p) => n + p.text.length, 0);
-		return { idx, role: m.role, kind, chars, estTokens: countTokens(JSON.stringify(m.content)), parts };
+		return { idx, role: m.role, kind, chars, estTokens: countContentTokens(m.content), parts };
 	});
 	// Whole-dump cap: strip part text oldest-first (line digests survive).
 	let total = JSON.stringify(lines).length;
@@ -256,7 +256,7 @@ const resultText = (part: AgentToolResultPart): string =>
 
 function estimateTokens(messages: readonly AgentMessage[], systemPrompt?: string, tools?: unknown): number {
 	let tokens = countTokens(systemPrompt ?? "") + (tools ? countTokens(JSON.stringify(tools)) : 0);
-	for (const m of messages) tokens += countTokens(JSON.stringify(m.content));
+	for (const m of messages) tokens += countContentTokens(m.content);
 	return tokens;
 }
 

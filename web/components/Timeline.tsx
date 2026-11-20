@@ -520,12 +520,14 @@ function TurnCard({
 	settled,
 	toggled,
 	onToggle,
+	id,
 	children,
 }: {
 	turn: Extract<Item, { kind: "turn" }>;
 	settled: boolean;
 	toggled?: boolean;
 	onToggle: (open: boolean) => void;
+	id?: string;
 	children: React.ReactNode;
 }) {
 	const done = settled || turn.done;
@@ -563,7 +565,7 @@ function TurnCard({
 	// line (or "Working…" live) when the step produced no tool actions.
 	const headline = achieved.length ? null : note?.text.split("\n")[0];
 	return (
-		<div className="step">
+		<div className="step" id={id}>
 			<div className="step-rail">
 				<span className="step-num">{turn.num ?? "•"}</span>
 			</div>
@@ -833,7 +835,7 @@ function CheckRow({ e }: { e: RunEvent }) {
 	);
 }
 
-function Event({ user, sessionId, e, events, runs, githubUrl }: { user: User; sessionId: string; e: RunEvent; events: RunEvent[]; runs: RunDoc[]; githubUrl?: string }) {
+function Event({ user, sessionId, e, events, runs, githubUrl, onShowFailures }: { user: User; sessionId: string; e: RunEvent; events: RunEvent[]; runs: RunDoc[]; githubUrl?: string; onShowFailures?: (runId: string) => void }) {
 	const ev = e.event;
 	const kind = KIND[ev.type] ?? ev.type;
 	const cls =
@@ -988,7 +990,14 @@ function Event({ user, sessionId, e, events, runs, githubUrl }: { user: User; se
 				</div>
 				{issues > 0 && (
 					<div className="result-issues muted">
-						{issues} command{issues > 1 ? "s" : ""} or check{issues > 1 ? "s" : ""} failed during this run — expand the cards above to inspect.
+						{issues} command{issues > 1 ? "s" : ""} or check{issues > 1 ? "s" : ""} failed during this run —{" "}
+						{onShowFailures && e.runId ? (
+							<button className="btn ghost sm" style={{ padding: "1px 8px", fontSize: 11 }} onClick={() => onShowFailures(e.runId!)}>
+								view failures ↓
+							</button>
+						) : (
+							"expand the cards above to inspect."
+						)}
 					</div>
 				)}
 				{summary && <div className="result-summary"><Md text={summary} /></div>}
@@ -1122,6 +1131,7 @@ export function Timeline({
 					key={item.key}
 					turn={item}
 					settled={frozen || !active}
+					id={`tl-${item.key}`}
 					toggled={turnToggles.get(item.key)}
 					onToggle={(o) =>
 						setTurnToggles((prev) => {
@@ -1439,7 +1449,7 @@ export function Timeline({
 				</div>
 			);
 		}
-		return <Event key={item.key} user={user} sessionId={sessionId} e={item.e} events={events} runs={runs} githubUrl={githubUrl} />;
+		return <Event key={item.key} user={user} sessionId={sessionId} e={item.e} events={events} runs={runs} githubUrl={githubUrl} onShowFailures={jumpToFailures} />;
 	};
 
 	// Multi-agent helpers (shared with MultiAgentPanel): titles from the
@@ -1474,6 +1484,43 @@ export function Timeline({
 	}
 	// Lane open state: default by status, but a manual toggle sticks across re-renders.
 	const [laneToggles, setLaneToggles] = useState<Map<string, boolean>>(new Map());
+	// "view failures" jump from the run-completed card: open every turn/lane
+	// containing a failed action or check, then scroll to the first one.
+	const isFailItem = (i: Item): boolean =>
+		(i.kind === "action" && i.ok === false) ||
+		(i.kind === "event" && (i.e.event.type === "tool-finished" || i.e.event.type === "check") && i.e.event.ok === false);
+	const jumpToFailures = (runId: string) => {
+		const failedTurns: string[] = [];
+		const failedLanes = new Set<string>();
+		const scan = (list: Item[], laneKey?: string) => {
+			for (const i of list) {
+				if (i.kind === "turn") {
+					if (i.items.some((x) => isFailItem(x) && laneKeyOf(x).runId === runId)) {
+						failedTurns.push(i.key);
+						if (laneKey) failedLanes.add(laneKey);
+					}
+				} else if (isFailItem(i) && laneKeyOf(i).runId === runId && laneKey) {
+					failedLanes.add(laneKey);
+				}
+			}
+		};
+		scan(mainItems);
+		for (const [k, l] of laneItems) if (k.startsWith(`${runId}:`)) scan(l, k);
+		if (failedTurns.length)
+			setTurnToggles((prev) => {
+				const next = new Map(prev);
+				for (const k of failedTurns) next.set(k, true);
+				return next;
+			});
+		if (failedLanes.size)
+			setLaneToggles((prev) => {
+				const next = new Map(prev);
+				for (const k of failedLanes) next.set(k, true);
+				return next;
+			});
+		if (failedTurns[0])
+			setTimeout(() => document.getElementById(`tl-${failedTurns[0]}`)?.scrollIntoView({ behavior: "smooth", block: "center" }), 100);
+	};
 	const lanesBlock = (runId: string | undefined) =>
 		laneItems.size > 0 && (
 			<div className="slice-lanes">

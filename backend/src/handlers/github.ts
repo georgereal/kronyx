@@ -98,6 +98,29 @@ export async function prs(req: Request): Promise<Response> {
 	});
 }
 
+/** GET /api/github/tree?installationId=&repo=&ref= — recursive file paths for the composer's @file picker. */
+export async function tree(req: Request): Promise<Response> {
+	const uid = await authenticate(req);
+	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
+	const url = new URL(req.url);
+	const inst = Number(url.searchParams.get("installationId"));
+	const repo = url.searchParams.get("repo") ?? "";
+	const ref = url.searchParams.get("ref") ?? "";
+	if (!inst || !/^[\w.-]+\/[\w.-]+$/.test(repo) || !ref) return json({ error: "installationId, repo and ref required" }, { status: 400 });
+	const token = await installationToken(inst).catch(swallow("github", "installationToken", ""));
+	if (!token) return json({ error: "token_failed" }, { status: 502 });
+	const res = await fetch(`https://api.github.com/repos/${repo}/git/trees/${encodeURIComponent(ref)}?recursive=1`, {
+		headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" },
+	}).catch(swallow("github", "tree", null));
+	if (!res?.ok) return json({ paths: [] });
+	const body = (await res.json()) as { tree?: { path?: string; type?: string }[] };
+	const paths = (body.tree ?? [])
+		.filter((e) => e.type === "blob" && e.path && !e.path.startsWith(".git"))
+		.map((e) => e.path!)
+		.slice(0, 5000);
+	return json({ paths });
+}
+
 /** POST /api/github/create-repo — create a repo in an org the app is installed on. */
 export async function createRepo(req: Request): Promise<Response> {
 	const uid = await authenticate(req);
