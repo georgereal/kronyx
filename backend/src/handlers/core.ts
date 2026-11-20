@@ -32,8 +32,15 @@ export async function me(req: Request): Promise<Response> {
 export async function createKey(req: Request): Promise<Response> {
 	const uid = await verifyRequest(req);
 	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
-	const body = (await req.json().catch(swallow("core", "op", ({})))) as { label?: string };
-	const { key, id } = await mintApiKey(uid, String(body.label ?? "").slice(0, 80));
+	const body = (await req.json().catch(swallow("core", "op", ({})))) as { label?: string; replace?: boolean };
+	const label = String(body.label ?? "").slice(0, 80);
+	if (body.replace && label) {
+		// Per-device IDE keys: re-connecting replaces the editor's previous key
+		// instead of accumulating dead ones.
+		const db = await getDb();
+		await db.collection("api_keys").deleteMany({ uid, label });
+	}
+	const { key, id } = await mintApiKey(uid, label);
 	return json({ key, id });
 }
 

@@ -2,33 +2,56 @@
 
 import { CheckCircle2, MonitorSmartphone } from "lucide-react";
 import { useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import { CopyButton } from "@/components/CopyButton";
 import { useUser, apiFetch } from "@/lib/api";
 
-const VSCODE_URI = (key: string) => `vscode://kronyx.kronyx/auth?key=${encodeURIComponent(key)}`;
+const VSCODE_URI = (key: string, id: string) =>
+	`vscode://kronyx.kronyx/auth?key=${encodeURIComponent(key)}&id=${encodeURIComponent(id)}`;
 
 /** /connect — mints a Kronyx API key and hands it to the extension. */
 export default function ConnectPage() {
+	return (
+		<Suspense>
+			<Connect />
+		</Suspense>
+	);
+}
+
+function Connect() {
 	const router = useRouter();
+	const search = useSearchParams();
 	const user = useUser();
 	const [key, setKey] = useState("");
+	const [keyId, setKeyId] = useState("");
 	const [error, setError] = useState("");
 
+	// The IDE passes its device id so the key is labeled per-editor and the
+	// previous key for this device is replaced, not accumulated.
+	const device = search.get("device")?.replace(/[^\w-]/g, "").slice(0, 40) ?? "";
+	const deviceName = search.get("name")?.slice(0, 60) ?? "";
+	const label = device ? `vscode-${device}` : "vscode-extension";
+
 	useEffect(() => {
-		if (user === null) router.replace("/login?next=/connect");
-	}, [user, router]);
+		if (user === null) router.replace(`/login?next=${encodeURIComponent(`/connect${device ? `?device=${device}&name=${encodeURIComponent(deviceName)}` : ""}`)}`);
+	}, [user, router, device, deviceName]);
 
 	useEffect(() => {
 		if (!user) return;
 		void (async () => {
 			const res = await apiFetch("/api/keys", user, {
 				method: "POST",
-				body: JSON.stringify({ label: "vscode-extension" }),
+				body: JSON.stringify({ label, replace: true }),
 			});
-			if (res.ok) setKey(((await res.json()) as { key: string }).key);
-			else setError("Could not create an API key.");
+			if (!res.ok) return setError("Could not create an API key.");
+			const body = (await res.json()) as { key: string; id: string };
+			setKey(body.key);
+			setKeyId(body.id);
+			// Hand the key to the editor automatically — same account, no paste.
+			window.location.href = VSCODE_URI(body.key, body.id);
 		})();
+		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [user]);
 
 	if (!user) return null;
@@ -43,9 +66,9 @@ export default function ConnectPage() {
 				{key ? (
 					<>
 						<p className="tagline-sub" style={{ maxWidth: 300 }}>
-							One click sends a connection key to Kronyx in your editor — you&apos;re done.
+							Sending a connection key to Kronyx in your editor{deviceName ? ` (${deviceName})` : ""} — you&apos;re done.
 						</p>
-						<a href={VSCODE_URI(key)}>
+						<a href={VSCODE_URI(key, keyId)}>
 							<button className="btn w-full" style={{ justifyContent: "center" }}>
 								Connect in VS Code
 							</button>
@@ -64,7 +87,9 @@ export default function ConnectPage() {
 			</div>
 			<div className="card auth-card" style={{ marginTop: 16 }}>
 				<h1 style={{ fontSize: 15 }}>Connect your Git provider</h1>
-				<p className="tagline-sub" style={{ marginBottom: 14 }}>So cloud sessions can clone, push and open PRs.</p>
+				<p className="tagline-sub" style={{ marginBottom: 14 }}>
+					So cloud sessions can clone, push and open PRs.
+				</p>
 				<a href="/settings" style={{ display: "block" }}>
 					<button className="btn w-full" style={{ justifyContent: "center", marginBottom: 8 }}>
 						Connect GitHub

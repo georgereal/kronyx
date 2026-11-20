@@ -114,6 +114,18 @@
 				"icon": "$(add)"
 			},
 			{
+				"command": "kronyx.openAgents",
+				"title": "Kronyx Agents",
+				"category": "Kronyx",
+				"icon": "$(cloud)"
+			},
+			{
+				"command": "kronyx.exitAgentMode",
+				"title": "Back to IDE",
+				"category": "Kronyx",
+				"icon": "$(arrow-left)"
+			},
+			{
 				"command": "kronyx.checkCloudSetup",
 				"title": "Check cloud setup",
 				"category": "Kronyx"
@@ -211,7 +223,17 @@
 			}
 		],
 		"menus": {
+			"commandCenter": [
+				{
+					"command": "kronyx.openAgents"
+				}
+			],
 			"editor/title": [
+				{
+					"command": "kronyx.exitAgentMode",
+					"when": "kronyx.agentMode",
+					"group": "navigation@0"
+				},
 				{
 					"command": "kronyx.newSession",
 					"when": "activeWebviewPanelId == 'kronyx.session'",
@@ -241,6 +263,11 @@
 				}
 			],
 			"view/title": [
+				{
+					"command": "kronyx.openAgents",
+					"when": "view == kronyx.sessionView || view == kronyx.runViewRight || view == kronyx.agentsView",
+					"group": "navigation@0"
+				},
 				{
 					"command": "kronyx.newSession",
 					"when": "view == kronyx.sessionView || view == kronyx.runViewRight",
@@ -540,6 +567,11 @@
 					"type": "string",
 					"default": "http://localhost:3000",
 					"description": "Base URL of the Kronyx web app (ingest API lives at /api/ingest). Change to your deployed app URL in production."
+				},
+				"kronyx.api.endpoint": {
+					"type": "string",
+					"default": "http://localhost:4000",
+					"description": "Base URL of the Kronyx backend API used by Agent Mode cloud sessions (the web app's BACKEND_URL)."
 				}
 			}
 		}

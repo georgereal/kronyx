@@ -19,10 +19,8 @@ export async function mintApiKey(uid: string, label = ""): Promise<{ key: string
 	return { key, id: result.insertedId.toHexString() };
 }
 
-/** Resolve `Authorization: Bearer krx_…` to a uid; updates lastUsedAt. */
-export async function resolveApiKey(req: Request): Promise<string | null> {
-	const header = req.headers.get("authorization") ?? "";
-	const key = header.startsWith("Bearer ") ? header.slice(7) : "";
+/** Resolve a `krx_…` key value to a uid; updates lastUsedAt. */
+export async function resolveApiKeyValue(key: string): Promise<string | null> {
 	if (!key.startsWith("krx_")) return null;
 	const db = await getDb();
 	const doc = await db.collection("api_keys").findOneAndUpdate(
@@ -30,6 +28,13 @@ export async function resolveApiKey(req: Request): Promise<string | null> {
 		{ $set: { lastUsedAt: new Date() } },
 	);
 	return doc?.uid ?? null;
+}
+
+/** Resolve `Authorization: Bearer krx_…` to a uid; updates lastUsedAt. */
+export async function resolveApiKey(req: Request): Promise<string | null> {
+	const header = req.headers.get("authorization") ?? "";
+	const key = header.startsWith("Bearer ") ? header.slice(7) : "";
+	return resolveApiKeyValue(key);
 }
 
 /**

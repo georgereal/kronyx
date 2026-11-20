@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { errlog, swallow } from "../lib/log";
-import { authenticate } from "../lib/apiKeys";
+import { authenticate, resolveApiKeyValue } from "../lib/apiKeys";
 import { verifyIdToken } from "../lib/firebaseAdmin";
 import { getDb } from "../lib/mongo";
 import { installationRepos, installationToken, listInstallations } from "../lib/githubApp";
@@ -453,7 +453,10 @@ export async function preflight(req: Request, p: Record<string, string>): Promis
 /** GET /api/sessions/:id/events?run=<runId>&after=<seq>[&stream=1] */
 export async function sessionEvents(req: Request, p: Record<string, string>): Promise<Response> {
 	const url = new URL(req.url);
-	const uid = (await authenticate(req)) ?? (await verifyIdToken(url.searchParams.get("token") ?? ""));
+	// The ?token= param carries a Firebase ID token from the dashboard or a
+	// krx_ API key from the IDE webview (EventSource can't set headers).
+	const tokenParam = url.searchParams.get("token") ?? "";
+	const uid = (await authenticate(req)) ?? (await verifyIdToken(tokenParam)) ?? (await resolveApiKeyValue(tokenParam));
 	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
 	const after = Number(url.searchParams.get("after")) || 0;
 	const before = Number(url.searchParams.get("before")) || 0;

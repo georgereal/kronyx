@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { log } from "./log";
 
 const API_KEY_SECRET = "kronyx.account.apiKey";
+const API_KEY_ID = "kronyx.account.apiKeyId";
 const USER_KEY = "kronyx.account.user";
 
 /** Fired whenever the stored account changes (sign-in, sign-out, key swap). */
@@ -83,7 +84,12 @@ export async function signIn(context: vscode.ExtensionContext): Promise<KronyxUs
 		"Paste API key",
 	);
 	if (pick === "Open dashboard") {
-		await vscode.env.openExternal(vscode.Uri.parse(`${base}/connect`));
+		// Same account as the web (Firebase) — /connect mints a krx_ key labeled
+		// per-device, replaces this editor's previous key, and deep-links it back.
+		const { getDeviceId, deviceName } = await import("./settingsSync");
+		const device = await getDeviceId(context).catch(() => "");
+		const qs = device ? `?device=${encodeURIComponent(device)}&name=${encodeURIComponent(deviceName())}` : "";
+		await vscode.env.openExternal(vscode.Uri.parse(`${base}/connect${qs}`));
 		return undefined; // completes asynchronously via handleAuthUri
 	}
 	if (pick !== "Paste API key") return undefined;
@@ -109,12 +115,14 @@ export async function signIn(context: vscode.ExtensionContext): Promise<KronyxUs
 /** Handle vscode://kronyx.kronyx/auth?key=krx_… deep links from the connect page. */
 export async function handleAuthUri(context: vscode.ExtensionContext, uri: vscode.Uri): Promise<KronyxUser | undefined> {
 	if (uri.path !== "/auth") return undefined;
-	const key = new URLSearchParams(uri.query).get("key")?.trim() ?? "";
+	const params = new URLSearchParams(uri.query);
+	const key = params.get("key")?.trim() ?? "";
 	if (!key.startsWith("krx_")) {
 		void vscode.window.showErrorMessage("Kronyx: sign-in link didn't contain a valid API key.");
 		return undefined;
 	}
 	await setApiKey(context, key);
+	await context.globalState.update(API_KEY_ID, params.get("id") ?? undefined);
 	const user = await currentUser(context);
 	if (user) {
 		log("auth", `signed in as ${user.email ?? user.uid} (deep link)`);
@@ -128,7 +136,18 @@ export async function handleAuthUri(context: vscode.ExtensionContext, uri: vscod
 }
 
 export async function signOut(context: vscode.ExtensionContext): Promise<void> {
+	// Best-effort remote revoke — the minted key must not stay valid server-side
+	// after the editor signs out.
+	const [key, id, base] = await Promise.all([apiKey(context), Promise.resolve(context.globalState.get<string>(API_KEY_ID)), Promise.resolve(webAppUrl())]);
+	if (key && id && base) {
+		await fetch(`${base}/api/keys?id=${encodeURIComponent(id)}`, {
+			method: "DELETE",
+			headers: { Authorization: `Bearer ${key}` },
+			signal: AbortSignal.timeout(8000),
+		}).catch(() => {});
+	}
 	await context.secrets.delete(API_KEY_SECRET);
+	await context.globalState.update(API_KEY_ID, undefined);
 	await context.globalState.update(USER_KEY, undefined);
 	fireAuthChanged(undefined);
 }

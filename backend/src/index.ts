@@ -48,6 +48,16 @@ async function sendResponse(res: ServerResponse, response: Response): Promise<vo
 }
 
 const server = createServer((req, res) => {
+	// CORS: the VS Code webview (vscode-webview:// origin) calls this API
+	// directly — the Next proxy used to hide the cross-origin hop.
+	res.setHeader("access-control-allow-origin", "*");
+	res.setHeader("access-control-allow-headers", "Authorization, Content-Type");
+	res.setHeader("access-control-allow-methods", "GET, POST, DELETE, OPTIONS");
+	if (req.method === "OPTIONS") {
+		res.statusCode = 204;
+		res.end();
+		return;
+	}
 	void (async () => {
 		const started = Date.now();
 		const request = await toRequest(req);

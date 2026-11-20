@@ -16,6 +16,7 @@ import { RunLock, type SessionDeps } from "./ui/sessionController";
 import { RunComments } from "./ui/comments";
 import { DiffReview, ORIGINAL_SCHEME } from "./ui/diffReview";
 import { openCloudSessionPanel, openSessionPanel, registerSessionSerializer } from "./ui/sessionPanel";
+import { openAgentsPanel, disposeAgentsPanel } from "./ui/agentsPanel";
 import { AgentsView } from "./ui/agentsView";
 import { checkCloudSetup } from "./ui/cloudController";
 import { openSettingsPage, openSettingsWindow, setProviderSavedListener } from "./ui/settingsPage";
@@ -117,6 +118,7 @@ export function activate(context: vscode.ExtensionContext): void {
 	// Reflect sign-in state in the context key, status bar, and all webview surfaces.
 	const applyAuthState = async (user: Awaited<ReturnType<typeof currentUser>>): Promise<void> => {
 		const signedIn = !!user;
+		await vscode.commands.executeCommand("setContext", "kronyx.agentMode", false);
 		await vscode.commands.executeCommand("setContext", "kronyx.signedIn", signedIn);
 		accountStatus.text = signedIn ? `$(account) ${user!.email ?? user!.name ?? "account"}` : "$(account) Sign in";
 		accountStatus.show();
@@ -510,6 +512,8 @@ export function activate(context: vscode.ExtensionContext): void {
 			// Cloud agent opens as an editor tab in this window (no new window).
 			openCloudSessionPanel(context, deps, task),
 		),
+		vscode.commands.registerCommand("kronyx.openAgents", () => openAgentsPanel(context, deps)),
+		vscode.commands.registerCommand("kronyx.exitAgentMode", () => disposeAgentsPanel()),
 		vscode.commands.registerCommand("kronyx.openSettings", () =>
 			vscode.commands.executeCommand("workbench.action.openSettings", "@ext:kronyx.kronyx"),
 		),

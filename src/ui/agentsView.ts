@@ -3,11 +3,14 @@ import { listSessions, openStore } from "../store";
 import { log } from "../log";
 import type { SessionDeps } from "./sessionController";
 import { webAppUrl } from "../auth";
+import { openAgentsPanel } from "./agentsPanel";
 
 interface AgentsMessage {
 	type: "open" | "refresh" | "newLocal" | "newCloud";
 	name?: string;
 	url?: string;
+	cloud?: boolean;
+	runId?: string;
 }
 
 /**
@@ -37,6 +40,11 @@ export class AgentsView implements vscode.WebviewViewProvider {
 		if (m.type === "refresh") return this.refresh();
 		if (m.type === "newLocal") return void vscode.commands.executeCommand("kronyx.newSession");
 		if (m.type === "newCloud") return void vscode.commands.executeCommand("kronyx.newCloudSession");
+		if (m.type === "open" && m.cloud && m.name) {
+			// Cloud sessions open inside the Agent Mode overlay, not a dashboard tab.
+			log("agents", `click → agents overlay "${m.name}"`);
+			return openAgentsPanel(this.deps.context, this.deps, m.name);
+		}
 		if (m.type === "open" && m.url) return void vscode.env.openExternal(vscode.Uri.parse(m.url));
 		if (m.type === "open" && m.name) {
 			log("agents", `click → openSession "${m.name}"`);
@@ -137,10 +145,9 @@ function render() {
 		const el = document.createElement("div");
 		el.className = "item";
 		const cls = r.status === "running" ? "running" : r.status === "failed" ? "failed" : "completed";
-		const link = r.cloud && r.runId && dashboard ? dashboard + "/runs/" + r.runId : "";
 		el.innerHTML = '<span class="dot ' + cls + '"></span><span class="t">' + (r.task || r.session).replace(/</g, "&lt;") +
 			'</span>' + (r.cloud ? '<span class="cloud">☁</span>' : "") + '<span class="meta">' + fmtAgo(r.at) + "</span>";
-		el.onclick = () => vscode.postMessage(link ? { type: "open", url: link } : { type: "open", name: r.session });
+		el.onclick = () => vscode.postMessage({ type: "open", name: r.session, cloud: !!r.cloud, runId: r.runId });
 		list.appendChild(el);
 	}
 }
