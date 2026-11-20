@@ -56,6 +56,7 @@ export class AgentsView implements vscode.WebviewViewProvider {
 			at: r.lastAt,
 			events: r.events,
 			cloud: r.cloud,
+			runId: r.runId,
 		}));
 		this.view.webview.postMessage({ type: "runs", runs, dashboard: webAppUrl() });
 	}

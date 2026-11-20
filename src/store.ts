@@ -229,7 +229,7 @@ export function migrateLegacyStore(legacyPath: string): void {
 	} catch { /* migration best-effort */ }
 }
 
-export function listSessions(d: Store | undefined, limit = 50, root?: string): { session: string; title: string; events: number; lastAt: number; status: string; cloud: boolean }[] {
+export function listSessions(d: Store | undefined, limit = 50, root?: string): { session: string; title: string; events: number; lastAt: number; status: string; cloud: boolean; runId: string }[] {
 	try {
 		const rows = all(
 			d,
@@ -249,7 +249,7 @@ export function listSessions(d: Store | undefined, limit = 50, root?: string): {
 					}
 				} catch { /* skip */ }
 			}
-			const lastRun = all(d, "SELECT at, status FROM runs WHERE session = ? ORDER BY at DESC LIMIT 1", [session])[0];
+			const lastRun = all(d, "SELECT at, status, run_id FROM runs WHERE session = ? ORDER BY at DESC LIMIT 1", [session])[0];
 			return {
 				session,
 				title,
@@ -257,6 +257,7 @@ export function listSessions(d: Store | undefined, limit = 50, root?: string): {
 				lastAt: Number(lastRun?.at ?? 0),
 				status: String(lastRun?.status ?? "completed"),
 				cloud: session.startsWith("Cloud"),
+				runId: String(lastRun?.run_id ?? ""),
 			};
 		});
 	} catch {
