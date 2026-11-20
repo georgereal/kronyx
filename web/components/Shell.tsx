@@ -3,7 +3,6 @@
 import { signOut } from "firebase/auth";
 import {
 	BarChart3,
-	Bot,
 	Database,
 	ChevronsLeft,
 	KeyRound,
@@ -34,7 +33,6 @@ const TABS = [
 	{ href: "/usage", label: "Usage", icon: <BarChart3 size={14} /> },
 	{ href: "/compaction", label: "Compaction", icon: <Shrink size={14} /> },
 	{ href: "/memory", label: "Memory", icon: <Database size={14} /> },
-	{ href: "/agents", label: "Agents", icon: <Bot size={14} /> },
 	{ href: "/ide", label: "IDE Tools", icon: <Wrench size={14} /> },
 	{ href: "/sandboxes", label: "Sandboxes", icon: <Box size={14} /> },
 	{ href: "/keys", label: "API Keys", icon: <KeyRound size={14} /> },
@@ -185,7 +183,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
 					</button>
 				</div>
 			</aside>}
-			<main className={`container${["/settings", "/usage", "/compaction", "/memory", "/ide", "/sandboxes", "/runs", "/agents"].includes(pathname) ? " wide" : ""}`}>{children}</main>
+			<main className={`container${["/settings", "/usage", "/compaction", "/memory", "/ide", "/sandboxes", "/runs"].includes(pathname) ? " wide" : ""}`}>{children}</main>
 		</div>
 	);
 }
