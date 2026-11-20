@@ -507,11 +507,8 @@ export function activate(context: vscode.ExtensionContext): void {
 		}),
 		vscode.commands.registerCommand("kronyx.checkCloudSetup", () => checkCloudSetup(context)),
 		vscode.commands.registerCommand("kronyx.newCloudSession", (task?: string) =>
-			// Devin-style: a dedicated agent window — flag consumed by the new
-			// window's extension host on activation (see below).
-			void context.globalState
-				.update("kronyx.cloudLaunch", { task: task ?? null, at: Date.now() })
-				.then(() => vscode.commands.executeCommand("workbench.action.newWindow")),
+			// Cloud agent opens as an editor tab in this window (no new window).
+			openCloudSessionPanel(context, deps, task),
 		),
 		vscode.commands.registerCommand("kronyx.openSettings", () =>
 			vscode.commands.executeCommand("workbench.action.openSettings", "@ext:kronyx.kronyx"),
@@ -617,16 +614,6 @@ export function activate(context: vscode.ExtensionContext): void {
 			if (event.affectsConfiguration("kronyx.provider")) void refreshModels();
 		}),
 	);
-
-	// Dedicated cloud window: if this activation was launched by
-	// kronyx.newCloudSession (flag is fresh), boot straight into the cloud page.
-	void (async () => {
-		const launch = context.globalState.get<{ task?: string | null; at?: number }>("kronyx.cloudLaunch");
-		if (launch?.at && Date.now() - launch.at < 30_000) {
-			await context.globalState.update("kronyx.cloudLaunch", undefined);
-			setTimeout(() => openCloudSessionPanel(context, deps, launch.task ?? undefined), 600);
-		}
-	})();
 
 	setProviderSavedListener(() => void refreshModels());
 	void refreshModels();
