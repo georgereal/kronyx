@@ -96,11 +96,6 @@ export function openCloudSessionPanel(context: vscode.ExtensionContext, deps: Se
 		workspaceName: vscode.workspace.workspaceFolders?.[0]?.name ?? "",
 	});
 	deps.surfaces.add(surface);
-	// Devin-style overlay: hide sidebars + panel so the agent page fills the
-	// window edge-to-edge (Zen Mode's centered layout leaves dead margins).
-	for (const cmd of ["workbench.action.closeSidebar", "workbench.action.closeAuxiliaryBar", "workbench.action.closePanel"]) {
-		void vscode.commands.executeCommand(cmd);
-	}
 	if (task) void controller.start(task);
 	panel.onDidDispose(() => {
 		panels.delete(panel);
