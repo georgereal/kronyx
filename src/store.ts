@@ -1,6 +1,7 @@
 import { existsSync, promises as fs } from "node:fs";
 import * as path from "node:path";
 import Sqlite, { type Database } from "better-sqlite3";
+import { isConversationalTask } from "./agent/taskGuard";
 
 export type Store = Database;
 
