@@ -1,6 +1,7 @@
 import { existsSync, promises as fs } from "node:fs";
 import * as path from "node:path";
 import Sqlite, { type Database } from "better-sqlite3";
+import { isConversationalTask } from "./agent/taskGuard";
 
 export type Store = Database;
 
@@ -229,9 +230,10 @@ export function migrateLegacyStore(legacyPath: string): void {
 	} catch { /* migration best-effort */ }
 }
 
+/** Probe openers (test/ping) that carry no signal for a session title; greetings come from taskGuard. */
+const PROBE_TASK = /^(test|ping)[!.\s]*$/i;
 /** Openers that carry no signal for a session title: greetings and probes. */
-const TRIVIAL_TASK = /^(hi+|hello|hey+|yo|sup|test|ping|ok)[!.\s]*$/i;
-const isTrivialTask = (task: string) => task.trim().length < 4 || TRIVIAL_TASK.test(task.trim());
+const isTrivialTask = (task: string) => task.trim().length < 4 || isConversationalTask(task.trim()) || PROBE_TASK.test(task.trim());
 
 export function listSessions(d: Store | undefined, limit = 50, root?: string): { session: string; title: string; events: number; lastAt: number; status: string; cloud: boolean; runId: string }[] {
 	try {

@@ -17,6 +17,18 @@ describe("isConversationalTask", () => {
 	);
 });
 
+describe("session-title openers", () => {
+	// store.ts skips these when picking a session title: greetings via
+	// isConversationalTask, plus the probes test/ping handled locally there.
+	it.each(["hi", "hey", "hello", "yo", "sup", "ok"])("greeting skipped for titles: %j", (task) => {
+		expect(isConversationalTask(task)).toBe(true);
+	});
+
+	it.each(["test", "ping"])("probe is not a conversational greeting: %j", (task) => {
+		expect(isConversationalTask(task)).toBe(false);
+	});
+});
+
 describe("isTrivialTask", () => {
 	it.each(["hi", "Hello!", "thanks", "ok", "", "   ", "fix it", "ping"])("trivial: %j", (task) => {
 		expect(isTrivialTask(task)).toBe(true);
