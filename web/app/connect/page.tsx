@@ -66,7 +66,7 @@ function Connect() {
 				{key ? (
 					<>
 						<p className="tagline-sub" style={{ maxWidth: 300 }}>
-							Sending a connection key to Kronyx in your editor{deviceName ? ` (${deviceName})` : ""} — you&apos;re done.
+							You&apos;re signed in — Kronyx is connecting to your editor{deviceName ? ` (${deviceName})` : ""}. You can close this window.
 						</p>
 						<a href={VSCODE_URI(key, keyId)}>
 							<button className="btn w-full" style={{ justifyContent: "center" }}>
@@ -84,23 +84,6 @@ function Connect() {
 				) : (
 					!error && <p className="tagline-sub">Preparing your key…</p>
 				)}
-			</div>
-			<div className="card auth-card" style={{ marginTop: 16 }}>
-				<h1 style={{ fontSize: 15 }}>Connect your Git provider</h1>
-				<p className="tagline-sub" style={{ marginBottom: 14 }}>
-					So cloud sessions can clone, push and open PRs.
-				</p>
-				<a href="/settings" style={{ display: "block" }}>
-					<button className="btn w-full" style={{ justifyContent: "center", marginBottom: 8 }}>
-						Connect GitHub
-					</button>
-				</a>
-				<button className="btn ghost w-full" style={{ justifyContent: "center", marginBottom: 8 }} disabled title="Coming soon">
-					Connect GitLab
-				</button>
-				<button className="btn ghost w-full" style={{ justifyContent: "center" }} disabled title="Coming soon">
-					Connect Bitbucket
-				</button>
 			</div>
 		</main>
 	);

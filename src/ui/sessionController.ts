@@ -346,7 +346,7 @@ export class SessionController {
 			}
 			case "newSession":
 				// Sidebar/right-window surfaces start a fresh named session; editor tabs spawn a new tab.
-				if (this.name === "Side Session" || this.deps.isSidebar?.(this)) {
+				if (this.deps.isSidebar?.(this)) {
 					await this.startNewSession();
 				} else {
 					await vscode.commands.executeCommand("kronyx.newSession");

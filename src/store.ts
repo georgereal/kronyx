@@ -229,6 +229,10 @@ export function migrateLegacyStore(legacyPath: string): void {
 	} catch { /* migration best-effort */ }
 }
 
+/** Openers that carry no signal for a session title: greetings and probes. */
+const TRIVIAL_TASK = /^(hi+|hello|hey+|yo|sup|test|ping|ok)[!.\s]*$/i;
+const isTrivialTask = (task: string) => task.trim().length < 4 || TRIVIAL_TASK.test(task.trim());
+
 export function listSessions(d: Store | undefined, limit = 50, root?: string): { session: string; title: string; events: number; lastAt: number; status: string; cloud: boolean; runId: string }[] {
 	try {
 		const rows = all(
@@ -239,16 +243,17 @@ export function listSessions(d: Store | undefined, limit = 50, root?: string): {
 		);
 		return rows.map((r) => {
 			const session = String(r.session ?? "");
-			let title = session;
+			const tasks: string[] = [];
 			for (const e of all(d, "SELECT event FROM session_events WHERE session = ? ORDER BY id LIMIT 20", [session])) {
 				try {
 					const j = JSON.parse(String(e.event)) as { type?: string; task?: string };
-					if (j.type === "run-started" && j.task) {
-						title = String(j.task).slice(0, 60);
-						break;
-					}
+					if (j.type === "run-started" && j.task) tasks.push(String(j.task));
 				} catch { /* skip */ }
 			}
+			// Title = first real task — skip trivial openers ("hi", "test") so a
+			// throwaway first message doesn't brand the session forever. If every
+			// task is trivial, the first one is still better than the session name.
+			const title = (tasks.find((t) => !isTrivialTask(t)) ?? tasks[0] ?? session).slice(0, 60);
 			const lastRun = all(d, "SELECT at, status, run_id FROM runs WHERE session = ? ORDER BY at DESC LIMIT 1", [session])[0];
 			return {
 				session,
@@ -308,16 +313,6 @@ export function listEvents(d: Store | undefined, session: string, root?: string)
 		return rows.map((r) => JSON.parse(String(r.event)));
 	} catch {
 		return [];
-	}
-}
-
-/** Most recently active session name for a workspace (by last event id). */
-export function latestSession(d: Store | undefined, root: string): string | undefined {
-	try {
-		const rows = all(d, "SELECT session FROM session_events WHERE root = ? ORDER BY id DESC LIMIT 1", [root]);
-		return rows[0] ? String(rows[0].session) : undefined;
-	} catch {
-		return undefined;
 	}
 }
 

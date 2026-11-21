@@ -33,7 +33,11 @@ export function isAgentsPanelOpen(): boolean {
 }
 
 function apiEndpoint(): string {
-	return (vscode.workspace.getConfiguration("kronyx").get<string>("api.endpoint") ?? "").replace(/\/+$/, "");
+	// Keys are minted by the web app's backend, so prefer it — the web app
+	// proxies /api/* to the backend. An api.endpoint pointing at a different
+	// backend won't recognize those keys (401).
+	const explicit = vscode.workspace.getConfiguration("kronyx").get<string>("api.endpoint") ?? "";
+	return (webAppUrl() || explicit).replace(/\/+$/, "");
 }
 
 /**
@@ -103,18 +107,34 @@ export function disposeAgentsPanel(): void {
 	agentsPanel?.dispose();
 }
 
-/** Select a session: backend UUID → mount the bundled view; legacy "Cloud N" name → reveal its tab. */
+/** Select a session: backend UUID → mount the bundled view; otherwise match a
+ *  backend session by title; legacy "Cloud N" name → reveal its tab. */
 async function select(webview: vscode.Webview, context: vscode.ExtensionContext, name: string): Promise<void> {
 	if (/^[0-9a-f]{8}-[0-9a-f-]{20,}$/i.test(name)) return mountSession(webview, context, name);
+	// Agents sidebar passes local session names, but the backend may have a
+	// session with the same title — mount it instead of opening the local tab.
+	const key = await apiKey(context);
+	const endpoint = apiEndpoint();
+	if (key && endpoint) {
+		try {
+			const match = (await listCloudSessions(endpoint, key)).find((s) => s.title === name || s.sessionId === name);
+			if (match) return mountSession(webview, context, match.sessionId);
+		} catch { /* fall through to local reveal */ }
+	}
 	revealSession(name);
 }
 
-/** Tell the webview to mount the bundled web session page for this session. */
-async function mountSession(webview: vscode.Webview, context: vscode.ExtensionContext, sessionId: string): Promise<void> {
+/** Tell the webview to mount the bundled web session page (sessionId), or the
+ *  web's new-session page when no sessionId is given. */
+async function mountSession(webview: vscode.Webview, context: vscode.ExtensionContext, sessionId?: string): Promise<void> {
 	const key = await apiKey(context);
 	const endpoint = apiEndpoint();
-	if (!key || !endpoint) return;
-	void webview.postMessage({ type: "mountSession", sessionId, token: key, apiBase: endpoint, webBase: webAppUrl() });
+	if (!key || !endpoint) {
+		if (sessionId) void webview.postMessage({ type: "error", text: "Not connected to the Kronyx backend — check sign-in and endpoints." });
+		return;
+	}
+	const modelId = vscode.workspace.getConfiguration("kronyx").get<string>("provider.modelId") ?? "";
+	void webview.postMessage({ type: sessionId ? "mountSession" : "showNew", sessionId, token: key, apiBase: endpoint, webBase: webAppUrl(), modelId });
 }
 
 async function pushState(webview: vscode.Webview, context: vscode.ExtensionContext, deps: SessionDeps): Promise<void> {
@@ -223,11 +243,19 @@ async function onMessage(
 			openCloudSessionPanel(context, deps);
 			return;
 
+		case "newPage":
+			return mountSession(webview, context);
+
 		case "nav":
 		case "openExternal": {
-			// Links inside the bundled session page (PRs, dashboard routes).
+			// Links inside the bundled pages (PRs, dashboard routes). Session and
+			// new-agent routes stay in the panel; everything else opens the dashboard.
 			const raw = String(m.url ?? m.href ?? "");
 			if (!raw) return;
+			const path = raw.startsWith(webAppUrl()) ? raw.slice(webAppUrl().length) : raw;
+			const route = path.match(/^\/sessions\/([0-9a-f-]{36})\/?$/i);
+			if (route) return mountSession(webview, context, route[1]);
+			if (/^\/sessions\/?$/.test(path)) return mountSession(webview, context);
 			const url = /^https?:/i.test(raw) ? raw : `${webAppUrl()}${raw.startsWith("/") ? raw : `/${raw}`}`;
 			void vscode.env.openExternal(vscode.Uri.parse(url));
 			return;
@@ -258,6 +286,7 @@ function html(webview: vscode.Webview, extensionUri: vscode.Uri): string {
 <link rel="stylesheet" href="${sessionCss}">
 <style>
 *, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body {
 	font: 13px var(--vscode-font-family, system-ui);
 	color: var(--vscode-foreground);
@@ -434,7 +463,54 @@ body {
    tracking — none of which fire if an inner div scrolls instead). ── */
 body.session-on { display: block; height: auto; overflow: auto; }
 body.session-on .header { position: fixed; top: 0; left: 0; right: 0; }
-body.session-on .body { display: none; }
+body.session-on .main { display: none; }
+/* Keep the rail as a fixed side panel next to the mounted session (mirrors
+   the dashboard's session sidebar); the document still scrolls for the
+   shared page's pin-to-bottom logic. */
+body.session-on .rail {
+	position: fixed;
+	top: 40px;
+	left: 0;
+	bottom: 0;
+	width: 240px;
+	z-index: 50;
+	overflow-y: auto;
+}
+body.session-on #kronyx-session-root { margin-left: 240px; }
+/* The shared page's sticky session header (Clear / … buttons) pins to top:0 —
+   push it below our fixed title bar so it isn't covered. */
+body.session-on #kronyx-session-root .page > div:first-child { top: 40px !important; }
+/* The shared page docks the composer with position:fixed (tuned for the web
+   Shell, which also pads its content so nothing hides under the dock). The
+   IDE has no Shell padding, so the dock covered the last messages. Sticky at
+   the bottom of the session column keeps it pinned while taking real space in
+   the flow; center the dock contents in an 820px column like the web. */
+body.session-on { overflow-x: hidden; }
+body.session-on .sess-body { justify-content: flex-start; }
+/* The shared page caps the timeline column at 860px (inline style), which also
+   caps the docked composer. Use the full Agent Mode width for both. */
+body.session-on .sess-body > div:first-child { max-width: none !important; width: 100% !important; padding-left: 16px !important; padding-right: 16px !important; }
+/* The multi-agent side panel (264px) beside the timeline narrowed the column
+   and the composer docked inside it. Stack the panel below the timeline in the
+   IDE, as the web does at narrow widths, so the composer gets the full width. */
+body.session-on .sess-body { flex-direction: column; align-items: stretch; }
+body.session-on .ma-panel { width: 100% !important; flex: none; max-width: none; margin: 0; position: static; }
+body.session-on .composer-dock {
+	position: sticky; bottom: 0; left: auto; right: auto;
+	padding: 28px 16px 12px; background: var(--bg);
+}
+body.session-on .composer-dock > * { max-width: none; margin-left: 0; margin-right: 0; }
+body.session-on .composer { max-width: none; padding: 8px 10px; }
+body.session-on .composer textarea { min-height: 36px; }
+body.session-on .composer-bar { margin-top: 6px; }
+/* Under 1100px the shared page stacks the multi-agent panel below the timeline
+   (flex-direction: column with align-items: flex-start), which shrinks the
+   timeline column to its content width. Stretch it back to the full column. */
+@media (max-width: 1100px) {
+	body.session-on .sess-body > div:first-child { width: 100%; }
+}
+.sess.active { background: var(--vscode-list-activeSelectionBackground); }
+.sess.active .sess-task { color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground)); }
 #kronyx-session-root {
 	margin-top: 40px;
 	min-height: calc(100vh - 40px);
@@ -489,7 +565,31 @@ const vscode = acquireVsCodeApi();
 // (next/link shim) instead of calling acquireVsCodeApi itself (one-shot API).
 window.__kronyxPost = (m) => vscode.postMessage(m);
 let st = { signedIn: false, backendError: "", sessions: [], modelId: "", models: [], workspace: "" };
-let sessionMounted = false;
+let pendingMount = null;
+let activeId = "";
+
+function tryMount() {
+	if (!pendingMount || !window.KronyxSession) return;
+	const cfg = pendingMount;
+	pendingMount = null;
+	try {
+		const args = { token: cfg.token, apiBase: cfg.apiBase, webBase: cfg.webBase, modelId: cfg.modelId };
+		if (cfg.type === "showNew") window.KronyxSession.showNew(args);
+		else window.KronyxSession.mount({ ...args, sessionId: cfg.sessionId });
+		activeId = cfg.sessionId || "";
+		renderRail();
+		$("sessionsBtn").classList.add("on");
+		document.body.classList.add("session-on");
+	} catch (err) {
+		$("errorLine").textContent = "Failed to load session: " + (err && err.message ? err.message : err);
+	}
+}
+// sessionPage.js can load after a mount message arrives — poll until ready.
+window.addEventListener("load", tryMount);
+setInterval(tryMount, 500);
+window.addEventListener("error", (e) => {
+	$("errorLine").textContent = "Session bundle error: " + (e.message || "script failed to evaluate");
+});
 
 const $ = (id) => document.getElementById(id);
 const fmtAgo = (at) => {
@@ -509,7 +609,7 @@ function renderRail() {
 	}
 	for (const r of st.sessions) {
 		const el = document.createElement("div");
-		el.className = "sess";
+		el.className = "sess" + (r.id === activeId ? " active" : "");
 		const cls = (r.status || "idle").toLowerCase();
 		el.innerHTML =
 			'<span class="dot ' + cls + '"></span>' +
@@ -549,13 +649,8 @@ function render() {
 $("backBtn").onclick = () => vscode.postMessage({ type: "back" });
 $("settingsBtn").onclick = () => vscode.postMessage({ type: "settings" });
 $("connectBtn").onclick = () => vscode.postMessage({ type: "signIn" });
-$("sessionsBtn").onclick = () => {
-	window.KronyxSession?.unmount();
-	sessionMounted = false;
-	$("sessionsBtn").classList.remove("on");
-	document.body.classList.remove("session-on");
-};
-$("newBtn").onclick = () => { if (sessionMounted) $("sessionsBtn").click(); $("taskInput").focus(); };
+$("sessionsBtn").onclick = () => vscode.postMessage({ type: "newPage" });
+$("newBtn").onclick = () => vscode.postMessage({ type: "newPage" });
 
 function submit() {
 	const task = $("taskInput").value.trim();
@@ -570,16 +665,20 @@ $("modelSelect").onchange = () => vscode.postMessage({ type: "setModel", modelId
 window.addEventListener("message", (e) => {
 	const msg = e.data;
 	if (msg.type === "state") { st = msg; render(); }
-	else if (msg.type === "mountSession") {
-		window.KronyxSession.mount({ sessionId: msg.sessionId, token: msg.token, apiBase: msg.apiBase, webBase: msg.webBase });
-		sessionMounted = true;
-		$("sessionsBtn").classList.add("on");
-		document.body.classList.add("session-on");
+	else if (msg.type === "mountSession" || msg.type === "showNew") {
+		pendingMount = msg;
+		tryMount();
+		if (pendingMount === msg) {
+			setTimeout(() => {
+				if (pendingMount === msg) $("errorLine").textContent = "Session view failed to load — the bundle may not be built.";
+			}, 4000);
+		}
 	}
 	else if (msg.type === "error") { $("errorLine").textContent = msg.text || ""; }
 });
 
 vscode.postMessage({ type: "refresh" });
+vscode.postMessage({ type: "newPage" });
 </script>
 <script src="${sessionJs}"></script>
 </body>

@@ -3,6 +3,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { chunkTextInfo, contentHash, cosine, topK as topKOf } from "../agent/vector";
 import type { RecallScorer } from "../agent/recall";
+import { isTrivialTask } from "../agent/taskGuard";
 
 /** Recall ranking knobs, aligned with the backend scorer (backend/src/worker/memory.ts). */
 const RECALL_CHUNK_CHARS = 1500;
@@ -43,7 +44,9 @@ export async function loadMemoryContext(
 		factsText.length > 2400 ? factsText.slice(-2400).replace(/^[^\n]*\n?/, "") : factsText;
 	if (factsCapped) parts.push(`Remembered project facts (.kronyx/memory/facts.md):\n${factsCapped}`);
 	let hits: string[] = [];
-	if (task && settings) {
+	// Trivial tasks ("hi", "thanks") have no query substance — semantic search
+	// would return noise that reads as a to-do list. Rules/facts still inject.
+	if (task && settings && !isTrivialTask(task)) {
 		hits = await searchMemory(root, task, settings.baseUrl, settings.apiKey).catch(() => []);
 		if (hits.length > 0) parts.push(`Relevant code/memory snippets (semantic search):\n${hits.join("\n\n")}`);
 	}

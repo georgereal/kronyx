@@ -31,6 +31,7 @@ import type { AgentMessage } from "@cline/shared";
 import type { PriorTranscript } from "../../../src/agent/recall";
 import { evaluate, parseModePermissions, parsePermissions, parsePermissionsText, type PermissionLayers } from "../../../src/agent/permissions";
 import { DECOMPOSE_PROMPT, isSharedManifest, ownsMatch, parseSlices, type ParsedSlices, type SliceSpec } from "../../../src/agent/decompose";
+import { isTrivialTask } from "../../../src/agent/taskGuard";
 import {
 	createRecallScorer,
 	loadTranscripts,
@@ -719,9 +720,15 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		);
 		// Context manifest (ADR §9): record what rehydration actually loaded.
 		const embed: EmbedProvider | undefined = this.embedProvider;
-		const memories = await searchMemories(this.db, job.uid, job.sessionId, job.task, embed, session.repo ?? undefined, this.memoryReport, job.runId, session.base ?? undefined).catch(
-			swallow("executor", "op", []),
-		);
+		// Trivial tasks ("hi", "thanks") have no query substance — vector recall
+		// returns noise that reads as a to-do list; skip injection entirely.
+		const trivialTask = isTrivialTask(job.task);
+		if (trivialTask) this.memoryReport({ op: "memory_recall", path: "trivial-skip", query: job.task.slice(0, 140) });
+		const memories = trivialTask
+			? []
+			: await searchMemories(this.db, job.uid, job.sessionId, job.task, embed, session.repo ?? undefined, this.memoryReport, job.runId, session.base ?? undefined).catch(
+					swallow("executor", "op", []),
+				);
 		// sessionMemoryContext injects the newest 10 — record exactly those, not
 		// the whole recall set, or outcome credit lands on memories never seen.
 		const injectedMemories = memories.slice(-10);
@@ -794,9 +801,11 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				// Cold-start already searched for this exact task — reuse it.
 				let mem = memories;
 				if (task !== job.task) {
-					mem = await searchMemories(this.db, job.uid, job.sessionId, task, embed, session.repo ?? undefined, this.memoryReport, job.runId, session.base ?? undefined).catch(
-						swallow("executor", "op", memories),
-					);
+					mem = isTrivialTask(task)
+						? []
+						: await searchMemories(this.db, job.uid, job.sessionId, task, embed, session.repo ?? undefined, this.memoryReport, job.runId, session.base ?? undefined).catch(
+								swallow("executor", "op", memories),
+							);
 					// A different recall set is being injected — merge it into the
 					// manifest so recordMemoryOutcome credits the right memories.
 					const newIds = mem.slice(-10).map((m) => m.memoryId);
@@ -2712,9 +2721,13 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		// manifest gets the base recall; each slice re-searches on its own task
 		// inside memoryContext and records its own manifest on its sub-run doc.
 		const embed = this.embedProvider;
-		const baseMemories = await searchMemories(this.db, job.uid, job.sessionId, job.task, embed, session.repo ?? undefined, this.memoryReport, job.runId, session.base ?? undefined).catch(
-			swallow("executor", "op", [] as MemoryDoc[]),
-		);
+		const trivialJob = isTrivialTask(job.task);
+		if (trivialJob) this.memoryReport({ op: "memory_recall", path: "trivial-skip", query: job.task.slice(0, 140) });
+		const baseMemories = trivialJob
+			? []
+			: await searchMemories(this.db, job.uid, job.sessionId, job.task, embed, session.repo ?? undefined, this.memoryReport, job.runId, session.base ?? undefined).catch(
+					swallow("executor", "op", [] as MemoryDoc[]),
+				);
 		const baseInjected = baseMemories.slice(-10);
 		const planSlugs = (
 			await listPlans(this.db, job.uid, job.sessionId).catch(swallow("executor", "op", [] as { slug: string }[]))
@@ -3189,7 +3202,9 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				const recalled =
 					task === job.task
 						? mem.baseMemories
-						: await searchMemories(this.db, job.uid, job.sessionId, task, mem.embed, session.repo ?? undefined, sliceReport, sliceRunId, session.base ?? undefined).catch(swallow("executor", "op", mem.baseMemories));
+						: isTrivialTask(task)
+							? []
+							: await searchMemories(this.db, job.uid, job.sessionId, task, mem.embed, session.repo ?? undefined, sliceReport, sliceRunId, session.base ?? undefined).catch(swallow("executor", "op", mem.baseMemories));
 				const injected = recalled.slice(-10);
 				if (injected.length)
 					void this.db

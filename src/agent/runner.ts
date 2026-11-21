@@ -15,6 +15,7 @@ import { createRepeatGuard } from "./guards/repeatGuard";
 import { createPermissionGuard } from "./guards/permissionGuard";
 import { createSavePlanGuard, createWriteModeGuard } from "./guards/modeGuard";
 import { createApprovalGuard } from "./guards/approvalGuard";
+import { isConversationalTask } from "./taskGuard";
 import type { ApprovalsProvider, EventsProvider, FilesProvider, MemoryProvider, RecallProvider, ResumeProvider, ToolsProvider, TranscriptsProvider } from "./seams";
 
 export interface ProviderSettings {
@@ -325,7 +326,9 @@ export class AgentRunner {
 			const toolCalls = result.messages
 				.slice(beforeCount)
 				.reduce((n, m) => n + m.content.filter((p) => p.type === "tool-call").length, 0);
-			if (result.status === "completed" && toolCalls === 0 && WRITE_MODES.has(this.host.currentMode())) {
+			// Conversational tasks ("hi", "thanks") keep the agent's own reply —
+			// nudging tool use would turn a greeting into invented work.
+			if (result.status === "completed" && toolCalls === 0 && WRITE_MODES.has(this.host.currentMode()) && !isConversationalTask(task)) {
 				this.host.emit({ type: "info", text: "Finished without using any tools — nudging the agent to proceed." });
 				result = await agent.continue(
 					"You ended the run without calling any tools or changing files. " +

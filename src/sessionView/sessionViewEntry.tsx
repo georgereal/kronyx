@@ -5,10 +5,11 @@
  * `@/lib/api` swapped for the shims in ./shims) so Agent Mode renders exactly
  * the dashboard's session view. Exposed as `window.KronyxSession.mount(cfg)`.
  */
-import { createElement } from "react";
+import { createElement, type ReactElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
-// The real session page — shared source with the dashboard.
+// The real session page and new-session page — shared source with the dashboard.
 import SessionView from "../../web/app/(app)/sessions/[id]/page";
+import SessionsLanding from "../../web/app/(app)/sessions/page";
 import { configure, resolveApiUrl } from "./shims/kronyxApi";
 import { setSessionParams } from "./shims/nextNavigation";
 import "../../web/app/globals.css";
@@ -18,6 +19,7 @@ interface MountConfig {
 	token: string;
 	apiBase: string;
 	webBase: string;
+	modelId?: string;
 }
 
 // window.__kronyxPost is injected by the webview's inline script BEFORE this
@@ -28,12 +30,14 @@ interface MountConfig {
 // bypassing apiFetch — rewrite relative /api URLs to the backend here so the
 // stream works inside the webview (backend CORS handles the cross-origin).
 const NativeEventSource = globalThis.EventSource;
-class PatchedEventSource extends NativeEventSource {
-	constructor(url: string | URL, config?: EventSourceInit) {
-		super(resolveApiUrl(String(url)), config);
+if (typeof NativeEventSource === "function") {
+	class PatchedEventSource extends NativeEventSource {
+		constructor(url: string | URL, config?: EventSourceInit) {
+			super(resolveApiUrl(String(url)), config);
+		}
 	}
+	(globalThis as Record<string, unknown>).EventSource = PatchedEventSource;
 }
-(globalThis as Record<string, unknown>).EventSource = PatchedEventSource;
 
 // window.confirm is a no-op in VS Code webviews — the shared page gates
 // "Clear context" on it. Let it pass, then put the real confirmation on the
@@ -98,18 +102,35 @@ document.addEventListener("click", (e) => {
 let root: Root | undefined;
 let container: HTMLElement | undefined;
 
+// Fresh root per page — clean React state when switching sessions or pages.
+function render(el: ReactElement) {
+	root?.unmount();
+	container?.remove();
+	container = document.createElement("div");
+	container.id = "kronyx-session-root";
+	document.body.appendChild(container);
+	root = createRoot(container);
+	root.render(el);
+}
+
+// The shared Composer reads the last-picked model from localStorage — seed it
+// from the extension's provider.modelId so the chip isn't blank.
+function seedModel(modelId?: string) {
+	if (modelId && !localStorage.getItem("kronyx.modelId")) localStorage.setItem("kronyx.modelId", modelId);
+}
+
 (globalThis as Record<string, unknown>).KronyxSession = {
 	mount(cfg: MountConfig) {
 		configure({ apiBase: cfg.apiBase, webBase: cfg.webBase, token: cfg.token });
 		setSessionParams({ id: cfg.sessionId });
-		// Fresh root per session — clean React state when switching sessions.
-		root?.unmount();
-		container?.remove();
-		container = document.createElement("div");
-		container.id = "kronyx-session-root";
-		document.body.appendChild(container);
-		root = createRoot(container);
-		root.render(createElement(SessionView));
+		seedModel(cfg.modelId);
+		render(createElement(SessionView));
+	},
+	// The web's new-session page (repo/branch/mode/environment composer).
+	showNew(cfg: Omit<MountConfig, "sessionId">) {
+		configure({ apiBase: cfg.apiBase, webBase: cfg.webBase, token: cfg.token });
+		seedModel(cfg.modelId);
+		render(createElement(SessionsLanding));
 	},
 	unmount() {
 		root?.unmount();

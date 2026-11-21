@@ -49,7 +49,9 @@
 	/** @type {{name: string, title: string}[]} */
 	let moreTabs = [];
 	let activeSession = "";
-	if (persisted.draft) task.value = persisted.draft;
+	// Drafts are per-session — switching sessions swaps the composer text.
+	/** @type {Record<string, string>} */
+	const drafts = persisted.drafts || {};
 
 	const MODES = [
 		{ id: "code", label: "Code", desc: "Write and edit code" },
@@ -59,7 +61,10 @@
 		{ id: "bypass", label: "Bypass Permissions", desc: "Auto-approve all tool calls" },
 	];
 
-	const persist = () => vscode.setState({ mode, modelId, models, recentModels, draft: task.value, authDismissed, cloudEnv });
+	const persist = () => {
+		drafts[activeSession] = task.value;
+		vscode.setState({ mode, modelId, models, recentModels, drafts, authDismissed, cloudEnv });
+	};
 
 	let cloudEnv = persisted.cloudEnv === true;
 
@@ -196,7 +201,10 @@
 	let mdTimer = 0;
 	let lastVerb = "";
 
+	const setEmptyMode = (empty) => timeline.classList.toggle("is-empty", empty);
+
 	const add = (node) => {
+		setEmptyMode(false);
 		timeline.querySelector(".empty")?.remove();
 		const target = runGroup?.querySelector(".group-body") ?? timeline;
 		target.appendChild(node);
@@ -295,12 +303,31 @@
 	let statusText = "Idle";
 	let elapsedTimer = 0;
 
+	const activityFill = document.getElementById("activity-fill");
+	const RING_C = 2 * Math.PI * 6; // r=6 in the 16x16 activity svg
+	const contextWindow = () => models.find((m) => m.id === modelId)?.contextWindow || 0;
+
+	const updateActivityRing = () => {
+		const ctx = contextWindow();
+		const used = usage.inputTokens + usage.outputTokens + usage.cacheReadTokens + usage.cacheWriteTokens;
+		let frac = ctx > 0 ? Math.min(1, used / ctx) : 0;
+		if (used > 0 && frac < 0.05) frac = 0.05; // keep a visible sliver once any tokens exist
+		activityFill.style.strokeDasharray = `${RING_C}`;
+		activityFill.style.strokeDashoffset = `${RING_C * (1 - frac)}`;
+		activity.classList.toggle("warn", frac >= 0.7 && frac < 0.9);
+		activity.classList.toggle("crit", frac >= 0.9);
+		activity.classList.toggle("has-usage", used > 0);
+		activity.title = ctx > 0
+			? `Context ${(frac * 100).toFixed(0)}% — ${used.toLocaleString()} / ${ctx.toLocaleString()} tokens`
+			: used > 0 ? `Context usage — ${used.toLocaleString()} tokens` : "Context usage";
+	};
+
 	const setStatus = (text) => {
 		statusText = text;
 		const total = usage.inputTokens + usage.outputTokens;
 		const elapsed = startedAt ? ` · ${((Date.now() - startedAt) / 1000).toFixed(0)}s` : "";
 		status.textContent = (text === "Running..." && lastVerb ? lastVerb : text) + elapsed;
-		activity.title = status.textContent;
+		updateActivityRing();
 		tokchip.hidden = total === 0;
 		if (total > 0) {
 			tokchip.textContent = `in ${fmt(usage.inputTokens)} · out ${fmt(usage.outputTokens)}` +
@@ -405,21 +432,31 @@
 	const toolVerb = (name) => TOOL_STYLE[name] || ["⛭", name];
 
 	const showEmpty = () => {
+		setEmptyMode(true);
 		timeline.innerHTML = "";
+		timeline.scrollTop = 0;
 		const empty = el("div", "empty");
-		empty.appendChild(el("div", "empty-title", "Kronyx"));
-		empty.appendChild(el("div", "empty-sub", "Describe a change, or try:"));
+		const hero = el("div", "empty-hero");
+		const logo = el("div", "empty-logo");
+		logo.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 4v16"/><path d="M19 4l-9 8 9 8"/><circle cx="10" cy="12" r="1.5" fill="currentColor"/></svg>';
+		hero.appendChild(logo);
+		hero.appendChild(el("div", "empty-kicker", "Kronyx · Agentic engineering in your editor"));
+		hero.appendChild(el("h1", "empty-headline", "From prompts to production."));
+		hero.appendChild(el("p", "empty-copy", "Understand your code, make changes, and verify them before you ship."));
+		hero.appendChild(el("div", "empty-sub", "Try a starting point"));
 		const list = el("div", "empty-prompts");
-		for (const p of ["Explain this codebase", "Fix a bug in the open file", "Write tests for the current file"]) {
+		for (const p of ["Explain this codebase", "Fix a bug in the open file"]) {
 			const b = el("button", "prompt-chip", p);
 			b.addEventListener("click", () => {
 				task.value = p;
 				autogrow();
 				task.focus();
+				persist();
 			});
 			list.appendChild(b);
 		}
-		empty.appendChild(list);
+		hero.appendChild(list);
+		empty.appendChild(hero);
 		timeline.appendChild(empty);
 	};
 
@@ -443,6 +480,7 @@
 		attachmentPreviews.replaceChildren();
 		attachmentPreviews.hidden = true;
 		autogrow();
+		persist();
 	};
 
 	task.addEventListener("keydown", (e) => {
@@ -559,6 +597,14 @@
 	const modeLabelFor = (id) => MODES.find((m) => m.id === id)?.label ?? id;
 
 	const MODE_ICONS = { code: "</>", smart: "✦", ask: "◯", plan: "≡", bypass: "⛨" };
+	const svg = (paths) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${paths}</svg>`;
+	const MODE_SVGS = {
+		code: svg('<polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>'),
+		smart: svg('<path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8L19 15z"/>'),
+		ask: svg('<circle cx="12" cy="12" r="9"/><path d="M9.2 9a3 3 0 0 1 5.8 1c0 2-3 2.6-3 4.5"/><line x1="12" y1="17.5" x2="12" y2="17.6"/>'),
+		plan: svg('<line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>'),
+		bypass: svg('<path d="M12 22s8-3.5 8-10V5l-8-3-8 3v7c0 6.5 8 10 8 10z"/><path d="M4 4l16 16"/>'),
+	};
 
 	const MODE_PLACEHOLDERS = {
 		ask: "Ask a question about the codebase…",
@@ -567,7 +613,7 @@
 
 	const refreshChips = () => {
 		modeLabel.textContent = modeLabelFor(mode);
-		document.getElementById("mode-icon").textContent = MODE_ICONS[mode] || "●";
+		document.getElementById("mode-icon").innerHTML = MODE_SVGS[mode] || MODE_SVGS.code;
 		const found = models.find((m) => m.id === modelId);
 		modelLabel.textContent = found?.label || modelId || "Model";
 		task.placeholder = MODE_PLACEHOLDERS[mode] || "Ask, plan, or describe a change…";
@@ -754,11 +800,18 @@
 				if (Array.isArray(msg.sessions)) {
 					sessionTabs = msg.sessions;
 					moreTabs = Array.isArray(msg.moreSessions) ? msg.moreSessions : [];
-					activeSession = msg.activeSession || activeSession;
+					const nextSession = msg.activeSession || activeSession;
+					if (nextSession !== activeSession) {
+						drafts[activeSession] = task.value;
+						task.value = drafts[nextSession] || "";
+						activeSession = nextSession;
+						autogrow();
+					}
 					renderTabs();
 				}
 				refreshAuthBanner();
 				refreshChips();
+				updateActivityRing();
 				persist();
 				break;
 			case "insertMention": {

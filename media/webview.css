@@ -96,8 +96,14 @@ body {
 
 .timeline {
 	flex: 1;
+	min-height: 0;
 	overflow-y: auto;
+	overflow-x: hidden;
 	padding: 10px 10px 4px;
+}
+.timeline.is-empty {
+	overflow: hidden;
+	padding: 0;
 }
 .empty {
 	opacity: 0.6;
@@ -405,7 +411,15 @@ pre.io {
 	border-left: 3px solid var(--vscode-panel-border);
 	opacity: 0.85;
 }
-.md table { border-collapse: collapse; margin: 6px 0; font-size: 0.88em; }
+.md table {
+	display: block;
+	border-collapse: collapse;
+	margin: 6px 0;
+	font-size: 0.88em;
+	max-width: 100%;
+	overflow-x: auto;
+}
+.md td, .md th { word-break: break-word; }
 .md th, .md td { border: 1px solid var(--vscode-panel-border); padding: 3px 8px; }
 .code-wrap {
 	margin: 6px 0;
@@ -497,7 +511,130 @@ pre.io-err { color: var(--vscode-errorForeground); }
 .dl.sep { opacity: 0.45; text-align: center; }
 
 /* ---------- empty state / jump ---------- */
-.empty { padding: 24px 16px; display: flex; flex-direction: column; gap: 8px; align-items: center; }
+.empty {
+	height: 100%;
+	box-sizing: border-box;
+	display: flex;
+	align-items: flex-start;
+	justify-content: center;
+	padding: 18px 16px 8px;
+}
+.empty-hero {
+	width: min(100%, 500px);
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: 10px;
+	text-align: center;
+	font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+.empty-logo {
+	width: 52px;
+	height: 52px;
+	margin-top: 4px;
+	display: grid;
+	place-items: center;
+	border-radius: 17px;
+	color: var(--vscode-button-foreground, #fff);
+	background: linear-gradient(180deg, color-mix(in srgb, var(--vscode-button-background, #0e639c) 92%, white 8%), var(--vscode-button-background, #0e639c));
+	border: 1px solid color-mix(in srgb, var(--vscode-button-background, #0e639c) 62%, white 18%);
+	box-shadow: 0 16px 40px color-mix(in srgb, var(--vscode-button-background, #0e639c) 24%, transparent);
+}
+.empty-logo svg {
+	width: 24px;
+	height: 24px;
+}
+.empty-kicker {
+	font-size: 10.5px;
+	font-weight: 700;
+	letter-spacing: 0.075em;
+	text-transform: uppercase;
+	color: var(--vscode-textLink-foreground, var(--vscode-foreground));
+	opacity: 0.86;
+}
+.empty-headline {
+	margin: 0;
+	font-size: clamp(24px, 3.5vw, 30px);
+	line-height: 1.08;
+	letter-spacing: -0.035em;
+	font-weight: 700;
+	max-width: 12ch;
+}
+.empty-copy {
+	margin: 0;
+	max-width: 460px;
+	font-size: 13px;
+	line-height: 1.55;
+	color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+	opacity: 0.92;
+}
+.empty-sub {
+	margin-top: 2px;
+	font-size: 10px;
+	font-weight: 700;
+	letter-spacing: 0.07em;
+	text-transform: uppercase;
+	color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+	opacity: 0.68;
+}
+.empty-prompts {
+	display: grid;
+	gap: 8px;
+	width: 100%;
+	max-width: 420px;
+}
+.prompt-chip {
+	background: color-mix(in srgb, var(--vscode-input-background) 84%, var(--vscode-editor-background) 16%);
+	border: 1px solid color-mix(in srgb, var(--vscode-foreground) 10%, transparent);
+	border-radius: 12px;
+	color: var(--vscode-foreground);
+	padding: 10px 13px;
+	cursor: pointer;
+	font-family: inherit;
+	font-size: 12.5px;
+	font-weight: 600;
+	line-height: 1.3;
+	text-align: left;
+	transition: transform 0.12s ease, border-color 0.12s ease, background 0.12s ease;
+}
+.prompt-chip:hover {
+	border-color: var(--vscode-focusBorder);
+	background: color-mix(in srgb, var(--vscode-input-background) 72%, var(--vscode-editor-background) 28%);
+	transform: translateY(-1px);
+}
+.prompt-chip:active {
+	transform: translateY(0);
+}
+@media (max-height: 760px) {
+	.empty {
+		padding-top: 12px;
+	}
+	.empty-hero {
+		gap: 8px;
+	}
+}
+@media (max-height: 680px) {
+	.empty-logo,
+	.empty-kicker {
+		display: none;
+	}
+}
+@media (max-width: 520px) {
+	.empty {
+		padding-left: 10px;
+		padding-right: 10px;
+	}
+	.empty-hero {
+		gap: 8px;
+	}
+	.empty-kicker,
+	.empty-sub {
+		letter-spacing: 0.06em;
+	}
+	.empty-copy {
+		font-size: 12.5px;
+	}
+}
 
 /* ---------- auth banner ---------- */
 .authbanner { display: flex; align-items: center; gap: 8px; padding: 6px 10px; font-size: 0.85em; background: var(--vscode-badge-background, #4d4d4d); color: var(--vscode-badge-foreground, #fff); }
@@ -506,21 +643,6 @@ pre.io-err { color: var(--vscode-errorForeground); }
 .authbanner button { border: none; border-radius: 3px; padding: 2px 10px; font-size: 0.95em; cursor: pointer; background: var(--vscode-button-background, #0e639c); color: var(--vscode-button-foreground, #fff); }
 .authbanner button:hover { background: var(--vscode-button-hoverBackground, #1177bb); }
 .authbanner .auth-dismiss { background: transparent; padding: 0 6px; font-size: 1.1em; }
-.empty-title { font-size: 1.3em; font-weight: 600; opacity: 0.85; }
-.empty-sub { font-size: 0.85em; opacity: 0.6; }
-.empty-prompts { display: flex; flex-direction: column; gap: 6px; width: 100%; max-width: 320px; }
-.prompt-chip {
-	background: var(--vscode-input-background);
-	border: 1px solid var(--vscode-panel-border);
-	border-radius: 8px;
-	color: var(--vscode-foreground);
-	padding: 8px 12px;
-	cursor: pointer;
-	font-family: inherit;
-	font-size: 0.85em;
-	text-align: left;
-}
-.prompt-chip:hover { border-color: var(--vscode-focusBorder); }
 .jump-latest {
 	position: absolute;
 	bottom: 120px;
@@ -548,19 +670,22 @@ pre.io-err { color: var(--vscode-errorForeground); }
 /* ---------- composer ---------- */
 
 .composer {
-	margin: 10px 18px 8px;
-	background: color-mix(in srgb, var(--vscode-editor-background) 88%, var(--vscode-foreground) 12%);
-	border: 1px solid color-mix(in srgb, var(--vscode-foreground) 18%, transparent);
-	border-radius: 20px;
-	padding: 14px 16px 7px;
+	width: min(100% - 24px, 520px);
+	align-self: center;
+	margin: 8px 0 10px;
+	background: var(--vscode-input-background);
+	border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, transparent));
+	border-radius: 16px;
+	padding: 10px;
 	display: flex;
 	flex-direction: column;
 	gap: 6px;
-	box-shadow: 0 7px 0 color-mix(in srgb, var(--vscode-editor-background) 85%, #000 15%);
+	box-shadow: none;
 	container-type: inline-size;
+	font-family: var(--vscode-font-family);
 }
 .composer:focus-within {
-	border-color: color-mix(in srgb, var(--vscode-foreground) 24%, transparent);
+	border-color: var(--vscode-focusBorder);
 }
 @container (max-width: 520px) {
 	.workspace-chip {
@@ -586,12 +711,14 @@ pre.io-err { color: var(--vscode-errorForeground); }
 	flex-shrink: 2;
 }
 .tok {
-	font-size: 0.78em;
+	font-size: 0.84em;
+	font-weight: 400;
+	letter-spacing: 0;
 	opacity: 0.58;
 	white-space: nowrap;
 	flex-shrink: 0;
-	padding: 0 3px;
-	font-family: var(--vscode-editor-font-family);
+	padding: 0 2px;
+	font-family: inherit;
 }
 textarea {
 	resize: none;
@@ -599,15 +726,16 @@ textarea {
 	color: var(--vscode-input-foreground);
 	border: none;
 	outline: none;
-	padding: 0 6px;
-	font-family: inherit;
-	font-size: 1.05em;
-	line-height: 1.5;
+	padding: 2px 4px;
+	font-family: var(--vscode-font-family);
+	font-size: var(--vscode-font-size);
+	font-weight: 400;
+	line-height: 1.45;
 	width: 100%;
 	box-sizing: border-box;
-	min-height: 44px;
+	min-height: calc(var(--vscode-font-size) * 1.45 + 6px);
 	max-height: 180px;
-	opacity: 0.9;
+	opacity: 0.95;
 }
 textarea::placeholder {
 	color: var(--vscode-input-placeholderForeground);
@@ -684,10 +812,11 @@ textarea::placeholder {
 .composer-bar {
 	display: flex;
 	align-items: center;
-	gap: 8px;
+	gap: 6px;
 	flex-wrap: nowrap;
 	min-width: 0;
-	min-height: 28px;
+	min-height: 24px;
+	padding: 0 2px 1px;
 }
 .spacer {
 	flex: 1;
@@ -698,26 +827,31 @@ textarea::placeholder {
 	background: transparent;
 	color: var(--vscode-foreground);
 	border: none;
-	border-radius: 7px;
+	border-radius: 8px;
 	cursor: pointer;
 	font-family: inherit;
-	font-size: 0.86em;
+	font-size: 0.92em;
+	font-weight: 400;
 	padding: 0 4px;
 	display: inline-flex;
 	align-items: center;
 	justify-content: center;
 	gap: 6px;
 	white-space: nowrap;
-	height: 26px;
+	height: 24px;
 	box-sizing: border-box;
-	opacity: 0.62;
+	opacity: 0.7;
 }
 .icon-btn {
-	width: 26px;
+	width: 24px;
 	padding: 0;
-	font-size: 16px;
 	line-height: 1;
 	flex-shrink: 0;
+}
+.icon-btn svg {
+	width: 14px;
+	height: 14px;
+	display: block;
 }
 .chip {
 	flex: 0 1 auto;
@@ -740,9 +874,15 @@ textarea::placeholder {
 	min-width: 0;
 }
 .chip-icon {
-	font-size: 11px;
+	display: inline-flex;
+	align-items: center;
 	opacity: 0.76;
 	flex-shrink: 0;
+}
+.chip-icon svg {
+	width: 12px;
+	height: 12px;
+	display: block;
 }
 .model-chip {
 	max-width: 160px;
@@ -773,28 +913,41 @@ textarea::placeholder {
 	border-radius: 2px 2px 0 0;
 	box-sizing: border-box;
 }
-.context-glyph {
-	display: inline-flex;
-	align-items: center;
-	justify-content: center;
-	width: 15px;
-	height: 19px;
-	border: 1px solid currentColor;
-	border-radius: 3px;
-	font-size: 10px;
-	transform: skew(-7deg);
-}
 .activity {
-	width: 17px;
-	height: 17px;
-	flex: 0 0 17px;
+	width: 14px;
+	height: 14px;
+	flex: 0 0 14px;
 	box-sizing: border-box;
-	border: 3px solid color-mix(in srgb, var(--vscode-foreground) 25%, transparent);
-	border-right-color: color-mix(in srgb, var(--vscode-foreground) 70%, transparent);
-	border-radius: 50%;
-	opacity: 0.72;
+	display: inline-flex;
+	opacity: 0.85;
 }
-.activity.running {
+.activity svg {
+	width: 14px;
+	height: 14px;
+	display: block;
+	transform: rotate(-90deg);
+}
+.activity-track {
+	fill: none;
+	stroke: color-mix(in srgb, var(--vscode-foreground) 18%, transparent);
+	stroke-width: 2.5;
+}
+.activity-fill {
+	fill: none;
+	stroke: var(--vscode-charts-blue, var(--vscode-button-background, #0a7cff));
+	stroke-width: 2.5;
+	stroke-linecap: round;
+	stroke-dasharray: 37.7;
+	stroke-dashoffset: 37.7;
+	transition: stroke-dashoffset 0.3s ease, stroke 0.2s ease;
+}
+.activity.warn .activity-fill {
+	stroke: var(--vscode-charts-yellow, #cca700);
+}
+.activity.crit .activity-fill {
+	stroke: var(--vscode-errorForeground, #f14c4c);
+}
+.activity.running svg {
 	animation: composer-spin 0.9s linear infinite;
 }
 @keyframes composer-spin {
@@ -804,39 +957,32 @@ textarea::placeholder {
 	opacity: 0.55;
 	cursor: not-allowed;
 }
-.microphone::before {
-	content: "";
-	display: block;
-	width: 16px;
-	height: 16px;
-	background: currentColor;
-	-webkit-mask-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><rect x='9' y='2' width='6' height='12' rx='3'/><path d='M5 10a7 7 0 0 0 14 0'/><line x1='12' y1='19' x2='12' y2='22'/></svg>");
-	mask-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><rect x='9' y='2' width='6' height='12' rx='3'/><path d='M5 10a7 7 0 0 0 14 0'/><line x1='12' y1='19' x2='12' y2='22'/></svg>");
-	-webkit-mask-size: contain;
-	mask-size: contain;
-	-webkit-mask-repeat: no-repeat;
-	mask-repeat: no-repeat;
-}
 .send-btn {
-	width: 38px;
-	height: 38px;
+	width: 30px;
+	height: 30px;
 	flex-shrink: 0;
 	border-radius: 50%;
 	border: none;
 	cursor: pointer;
 	background: var(--vscode-button-background, #0a7cff);
 	color: var(--vscode-button-foreground, #fff);
-	font-size: 18px;
-	font-weight: 300;
 	line-height: 1;
 	display: inline-flex;
 	align-items: center;
 	justify-content: center;
 }
+.send-btn svg {
+	width: 15px;
+	height: 15px;
+	display: block;
+}
 .send-btn.stop {
 	background: var(--vscode-errorForeground, #f14c4c);
 	color: #fff;
-	font-size: 0.6em;
+}
+.send-btn.stop svg {
+	width: 11px;
+	height: 11px;
 }
 .send-btn:disabled {
 	opacity: 0.5;

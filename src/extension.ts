@@ -11,7 +11,7 @@ import { initLog, log } from "./log";
 import { refreshUserConfig, saveUserConfig, seedUserConfig, setUserConfigSavedListener, userConfigDir } from "./userConfig";
 import { SettingsSync, deviceName, getDeviceId } from "./settingsSync";
 import { loadSuite, runSuite, writeReport } from "./evals";
-import { appendEvent, clearEvents, insertApiCall, insertRun, insertTranscript, insertUsage, kvGet, kvSet, listEvents, listRuns, listSessions, listTranscripts, latestSession, openStore, refreshStore, migrateLegacyStore, setStorageDir, setWasmDir, storeError } from "./store";
+import { appendEvent, clearEvents, insertApiCall, insertRun, insertTranscript, insertUsage, kvGet, kvSet, listEvents, listRuns, listSessions, listTranscripts, openStore, refreshStore, migrateLegacyStore, setStorageDir, setWasmDir, storeError } from "./store";
 import { RunLock, type SessionDeps } from "./ui/sessionController";
 import { RunComments } from "./ui/comments";
 import { DiffReview, ORIGINAL_SCHEME } from "./ui/diffReview";
@@ -30,8 +30,7 @@ const HISTORY_KEY = "kronyx.history";
 const KNOWN_MODEL_KEY = "kronyx.knownModel";
 let pendingGate: string | undefined; // prior model to restore if a gated eval run fails
 let syncWorker: UsageSync | undefined; // usage sync worker (set in activate)
-let sidebarController: SessionController | undefined; // the canonical right-sidebar session
-let rightController: SessionController | undefined; // the session in the dedicated right window
+let rightController: SessionController | undefined; // the session in the dedicated right sidebar view
 let gateSuppressed = false; // set briefly while reverting modelId
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -41,8 +40,8 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
  * editor tab only if no session view can be resolved. */
 async function sessionSurface(context: vscode.ExtensionContext, deps: SessionDeps, newTabName?: string): Promise<SessionController> {
 	void vscode.commands.executeCommand(`${RunViewProvider.rightViewId}.focus`);
-	for (let i = 0; i < 50 && !(rightController ?? sidebarController); i++) await sleep(100);
-	return rightController ?? sidebarController ?? openSessionPanel(context, deps, newTabName);
+	for (let i = 0; i < 50 && !rightController; i++) await sleep(100);
+	return rightController ?? openSessionPanel(context, deps, newTabName);
 }
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -160,7 +159,7 @@ export function activate(context: vscode.ExtensionContext): void {
 				if (root) void openStore(root).then((d) => insertRun(d, entry, root));
 			});
 		},
-		isSidebar: (controller) => controller === sidebarController || controller === rightController,
+		isSidebar: (controller) => controller === rightController,
 		recordUsage: (entry) => {
 			void storeRoot.then((root) => {
 				if (root) void openStore(root).then((d) => insertUsage(d, entry, root));
@@ -432,8 +431,8 @@ export function activate(context: vscode.ExtensionContext): void {
 		registerSessionSerializer(context, deps),
 		// Devin-style Agents sidebar: live sessions + recent runs with cloud links.
 		vscode.window.registerWebviewViewProvider(AgentsView.viewId, new AgentsView(deps)),
-		// Session webview provider — registered for both the left activity-bar view and the dedicated right-sidebar container.
-		...["kronyx.sessionView", RunViewProvider.rightViewId].map((viewId) =>
+		// Session webview provider — the dedicated right-sidebar container.
+		...[RunViewProvider.rightViewId].map((viewId) =>
 			vscode.window.registerWebviewViewProvider(viewId, {
 				resolveWebviewView(view) {
 					const mediaUri = vscode.Uri.joinPath(context.extensionUri, "media");
@@ -441,15 +440,10 @@ export function activate(context: vscode.ExtensionContext): void {
 					view.webview.html = renderPage(view.webview, context.extensionUri);
 					const surface = new RunViewProvider(context.extensionUri);
 					void (async () => {
-						const root = await storeRoot;
-						const d = root ? await openStore(root) : undefined;
-						const name =
-							(viewId === "kronyx.sessionView" ? root && latestSession(d, root) : undefined) ??
-							(viewId === "kronyx.sessionView" ? "Side Session" : deps.tabState?.get().last ?? "Kronyx Local Session");
+						const name = deps.tabState?.get().last ?? "Kronyx Local Session";
 						const controller = new SessionController(name, surface, deps);
 						log("view", `${viewId} resolved — session "${name}"`);
-						if (viewId === "kronyx.sessionView") sidebarController = controller;
-						else rightController = controller;
+						rightController = controller;
 						view.webview.onDidReceiveMessage((m) => {
 							log("ui", `${viewId} message: ${(m as { type?: string }).type ?? typeof m}`);
 							void controller.handle(m);
@@ -464,7 +458,6 @@ export function activate(context: vscode.ExtensionContext): void {
 						output.appendLine(`[store] ${viewId} resolved session "${name}"`);
 						view.onDidDispose(() => {
 							deps.surfaces.delete(surface);
-							if (sidebarController === controller) sidebarController = undefined;
 							if (rightController === controller) rightController = undefined;
 							void controller.handle({ type: "stop" });
 						});

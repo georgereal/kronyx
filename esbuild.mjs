@@ -25,6 +25,16 @@ const sessionViewShims = {
 		build.onResolve({ filter: /^@\/lib\/api$/ }, () => ({ path: path.join(shimDir, "kronyxApi.ts") }));
 		build.onResolve({ filter: /^@\/lib\/firebase$/ }, () => ({ path: path.join(shimDir, "firebaseStub.ts") }));
 		build.onResolve({ filter: /^firebase\// }, () => ({ path: path.join(shimDir, "firebaseStub.ts") }));
+		// Pin react to web/node_modules — the entry lives in src/, so default
+		// resolution can walk into a PARENT dir's node_modules and bundle a
+		// second React copy (null dispatcher → "reading 'useState'" crash).
+		build.onResolve({ filter: /^react(-dom)?(\/.*)?$/ }, (args) => {
+			const target = path.join(webRoot, "node_modules", args.path);
+			for (const cand of [target, `${target}.js`, `${target}.ts`, `${target}/index.js`, `${target}/client.js`]) {
+				if (existsSync(cand) && statSync(cand).isFile()) return { path: cand };
+			}
+			return { path: target };
+		});
 		// "@/x" → "web/x" (web/tsconfig paths: "@/*" -> "./*"); plugin-returned
 		// paths don't get extension resolution, so probe for the real file.
 		build.onResolve({ filter: /^@\// }, (args) => {
@@ -59,7 +69,6 @@ const sessionCtx = await esbuild.context({
 	entryPoints: ["src/sessionView/sessionViewEntry.tsx"],
 	bundle: true,
 	format: "iife",
-	globalName: "KronyxSession",
 	platform: "browser",
 	target: "es2022",
 	outfile: "media/sessionPage.js",

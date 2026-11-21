@@ -45,11 +45,6 @@
 					"id": "kronyx.agentsView",
 					"name": "Agents",
 					"type": "webview"
-				},
-				{
-					"id": "kronyx.sessionView",
-					"name": "Session",
-					"type": "webview"
 				}
 			],
 			"kronyx-right": [
@@ -265,54 +260,54 @@
 			"view/title": [
 				{
 					"command": "kronyx.openAgents",
-					"when": "view == kronyx.sessionView || view == kronyx.runViewRight || view == kronyx.agentsView",
+					"when": "view == kronyx.runViewRight || view == kronyx.agentsView",
 					"group": "navigation@0"
 				},
 				{
 					"command": "kronyx.newSession",
-					"when": "view == kronyx.sessionView || view == kronyx.runViewRight",
+					"when": "view == kronyx.runViewRight",
 					"group": "navigation@1"
 				},
 				{
 					"command": "kronyx.showHistory",
-					"when": "view == kronyx.sessionView || view == kronyx.runViewRight",
+					"when": "view == kronyx.runViewRight",
 					"group": "navigation@2"
 				},
 				{
 					"command": "kronyx.showUsage",
-					"when": "view == kronyx.sessionView || view == kronyx.runViewRight",
+					"when": "view == kronyx.runViewRight",
 					"group": "navigation@3"
 				},
 				{
 					"command": "kronyx.newCloudSession",
-					"when": "(view == kronyx.sessionView || view == kronyx.runViewRight)",
+					"when": "(view == kronyx.runViewRight)",
 					"group": "navigation@4"
 				},
 				{
 					"command": "kronyx.signIn",
-					"when": "(view == kronyx.sessionView || view == kronyx.runViewRight) && !kronyx.signedIn",
+					"when": "(view == kronyx.runViewRight) && !kronyx.signedIn",
 					"group": "navigation@5"
 				},
 				{
 					"command": "kronyx.account",
-					"when": "(view == kronyx.sessionView || view == kronyx.runViewRight) && kronyx.signedIn",
+					"when": "(view == kronyx.runViewRight) && kronyx.signedIn",
 					"group": "navigation@5"
 				},
 				{
 					"command": "kronyx.newTask",
-					"when": "view == kronyx.sessionView || view == kronyx.runViewRight"
+					"when": "view == kronyx.runViewRight"
 				},
 				{
 					"command": "kronyx.reviewChanges",
-					"when": "view == kronyx.sessionView || view == kronyx.runViewRight"
+					"when": "view == kronyx.runViewRight"
 				},
 				{
 					"command": "kronyx.openSettingsPage",
-					"when": "view == kronyx.sessionView || view == kronyx.runViewRight"
+					"when": "view == kronyx.runViewRight"
 				},
 				{
 					"command": "kronyx.openSettings",
-					"when": "view == kronyx.sessionView || view == kronyx.runViewRight"
+					"when": "view == kronyx.runViewRight"
 				}
 			]
 		},

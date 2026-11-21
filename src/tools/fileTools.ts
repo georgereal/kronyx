@@ -2,6 +2,7 @@ import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import type { AgentTool } from "@cline/shared";
 import { computeHunks, formatHunks } from "../diff/hunks";
+import { isRunSummaryFact } from "../agent/taskGuard";
 import { adaptIndentation, findMatches, lineNumberAt, mostSimilarRegion } from "./matching";
 import { IGNORED_DIRS, WorkspaceGuard } from "./workspace";
 
@@ -368,6 +369,9 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 		},
 		async execute(input) {
 			if (!options.onMemoryFact) return "Memory is unavailable in this environment.";
+			if (isRunSummaryFact(String(input.fact ?? ""))) {
+				return "Not recorded — that reads as a run/task summary, not a durable project fact. Save build/test commands, conventions, or gotchas instead.";
+			}
 			await options.onMemoryFact(input.fact);
 			return "Fact recorded.";
 		},

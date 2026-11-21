@@ -78,20 +78,18 @@ export async function signIn(context: vscode.ExtensionContext): Promise<KronyxUs
 		void vscode.window.showErrorMessage("Kronyx: set kronyx.sync.endpoint first (the web app URL).");
 		return undefined;
 	}
+	// Open /connect directly — same account as the web (Firebase). The page mints
+	// a krx_ key labeled per-device and deep-links it back via handleAuthUri.
+	// For web/remote where the deep link can't reach this IDE, the user can paste
+	// the key via the non-blocking notification below.
+	const { getDeviceId, deviceName } = await import("./settingsSync");
+	const device = await getDeviceId(context).catch(() => "");
+	const qs = device ? `?device=${encodeURIComponent(device)}&name=${encodeURIComponent(deviceName())}` : "";
+	await vscode.env.openExternal(vscode.Uri.parse(`${base}/connect${qs}`));
 	const pick = await vscode.window.showInformationMessage(
-		"Sign in on the Kronyx dashboard to connect this editor.",
-		"Open dashboard",
+		"Kronyx: finish sign-in in the browser — or paste an API key if the link can't reach this editor.",
 		"Paste API key",
 	);
-	if (pick === "Open dashboard") {
-		// Same account as the web (Firebase) — /connect mints a krx_ key labeled
-		// per-device, replaces this editor's previous key, and deep-links it back.
-		const { getDeviceId, deviceName } = await import("./settingsSync");
-		const device = await getDeviceId(context).catch(() => "");
-		const qs = device ? `?device=${encodeURIComponent(device)}&name=${encodeURIComponent(deviceName())}` : "";
-		await vscode.env.openExternal(vscode.Uri.parse(`${base}/connect${qs}`));
-		return undefined; // completes asynchronously via handleAuthUri
-	}
 	if (pick !== "Paste API key") return undefined;
 	const key = await vscode.window.showInputBox({
 		title: "Kronyx: API key",
