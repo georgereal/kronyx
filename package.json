@@ -550,7 +550,7 @@
 				},
 				"kronyx.sync.enabled": {
 					"type": "boolean",
-					"default": false,
+					"default": true,
 					"description": "Upload usage records to the Kronyx dashboard when signed in."
 				},
 				"kronyx.sync.providerKeys": {
@@ -603,6 +603,7 @@
 		"diff": "9.0.0",
 		"e2b": "^2.62.0",
 		"gpt-tokenizer": "4.1.0",
+		"highlight.js": "11.12.0",
 		"sql.js": "^1.15.2"
 	},
 	"keywords": [

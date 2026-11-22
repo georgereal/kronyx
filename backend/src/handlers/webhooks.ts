@@ -42,12 +42,18 @@ export async function enqueueSessionRun(
 ): Promise<string> {
 	const runId = `web-${randomUUID()}`;
 	const now = new Date();
+	// Webhook runs continue the session with its last explicit composer pick; no pick → the worker refuses to run.
+	const selection = await db.collection("sessions").findOne({ uid: opts.uid, sessionId: opts.sessionId }, { projection: { modelId: 1, profile: 1 } });
+	const modelId = (selection?.modelId as string | undefined) ?? null;
+	const profile = (selection?.profile as string | undefined) ?? null;
 	await db.collection("runs").insertOne({
 		uid: opts.uid,
 		runId,
 		sessionId: opts.sessionId,
 		task: opts.task,
 		mode: opts.mode,
+		modelId,
+		profile,
 		status: "queued",
 		at: now.getTime(),
 		createdAt: now,
@@ -60,6 +66,8 @@ export async function enqueueSessionRun(
 		runId,
 		task: opts.task,
 		mode: opts.mode,
+		modelId,
+		profile,
 		kind: opts.kind ?? "run",
 		status: "queued",
 		createdAt: now,

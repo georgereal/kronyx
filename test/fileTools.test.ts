@@ -73,6 +73,24 @@ describe("write_file and append_file", () => {
 	});
 });
 
+describe("file-changed diff payload", () => {
+	it("carries numbered context lines and +/- counts for an edit", async () => {
+		const stats: { added: number; removed: number; diff: string }[] = [];
+		const withStats = new Map(
+			createFileTools({ root, onFileChanged: (_abs, _kind, s) => s && stats.push(s) }).map((t) => [t.name, t]),
+		);
+		await withStats.get("edit_file")!.execute(
+			{ path: "a.ts", edits: [{ old_text: "return a + b;", new_text: "return a - b;" }] },
+			ctx,
+		);
+		expect(stats).toHaveLength(1);
+		expect(stats[0]).toMatchObject({ added: 1, removed: 1 });
+		expect(stats[0].diff).toContain("@@ -1,3 +1,3 @@");
+		expect(stats[0].diff).toContain("-  return a + b;");
+		expect(stats[0].diff).toContain("+  return a - b;");
+	});
+});
+
 describe("edit_file", () => {
 	it("applies exact edits", async () => {
 		await run("edit_file", { path: "a.ts", edits: [{ old_text: "return a + b;", new_text: "return a - b;" }] });

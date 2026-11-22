@@ -41,16 +41,26 @@ export class UsageSync implements vscode.Disposable {
 	}
 
 	enabled(): boolean {
-		return vscode.workspace.getConfiguration("kronyx").get<boolean>("sync.enabled", false);
+		return vscode.workspace.getConfiguration("kronyx").get<boolean>("sync.enabled", true);
+	}
+
+	/** Log each distinct skip reason once instead of every minute. */
+	private skipLogged = "";
+	private skip(reason: string): void {
+		if (this.skipLogged !== reason) {
+			this.skipLogged = reason;
+			log("sync", `flush skipped: ${reason}`);
+		}
 	}
 
 	async flush(): Promise<void> {
-		if (this.flushing || !this.enabled()) return;
+		if (this.flushing || !this.enabled()) return this.skip(this.enabled() ? "already flushing" : "kronyx.sync.enabled is off");
 		if (Date.now() < this.nextAttemptAt) return;
 		const endpoint = webAppUrl();
-		if (!endpoint) return;
+		if (!endpoint) return this.skip("no web endpoint configured");
 		const key = await apiKey(this.context);
-		if (!key) return;
+		if (!key) return this.skip("not signed in (no API key)");
+		this.skipLogged = "";
 		this.flushing = true;
 		try {
 			const d = await this.getStore();

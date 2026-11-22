@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { apiKey, webAppUrl } from "../auth";
-import { writeProviderValue } from "../config";
+import { currentSelection, pickModel, type ModelOption } from "../config";
 import { listCloudSessions, createCloudSession, sendTask, workspaceRepo } from "../cloud/api";
 import { openCloudSessionPanel, revealSession } from "./sessionPanel";
 import type { SessionDeps } from "./sessionController";
@@ -12,6 +12,7 @@ interface AgentsMsg {
 	type: string;
 	task?: string;
 	modelId?: string;
+	profile?: string;
 	name?: string;
 	sessionId?: string;
 	runId?: string;
@@ -54,7 +55,7 @@ export function openAgentsPanel(context: vscode.ExtensionContext, deps: SessionD
 	if (agentsPanel) {
 		agentsPanel.reveal();
 		void pushState(agentsPanel.webview, context, deps);
-		if (selectSession) void select(agentsPanel.webview, context, selectSession);
+		if (selectSession) void select(agentsPanel.webview, context, deps, selectSession);
 		return;
 	}
 
@@ -80,7 +81,7 @@ export function openAgentsPanel(context: vscode.ExtensionContext, deps: SessionD
 	panel.webview.onDidReceiveMessage((m: AgentsMsg) => void onMessage(context, deps, panel.webview, m));
 	refreshTimer = setInterval(() => void pushState(panel.webview, context, deps), 5000);
 	void pushState(panel.webview, context, deps);
-	if (selectSession) void select(panel.webview, context, selectSession);
+	if (selectSession) void select(panel.webview, context, deps, selectSession);
 
 	panel.onDidChangeViewState((e) => {
 		if (e.webviewPanel.visible) {
@@ -109,8 +110,8 @@ export function disposeAgentsPanel(): void {
 
 /** Select a session: backend UUID → mount the bundled view; otherwise match a
  *  backend session by title; legacy "Cloud N" name → reveal its tab. */
-async function select(webview: vscode.Webview, context: vscode.ExtensionContext, name: string): Promise<void> {
-	if (/^[0-9a-f]{8}-[0-9a-f-]{20,}$/i.test(name)) return mountSession(webview, context, name);
+async function select(webview: vscode.Webview, context: vscode.ExtensionContext, deps: SessionDeps, name: string): Promise<void> {
+	if (/^[0-9a-f]{8}-[0-9a-f-]{20,}$/i.test(name)) return mountSession(webview, context, deps, name);
 	// Agents sidebar passes local session names, but the backend may have a
 	// session with the same title — mount it instead of opening the local tab.
 	const key = await apiKey(context);
@@ -118,7 +119,7 @@ async function select(webview: vscode.Webview, context: vscode.ExtensionContext,
 	if (key && endpoint) {
 		try {
 			const match = (await listCloudSessions(endpoint, key)).find((s) => s.title === name || s.sessionId === name);
-			if (match) return mountSession(webview, context, match.sessionId);
+			if (match) return mountSession(webview, context, deps, match.sessionId);
 		} catch { /* fall through to local reveal */ }
 	}
 	revealSession(name);
@@ -126,16 +127,32 @@ async function select(webview: vscode.Webview, context: vscode.ExtensionContext,
 
 /** Tell the webview to mount the bundled web session page (sessionId), or the
  *  web's new-session page when no sessionId is given. */
-async function mountSession(webview: vscode.Webview, context: vscode.ExtensionContext, sessionId?: string): Promise<void> {
+async function mountSession(webview: vscode.Webview, context: vscode.ExtensionContext, deps: SessionDeps, sessionId?: string): Promise<void> {
 	const key = await apiKey(context);
 	const endpoint = apiEndpoint();
 	if (!key || !endpoint) {
 		if (sessionId) void webview.postMessage({ type: "error", text: "Not connected to the Kronyx backend — check sign-in and endpoints." });
 		return;
 	}
-	const modelId = vscode.workspace.getConfiguration("kronyx").get<string>("provider.modelId") ?? "";
-	void webview.postMessage({ type: sessionId ? "mountSession" : "showNew", sessionId, token: key, apiBase: endpoint, webBase: webAppUrl(), modelId });
+	const selection = currentSelection();
+	const modelId = selection?.modelId ?? "";
+	const modelProfile = selection?.profile ?? "";
+	// Seed local BYOK provider catalogs so the embedded composer's provider
+	// filter works even when backend settings sync hasn't pushed profiles yet.
+	const groups = (deps.viewState.groups ?? []).map((g) => ({
+		profile: g.profile,
+		active: g.active,
+		models: g.models.map(pickerOption),
+	}));
+	void webview.postMessage({ type: sessionId ? "mountSession" : "showNew", sessionId, token: key, apiBase: endpoint, webBase: webAppUrl(), modelId, modelProfile, groups });
 }
+
+const perMtok = (v?: number) => (v === undefined ? "?" : `$${(v * 1e6).toFixed(v * 1e6 < 1 ? 2 : 1)}`);
+const pickerOption = (m: ModelOption) => ({
+	id: m.id,
+	label: m.label ?? m.id,
+	hint: m.pricing && (m.pricing.input !== undefined || m.pricing.output !== undefined) ? ` · ${perMtok(m.pricing.input)}/${perMtok(m.pricing.output)} per Mtok` : "",
+});
 
 async function pushState(webview: vscode.Webview, context: vscode.ExtensionContext, deps: SessionDeps): Promise<void> {
 	const key = await apiKey(context);
@@ -160,8 +177,10 @@ async function pushState(webview: vscode.Webview, context: vscode.ExtensionConte
 		signedIn: !!(key && endpoint),
 		backendError,
 		sessions,
-		modelId: deps.viewState.modelId,
-		models: deps.viewState.models.map((m) => ({ id: m.id, label: m.label ?? m.id })),
+		modelId: currentSelection()?.modelId ?? "",
+		modelProfile: currentSelection()?.profile ?? "",
+		models: deps.viewState.models.map(pickerOption),
+		groups: (deps.viewState.groups ?? []).map((g) => ({ profile: g.profile, active: g.active, models: g.models.map(pickerOption) })),
 		workspace: vscode.workspace.workspaceFolders?.[0]?.name ?? "",
 	});
 }
@@ -202,15 +221,15 @@ async function onMessage(
 				void webview.postMessage({ type: "error", text: "No GitHub origin remote found in this workspace." });
 				return;
 			}
+			const pick = { modelId: String(m.modelId ?? ""), profile: String(m.profile ?? "") };
+			if (!pick.modelId || !pick.profile) {
+				void webview.postMessage({ type: "error", text: "Pick a model and its provider before starting a cloud agent." });
+				return;
+			}
 			try {
-				const sessionId = await createCloudSession(endpoint, key, {
-					repo,
-					title: task,
-					mode: "agent",
-					modelId: deps.viewState.modelId || undefined,
-				});
-				await sendTask(endpoint, key, sessionId, task);
-				void mountSession(webview, context, sessionId);
+				const sessionId = await createCloudSession(endpoint, key, { repo, title: task, mode: "agent", ...pick });
+				await sendTask(endpoint, key, sessionId, task, pick);
+				void mountSession(webview, context, deps, sessionId);
 				setTimeout(() => void pushState(webview, context, deps), 1500);
 			} catch (e) {
 				void webview.postMessage({ type: "error", text: e instanceof Error ? e.message : String(e) });
@@ -221,7 +240,7 @@ async function onMessage(
 		case "open": {
 			// Backend session → mount the bundled session view in the right pane.
 			if (m.sessionId) {
-				void mountSession(webview, context, m.sessionId);
+				void mountSession(webview, context, deps, m.sessionId);
 				return;
 			}
 			// Legacy local-store session → reveal its tab / dashboard.
@@ -244,7 +263,7 @@ async function onMessage(
 			return;
 
 		case "newPage":
-			return mountSession(webview, context);
+			return mountSession(webview, context, deps);
 
 		case "nav":
 		case "openExternal": {
@@ -254,8 +273,8 @@ async function onMessage(
 			if (!raw) return;
 			const path = raw.startsWith(webAppUrl()) ? raw.slice(webAppUrl().length) : raw;
 			const route = path.match(/^\/sessions\/([0-9a-f-]{36})\/?$/i);
-			if (route) return mountSession(webview, context, route[1]);
-			if (/^\/sessions\/?$/.test(path)) return mountSession(webview, context);
+			if (route) return mountSession(webview, context, deps, route[1]);
+			if (/^\/sessions\/?$/.test(path)) return mountSession(webview, context, deps);
 			const url = /^https?:/i.test(raw) ? raw : `${webAppUrl()}${raw.startsWith("/") ? raw : `/${raw}`}`;
 			void vscode.env.openExternal(vscode.Uri.parse(url));
 			return;
@@ -263,9 +282,9 @@ async function onMessage(
 
 		case "setModel": {
 			const id = String(m.modelId ?? "");
-			if (!id) return;
-			await vscode.workspace.getConfiguration("kronyx").update("provider.modelId", id, vscode.ConfigurationTarget.Global);
-			void writeProviderValue("provider.modelId", id);
+			const profile = String(m.profile ?? "");
+			if (!id || !profile) return;
+			await pickModel(id, profile);
 			deps.viewState.modelId = id;
 			return pushState(webview, context, deps);
 		}
@@ -442,6 +461,7 @@ body {
 	border: 1px solid var(--vscode-dropdown-border, #555);
 	border-radius: 6px; padding: 4px 8px; font-size: 12px; font-family: inherit;
 }
+#providerSelect { flex: none; max-width: 150px; }
 .workspace-label { font-size: 11.5px; color: var(--vscode-descriptionForeground); flex: none; }
 .send-btn {
 	width: 32px; height: 32px; border-radius: 50%; border: none; cursor: pointer;
@@ -545,6 +565,7 @@ body.session-on .composer-bar { margin-top: 6px; }
 		<div class="composer" id="composer">
 			<textarea id="taskInput" placeholder="Describe the task for the cloud agent…"></textarea>
 			<div class="composer-bar">
+				<select id="providerSelect" title="Provider — decides which endpoint and billing the run uses"></select>
 				<select id="modelSelect"></select>
 				<span class="workspace-label" id="workspaceLabel"></span>
 				<button class="send-btn" id="sendBtn" title="Run (⌘Enter)">↑</button>
@@ -564,7 +585,7 @@ const vscode = acquireVsCodeApi();
 // Injected BEFORE sessionPage.js loads — the bundle uses this for nav links
 // (next/link shim) instead of calling acquireVsCodeApi itself (one-shot API).
 window.__kronyxPost = (m) => vscode.postMessage(m);
-let st = { signedIn: false, backendError: "", sessions: [], modelId: "", models: [], workspace: "" };
+let st = { signedIn: false, backendError: "", sessions: [], modelId: "", modelProfile: "", models: [], groups: [], workspace: "" };
 let pendingMount = null;
 let activeId = "";
 
@@ -573,7 +594,7 @@ function tryMount() {
 	const cfg = pendingMount;
 	pendingMount = null;
 	try {
-		const args = { token: cfg.token, apiBase: cfg.apiBase, webBase: cfg.webBase, modelId: cfg.modelId };
+		const args = { token: cfg.token, apiBase: cfg.apiBase, webBase: cfg.webBase, modelId: cfg.modelId, modelProfile: cfg.modelProfile, groups: cfg.groups };
 		if (cfg.type === "showNew") window.KronyxSession.showNew(args);
 		else window.KronyxSession.mount({ ...args, sessionId: cfg.sessionId });
 		activeId = cfg.sessionId || "";
@@ -624,16 +645,18 @@ function renderRail() {
 }
 
 function renderModels() {
-	const sel = $("modelSelect");
+	const prov = $("providerSelect"), sel = $("modelSelect");
+	const option = (value, text) => { const o = document.createElement("option"); o.value = value; o.textContent = text; return o; };
+	const groups = st.groups.length ? st.groups : [{ profile: "", active: true, models: st.models }];
+	const profile = groups.some((g) => g.profile === st.modelProfile) ? st.modelProfile : (groups.find((g) => g.active) || groups[0]).profile;
+	const models = (groups.find((g) => g.profile === profile) || groups[0]).models;
 	const cur = sel.value || st.modelId;
+	prov.innerHTML = "";
+	for (const g of groups) prov.appendChild(option(g.profile, g.profile + (g.active ? " · active" : "")));
+	prov.value = profile;
 	sel.innerHTML = "";
-	for (const m of st.models) {
-		const o = document.createElement("option");
-		o.value = m.id;
-		o.textContent = m.label || m.id;
-		sel.appendChild(o);
-	}
-	if (cur) sel.value = cur;
+	for (const m of models) sel.appendChild(option(m.id, (m.label || m.id) + (m.hint || "")));
+	if (models.some((m) => m.id === cur)) sel.value = cur;
 }
 
 function render() {
@@ -655,12 +678,16 @@ $("newBtn").onclick = () => vscode.postMessage({ type: "newPage" });
 function submit() {
 	const task = $("taskInput").value.trim();
 	if (!task) return;
-	vscode.postMessage({ type: "start", task });
+	vscode.postMessage({ type: "start", task, modelId: $("modelSelect").value, profile: $("providerSelect").value });
 	$("taskInput").value = "";
 }
 $("sendBtn").onclick = submit;
 $("taskInput").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) submit(); });
-$("modelSelect").onchange = () => vscode.postMessage({ type: "setModel", modelId: $("modelSelect").value });
+$("providerSelect").onchange = () => {
+	const g = st.groups.find((x) => x.profile === $("providerSelect").value);
+	if (g && g.models.length) vscode.postMessage({ type: "setModel", modelId: g.models[0].id, profile: g.profile });
+};
+$("modelSelect").onchange = () => vscode.postMessage({ type: "setModel", modelId: $("modelSelect").value, profile: $("providerSelect").value });
 
 window.addEventListener("message", (e) => {
 	const msg = e.data;

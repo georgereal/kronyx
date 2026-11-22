@@ -87,6 +87,7 @@ export class SettingsSync implements vscode.Disposable {
 						modelId: uc.modelId,
 						profiles: uc.profiles,
 						activeProfile: uc.activeProfile,
+						embeddingModel: vscode.workspace.getConfiguration("kronyx").get<string>("memory.embeddingModel", "") || undefined,
 						permissions: { ...(await readGlobalPermissions()), modes: await readGlobalModePermissions() },
 					},
 					...(Object.keys(p.secrets as object).length ? { secrets: p.secrets } : {}),

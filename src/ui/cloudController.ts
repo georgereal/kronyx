@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { AgentRunner, type AgentMode, type ProviderSettings } from "../agent/runner";
-import { estimateCostUsd, modelPricing, providerErrorMessage, resolveProvider, writeProviderValue } from "../config";
+import { estimateCostUsd, modelPricing, pickModel, providerErrorMessage, resolveProvider } from "../config";
 import { insertPr, insertSandboxEvent, kvGet, kvSet, openStore } from "../store";
 import { deviceName, getDeviceId } from "../settingsSync";
 import { E2bSandbox, e2bApiKey, openPr } from "./e2b";
@@ -168,10 +168,7 @@ export class CloudController {
 				this.deps.modeRef.current = message.mode;
 				break;
 			case "setModel":
-				await vscode.workspace
-					.getConfiguration("kronyx")
-					.update("provider.modelId", message.modelId, vscode.ConfigurationTarget.Global);
-				void writeProviderValue("provider.modelId", message.modelId);
+				if (message.modelId && message.profile) await pickModel(message.modelId, message.profile);
 				break;
 			case "openSettings":
 				await vscode.commands.executeCommand("kronyx.openSettingsPage");
@@ -238,6 +235,7 @@ export class CloudController {
 				iteration: typeof event.iteration === "number" ? event.iteration : undefined,
 				contextMsgs: typeof event.contextMsgs === "number" ? event.contextMsgs : undefined,
 				durationMs: this.lastUsageAt ? now - this.lastUsageAt : now - this.runStartedAt,
+				runId: this.currentRunId,
 			});
 			this.lastUsageAt = now;
 			return;
@@ -257,6 +255,7 @@ export class CloudController {
 				tokensIn: 0,
 				tokensOut: 0,
 				durationMs: Date.now() - (this.lastUsageAt || this.runStartedAt),
+				runId: this.currentRunId,
 			});
 		}
 	}

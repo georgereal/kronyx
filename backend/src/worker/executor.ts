@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import type { Db } from "mongodb";
 import { dbg, swallow } from "../lib/log";
 import { AgentRunner, type AgentMode, type ProviderSettings, type RunnerAttachment, type RunViewEvent } from "../../../src/agent/runner";
-import { acceptsImages, describeImages, pickVisionModel } from "../../../src/agent/vision";
+import { acceptsImages } from "../../../src/agent/vision";
 import { deriveMessages, type KronyxEvent } from "../../../src/agent/events";
 import { getProvider, type ProviderCreds, type SandboxHandle, type SandboxProvider } from "../../../src/sandbox/provider";
 import { SandboxCore, openPr } from "../../../src/sandbox/sandboxCore";
@@ -1241,42 +1241,11 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		return atts.map((a) => ({ filename: a.filename, mediaType: a.mime, data: a.data }));
 	}
 
-	/**
-	 * Vision fallback: the coding model can't view images and attachments
-	 * include some — ask the user (approval card) to describe them with a
-	 * cheap vision-capable model, then inject the description as text.
-	 * Returns the description block, or undefined (capable model / no vision
-	 * model in the catalog / declined / describe failed).
-	 */
-	private async maybeDescribeImages(
-		job: CloudJob,
-		provider: ProviderSettings,
-		atts: { filename: string; mime: string; data?: Buffer }[],
-	): Promise<string | undefined> {
+	/** Images go to the selected model only: a model that can't view them fails the run. */
+	private assertCanViewImages(provider: ProviderSettings, atts: { mime: string; data?: Buffer }[]): void {
 		const imgs = atts.filter((a) => a.mime.startsWith("image/") && a.data?.byteLength);
-		if (!imgs.length || acceptsImages(this.modelMeta)) return undefined;
-		const models = await fetchModels(provider.baseUrl, provider.apiKey).catch(swallow("executor", "op", []));
-		const visionId = pickVisionModel(models, provider.modelId);
-		if (!visionId) return undefined;
-		const ok = await this.awaitPermission(job, "vision_fallback", {
-			command: `describe ${imgs.length} attached image(s) with ${visionId} — ${provider.modelId} cannot view images`,
-			path: imgs.map((i) => i.filename).join(", "),
-		});
-		if (!ok) return undefined;
-		await this.sink
-			.emit({ type: "info", text: `Describing ${imgs.length} attached image(s) with ${visionId}…` })
-			.catch(swallow("executor", "op"));
-		const desc = await describeImages({
-			baseUrl: provider.baseUrl,
-			apiKey: provider.apiKey,
-			modelId: visionId,
-			task: job.task,
-			images: imgs.map((i) => ({ filename: i.filename, mime: i.mime, data: i.data! })),
-		});
-		await this.sink
-			.emit({ type: "info", text: desc ? "Image descriptions added to context." : "Image description failed — continuing without it." })
-			.catch(swallow("executor", "op"));
-		return desc ? `Attached image descriptions (via ${visionId}):\n${desc}` : undefined;
+		if (imgs.length && !acceptsImages(this.modelMeta))
+			throw new Error(`${provider.modelId} can't view images — pick a vision-capable model or remove the attached images.`);
 	}
 
 	/** Ask mode: no sandbox, no repo — chat with memory_write only, attachments inlined. */
@@ -1298,9 +1267,8 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		);
 		this.throwIfStopped();
 		await this.sink.emit({ type: "cloud-status", text: "Contacting model…" });
-		const described = await this.maybeDescribeImages(job, s, atts);
-		const askAtts = described ? this.runnerAttachments(atts).filter((a) => !a.mediaType.startsWith("image/")) : this.runnerAttachments(atts);
-		await runner.run(`${described ? `${described}\n\n` : ""}${this.taskWithInline(job.task, atts)}`, s, askAtts);
+		this.assertCanViewImages(s, atts);
+		await runner.run(this.taskWithInline(job.task, atts), s, this.runnerAttachments(atts));
 		await this.afterRun(job);
 	}
 
@@ -2405,8 +2373,8 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			// stopping the agent promptly instead of letting it flail against a
 			// ghost VM. One recreate+resume retry, same contract as runTail.
 			live.onDead = () => this.runner?.stop();
-			const described = await this.maybeDescribeImages(job, provider, atts);
-			const tailAtts = described ? this.runnerAttachments(atts).filter((a) => !a.mediaType.startsWith("image/")) : this.runnerAttachments(atts);
+			this.assertCanViewImages(provider, atts);
+			const tailAtts = this.runnerAttachments(atts);
 			let resumed = false;
 			let preservedWorktree = false;
 			for (;;) {
@@ -2416,7 +2384,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 						? preservedWorktree
 							? "The sandbox VM running your tools stopped responding and was recovered — its disk was preserved, so the worktree (including uncommitted changes) should be intact. Check git status and the files you were editing, then continue the task."
 							: "The sandbox VM running your tools died and was recreated — the repository was re-cloned to your session branch, but any uncommitted changes were lost. Check the current state (git status, the files you were editing) and continue the task."
-						: `${described ? `${described}\n\n` : ""}${this.taskWithInline(job.task, atts, `${ATTACH_DIR}/`)}`,
+						: this.taskWithInline(job.task, atts, `${ATTACH_DIR}/`),
 					provider,
 					tailAtts,
 				);
@@ -2784,10 +2752,8 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		let lastCoordText = "";
 
 		/** One coordinator invocation — resolves conflicts or applies deferred
-		 *  manifest changes. Returns false when the pass itself errored.
-		 *  `strong` uses the run's full model — for real feature work (dropped
-		 *  slices), not mechanical conflict resolution. */
-		const runCoordinator = async (task: string, strong = false): Promise<boolean> => {
+		 *  manifest changes. Returns false when the pass itself errored. */
+		const runCoordinator = async (task: string): Promise<boolean> => {
 			const coordLive: LiveSlot = { handle: sbx.inner! };
 			const coordFinish: { value: string; failed?: string } = { value: "" };
 			const coordinator = this.makeSliceRunner(
@@ -2806,7 +2772,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			await patchSliceRun(0, { task: "Merge coordinator", kind: "coordinator", status: "running", startedAt: new Date() });
 			let coordErr: unknown;
 			try {
-				await coordinator.run(task, strong ? provider : await this.cheapProvider(provider));
+				await coordinator.run(task, provider);
 				if (coordFinish.failed) coordErr = coordFinish.failed;
 			} catch (e) {
 				coordErr = e;
@@ -2951,7 +2917,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		// Conflicts were resolved inline during the merge loop — the only
 		// remaining coordinator work is deferred dependency/manifest changes
 		// plus any proposed slices that couldn't run bounded (dropped work is
-		// real feature work → strong model, not the mechanical cheap one).
+		// real feature work, run on the selected model).
 		if (depLines.length || droppedSlices.length) {
 			this.throwIfStopped();
 			const parts = ["You are the merge coordinator for a parallel multi-agent run."];
@@ -2966,7 +2932,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			parts.push(
 				"End your final message with a `NEXT STEPS:` line followed by up to 5 `- ` bullet suggestions for follow-up work (tests, docs, refactors, verification). Write `NEXT STEPS: none` if nothing is worth suggesting.",
 			);
-			await runCoordinator(parts.join("\n"), droppedSlices.length > 0);
+			await runCoordinator(parts.join("\n"));
 		}
 		// Next steps: parsed from the coordinator's NEXT STEPS trailer. When no
 		// coordinator pass ran, fall back to mining slice summaries — several
@@ -3079,23 +3045,6 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		}, token);
 	}
 
-	/**
-	 * Cheapest model in the provider's catalog for mechanical calls (planner,
-	 * merge coordinator) — same credentials, only modelId swapped. Falls back
-	 * to the run's model when the catalog has no priced alternative.
-	 */
-	private cheap: ProviderSettings | undefined;
-	private async cheapProvider(p: ProviderSettings): Promise<ProviderSettings> {
-		if (this.cheap) return this.cheap;
-		const models = await fetchModels(p.baseUrl, p.apiKey).catch(swallow("executor", "op", []));
-		const price = (m: ModelOption | undefined) => (m?.pricing?.input ?? Infinity) + (m?.pricing?.output ?? Infinity);
-		const cur = models.find((m) => m.id === p.modelId);
-		const best = models.filter((m) => m.id !== p.modelId && price(m) < Infinity).sort((a, b) => price(a) - price(b))[0];
-		if (!best || price(best) >= price(cur)) return p;
-		this.cheap = { ...p, modelId: best.id };
-		return this.cheap;
-	}
-
 	/** Planner: one cheap chat call returns the slice list (or null → single agent). */
 	private async planSlices(
 		job: CloudJob,
@@ -3103,7 +3052,6 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		sbx: SandboxCore,
 		fullTask: string,
 	): Promise<ParsedSlices | null> {
-		provider = await this.cheapProvider(provider);
 		if (!provider.baseUrl || !provider.apiKey || !provider.modelId) return null;
 		const tree = await sbx
 			.runIn(REPO_DIR, `git ls-files | grep -v 'node_modules' | head -400 && echo '--- dirs ---' && find . -maxdepth 2 -type d | grep -v 'node_modules\\|\\.git' | head -60`, 30_000)
@@ -3351,7 +3299,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	 * LLM call still yields `kronyx/<repo>-<runid>` rather than dead code.
 	 */
 	private async branchSlug(job: CloudJob, session: SessionDoc, provider?: ProviderSettings): Promise<string> {
-		const p = provider ? await this.cheapProvider(provider).catch(() => provider) : undefined;
+		const p = provider;
 		if (p?.baseUrl && p.apiKey && p.modelId) {
 			const res = await fetch(`${p.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
 				method: "POST",

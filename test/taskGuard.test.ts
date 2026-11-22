@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { isConversationalTask, isRunSummaryFact, isTrivialTask } from "../src/agent/taskGuard";
+import { isTrivialTitle } from "../src/store";
 
 describe("isConversationalTask", () => {
 	it.each(["hi", "Hello!", "hey", "thanks", "thank you", "ok", "yes", "no", "sure", "lol", "gm", "good morning", "got it"])(
@@ -26,6 +27,19 @@ describe("isTrivialTask", () => {
 		"not trivial: %j",
 		(task) => {
 			expect(isTrivialTask(task)).toBe(false);
+		},
+	);
+});
+
+describe("isTrivialTitle (session titles)", () => {
+	it.each(["hi", "Hello!", "hey", "ok", "yo", "sup", "thanks", "test", "Test.", "ping", " ping "])("trivial title: %j", (task) => {
+		expect(isTrivialTitle(task)).toBe(true);
+	});
+
+	it.each(["fix the login bug", "test the login flow", "ping endpoint returns 500", "add a health check endpoint"])(
+		"valid title: %j",
+		(task) => {
+			expect(isTrivialTitle(task)).toBe(false);
 		},
 	);
 });

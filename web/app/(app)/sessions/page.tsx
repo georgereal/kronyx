@@ -170,6 +170,7 @@ export default function SessionsLanding() {
 	};
 
 	const start = async (task: string, attachmentIds: string[], e: EnvState, m: Mode = mode) => {
+		if (!modelId || !modelProfile) return setError("Pick a model and its provider before starting.");
 		setBusy(true);
 		setError("");
 		const res = await apiFetch("/api/sessions", user, {
@@ -179,8 +180,8 @@ export default function SessionsLanding() {
 				base: e.base,
 				startRef: e.startRef || e.base,
 				mode: m,
-				modelId: modelId || undefined,
-				profile: modelProfile || undefined,
+				modelId,
+				profile: modelProfile,
 				title: task.slice(0, 80),
 				template: e.template || undefined,
 				extraRepos: e.extraRepos,
@@ -195,7 +196,7 @@ export default function SessionsLanding() {
 		const { session } = (await res.json()) as { session: { sessionId: string } };
 		await apiFetch(`/api/sessions/${session.sessionId}/messages`, user, {
 			method: "POST",
-			body: JSON.stringify({ task, mode: m, attachmentIds, modelId: modelId || undefined, profile: modelProfile || undefined }),
+			body: JSON.stringify({ task, mode: m, attachmentIds, modelId, profile: modelProfile }),
 		});
 		router.push(`/sessions/${session.sessionId}`);
 	};

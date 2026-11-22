@@ -1,7 +1,7 @@
 "use client";
 
-import { Bot, Box, Check, ChevronDown, Copy, GitBranch, KeyRound, MoreHorizontal, Pencil, Plus, ShieldCheck, SlidersHorizontal, Trash2, X } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { Bot, Box, Check, ChevronDown, Copy, GitBranch, KeyRound, MoreHorizontal, Pencil, Plus, ShieldCheck, Trash2, X } from "lucide-react";
+import { useEffect, useState } from "react";
 import { apiFetch, useUser } from "@/lib/api";
 import { CopyButton } from "@/components/CopyButton";
 import { Modal } from "@/components/Modal";
@@ -47,7 +47,6 @@ const SANDBOX_PROVIDERS: { id: string; label: string; fields: { key: string; lab
 const SECTIONS = [
 	{ id: "llm", label: "LLM Providers", icon: <Bot size={14} /> },
 	{ id: "sandbox", label: "Sandbox Providers", icon: <Box size={14} /> },
-	{ id: "defaults", label: "Model Defaults", icon: <SlidersHorizontal size={14} /> },
 	{ id: "permissions", label: "Permissions", icon: <ShieldCheck size={14} /> },
 	{ id: "github", label: "GitHub Access", icon: <GitBranch size={14} /> },
 	{ id: "secrets", label: "Shared Secrets", icon: <KeyRound size={14} /> },
@@ -80,7 +79,6 @@ interface SettingsDoc {
 		sandboxAutoSwitch?: boolean;
 		sliceForkMode?: "auto" | "always" | "never";
 		postRunChecks?: boolean;
-		modelDefaults?: Record<string, string>;
 		permissions?: { allow?: string[]; ask?: string[]; deny?: string[]; modes?: Record<string, { allow?: string[]; ask?: string[]; deny?: string[] }> };
 		profiles?: { name?: string; providerId?: string; baseUrl?: string; modelId?: string; enabled?: boolean }[];
 	};
@@ -132,7 +130,6 @@ export default function SettingsPage() {
 	const [sandboxAutoSwitch, setSandboxAutoSwitch] = useState(true);
 	const [sliceForkMode, setSliceForkMode] = useState<"auto" | "always" | "never">("auto");
 	const [postRunChecks, setPostRunChecks] = useState(true);
-	const [modelDefaults, setModelDefaults] = useState<Record<string, string>>({});
 	type PermScope = "global" | "ask" | "plan" | "agent";
 	const emptyPermText = () => ({ allow: "", ask: "", deny: "" });
 	const [permText, setPermText] = useState<Record<PermScope, { allow: string; ask: string; deny: string }>>({
@@ -221,7 +218,6 @@ export default function SettingsPage() {
 				setSandboxAutoSwitch(settings?.data?.sandboxAutoSwitch !== false);
 				setSliceForkMode(settings?.data?.sliceForkMode === "always" || settings?.data?.sliceForkMode === "never" ? settings.data.sliceForkMode : "auto");
 				setPostRunChecks(settings?.data?.postRunChecks !== false);
-				setModelDefaults(settings?.data?.modelDefaults ?? {});
 				const toText = (r?: { allow?: string[]; ask?: string[]; deny?: string[] }) => ({
 					allow: (r?.allow ?? []).join("\n"),
 					ask: (r?.ask ?? []).join("\n"),
@@ -237,7 +233,7 @@ export default function SettingsPage() {
 				// PUT replaces settings.data wholesale — retain keys this page doesn't own
 				// (providerId/baseUrl/modelId synced by the extension) so saving here
 				// doesn't wipe them.
-				const { activeProfile: _a, sandboxProvider: _s, e2bTemplate: _t, sandboxAutoSwitch: _sw, sliceForkMode: _sf, postRunChecks: _pc, modelDefaults: _m, permissions: _p, profiles: _pr, ...rest } =
+				const { activeProfile: _a, sandboxProvider: _s, e2bTemplate: _t, sandboxAutoSwitch: _sw, sliceForkMode: _sf, postRunChecks: _pc, permissions: _p, profiles: _pr, ...rest } =
 					(settings?.data ?? {}) as Record<string, unknown>;
 				setDataExtras(rest);
 			}
@@ -326,7 +322,6 @@ export default function SettingsPage() {
 		};
 	};
 
-	const allModels = useMemo(() => groups.flatMap((g) => g.models), [groups]);
 	const defaultProfile = profiles.find((p) => p.name === activeProfile) ?? profiles[0];
 
 	const save = async () => {
@@ -347,7 +342,6 @@ export default function SettingsPage() {
 					sandboxAutoSwitch,
 					sliceForkMode,
 					postRunChecks,
-					modelDefaults,
 					permissions: (() => {
 						const toList = (t: { allow: string; ask: string; deny: string }) => ({
 							allow: t.allow.split("\n").map((s) => s.trim()).filter(Boolean),
@@ -389,13 +383,6 @@ export default function SettingsPage() {
 					<span className="muted">Default Provider</span>
 					<strong>{defaultProfile?.name || "—"}</strong>
 				</div>
-				<div className="summary-cell">
-					<span className="muted">Default Model</span>
-					<strong className="mono">{defaultProfile?.modelId || "—"}</strong>
-				</div>
-				<button className="btn ghost sm" style={{ marginLeft: "auto" }} onClick={() => setSection("defaults")}>
-					Change Defaults
-				</button>
 			</div>
 
 			{profiles.length === 0 && <p className="muted" style={{ fontSize: 12 }}>No providers — add one to define a BYOK provider + model + key.</p>}
@@ -646,27 +633,6 @@ export default function SettingsPage() {
 		</>
 	);
 
-	const defaultsSection = (
-		<>
-			<div className="settings-head">
-				<div>
-					<div className="chart-title">Model Defaults</div>
-					<p className="muted" style={{ fontSize: 12 }}>Default model per session mode — overridden by the composer picker.</p>
-				</div>
-			</div>
-			{(["agent", "multi", "plan", "ask"] as const).map((mode) => (
-				<Field key={mode} label={`${mode[0].toUpperCase() + mode.slice(1)} mode`}>
-					<select className="input" value={modelDefaults[mode] ?? ""} onChange={(e) => setModelDefaults({ ...modelDefaults, [mode]: e.target.value })}>
-						<option value="">(provider default)</option>
-						{allModels.map((m) => (
-							<option key={m.id} value={m.id}>{m.label ?? m.id}</option>
-						))}
-					</select>
-				</Field>
-			))}
-		</>
-	);
-
 	const permissionsSection = (
 		<>
 			<div className="settings-head">
@@ -844,7 +810,7 @@ export default function SettingsPage() {
 	const secretLabel = (key: string): { label: string; hint: string } => {
 		if (key === "githubToken") return { label: "GitHub token", hint: "fallback when no app installation" };
 		if (key === "e2bApiKey") return { label: "E2B API key", hint: "cloud sandboxes — overrides worker env" };
-		if (key === "providerApiKey") return { label: "LLM API key", hint: "fallback when no profile key" };
+		if (key === "providerApiKey") return { label: "Legacy LLM API key", hint: "unused — each provider uses its profile key" };
 		if (key.startsWith("profile.apiKey.")) return { label: `Profile key — ${key.slice("profile.apiKey.".length)}`, hint: "LLM key for that provider profile" };
 		const prof = profiles.find((p) => p.name === key);
 		if (prof) return { label: `Profile key — ${key}`, hint: "LLM key for that provider profile" };
@@ -930,7 +896,6 @@ export default function SettingsPage() {
 				<div className="settings-main">
 					{section === "llm" && llmSection}
 					{section === "sandbox" && sandboxSection}
-					{section === "defaults" && defaultsSection}
 					{section === "permissions" && permissionsSection}
 					{section === "github" && githubSection}
 					{section === "secrets" && secretsSection}

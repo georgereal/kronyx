@@ -1,6 +1,7 @@
 import { existsSync, promises as fs } from "node:fs";
 import * as path from "node:path";
 import Sqlite, { type Database } from "better-sqlite3";
+import { isConversationalTask } from "./agent/taskGuard";
 
 export type Store = Database;
 
@@ -229,9 +230,10 @@ export function migrateLegacyStore(legacyPath: string): void {
 	} catch { /* migration best-effort */ }
 }
 
-/** Openers that carry no signal for a session title: greetings and probes. */
-const TRIVIAL_TASK = /^(hi+|hello|hey+|yo|sup|test|ping|ok)[!.\s]*$/i;
-const isTrivialTask = (task: string) => task.trim().length < 4 || TRIVIAL_TASK.test(task.trim());
+/** Connectivity probes that aren't greetings but still carry no signal for a session title. */
+const TITLE_PROBE = /^(test|ping)[!.\s]*$/i;
+/** Openers that carry no signal for a session title: greetings, acks and probes. */
+export const isTrivialTitle = (task: string) => task.trim().length < 4 || isConversationalTask(task) || TITLE_PROBE.test(task.trim());
 
 export function listSessions(d: Store | undefined, limit = 50, root?: string): { session: string; title: string; events: number; lastAt: number; status: string; cloud: boolean; runId: string }[] {
 	try {
@@ -253,7 +255,7 @@ export function listSessions(d: Store | undefined, limit = 50, root?: string): {
 			// Title = first real task — skip trivial openers ("hi", "test") so a
 			// throwaway first message doesn't brand the session forever. If every
 			// task is trivial, the first one is still better than the session name.
-			const title = (tasks.find((t) => !isTrivialTask(t)) ?? tasks[0] ?? session).slice(0, 60);
+			const title = (tasks.find((t) => !isTrivialTitle(t)) ?? tasks[0] ?? session).slice(0, 60);
 			const lastRun = all(d, "SELECT at, status, run_id FROM runs WHERE session = ? ORDER BY at DESC LIMIT 1", [session])[0];
 			return {
 				session,

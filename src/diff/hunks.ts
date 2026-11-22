@@ -65,6 +65,60 @@ export function formatHunks(hunks: Hunk[], maxLines = 60): string {
 	return lines.join("\n");
 }
 
+/**
+ * Unified diff with `context` unchanged lines around each change. Nearby hunks
+ * whose context windows overlap share one `@@` block. Output is capped at
+ * `maxLines` with a trailing note.
+ */
+export function formatUnifiedWithContext(before: string, after: string, { context = 3, maxLines = 400 } = {}): string {
+	const hunks = computeHunks(before, after);
+	if (hunks.length === 0) return "";
+	const afterLines = after === "" ? [] : after.replace(/\n$/, "").split("\n");
+
+	const groups: Hunk[][] = [];
+	for (const h of hunks) {
+		const group = groups.at(-1);
+		const prev = group?.at(-1);
+		if (group && prev && h.afterStart - (prev.afterStart + prev.newLines.length) <= 2 * context) group.push(h);
+		else groups.push([h]);
+	}
+
+	const lines: string[] = [];
+	for (const group of groups) {
+		const first = group[0];
+		const last = group[group.length - 1];
+		const start = Math.max(0, first.afterStart - context);
+		const end = Math.min(afterLines.length, last.afterStart + last.newLines.length + context);
+		const body: string[] = [];
+		let oldCount = 0;
+		let newCount = 0;
+		let cursor = start;
+		const pushContext = (until: number) => {
+			for (; cursor < until; cursor++) {
+				body.push(` ${afterLines[cursor]}`);
+				oldCount++;
+				newCount++;
+			}
+		};
+		for (const h of group) {
+			pushContext(h.afterStart);
+			for (const l of h.oldLines) body.push(`-${l}`);
+			for (const l of h.newLines) body.push(`+${l}`);
+			oldCount += h.oldLines.length;
+			newCount += h.newLines.length;
+			cursor = h.afterStart + h.newLines.length;
+		}
+		pushContext(end);
+		const oldStart = first.beforeStart - (first.afterStart - start);
+		lines.push(`@@ -${oldStart + 1},${oldCount} +${start + 1},${newCount} @@`, ...body);
+	}
+
+	if (lines.length > maxLines) {
+		return `${lines.slice(0, maxLines).join("\n")}\n… (${lines.length - maxLines} more lines)`;
+	}
+	return lines.join("\n");
+}
+
 /** Apply hunk edits: replace `oldLines` at `beforeStart` in `before` with `newLines`. */
 export function applyHunk(before: string, hunk: Hunk): string {
 	const lines = before.split("\n");

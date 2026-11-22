@@ -72,15 +72,14 @@ export async function createSession(req: Request): Promise<Response> {
 	}
 	const db = await getDb();
 	const userDoc = await db
-		.collection<{ settings?: { data?: { sandboxProvider?: string; e2bTemplate?: string; modelDefaults?: Record<string, string> } } }>("users")
-		.findOne({ _id: uid as never }, { projection: { "settings.data.sandboxProvider": 1, "settings.data.e2bTemplate": 1, "settings.data.modelDefaults": 1 } })
+		.collection<{ settings?: { data?: { sandboxProvider?: string; e2bTemplate?: string; } } }>("users")
+		.findOne({ _id: uid as never }, { projection: { "settings.data.sandboxProvider": 1, "settings.data.e2bTemplate": 1 } })
 		.catch(swallow("sessions", "op", null));
 	const requested = String(body.provider ?? userDoc?.settings?.data?.sandboxProvider ?? "e2b");
 	const provider = requested in providers ? requested : "e2b";
 	// Composer template wins; otherwise the user's default applies. When both
 	// are unset the worker's LLM pick chooses from the live E2B template list.
 	const template = body.template?.slice(0, 80) || userDoc?.settings?.data?.e2bTemplate?.slice(0, 80) || null;
-	const defaultModel = userDoc?.settings?.data?.modelDefaults?.[mode] ?? userDoc?.settings?.data?.modelDefaults?.agent ?? null;
 	// startRef: the ref to check out at clone time (feature branch or
 	// pull/<n>/head); base stays the rebase/PR target.
 	const startRef = /^[\w./-]{1,200}$/.test(String(body.startRef ?? "")) ? String(body.startRef) : "";
@@ -100,7 +99,7 @@ export async function createSession(req: Request): Promise<Response> {
 		securityProfile: body.securityProfile === "bypass" ? "bypass" : body.securityProfile === "controlled" ? "controlled" : "agent",
 		cloned: false,
 		mode,
-		modelId: body.modelId ?? defaultModel,
+		modelId: body.modelId ?? null,
 		profile: body.profile ?? null,
 		prUrl: null,
 		createdAt: new Date(),
@@ -158,6 +157,10 @@ export async function postMessage(req: Request, p: Record<string, string>): Prom
 		repo?: string;
 		installationId?: number;
 	};
+	// Every run names the model and provider the composer selected — no session or user defaults.
+	const modelId = String(body.modelId ?? "");
+	const profile = String(body.profile ?? "");
+	if (!modelId || !profile) return json({ error: "Pick a model and its provider before sending." }, { status: 400 });
 	const task = String(body.task ?? "").trim();
 	if (!task && !body.planSlug) return json({ error: "task required" }, { status: 400 });
 	const db = await getDb();
@@ -227,8 +230,8 @@ export async function postMessage(req: Request, p: Record<string, string>): Prom
 		sessionId: p.id,
 		task,
 		mode,
-		modelId: body.modelId ?? session.modelId ?? null,
-		profile: body.profile ?? session.profile ?? null,
+		modelId,
+		profile,
 		attachmentIds: (body.attachmentIds ?? []).slice(0, 20),
 		planSlug: body.planSlug ?? null,
 		status: "queued",
@@ -254,7 +257,7 @@ export async function postMessage(req: Request, p: Record<string, string>): Prom
 	});
 	await db
 		.collection("sessions")
-		.updateOne({ uid, sessionId: p.id }, { $set: { updatedAt: now, lastTask: task.slice(0, 120), mode, ...envSet } });
+		.updateOne({ uid, sessionId: p.id }, { $set: { updatedAt: now, lastTask: task.slice(0, 120), mode, modelId, profile, ...envSet } });
 	// First event lands immediately — the timeline shows "Queued" instead of blank.
 	await db.collection("run_events").insertOne({
 		uid, runId, sessionId: p.id, seq: 1,

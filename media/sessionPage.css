@@ -1405,6 +1405,18 @@ tbody tr:hover {
 .ev.thinking.streaming .stream-text {
   opacity: 0.85;
 }
+.ev.thinking.tl-thought {
+  margin: 4px 0;
+}
+.tl-thought-preview {
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 400;
+  opacity: 0.75;
+}
+.tl-tool-ico {
+  font-size: 12px;
+}
 .app-shell {
   display: flex;
   min-height: 100vh;
@@ -3994,6 +4006,50 @@ button.filediff-head:hover {
 .worked-done-item {
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.kronyx-ide {
+  font-family: var(--vscode-font-family, system-ui);
+  font-size: var(--vscode-font-size, 13px);
+}
+.kronyx-ide button {
+  font-family: inherit;
+}
+.kronyx-ide .timeline .worked-head,
+.kronyx-ide .timeline .act-head,
+.kronyx-ide .timeline .term-head,
+.kronyx-ide .timeline .ev,
+.kronyx-ide .timeline .ev.thinking,
+.kronyx-ide .timeline .step-note,
+.kronyx-ide .timeline .step-achieved,
+.kronyx-ide .timeline .worked-done {
+  font-size: 1em;
+}
+.kronyx-ide .timeline .worked-stats,
+.kronyx-ide .timeline .act-stat,
+.kronyx-ide .timeline .act-pill {
+  font-size: 0.9em;
+}
+.kronyx-ide .timeline .mono,
+.kronyx-ide .timeline .act-out,
+.kronyx-ide .timeline .term-out,
+.kronyx-ide .timeline .fd-body {
+  font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+}
+.kronyx-ide .timeline .act-out,
+.kronyx-ide .timeline .term-out,
+.kronyx-ide .timeline .fd-body {
+  font-size: var(--vscode-editor-font-size, 13px);
+}
+.kronyx-ide .timeline .caret {
+  width: 14px;
+  font-size: 1.15em;
+}
+.kronyx-ide .timeline .act-icon,
+.kronyx-ide .timeline .tl-tool-ico {
+  font-size: 1.1em;
+}
+.kronyx-ide .timeline .step-num {
+  font-size: 0.9em;
 }
 .step {
   display: flex;

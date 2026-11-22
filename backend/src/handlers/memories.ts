@@ -4,20 +4,19 @@ import { getDb } from "../lib/mongo";
 import { swallow } from "../lib/log";
 import { json } from "../routes";
 import { embedText, searchMemories, type EmbedProvider } from "../worker/memory";
-import { loadUserSettings } from "../worker/settings";
+import { activeProviderCreds, loadUserSettings } from "../worker/settings";
 
 const MAX_IMPORT = 200;
 
-/** Embedder for manual memory ops — resolved from the user's default provider
+/** Embedder for manual memory ops — the account's active provider profile
  *  (embeddings only need baseUrl+apiKey, not a chat model). Each call records a
  *  usage_events row so manual ops appear in usage telemetry. */
 async function embedder(uid: string): Promise<EmbedProvider | undefined> {
 	const db = await getDb();
 	const settings = await loadUserSettings(db, uid).catch(() => null);
-	if (!settings) return undefined;
-	const baseUrl = typeof settings.data.baseUrl === "string" ? settings.data.baseUrl : "";
-	const apiKey = settings.secrets.providerApiKey ?? "";
-	if (!baseUrl || !apiKey) return undefined;
+	const creds = settings && activeProviderCreds(settings);
+	if (!settings || !creds) return undefined;
+	const { baseUrl, apiKey } = creds;
 	return {
 		baseUrl,
 		apiKey,

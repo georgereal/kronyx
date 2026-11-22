@@ -4,6 +4,7 @@ export function renderPage(webview: vscode.Webview, extensionUri: vscode.Uri): s
 	const media = vscode.Uri.joinPath(extensionUri, "media");
 	const script = webview.asWebviewUri(vscode.Uri.joinPath(media, "webview.js"));
 	const markedJs = webview.asWebviewUri(vscode.Uri.joinPath(media, "marked.js"));
+	const highlightJs = webview.asWebviewUri(vscode.Uri.joinPath(media, "highlight.js"));
 	const style = webview.asWebviewUri(vscode.Uri.joinPath(media, "webview.css"));
 	const nonce = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
 	return `<!DOCTYPE html>
@@ -34,7 +35,7 @@ export function renderPage(webview: vscode.Webview, extensionUri: vscode.Uri): s
     <span class="spacer"></span>
     <span id="tokchip" class="tok" title="Tokens in / out" hidden></span>
     <button type="button" id="model" class="chip model-chip" title="Model"><span class="chip-text" id="model-label">Model</span><span class="caret">&#9662;</span></button>
-    <span id="activity" class="activity" title="Context usage" aria-hidden="true"><svg viewBox="0 0 16 16"><circle class="activity-track" cx="8" cy="8" r="6"/><circle id="activity-fill" class="activity-fill" cx="8" cy="8" r="6"/></svg></span>
+    <button type="button" id="activity" class="activity" title="Context usage" aria-label="Context usage" aria-expanded="false"><svg viewBox="0 0 16 16"><circle class="activity-track" cx="8" cy="8" r="6"/><circle id="activity-fill" class="activity-fill" cx="8" cy="8" r="6"/></svg></button>
     <button type="button" id="microphone" class="icon-btn microphone" title="Voice input coming soon" disabled aria-label="Voice input coming soon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><line x1="12" y1="19" x2="12" y2="22"/></svg></button>
     <button type="button" id="send" class="send-btn" title="Run (Enter)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 7-7 7 7"/><path d="M12 19V5"/></svg></button>
     <button type="button" id="stop" class="send-btn stop" title="Stop" hidden><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="7" y="7" width="10" height="10" rx="2"/></svg></button>
@@ -42,7 +43,9 @@ export function renderPage(webview: vscode.Webview, extensionUri: vscode.Uri): s
 </div>
 <div id="status" class="status" role="status" aria-live="polite">Idle</div>
 <div id="menu" class="menu" hidden></div>
+<div id="context-popover" class="context-popover" hidden></div>
 <script nonce="${nonce}" src="${markedJs}"></script>
+<script nonce="${nonce}" src="${highlightJs}"></script>
 <script nonce="${nonce}" src="${script}"></script>
 </body>
 </html>`;

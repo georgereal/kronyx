@@ -26,13 +26,24 @@
 	const tabPrev = /** @type {HTMLButtonElement} */ (document.getElementById("tab-prev"));
 	const tabRight = /** @type {HTMLButtonElement} */ (document.getElementById("tab-right"));
 	const attachmentPreviews = /** @type {HTMLElement} */ (document.getElementById("attachment-previews"));
-	const activity = /** @type {HTMLElement} */ (document.getElementById("activity"));
+	const activity = /** @type {HTMLButtonElement} */ (document.getElementById("activity"));
+	const contextPopover = /** @type {HTMLElement} */ (document.getElementById("context-popover"));
 	/** @type {Map<string, HTMLElement>} */
 	const tools = new Map();
 	/** @type {Map<string, HTMLElement>} */
 	const attachments = new Map();
 	let openToolCard = null;
-	let usage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+	let usage = {
+		inputTokens: 0,
+		outputTokens: 0,
+		cacheReadTokens: 0,
+		cacheWriteTokens: 0,
+		reasoningTokens: 0,
+		totalCost: 0,
+		iteration: 0,
+		contextMsgs: 0,
+		contextBudget: 0,
+	};
 	let startedAt = 0;
 
 	const persisted = vscode.getState() || {};
@@ -42,6 +53,10 @@
 	let modelId = persisted.modelId || "";
 	/** @type {import("../src/config").ModelOption[]} */
 	let models = persisted.models || [];
+	/** Per-provider catalogs from the host; `models` stays the active profile's flat list. @type {{profile: string, active?: boolean, models: any[]}[]} */
+	let groups = [];
+	let modelProfile = "";
+	let providerFilter = "";
 	/** @type {string[]} */
 	let recentModels = persisted.recentModels || [];
 	/** @type {{name: string, title: string}[]} */
@@ -192,11 +207,12 @@
 	};
 
 	let runGroup = null;
-	let groupStats = { added: 0, removed: 0 };
+	let groupStats = { added: 0, removed: 0, files: new Set() };
 	let streamMsg = null;
 	let streamText = "";
 	let streamReasoning = null;
 	let reasoningText = "";
+	let lastReasoningNorm = "";
 	let thoughts = null;
 	let mdTimer = 0;
 	let lastVerb = "";
@@ -221,7 +237,8 @@
 		group.appendChild(summary);
 		const body = el("div", "group-body");
 		group.appendChild(body);
-		groupStats = { added: 0, removed: 0 };
+		groupStats = { added: 0, removed: 0, files: new Set() };
+		lastReasoningNorm = "";
 		runGroup = group;
 		streamMsg = null;
 		streamText = "";
@@ -241,9 +258,14 @@
 	const updateGroupTitle = (prefix) => {
 		if (!runGroup) return;
 		const secs = startedAt ? Math.round((Date.now() - startedAt) / 1000) : 0;
-		const stats = groupStats.added || groupStats.removed ? ` +${groupStats.added} −${groupStats.removed}` : "";
-		runGroup.querySelector(".group-title").textContent =
-			secs > 0 ? `${prefix} ${fmtDur(secs)}${stats}` : `${prefix.replace(/\s+for$/, "ed").trim()}${stats}`;
+		const diff = groupStats.added || groupStats.removed ? ` +${groupStats.added} −${groupStats.removed}` : "";
+		const files = groupStats.files.size ? ` · ${groupStats.files.size} file${groupStats.files.size === 1 ? "" : "s"}` : "";
+		// "Finished · worked for 45s" live, just "Finished" when no duration;
+		// "Worked for 45s" live, "Worked" when the step took under a second.
+		const title = secs > 0
+			? `${prefix} ${fmtDur(secs)}`
+			: prefix.replace(/ · worked for$/, "").replace(/\s+for$/, "");
+		runGroup.querySelector(".group-title").textContent = `${title}${diff}${files}`;
 	};
 
 	// First line of assistant text becomes a bold header; the rest renders as markdown.
@@ -260,7 +282,7 @@
 	};
 
 	// Each reasoning segment gets its own inline collapsed section at the position it occurs.
-	const newThoughtSegment = () => {
+	const newThoughtSegment = (previewText) => {
 		// Only the newest thoughts segment stays expanded; earlier ones collapse.
 		runGroup?.querySelectorAll(".thoughts-group[open]").forEach((t) => (t.open = false));
 		thoughts = el("details", "thoughts-group dim");
@@ -268,9 +290,24 @@
 		const s = el("summary");
 		s.appendChild(el("span", "twisty", "›"));
 		s.appendChild(el("span", "tool-name", "Thoughts"));
+		s.appendChild(el("span", "thought-preview", previewText || ""));
 		thoughts.appendChild(s);
 		add(thoughts);
 		return thoughts;
+	};
+
+	const firstLine = (text) => {
+		const line = String(text).split("\n").find((l) => l.trim()) || "";
+		return line.trim().length > 90 ? `${line.trim().slice(0, 90)}…` : line.trim();
+	};
+
+	const setThoughtPreview = (text) => {
+		const p = thoughts?.querySelector(".thought-preview");
+		if (p) p.textContent = firstLine(text);
+	};
+
+	const collapseEditCards = () => {
+		runGroup?.querySelectorAll("details.diff-editor[data-state='done']").forEach((d) => (d.open = false));
 	};
 
 	const collapseAux = () => {
@@ -280,6 +317,7 @@
 	const closeGroup = (label) => {
 		if (!runGroup) return;
 		collapseAux();
+		collapseEditCards();
 		updateGroupTitle(label);
 		runGroup.open = false;
 		runGroup = null;
@@ -305,11 +343,15 @@
 
 	const activityFill = document.getElementById("activity-fill");
 	const RING_C = 2 * Math.PI * 6; // r=6 in the 16x16 activity svg
-	const contextWindow = () => models.find((m) => m.id === modelId)?.contextWindow || 0;
+	const contextWindow = () =>
+		models.find((m) => m.id === modelId)?.contextWindow ||
+		groups.flatMap((g) => g.models || []).find((m) => m.id === modelId)?.contextWindow ||
+		0;
+	const contextUsed = () => usage.inputTokens + usage.cacheReadTokens + usage.cacheWriteTokens;
 
 	const updateActivityRing = () => {
 		const ctx = contextWindow();
-		const used = usage.inputTokens + usage.outputTokens + usage.cacheReadTokens + usage.cacheWriteTokens;
+		const used = contextUsed();
 		let frac = ctx > 0 ? Math.min(1, used / ctx) : 0;
 		if (used > 0 && frac < 0.05) frac = 0.05; // keep a visible sliver once any tokens exist
 		activityFill.style.strokeDasharray = `${RING_C}`;
@@ -320,7 +362,93 @@
 		activity.title = ctx > 0
 			? `Context ${(frac * 100).toFixed(0)}% — ${used.toLocaleString()} / ${ctx.toLocaleString()} tokens`
 			: used > 0 ? `Context usage — ${used.toLocaleString()} tokens` : "Context usage";
+		if (!contextPopover.hidden) renderContextPopover();
 	};
+
+	let contextPinned = false;
+	let contextHideTimer = 0;
+
+	const usageRow = (label, value) => {
+		const row = el("div", "context-row");
+		row.appendChild(el("span", "context-key", label));
+		row.appendChild(el("span", "context-val", String(value)));
+		return row;
+	};
+
+	const renderContextPopover = () => {
+		contextPopover.innerHTML = "";
+		const ctx = contextWindow();
+		const used = contextUsed();
+		const pct = ctx > 0 ? Math.min(100, Math.round((used / ctx) * 100)) : 0;
+		const head = el("div", "context-head");
+		head.appendChild(el("div", "context-title", ctx ? `${pct}% context used` : "Context usage"));
+		head.appendChild(el("div", "context-sub", ctx ? `${used.toLocaleString()} of ${ctx.toLocaleString()} tokens` : `${used.toLocaleString()} tokens`));
+		contextPopover.appendChild(head);
+		const meter = el("div", "context-meter");
+		const fill = el("span", "context-meter-fill");
+		fill.style.width = `${Math.max(used > 0 ? 2 : 0, pct)}%`;
+		if (pct >= 90) fill.classList.add("crit");
+		else if (pct >= 70) fill.classList.add("warn");
+		meter.appendChild(fill);
+		contextPopover.appendChild(meter);
+		const rows = el("div", "context-rows");
+		rows.appendChild(usageRow("Input", usage.inputTokens.toLocaleString()));
+		if (usage.cacheReadTokens) rows.appendChild(usageRow("Cached input", usage.cacheReadTokens.toLocaleString()));
+		if (usage.cacheWriteTokens) rows.appendChild(usageRow("Cache write", usage.cacheWriteTokens.toLocaleString()));
+		if (usage.outputTokens) rows.appendChild(usageRow("Output", usage.outputTokens.toLocaleString()));
+		if (usage.reasoningTokens) rows.appendChild(usageRow("Reasoning", usage.reasoningTokens.toLocaleString()));
+		if (usage.contextMsgs) rows.appendChild(usageRow("Messages", usage.contextMsgs.toLocaleString()));
+		if (usage.iteration) rows.appendChild(usageRow("Iteration", usage.iteration.toLocaleString()));
+		if (usage.contextBudget) rows.appendChild(usageRow("Compaction budget", usage.contextBudget.toLocaleString()));
+		if (usage.totalCost) rows.appendChild(usageRow("Provider cost", `$${usage.totalCost < 0.01 ? usage.totalCost.toFixed(4) : usage.totalCost.toFixed(2)}`));
+		contextPopover.appendChild(rows);
+		contextPopover.appendChild(el("div", "context-note", "Values are provider-reported usage for this run."));
+	};
+
+	const showContextPopover = (pinned) => {
+		clearTimeout(contextHideTimer);
+		contextPinned = pinned;
+		renderContextPopover();
+		contextPopover.hidden = false;
+		activity.setAttribute("aria-expanded", "true");
+		const rect = activity.getBoundingClientRect();
+		const width = contextPopover.offsetWidth;
+		contextPopover.style.left = `${Math.max(8, Math.min(rect.right - width, document.body.clientWidth - width - 8))}px`;
+		contextPopover.style.bottom = `${document.body.clientHeight - rect.top + 8}px`;
+		contextPopover.style.top = "auto";
+	};
+
+	const hideContextPopover = () => {
+		contextPinned = false;
+		contextPopover.hidden = true;
+		activity.setAttribute("aria-expanded", "false");
+	};
+
+	const scheduleContextHide = () => {
+		clearTimeout(contextHideTimer);
+		contextHideTimer = setTimeout(() => {
+			if (!contextPinned) hideContextPopover();
+		}, 220);
+	};
+
+	activity.addEventListener("mouseenter", () => showContextPopover(contextPinned));
+	activity.addEventListener("mouseleave", scheduleContextHide);
+	activity.addEventListener("focus", () => showContextPopover(contextPinned));
+	activity.addEventListener("blur", scheduleContextHide);
+	activity.addEventListener("click", () => {
+		if (!contextPopover.hidden && contextPinned) hideContextPopover();
+		else showContextPopover(true);
+	});
+	contextPopover.addEventListener("mouseenter", () => clearTimeout(contextHideTimer));
+	contextPopover.addEventListener("mouseleave", scheduleContextHide);
+	document.addEventListener("mousedown", (e) => {
+		if (!contextPopover.hidden && e.target instanceof Node && !contextPopover.contains(e.target) && e.target !== activity && !activity.contains(e.target)) {
+			hideContextPopover();
+		}
+	});
+	document.addEventListener("keydown", (e) => {
+		if (e.key === "Escape") hideContextPopover();
+	});
 
 	const setStatus = (text) => {
 		statusText = text;
@@ -361,9 +489,63 @@
 		if (!input || typeof input !== "object") return "";
 		const p = input.path ?? input.pattern ?? input.command ?? input.cmd ?? "";
 		if (name === "run_command") return String(p).replace(/\s+/g, " ").slice(0, 90);
+		if (name === "list_files") return p === "." ? "repo root" : String(p);
 		if (name === "read_file" && input.start_line) return `${p} (${input.start_line}-${input.end_line ?? "end"})`;
 		if (name === "edit_file" && Array.isArray(input.edits)) return `${p} (${input.edits.length} edit(s))`;
 		return String(p);
+	};
+
+	/** Result rollup for the collapsed tool row, e.g. "1,204 lines", "3 matches". */
+	const resultDetail = (name, output) => {
+		const lines = String(output || "").split("\n").filter((l) => l.trim());
+		const plural = (n, one, many) => `${n.toLocaleString()} ${n === 1 ? one : many}`;
+		if (!lines.length) return "";
+		if (name === "read_file") {
+			const n = lines.filter((l) => /^\s*\d+\|/.test(l)).length;
+			return n ? plural(n, "line", "lines") : "";
+		}
+		if (name === "list_files") return plural(lines.length, "entry", "entries");
+		if (name === "search_files") return plural(lines.filter((l) => /:\d+:/.test(l)).length, "match", "matches");
+		return "";
+	};
+
+	const fmtMs = (ms) => {
+		ms = Number(ms) || 0;
+		if (ms < 1000) return "";
+		const s = ms / 1000;
+		return s < 10 ? `${s.toFixed(1)}s` : `${Math.round(s)}s`;
+	};
+
+	const copyIconButton = (text, title) => {
+		const copy = el("button", "perm-copy");
+		copy.type = "button";
+		copy.title = title;
+		copy.setAttribute("aria-label", title);
+		copy.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>';
+		copy.addEventListener("click", async (e) => {
+			e.stopPropagation();
+			try {
+				await navigator.clipboard.writeText(text);
+				copy.classList.add("copied");
+				copy.title = "Copied";
+				setTimeout(() => {
+					copy.classList.remove("copied");
+					copy.title = title;
+				}, 1400);
+			} catch {
+				copy.title = "Copy failed";
+			}
+		});
+		return copy;
+	};
+
+	const commandResult = (raw, ok) => {
+		const clean = prettyOut(String(raw || "")).replace(/\x1b\[[0-9;]*m/g, "").trim();
+		const match = /^exit\s+(-?\d+)\s*(?:\n|$)/i.exec(clean);
+		return {
+			code: match ? Number(match[1]) : ok ? 0 : 1,
+			text: match ? clean.slice(match[0].length).trim() : clean,
+		};
 	};
 
 	/** Unwrap {"error": "…"} JSON envelopes so failures read as text. */
@@ -380,38 +562,177 @@
 	};
 
 	/** Numbered unified-diff rows: new-file numbers for +/ctx, old for −. */
-	const diffRows = (diff, cap = 300) => {
-		const rows = [];
-		let oldN = 0, newN = 0, truncated = false;
-		for (const l of String(diff).split("\n")) {
-			const h = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(l);
-			const hOld = /^@@ -(\d+)/.exec(l);
-			if (h) {
-				newN = Number(h[1]);
-				oldN = hOld ? Number(hOld[1]) : newN;
-				rows.push({ num: 0, cls: "fd-l-hunk", text: l });
+	const LANG_BY_EXT = {
+		ts: ["typescript", "TS"], tsx: ["typescript", "TSX"], js: ["javascript", "JS"], jsx: ["javascript", "JSX"],
+		mjs: ["javascript", "JS"], cjs: ["javascript", "JS"], json: ["json", "JSON"], py: ["python", "PY"],
+		css: ["css", "CSS"], html: ["xml", "HTML"], htm: ["xml", "HTML"], xml: ["xml", "XML"], svg: ["xml", "SVG"],
+		sh: ["bash", "SH"], bash: ["bash", "SH"], zsh: ["bash", "SH"], md: ["markdown", "MD"], go: ["go", "GO"], rs: ["rust", "RS"],
+	};
+	/** Highlight.js language id + short badge + split name/dir for a file path. */
+	const fileLang = (path) => {
+		const full = String(path || "");
+		const name = full.split("/").pop() || "";
+		const ext = name.includes(".") ? name.split(".").pop().toLowerCase() : "";
+		const [lang, badge] = LANG_BY_EXT[ext] || [null, ext.slice(0, 4).toUpperCase() || "TXT"];
+		return { lang, badge, name, dir: full.slice(0, full.length - name.length).replace(/\/$/, "") };
+	};
+	const normPath = (p) => String(p ?? "").replace(/^\.\//, "").replace(/^\/+/, "");
+	const parseInput = (input) => {
+		if (typeof input === "string") {
+			try { return JSON.parse(input) ?? {}; } catch { return {}; }
+		}
+		return input && typeof input === "object" ? input : {};
+	};
+
+	/** One diff code line, highlighted when the language is bundled (media/highlight.js). */
+	const codeCell = (text, lang) => {
+		const span = el("span", "fd-code");
+		const hl = /** @type {any} */ (globalThis).hljs;
+		if (lang && text && hl?.getLanguage?.(lang)) span.innerHTML = hl.highlight(text, { language: lang, ignoreIllegals: true }).value;
+		else span.textContent = text || " ";
+		return span;
+	};
+	const renderDiffRows = (rows, lang, truncated) => {
+		const pre = el("div", "diff-body");
+		for (const r of rows) {
+			if (r.cls === "fd-fold") {
+				pre.appendChild(el("div", "fd-fold", "⋯"));
 				continue;
 			}
-			if (l.startsWith("+++") || l.startsWith("---") || l.startsWith("diff ") || l.startsWith("index ")) continue;
+			const line = el("div", `fd-row ${r.cls}`);
+			line.appendChild(el("span", "fd-num", r.num ? String(r.num) : ""));
+			line.appendChild(codeCell(r.text, lang));
+			pre.appendChild(line);
+		}
+		if (truncated) pre.appendChild(el("div", "fd-trunc", "…truncated…"));
+		return pre;
+	};
+	/** Parses formatUnifiedWithContext / formatHunks text. Numbers appear only when the text has @@ headers. */
+	const parseDiffRows = (diff, cap = 400) => {
+		const rows = [];
+		let oldN = 0, newN = 0, truncated = false, numbered = false;
+		const num = (n) => (numbered ? n : 0);
+		for (const l of String(diff || "").split("\n")) {
+			const h = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(l);
+			if (h) {
+				numbered = true;
+				oldN = Number(h[1]);
+				newN = Number(h[2]);
+				if (rows.length) rows.push({ cls: "fd-fold" });
+				continue;
+			}
+			if (/^… \(\d+ more lines\)$/.test(l)) { truncated = true; break; }
+			if (l === "…") { rows.push({ cls: "fd-fold" }); continue; }
 			if (rows.length >= cap) { truncated = true; break; }
-			if (l.startsWith("+")) rows.push({ num: newN++, cls: "fd-l-add", text: l });
-			else if (l.startsWith("-")) rows.push({ num: oldN++, cls: "fd-l-del", text: l });
-			else rows.push({ num: newN++, cls: "fd-l-ctx", text: l });
+			if (l.startsWith("+")) rows.push({ num: num(newN++), cls: "fd-l-add", text: l.slice(1) });
+			else if (l.startsWith("-")) rows.push({ num: num(oldN++), cls: "fd-l-del", text: l.slice(1) });
+			else if (l.startsWith(" ")) rows.push({ num: num(newN++), cls: "fd-l-ctx", text: l.slice(1) });
+		}
+		return { rows, truncated };
+	};
+	/** Finished write: numbered lines with context, highlighted for the file's language. */
+	const renderEditorDiff = (diff, path) => {
+		const { rows, truncated } = parseDiffRows(diff);
+		return renderDiffRows(rows, fileLang(path).lang, truncated);
+	};
+
+	const EDIT_TOOLS = new Set(["edit_file", "write_file", "append_file", "insert_lines"]);
+	/** Proposed lines for an edit call — available as soon as the call starts, before the write runs. */
+	const previewRows = (name, input, cap = 200) => {
+		const rows = [];
+		let truncated = false;
+		const lines = (s) => (s ? String(s).replace(/\n$/, "").split("\n") : []);
+		const push = (cls, text) => {
+			if (rows.length >= cap) truncated = true;
+			else rows.push({ num: 0, cls, text });
+		};
+		if (name === "edit_file" && Array.isArray(input?.edits)) {
+			input.edits.forEach((e, i) => {
+				if (i > 0) rows.push({ cls: "fd-fold" });
+				for (const l of lines(e?.old_text)) push("fd-l-del", l);
+				for (const l of lines(e?.new_text)) push("fd-l-add", l);
+			});
+		} else {
+			for (const l of lines(input?.content)) push("fd-l-add", l);
 		}
 		return { rows, truncated };
 	};
 
-	const renderDiff = (diff) => {
-		const { rows, truncated } = diffRows(diff);
-		const pre = el("pre", "diff-body fd-body");
-		for (const r of rows) {
-			const row = el("div", `fd-row ${r.cls}`);
-			row.appendChild(el("span", "fd-num", r.num ? String(r.num) : ""));
-			row.appendChild(el("span", "fd-code", r.text));
-			pre.appendChild(row);
+	/** Head of an editor card: language badge, file name, dir, +/- totals, and status. */
+	const editorHead = (path, { added = 0, removed = 0, status = "", cls = "" } = {}) => {
+		const { badge, name, dir } = fileLang(path);
+		const head = el("summary", "diff-editor-head");
+		head.appendChild(el("span", "diff-lang", badge));
+		const fileName = el("span", "diff-file-name", name || path || "file");
+		fileName.title = path;
+		head.appendChild(fileName);
+		if (dir) head.appendChild(el("span", "diff-dir", dir));
+		const stats = el("span", "file-stats");
+		if (added) stats.appendChild(el("span", "stat-add", `+${added}`));
+		if (removed) stats.appendChild(el("span", "stat-del", `−${removed}`));
+		head.appendChild(stats);
+		head.appendChild(el("span", `diff-status ${cls}`.trim(), status));
+		return head;
+	};
+	const setEditStatus = (card, text, cls = "") => {
+		const s = card.querySelector(".diff-status");
+		if (!s) return;
+		s.textContent = text;
+		s.className = `diff-status ${cls}`.trim();
+	};
+	/** Icon actions shared by edit cards and standalone file rows. */
+	const fileActions = (path, target) => {
+		const actions = el("span", "file-actions");
+		for (const [label, type, title] of [["↗", "review", "Open diff"], ["✓", "acceptChange", "Accept changes"], ["✗", "rejectChange", "Revert file"]]) {
+			const btn = el("button", "file-btn", label);
+			btn.title = title;
+			btn.addEventListener("click", (e) => {
+				e.stopPropagation();
+				vscode.postMessage({ type, path });
+				if (type !== "review") target.remove();
+			});
+			actions.appendChild(btn);
 		}
-		if (truncated) pre.appendChild(el("div", "fd-trunc", "…truncated…"));
-		return pre;
+		return actions;
+	};
+	const pendingEdits = [];
+	const pendingEditCard = (name, input, path) => {
+		const card = el("details", "diff-editor pending");
+		card.dataset.state = "pending";
+		card.open = true;
+		card.appendChild(editorHead(path, { status: "Editing…", cls: "pending" }));
+		const { rows, truncated } = previewRows(name, input);
+		card.appendChild(renderDiffRows(rows, fileLang(path).lang, truncated));
+		return card;
+	};
+	const takePending = (path) => {
+		const key = normPath(path);
+		const i = pendingEdits.findIndex((e) => e.path === key);
+		return i < 0 ? null : pendingEdits.splice(i, 1)[0].card;
+	};
+	const dropPending = (card) => {
+		const i = pendingEdits.findIndex((e) => e.card === card);
+		if (i >= 0) pendingEdits.splice(i, 1);
+	};
+	/** Fills an edit card in place: header with totals/actions, then the real diff when present. */
+	const fillEditorCard = (card, { path, diff = "", added = 0, removed = 0, status = "", cls = "" }) => {
+		card.classList.remove("pending");
+		card.dataset.state = "done";
+		card.open = startedAt > 0;
+		const head = editorHead(path, { added, removed, status, cls });
+		head.appendChild(fileActions(path, card));
+		card.replaceChildren(head);
+		if (diff) card.appendChild(renderEditorDiff(diff, path));
+	};
+	/** Marks edit cards whose result never arrived (stop, failure, or restore mid-edit). */
+	const settlePending = (label) => {
+		for (const { card } of pendingEdits) {
+			if (card.dataset.state !== "pending") continue;
+			card.classList.remove("pending");
+			card.dataset.state = "interrupted";
+			setEditStatus(card, label, "muted");
+		}
+		pendingEdits.length = 0;
 	};
 
 	/** Per-run counters for the summary card — reset on run-started. */
@@ -544,6 +865,18 @@
 			menu.appendChild(input);
 			setTimeout(() => input.focus(), 0);
 		}
+		if (config.chips) {
+			const row = el("div", "menu-chips");
+			for (const c of config.chips) {
+				const b = el("button", c.active ? "menu-chip on" : "menu-chip", c.label);
+				b.addEventListener("click", (e) => {
+					e.stopPropagation();
+					c.onPick();
+				});
+				row.appendChild(b);
+			}
+			menu.appendChild(row);
+		}
 		const list = el("div", "menu-list");
 		for (const item of config.items) {
 			if (item.header) {
@@ -636,18 +969,41 @@
 		});
 	});
 
-	modelBtn.addEventListener("click", () => {
-		const recent = recentModels.map((id) => models.find((m) => m.id === id)).filter(Boolean);
+	const reopenModelMenu = () => {
+		menu.dataset.anchor = "";
+		showModelMenu();
+	};
+	const showModelMenu = () => {
+		const pool = groups.length > 0 ? groups : [{ profile: "", active: true, models }];
+		const scoped = pool.filter((g) => !providerFilter || g.profile === providerFilter);
+		const all = scoped.flatMap((g) => g.models.map((m) => ({ m, profile: g.profile })));
+		const recent = recentModels
+			.map((id) => all.find((e) => e.m.id === id && e.profile === modelProfile) || all.find((e) => e.m.id === id))
+			.filter(Boolean);
 		const items = [];
 		if (recent.length > 0) {
 			items.push({ header: "Recently used" });
-			for (const m of recent) items.push(modelItem(m));
+			for (const e of recent) items.push(modelItem(e.m, e.profile));
 		}
-		items.push({ header: recent.length > 0 ? "All models" : "Models" });
-		if (models.length === 0) items.push({ label: modelId || "No models loaded", disabled: true });
-		for (const m of models) items.push(modelItem(m));
-		openMenu(modelBtn, { search: true, wide: true, items });
-	});
+		for (const g of scoped) {
+			items.push({ header: groups.length > 0 ? `${g.profile}${g.active ? " · active" : ""}` : recent.length > 0 ? "All models" : "Models" });
+			if (g.models.length === 0) items.push({ label: modelId || "No models loaded", disabled: true });
+			for (const m of g.models) items.push(modelItem(m, g.profile));
+		}
+		const chips =
+			pool.length > 1
+				? [
+						{ label: "All", active: !providerFilter, onPick: () => { providerFilter = ""; reopenModelMenu(); } },
+						...pool.map((g) => ({
+							label: g.active ? `${g.profile} · active` : g.profile,
+							active: providerFilter === g.profile,
+							onPick: () => { providerFilter = g.profile; reopenModelMenu(); },
+						})),
+					]
+				: undefined;
+		openMenu(modelBtn, { search: true, wide: true, chips, items });
+	};
+	modelBtn.addEventListener("click", showModelMenu);
 
 	const fmtToks = (n) => (n == null ? "" : n >= 1e6 ? `${n / 1e6}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n));
 	const fmtPrice = (v) => {
@@ -668,21 +1024,26 @@
 		return parts.join(" · ");
 	};
 
-	const modelItem = (m) => ({
+	/** Record a pick and tell the host which provider profile it belongs to (pins the run's provider). */
+	const chooseModel = (m, profile) => {
+		modelId = m.id;
+		modelProfile = profile || "";
+		recentModels = [m.id, ...recentModels.filter((id) => id !== m.id)].slice(0, 3);
+		refreshChips();
+		updateActivityRing();
+		persist();
+		vscode.postMessage({ type: "setModel", modelId, profile: modelProfile || undefined });
+	};
+
+	const modelItem = (m, profile) => ({
 		label: m.label || m.id,
 		desc: modelDesc(m) || m.description?.slice(0, 120),
-		checked: m.id === modelId,
-		onInfo: () => showModelDetail(m),
-		onPick: () => {
-			modelId = m.id;
-			recentModels = [m.id, ...recentModels.filter((id) => id !== m.id)].slice(0, 3);
-			refreshChips();
-			persist();
-			vscode.postMessage({ type: "setModel", modelId });
-		},
+		checked: m.id === modelId && (!profile || profile === modelProfile),
+		onInfo: () => showModelDetail(m, profile),
+		onPick: () => chooseModel(m, profile),
 	});
 
-	const showModelDetail = (m) => {
+	const showModelDetail = (m, profile) => {
 		const overlay = el("div", "detail-overlay");
 		const card = el("div", "detail-card");
 		const head = el("div", "detail-head");
@@ -697,11 +1058,7 @@
 		const actions = el("div", "detail-actions");
 		const use = el("button", "detail-use", "Use model");
 		use.addEventListener("click", () => {
-			modelId = m.id;
-			recentModels = [m.id, ...recentModels.filter((id) => id !== m.id)].slice(0, 3);
-			refreshChips();
-			persist();
-			vscode.postMessage({ type: "setModel", modelId });
+			chooseModel(m, profile);
 			overlay.remove();
 			closeMenu();
 		});
@@ -792,6 +1149,8 @@
 				mode = msg.mode || mode;
 				modelId = msg.modelId || modelId;
 				models = msg.models || models;
+				groups = msg.groups || groups;
+				if (typeof msg.modelProfile === "string") modelProfile = msg.modelProfile;
 				if (typeof msg.signedIn === "boolean") signedIn = msg.signedIn;
 				if (typeof msg.workspaceName === "string") {
 					workspaceLabel.textContent = msg.workspaceName;
@@ -863,10 +1222,21 @@
 			case "reset":
 				showEmpty();
 				tools.clear();
+				pendingEdits.length = 0;
 				attachments.clear();
 				attachmentPreviews.replaceChildren();
 				attachmentPreviews.hidden = true;
-				usage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+				usage = {
+					inputTokens: 0,
+					outputTokens: 0,
+					cacheReadTokens: 0,
+					cacheWriteTokens: 0,
+					reasoningTokens: 0,
+					totalCost: 0,
+					iteration: 0,
+					contextMsgs: 0,
+					contextBudget: 0,
+				};
 				setRunning(false);
 				stopTimer();
 				setStatus("Idle");
@@ -890,9 +1260,26 @@
 			}
 			case "reasoning": {
 				ensureSegment();
-				streamReasoning = null;
-				reasoningText = "";
-				newThoughtSegment().appendChild(el("div", "reasoning-text", msg.text));
+				const text = String(msg.text || "");
+				const norm = text.replace(/\s+/g, " ").trim();
+				if (streamReasoning) {
+					// Final event for the segment we already streamed — update it
+					// in place instead of opening a duplicate Thoughts pill.
+					streamReasoning.classList.remove("streaming");
+					if (norm) {
+						reasoningText = text;
+						streamReasoning.textContent = text;
+						lastReasoningNorm = norm;
+					} else {
+						lastReasoningNorm = reasoningText.replace(/\s+/g, " ").trim();
+					}
+					setThoughtPreview(reasoningText);
+					streamReasoning = null;
+					reasoningText = "";
+				} else if (norm && norm !== lastReasoningNorm) {
+					lastReasoningNorm = norm;
+					newThoughtSegment(text).appendChild(el("div", "reasoning-text", text));
+				}
 				scrollMaybe();
 				break;
 			}
@@ -905,6 +1292,7 @@
 				}
 				reasoningText += msg.text;
 				streamReasoning.textContent = reasoningText;
+				setThoughtPreview(reasoningText);
 				scrollMaybe();
 				break;
 			}
@@ -949,12 +1337,23 @@
 				const [icon, verb] = toolVerb(msg.name);
 				lastVerb = `${verb} ${describeInput(msg.name, msg.input)}…`;
 				setStatus("Running...");
+				if (EDIT_TOOLS.has(msg.name)) {
+					const input = parseInput(msg.input);
+					const path = normPath(input.path);
+					const card = pendingEditCard(msg.name, input, path);
+					card.dataset.toolId = msg.id;
+					tools.set(msg.id, card);
+					pendingEdits.push({ path, card });
+					add(card);
+					break;
+				}
 				const card = el("details", "step tool running");
 				const summary = el("summary");
 				summary.appendChild(el("span", "twisty", "›"));
 				summary.appendChild(el("span", "tool-icon", icon));
 				summary.appendChild(el("span", "tool-name", verb));
 				summary.appendChild(el("span", "tool-arg", describeInput(msg.name, msg.input)));
+				summary.appendChild(el("span", "tool-detail muted"));
 				const stat = el("span", "tool-status");
 				stat.appendChild(el("span", "live-elapsed muted", "0s"));
 				stat.appendChild(el("span", "act-pill run", "Running"));
@@ -978,39 +1377,74 @@
 			case "tool-finished": {
 				const card = tools.get(msg.id);
 				if (!card) break;
+				if (card.classList.contains("diff-editor")) {
+					dropPending(card);
+					if (!msg.ok) {
+						runStats.toolsFailed++;
+						card.dataset.state = "failed";
+						card.classList.remove("pending");
+						setEditStatus(card, "Not applied", "err");
+						card.open = true;
+						const out = prettyOut(String(msg.output || "")).replace(/\x1b\[[0-9;]*m/g, "").trim();
+						if (out) card.appendChild(el("pre", "io io-err", out));
+					} else if (card.dataset.state === "pending") {
+						card.classList.remove("pending");
+						card.dataset.state = "done";
+						setEditStatus(card, "No changes", "muted");
+					}
+					lastVerb = "";
+					break;
+				}
 				card.classList.remove("running");
 				card.classList.add(msg.ok ? "ok" : "error");
-				// Consolidate to a single line: icon verb arg ✓/✗ duration
+				// Consolidate to a single line: icon verb arg · detail … duration ✓/✗
 				const summary = card.querySelector("summary");
+				const det = card.querySelector(".tool-detail");
+				if (det) {
+					const d = resultDetail(msg.name, msg.output);
+					det.textContent = d ? `· ${d}` : "";
+				}
 				const stat = card.querySelector(".tool-status");
 				if (stat) {
 					stat.textContent = "";
-					stat.appendChild(el("span", "muted", `${msg.durationMs}ms`));
-					stat.appendChild(el("span", `act-pill ${msg.ok ? "ok" : "err"}`, msg.ok ? "Completed" : "Failed"));
+					const dur = fmtMs(msg.durationMs);
+					if (dur) stat.appendChild(el("span", "muted", dur));
+					stat.appendChild(
+						msg.ok
+							? el("span", "tool-check", "✓")
+							: el("span", "act-pill err", "Failed"),
+					);
 				}
 				if (!msg.ok) runStats.toolsFailed++;
 				card.classList.add("done-line");
-				card.open = !msg.ok;
 				if (openToolCard === card) openToolCard = null;
-				// Failed cards keep their output expanded; successes collapse to a line.
+				// Completed command cards keep their result visible; other successful
+				// tools collapse to a concise line.
 				if (summary && msg.ok) {
 					card.innerHTML = "";
 					card.appendChild(summary);
 				}
 				if (card.dataset.cmd) {
-					const cmdDet = el("details", "tool-output");
-					cmdDet.appendChild(el("summary", "", "Command"));
-					cmdDet.appendChild(el("pre", "io cmd-full", card.dataset.cmd));
-					const runBtn = el("button", "perm-btn", "\u29c9 Run in terminal");
-					runBtn.addEventListener("click", (e) => {
-						e.stopPropagation();
-						vscode.postMessage({ type: "runInTerminal", command: card.dataset.cmd });
-					});
-					cmdDet.appendChild(runBtn);
-					card.appendChild(cmdDet);
+					const result = commandResult(msg.output, msg.ok);
+					const resultBox = el("div", "tool-result");
+					const commandHead = el("div", "tool-result-head");
+					commandHead.appendChild(el("span", "tool-result-label", "Command"));
+					commandHead.appendChild(copyIconButton(card.dataset.cmd, "Copy command"));
+					resultBox.appendChild(commandHead);
+					resultBox.appendChild(el("pre", "io cmd-full", card.dataset.cmd));
+					const outputHead = el("div", "tool-result-head");
+					outputHead.appendChild(el("span", "tool-result-label", "Output"));
+					if (result.text) outputHead.appendChild(copyIconButton(result.text, "Copy output"));
+					resultBox.appendChild(outputHead);
+					if (result.text) resultBox.appendChild(el("pre", `io${msg.ok ? "" : " io-err"}`, result.text));
+					resultBox.appendChild(el("div", `tool-exit${msg.ok ? "" : " failed"}`, `${msg.ok ? "Exited" : "Failed"} with code ${result.code}`));
+					card.appendChild(resultBox);
+					card.open = true;
+				} else {
+					const cleanOutput = prettyOut(String(msg.output || "")).replace(/\x1b\[[0-9;]*m/g, "").trim();
+					if (cleanOutput) card.appendChild(el("pre", `io${msg.ok ? "" : " io-err"}`, cleanOutput));
+					card.open = !msg.ok;
 				}
-				const cleanOutput = prettyOut(String(msg.output || "")).replace(/\x1b\[[0-9;]*m/g, "").trim();
-				if (cleanOutput) card.appendChild(el("pre", `io${msg.ok ? "" : " io-err"}`, cleanOutput));
 				lastVerb = "";
 				break;
 			}
@@ -1031,6 +1465,7 @@
 			}
 			case "loop-detected":
 				add(el("div", "step info", `⏹ Stopped: \`${msg.tool}\` repeated ${msg.count}× — the model was looping.`));
+				settlePending("Interrupted");
 				setRunning(false);
 				stopTimer();
 				closeGroup("Stopped · worked for");
@@ -1044,35 +1479,27 @@
 				ensureSegment();
 				groupStats.added += msg.added || 0;
 				groupStats.removed += msg.removed || 0;
+				if ((msg.added || 0) + (msg.removed || 0) > 0) groupStats.files.add(msg.path);
 				runStats.files.set(msg.path, { added: msg.added || 0, removed: msg.removed || 0 });
 				updateGroupTitle("Working for");
+				const pending = takePending(msg.path);
+				if (msg.diff || pending) {
+					// Edit calls resolve their preview card in place; standalone writes get a new card.
+					const card = pending ?? el("details", "diff-editor");
+					fillEditorCard(card, { ...msg, status: msg.diff ? "" : "No changes", cls: msg.diff ? "" : "muted" });
+					if (!pending) add(card);
+					break;
+				}
 				const row = el("div", "step file");
 				row.appendChild(el("span", "file-name", `${msg.kind === "created" ? "✚" : "✎"} ${msg.path}`));
 				if (msg.added || msg.removed) {
 					const stats = el("span", "file-stats");
 					if (msg.added) stats.appendChild(el("span", "stat-add", `+${msg.added}`));
-					if (msg.removed) stats.appendChild(el("span", "stat-del", `-${msg.removed}`));
+					if (msg.removed) stats.appendChild(el("span", "stat-del", `−${msg.removed}`));
 					row.appendChild(stats);
 				}
-				const actions = el("span", "file-actions");
-				for (const [label, type] of [["Review", "review"], ["✓", "acceptChange"], ["✗", "rejectChange"]]) {
-					const btn = el("button", "file-btn", label);
-					btn.title = type === "review" ? "Open diff" : type === "acceptChange" ? "Accept changes" : "Revert file";
-					btn.addEventListener("click", () => {
-						vscode.postMessage({ type, path: msg.path });
-						if (type !== "review") row.remove();
-					});
-					actions.appendChild(btn);
-				}
-				row.appendChild(actions);
+				row.appendChild(fileActions(msg.path, row));
 				add(row);
-				if (msg.diff) {
-					const det = el("details", "diff-detail");
-					det.open = startedAt > 0;
-					det.appendChild(el("summary", "", "Changes"));
-					det.appendChild(renderDiff(msg.diff));
-					add(det);
-				}
 				break;
 			}
 			case "check": {
@@ -1100,20 +1527,44 @@
 				const titles = { run_command: "Run a command?", memory_write: "Save a fact?" };
 				row.appendChild(el("div", "perm-title", titles[msg.tool] || "Apply changes?"));
 				const card = el("div", "perm-card");
-				card.appendChild(el("div", "perm-label", msg.tool === "run_command" ? "Command" : msg.tool === "memory_write" ? "Fact" : "Path"));
+				const commandHead = el("div", "perm-command-head");
+				commandHead.appendChild(el("div", "perm-label", msg.tool === "run_command" ? "Command" : msg.tool === "memory_write" ? "Fact" : "Path"));
+				if (msg.tool === "run_command") {
+					const copy = el("button", "perm-copy");
+					copy.type = "button";
+					copy.title = "Copy command";
+					copy.setAttribute("aria-label", "Copy command");
+					copy.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>';
+					copy.addEventListener("click", async (e) => {
+						e.stopPropagation();
+						try {
+							await navigator.clipboard.writeText(String(msg.path || ""));
+							copy.classList.add("copied");
+							copy.title = "Copied";
+							setTimeout(() => {
+								copy.classList.remove("copied");
+								copy.title = "Copy command";
+							}, 1400);
+						} catch {
+							copy.title = "Copy failed";
+						}
+					});
+					commandHead.appendChild(copy);
+				}
+				card.appendChild(commandHead);
 				card.appendChild(el("code", "perm-body", msg.path));
-				if (msg.diff) card.appendChild(renderDiff(msg.diff));
-				row.appendChild(card);
+				if (msg.diff) card.appendChild(renderEditorDiff(msg.diff, msg.path));
 				const btns = el("div", "perm-btns");
 				const resolve = (decision, label) => {
 					vscode.postMessage({ type: "permissionResponse", id: msg.id, decision });
 					btns.remove();
-					row.appendChild(el("span", "perm-decision", label));
+					card.appendChild(el("span", "perm-decision", label));
 				};
 				const wrap = el("div", "perm-allow-wrap");
 				const allowBtn = el("button", "perm-btn allow", "Allow");
 				allowBtn.addEventListener("click", () => resolve("allow", "✓ allowed"));
-				const dropBtn = el("button", "perm-btn allow drop", "▾");
+				const dropBtn = el("button", "perm-btn allow drop");
+				dropBtn.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg>';
 				const menu = el("div", "perm-menu");
 				menu.hidden = true;
 				for (const [d, label] of [
@@ -1136,7 +1587,8 @@
 				wrap.appendChild(allowBtn);
 				wrap.appendChild(dropBtn);
 				wrap.appendChild(menu);
-				const wand = el("button", "perm-btn perm-wand", "🪄");
+				const wand = el("button", "perm-btn perm-wand");
+				wand.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 19 6v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6l7-3Z"/><path d="m9 12 2 2 4-4"/></svg>';
 				wand.title = "Always allow this tool";
 				wand.addEventListener("click", () => resolve("alwaysTool", "✓ always allow this tool"));
 				const rejectBtn = el("button", "perm-btn deny", "Reject");
@@ -1144,7 +1596,8 @@
 				btns.appendChild(wand);
 				btns.appendChild(wrap);
 				btns.appendChild(rejectBtn);
-				row.appendChild(btns);
+				card.appendChild(btns);
+				row.appendChild(card);
 				add(row);
 				break;
 			}
@@ -1152,7 +1605,8 @@
 				const row = timeline.querySelector(`[data-perm-id="${msg.id}"]`);
 				if (row && !row.querySelector(".perm-decision")) {
 					row.querySelector(".perm-btns")?.remove();
-					row.appendChild(el("span", "perm-decision", msg.decision === "deny" ? "✗ denied" : `✓ ${msg.decision}`));
+					const card = row.querySelector(".perm-card") || row;
+					card.appendChild(el("span", "perm-decision", msg.decision === "deny" ? "✗ denied" : `✓ ${msg.decision}`));
 				}
 				break;
 			}
@@ -1178,23 +1632,32 @@
 					outputTokens: msg.outputTokens,
 					cacheReadTokens: msg.cacheReadTokens || 0,
 					cacheWriteTokens: msg.cacheWriteTokens || 0,
+					reasoningTokens: msg.reasoningTokens || 0,
+					totalCost: msg.totalCost || 0,
+					iteration: msg.iteration || 0,
+					contextMsgs: msg.contextMsgs || 0,
+					contextBudget: msg.contextBudget || 0,
 				};
 				setStatus("Running...");
 				break;
 			case "run-finished": {
-				const secs = ((Date.now() - startedAt) / 1000).toFixed(0);
+				const secs = startedAt ? Math.round((Date.now() - startedAt) / 1000) : 0;
 				const issues = runStats.toolsFailed + runStats.checksFailed;
+				const stopped = msg.status === "stopped" || msg.status === "interrupted";
+				settlePending("Interrupted");
 				// Zero-diff churn (binary/.pyc) isn't a meaningful change.
 				const files = [...runStats.files.values()].filter((f) => f.added + f.removed > 0);
 				const added = files.reduce((a, f) => a + f.added, 0);
 				const removed = files.reduce((a, f) => a + f.removed, 0);
-				const card = el("div", `step done result-card${issues ? " has-issues" : ""}`);
+				const card = el("div", `step done result-card${stopped ? " stopped" : ""}${issues ? " has-issues" : ""}`);
 				const title = el("div", "result-title");
-				title.appendChild(el("span", "check-circle", "✓"));
-				title.appendChild(el("span", "", msg.status === "completed" || msg.status === "success" ? "Task completed" : `Finished (${msg.status})`));
-				const pill = issues
-					? el("span", "status-pill warn", `${issues} issue${issues > 1 ? "s" : ""}`)
-					: el("span", "status-pill completed", "Completed");
+				title.appendChild(el("span", stopped ? "stop-circle" : "check-circle", stopped ? "■" : "✓"));
+				title.appendChild(el("span", "result-heading", stopped ? "Stopped" : msg.status === "completed" || msg.status === "success" ? "Task completed" : `Finished (${msg.status})`));
+				const pill = stopped
+					? el("span", "status-pill stopped", "Stopped")
+					: issues
+						? el("span", "status-pill warn", `${issues} issue${issues > 1 ? "s" : ""}`)
+						: el("span", "status-pill completed", "Completed");
 				pill.style.marginLeft = "auto";
 				title.appendChild(pill);
 				card.appendChild(title);
@@ -1203,6 +1666,16 @@
 					const rs = el("div", "result-summary");
 					rs.appendChild(renderMd(msg.text));
 					card.appendChild(rs);
+				}
+				if (stopped) {
+					const actions = el("div", "result-actions");
+					const cont = el("button", "continue-btn", "Continue");
+					cont.addEventListener("click", () => {
+						cont.disabled = true;
+						vscode.postMessage({ type: "continue" });
+					});
+					actions.appendChild(cont);
+					card.appendChild(actions);
 				}
 				const stats = el("div", "result-stats");
 				const stat = (val, cls, label) => {
@@ -1218,23 +1691,26 @@
 				if (issues) stats.appendChild(stat(issues, "stat-del", "Failed"));
 				card.appendChild(stats);
 				const foot = el("div", "result-foot muted");
-				foot.textContent = `${secs}s · ${msg.iterations} step(s)`;
+				foot.textContent = `${secs ? `${secs}s · ` : ""}${msg.iterations} step(s)`;
 				card.appendChild(foot);
+				// Close the work group first so the card lands at top level —
+				// otherwise it is swallowed into the just-collapsed group.
+				closeGroup(stopped ? "Stopped · worked for" : "Finished · worked for");
 				add(card);
 				setRunning(false);
 				stopTimer();
-				closeGroup("Finished · worked for");
-				setStatus(`Done (${msg.status})`);
+				setStatus(stopped ? "Stopped" : `Done (${msg.status})`);
 				break;
 			}
 			case "run-failed": {
 				const card = el("div", "step failed");
 				card.appendChild(el("div", "label", "Run failed"));
 				card.appendChild(el("div", "body", msg.error));
-				add(card);
+				settlePending("Interrupted");
 				setRunning(false);
 				stopTimer();
 				closeGroup("Failed · worked for");
+				add(card);
 				setStatus("Failed");
 				break;
 			}

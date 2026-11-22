@@ -60,7 +60,7 @@ export async function models(req: Request): Promise<Response> {
 		.collection<{
 			_id: string;
 			settings?: {
-				data?: { profiles?: { name?: string; baseUrl?: string; enabled?: boolean }[]; activeProfile?: string; baseUrl?: string };
+				data?: { profiles?: { name?: string; baseUrl?: string; enabled?: boolean }[]; activeProfile?: string };
 				secrets?: Record<string, string>;
 			};
 		}>("users")
@@ -68,20 +68,16 @@ export async function models(req: Request): Promise<Response> {
 	const data = doc?.settings?.data ?? {};
 	const secrets = doc?.settings?.secrets ?? {};
 	const profiles = (data.profiles ?? []).filter((p) => p.baseUrl && p.enabled !== false);
-	const keyFor = (name?: string) =>
-		name ? (secrets[`profile.apiKey.${name}`] ?? secrets[name] ?? "") : (secrets.providerApiKey ?? "");
-	// Catalog per provider profile, in parallel. Ungrouped fallback = flat provider.*.
+	const keyFor = (name: string) => secrets[`profile.apiKey.${name}`] ?? secrets[name] ?? "";
+	// Catalog per configured provider profile, in parallel — the composer only offers providers that can run.
 	const groups = await Promise.all(
 		profiles.map(async (p) => ({
 			profile: p.name ?? "default",
-			active: p.name === (data.activeProfile ?? profiles[0]?.name),
-			models: await fetchModels(p.baseUrl!, keyFor(p.name)),
+			active: p.name === data.activeProfile,
+			models: await fetchModels(p.baseUrl!, keyFor(p.name ?? "")),
 		})),
 	);
-	if (!groups.length && data.baseUrl) {
-		groups.push({ profile: "default", active: true, models: await fetchModels(data.baseUrl, keyFor()) });
-	}
-	return json({ groups, activeProfile: (data.activeProfile ?? profiles[0]?.name) || null });
+	return json({ groups, activeProfile: data.activeProfile || null });
 }
 
 /** GET /api/plans/:id?session=&slug= */

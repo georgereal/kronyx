@@ -12,6 +12,7 @@ import SessionView from "../../web/app/(app)/sessions/[id]/page";
 import SessionsLanding from "../../web/app/(app)/sessions/page";
 import { configure, resolveApiUrl } from "./shims/kronyxApi";
 import { setSessionParams } from "./shims/nextNavigation";
+import type { ModelGroup } from "../../web/lib/types";
 import "../../web/app/globals.css";
 
 interface MountConfig {
@@ -20,6 +21,10 @@ interface MountConfig {
 	apiBase: string;
 	webBase: string;
 	modelId?: string;
+	modelProfile?: string;
+	/** Local BYOK provider catalogs seeded by the extension — fallback when the
+	 *  backend /api/models returns no synced profiles. */
+	groups?: ModelGroup[];
 }
 
 // window.__kronyxPost is injected by the webview's inline script BEFORE this
@@ -108,28 +113,42 @@ function render(el: ReactElement) {
 	container?.remove();
 	container = document.createElement("div");
 	container.id = "kronyx-session-root";
+	container.classList.add("kronyx-ide");
 	document.body.appendChild(container);
 	root = createRoot(container);
 	root.render(el);
 }
 
-// The shared Composer reads the last-picked model from localStorage — seed it
-// from the extension's provider.modelId so the chip isn't blank.
-function seedModel(modelId?: string) {
-	if (modelId && !localStorage.getItem("kronyx.modelId")) localStorage.setItem("kronyx.modelId", modelId);
+// The IDE's saved pick is the composer's starting selection on every mount; with
+// no pick, stale localStorage is cleared so a session can't run on an old model.
+function seedModel(modelId?: string, modelProfile?: string) {
+	if (modelId && modelProfile) {
+		localStorage.setItem("kronyx.modelId", modelId);
+		localStorage.setItem("kronyx.modelProfile", modelProfile);
+	} else {
+		localStorage.removeItem("kronyx.modelId");
+		localStorage.removeItem("kronyx.modelProfile");
+	}
+}
+
+// The Composer falls back to these when the backend has no synced profiles.
+function seedGroups(groups?: ModelGroup[]) {
+	if (groups?.length) localStorage.setItem("kronyx.modelGroups", JSON.stringify(groups));
 }
 
 (globalThis as Record<string, unknown>).KronyxSession = {
 	mount(cfg: MountConfig) {
 		configure({ apiBase: cfg.apiBase, webBase: cfg.webBase, token: cfg.token });
 		setSessionParams({ id: cfg.sessionId });
-		seedModel(cfg.modelId);
+		seedModel(cfg.modelId, cfg.modelProfile);
+		seedGroups(cfg.groups);
 		render(createElement(SessionView));
 	},
 	// The web's new-session page (repo/branch/mode/environment composer).
 	showNew(cfg: Omit<MountConfig, "sessionId">) {
 		configure({ apiBase: cfg.apiBase, webBase: cfg.webBase, token: cfg.token });
-		seedModel(cfg.modelId);
+		seedModel(cfg.modelId, cfg.modelProfile);
+		seedGroups(cfg.groups);
 		render(createElement(SessionsLanding));
 	},
 	unmount() {

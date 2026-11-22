@@ -1,8 +1,9 @@
+import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { AgentRunner, type AgentMode, type RunnerAttachment, type RunDigest } from "../agent/runner";
-import { acceptsImages, describeImages, pickVisionModel } from "../agent/vision";
+import { acceptsImages } from "../agent/vision";
 import { evaluate, parsePermissionsText, ruleFor, type PermissionLayers, type PermissionRules } from "../agent/permissions";
 import { readGlobalModePermissions, readGlobalPermissions } from "../permStore";
 import type { PriorTranscript } from "../agent/recall";
@@ -16,7 +17,7 @@ import { createMcpTools, type McpServerConfig } from "../tools/mcpTools";
 import { userConfig } from "../userConfig";
 import { insertMemoryEvent, openStore } from "../store";
 import { createIdeTools } from "./ideTools";
-import { autoApproveWrites, configuredModels, estimateCostUsd, implementPrompt, modelPricing, planDir, profiles, promptForApiKey, providerErrorMessage, readProviderSettings, resolveProvider, writeProviderValue } from "../config";
+import { autoApproveWrites, estimateCostUsd, implementPrompt, modelPricing, pickModel, planDir, type ProfileCatalog, profiles, promptForApiKey, providerErrorMessage, readProviderSettings, resolveProvider } from "../config";
 import { log } from "../log";
 import type { ApiCallRow } from "../store";
 import * as git from "../git";
@@ -78,7 +79,7 @@ export interface SessionDeps {
 	output: vscode.OutputChannel;
 	runLock: RunLock;
 	modeRef: { current: AgentMode };
-	viewState: { modelId: string; models: ModelOption[]; signedIn?: boolean; userEmail?: string };
+	viewState: { modelId: string; models: ModelOption[]; groups?: ProfileCatalog[]; signedIn?: boolean; userEmail?: string };
 	surfaces: Set<RunViewProvider>;
 	diffReview: DiffReview;
 	comments: RunComments;
@@ -170,6 +171,9 @@ export class SessionController {
 	private indexTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	private diagBaseline: { errors: number; warnings: number } | undefined;
 	private runStartedAt = 0;
+	/** Id shared by this run's api_calls/runs/session_events rows — required by
+	 *  the unsynced queries that batch-upload to the dashboard. */
+	private runId = "";
 	private replayed = false;
 	private runTask = "";
 	private lastUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, totalCost: 0 };
@@ -244,11 +248,41 @@ export class SessionController {
 		if (!this.openTabs.includes(name)) this.openTabs.push(name);
 		this.replayed = true;
 		this.surface.post({ type: "reset" });
-		const evs = await this.deps.loadEvents(name);
-		evs.forEach((e) => this.surface.post(e));
-		this.deps.setStatus("idle");
+		await this.replayStoredEvents();
 		this.rememberTabs();
 		void this.pushTabs();
+	}
+
+	/** Replay history without leaving a run visually active after an IDE restart. */
+	private async replayStoredEvents(): Promise<number> {
+		const evs = await this.deps.loadEvents(this.name);
+		let active = false;
+		let task = "";
+		for (const event of evs) {
+			if (event.type === "run-started") {
+				active = true;
+				task = event.task;
+			} else if (event.type === "run-finished" || event.type === "run-failed") {
+				active = false;
+			}
+			this.surface.post(event);
+		}
+		if (task) this.runTask = task;
+		// Do not close a run that is genuinely active in another surface of the
+		// same extension host; after a VS Code restart the lock is empty.
+		if (active && !this.runner?.isRunning && this.deps.runLock.current !== this.name) {
+			this.runTask = task;
+			const recovery = {
+				type: "run-finished" as const,
+				status: "stopped",
+				text: "Run interrupted because VS Code was closed.",
+				iterations: 0,
+			};
+			this.surface.post(recovery);
+			this.deps.persistEvent(this.name, recovery, this.runId);
+		}
+		this.deps.setStatus("idle");
+		return evs.length;
 	}
 
 	/** Push the session tab-strip state (sidebar surfaces only). */
@@ -276,6 +310,11 @@ export class SessionController {
 		switch (message.type) {
 			case "run":
 				await this.startRun(message.task, message.mode);
+				break;
+			case "continue":
+				if (!this.isRunning) {
+					await this.startRun("Continue from where the previous run stopped.", this.deps.modeRef.current);
+				}
 				break;
 			case "stop":
 				this.runner?.stop();
@@ -310,9 +349,8 @@ export class SessionController {
 			case "requestState":
 				if (!this.replayed) {
 					this.replayed = true;
-					const evs = await this.deps.loadEvents(this.name);
-					evs.forEach((e) => this.surface.post(e));
-					this.deps.output.appendLine(`[store] replayed "${this.name}" with ${evs.length} event(s)`);
+					const count = await this.replayStoredEvents();
+					this.deps.output.appendLine(`[store] replayed "${this.name}" with ${count} event(s)`);
 				}
 				await this.deps.refreshModels();
 				void this.pushTabs();
@@ -323,11 +361,10 @@ export class SessionController {
 				this.surface.setState({ mode: message.mode });
 				break;
 			case "setModel":
-				await vscode.workspace
-					.getConfiguration("kronyx")
-					.update("provider.modelId", message.modelId, vscode.ConfigurationTarget.Global);
-				void writeProviderValue("provider.modelId", message.modelId);
-				this.surface.setState({ modelId: message.modelId });
+				// A pick is always a model together with the provider it belongs to.
+				if (!message.modelId || !message.profile) break;
+				await pickModel(message.modelId, message.profile);
+				this.surface.setState({ modelId: message.modelId, modelProfile: message.profile });
 				break;
 			case "attach":
 				await this.attach(message.kind);
@@ -480,7 +517,7 @@ export class SessionController {
 					},
 				},
 				emit: (event) => this.onEvent(event),
-				events: { record: (e) => this.deps.persistEvent(this.name, e as Parameters<RunViewProvider["post"]>[0]) },
+				events: { record: (e) => this.deps.persistEvent(this.name, e as Parameters<RunViewProvider["post"]>[0], this.runId) },
 			});
 			void this.deps.loadDigest?.(this.name).then((d) => this.runner?.setRunDigests(d));
 			void this.deps.loadTranscripts?.(this.name).then((t) => {
@@ -509,7 +546,7 @@ export class SessionController {
 		this.surface.post(event);
 		// Delta events are transient streaming frames — final messages persist separately.
 		if (event.type !== "assistant-delta" && event.type !== "reasoning-delta" && event.type !== "usage") {
-			this.deps.persistEvent(this.name, event);
+			this.deps.persistEvent(this.name, event, this.runId);
 		}
 		this.deps.output.appendLine(`[${this.name}] [${event.type}] ${summarize(event)}`);
 		if (event.type === "file-changed" && this.runnerRoot) {
@@ -573,6 +610,7 @@ export class SessionController {
 				contextMsgs: event.contextMsgs,
 				costUsd: estimateCostUsd(delta, pricing),
 				durationMs: this.lastUsageAt ? now - this.lastUsageAt : now - this.runStartedAt,
+				runId: this.runId,
 			});
 			this.lastUsageAt = now;
 		}
@@ -597,6 +635,7 @@ export class SessionController {
 				tokensOut: this.lastUsage.outputTokens,
 				cacheRead: this.lastUsage.cacheReadTokens,
 				cacheWrite: this.lastUsage.cacheWriteTokens,
+				runId: this.runId,
 			});
 			this.recordDigest(event.status, event.text);
 			if (this.diagBaseline && this.runnerRoot) {
@@ -626,6 +665,7 @@ export class SessionController {
 					tokensIn: 0,
 					tokensOut: 0,
 					durationMs: Date.now() - (this.lastUsageAt || this.runStartedAt),
+					runId: this.runId,
 				});
 			}
 			this.deps.setStatus("failed");
@@ -635,6 +675,7 @@ export class SessionController {
 				status: "failed",
 				durationMs: Date.now() - this.runStartedAt,
 				at: Date.now(),
+				runId: this.runId,
 			});
 			this.recordDigest("failed", event.error);
 		}
@@ -661,13 +702,11 @@ export class SessionController {
 		}
 		try {
 			if (mode) this.deps.modeRef.current = mode;
-			const resolved = await resolveProvider(this.deps.context.secrets);
-			if (resolved.error) {
-				this.surface.post({ type: "run-failed", error: providerErrorMessage(resolved.error) });
+			const { settings, error } = await resolveProvider(this.deps.context.secrets);
+			if (!settings) {
+				this.surface.post({ type: "run-failed", error: providerErrorMessage(error!) });
 				return;
 			}
-			const settings = resolved.settings!;
-			if (!settings) return;
 			this.runProvider = {
 				providerId: settings.providerId,
 				baseUrl: settings.baseUrl,
@@ -678,43 +717,21 @@ export class SessionController {
 				`[${this.name}] Run with ${settings.providerId} ${settings.modelId} at ${settings.baseUrl} (mode: ${this.deps.modeRef.current})`,
 			);
 			this.changedPaths.clear();
+			this.runId = randomUUID();
 			await this.beforeRun(task);
 			const restored = freshRunner ? summarizePrior(await this.deps.loadEvents(this.name)) : "";
 			const expanded = await expandMentions(
 				restored ? `${task}\n\nContext from the previous session in this tab:\n${restored}` : task,
 				this.runnerRoot ?? "",
 			);
-			// Image @-mentions ride as image parts when the model can see them —
-			// otherwise offer to describe them with a vision-capable model.
-			const imageAtts = await collectImageMentions(task, this.runnerRoot ?? "");
-			let taskText = expanded;
-			let runnerAtts: RunnerAttachment[] = imageAtts;
-			if (imageAtts.length) {
-				const catalog = [...configuredModels(), ...profiles().flatMap((p) => p.models ?? [])];
-				const meta = catalog.find((m) => m.id === settings.modelId);
-				if (!acceptsImages(meta)) {
-					const visionId = pickVisionModel(catalog, settings.modelId);
-					if (visionId) {
-						const pick = await vscode.window.showInformationMessage(
-							`${settings.modelId} can't view images. Describe ${imageAtts.length} attached image(s) with ${visionId} and pass the context to the agent?`,
-							"Use fallback",
-							"Send without images",
-						);
-						if (pick === "Use fallback") {
-							const desc = await describeImages({
-								baseUrl: settings.baseUrl,
-								apiKey: settings.apiKey,
-								modelId: visionId,
-								task,
-								images: imageAtts.map((a) => ({ filename: a.filename, mime: a.mediaType, data: a.data! })),
-							});
-							if (desc) taskText = `Attached image descriptions (via ${visionId}):\n${desc}\n\n${taskText}`;
-						}
-						runnerAtts = [];
-					}
-				}
+			// Images go to the selected model only: no substitute describer model.
+			const attachments: RunnerAttachment[] = await collectImageMentions(task, this.runnerRoot ?? "");
+			const meta = profiles().find((p) => p.name === settings.profile)?.models?.find((m) => m.id === settings.modelId);
+			if (attachments.length && !acceptsImages(meta)) {
+				this.surface.post({ type: "run-failed", error: `${settings.modelId} can't view images — pick a vision-capable model or remove the attached images.` });
+				return;
 			}
-			await active.run(taskText, settings, runnerAtts);
+			await active.run(expanded, settings, attachments);
 		} finally {
 			this.deps.runLock.release(this.name);
 		}
@@ -881,14 +898,14 @@ export class SessionController {
 		const diff = await this.pendingDiff(root, file, toolName, input);
 		const event = { type: "permission-request" as const, id, tool: toolName, path: file, diff };
 		this.surface.post(event);
-		this.deps.persistEvent(this.name, event);
+		this.deps.persistEvent(this.name, event, this.runId);
 		void root;
 		const decision = await new Promise<"allow" | "always" | "deny" | "alwaysTool" | "alwaysRule">((resolve) => {
 			this.pendingPermissions.set(id, { toolName, input, resolve });
 		});
 		const response = { type: "permission-response" as const, id, decision };
 		this.surface.post(response);
-		this.deps.persistEvent(this.name, response);
+		this.deps.persistEvent(this.name, response, this.runId);
 		void logEpisode(root, { kind: "permission", path: file, task: this.runTask, tool: toolName, decision });
 		if (decision === "always") this.approveAll = true;
 		if (decision === "alwaysTool") this.permittedTools.add(toolName);
@@ -1028,8 +1045,11 @@ function summarizePrior(events: Parameters<RunViewProvider["post"]>[0][]): strin
 	const lastText = [...events].reverse().find((e) => e.type === "assistant-text") as { text?: string } | undefined;
 	const files = events.filter((e) => e.type === "file-changed").map((e) => (e as { path: string }).path);
 	if (!lastTask && !lastText && files.length === 0) return "";
+	// run-started persists the expanded prompt, which may already contain an
+	// injected context block — strip it so blocks don't nest across sends.
+	const taskText = lastTask?.task?.split("\n\nContext from the previous session in this tab:")[0];
 	const parts = [
-		lastTask?.task ? `Task: ${lastTask.task.slice(0, 300)}` : "",
+		taskText ? `Task: ${taskText.slice(0, 300)}` : "",
 		files.length ? `Files touched: ${[...new Set(files)].slice(0, 20).join(", ")}` : "",
 		lastText?.text ? `Last summary: ${lastText.text.slice(-600)}` : "",
 	].filter(Boolean);

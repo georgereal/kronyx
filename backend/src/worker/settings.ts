@@ -13,6 +13,7 @@ interface Profile {
 	baseUrl?: string;
 	modelId?: string;
 	enabled?: boolean;
+	models?: { id: string }[];
 }
 
 /** Read users/{uid}.settings — BYOK profiles + secrets synced from the editors/web. */
@@ -35,39 +36,42 @@ function profileKey(secrets: Record<string, string>, name: string): string {
 }
 
 /**
- * Resolve the runnable provider for a job. Job-level profile/model win;
- * otherwise the user's activeProfile, else the first profile, else the flat
- * provider.* fields. Mirrors resolveProvider() in src/config.ts.
+ * Resolve the runnable provider for a job. The job's own profile and model are
+ * the only selection: no fallback to the active profile, other profiles, or the
+ * flat provider.* fields. Mirrors resolveProvider() in src/config.ts.
  */
 export function resolveProvider(
 	settings: UserSettings,
 	job: { profile?: string; modelId?: string },
 ): { settings?: ProviderSettings; error?: string } {
-	const profiles = ((settings.data.profiles as Profile[] | undefined) ?? []).filter((p) => p.enabled !== false);
-	const name = job.profile ?? (settings.data.activeProfile as string | undefined) ?? profiles[0]?.name;
-	const profile = name ? profiles.find((p) => p.name === name) : undefined;
-	const allProfiles = (settings.data.profiles as Profile[] | undefined) ?? [];
-	if (allProfiles.length > 0 && !profile) {
-		const disabled = name ? allProfiles.some((p) => p.name === name && p.enabled === false) : false;
-		return { error: disabled ? `Provider profile "${name}" is disabled — enable it in Settings.` : `No provider profile "${name}" — configure one in Settings → Provider.` };
-	}
-	const providerId = profile?.providerId ?? (settings.data.providerId as string | undefined) ?? "openai-compatible";
-	const baseUrl = profile?.baseUrl ?? (settings.data.baseUrl as string | undefined) ?? "";
-	const modelId = job.modelId ?? profile?.modelId ?? (settings.data.modelId as string | undefined) ?? "";
-	const apiKey = profile?.name ? profileKey(settings.secrets, profile.name) : (settings.secrets.providerApiKey ?? "");
-	if (!baseUrl) return { error: "Provider is missing a base URL — complete it in Settings → Provider." };
-	if (!modelId) return { error: "No model selected — pick one in the composer or Settings → Provider." };
-	if (!apiKey) return { error: `No API key for provider "${name ?? "default"}" — set it in Settings → Provider.` };
+	if (!job.profile || !job.modelId) return { error: "No model selected — pick a provider and model in the composer." };
+	const profile = ((settings.data.profiles as Profile[] | undefined) ?? []).find((p) => p.name === job.profile);
+	if (!profile) return { error: `Provider "${job.profile}" is not configured — add it in Settings → Provider.` };
+	if (profile.enabled === false) return { error: `Provider "${job.profile}" is disabled — enable it in Settings.` };
+	if (!profile.providerId || !profile.baseUrl) return { error: `Provider "${job.profile}" is missing its provider id or base URL — complete it in Settings → Provider.` };
+	if (profile.models?.length && !profile.models.some((m) => m.id === job.modelId))
+		return { error: `Model "${job.modelId}" is not in the "${job.profile}" catalog — refresh its models or pick again.` };
+	const apiKey = profileKey(settings.secrets, profile.name ?? job.profile);
+	if (!apiKey) return { error: `No API key for provider "${job.profile}" — set it in Settings → Provider.` };
 	return {
 		settings: {
-			providerId,
-			baseUrl,
-			modelId,
+			providerId: profile.providerId,
+			baseUrl: profile.baseUrl,
+			modelId: job.modelId,
 			apiKey,
-			profile: name,
+			profile: job.profile,
 			maxIterations: Number(settings.data.agentMaxIterations) || 300,
 		},
 	};
+}
+
+/** Credentials of the account's active provider profile, for account-level calls that aren't runs (embeddings, pricing). */
+export function activeProviderCreds(settings: UserSettings): { baseUrl: string; apiKey: string } | undefined {
+	const profiles = (settings.data.profiles as Profile[] | undefined) ?? [];
+	const profile = profiles.find((p) => p.name === settings.data.activeProfile && p.enabled !== false);
+	if (!profile?.name || !profile.baseUrl) return undefined;
+	const apiKey = profileKey(settings.secrets, profile.name);
+	return apiKey ? { baseUrl: profile.baseUrl, apiKey } : undefined;
 }
 
 export function e2bApiKey(settings: UserSettings): string {

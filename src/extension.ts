@@ -3,7 +3,8 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import type { AgentMode, RunDigest } from "./agent/runner";
 import type { PriorTranscript } from "./agent/recall";
-import { activeProfile, clearApiKey, configuredModels, fetchModelCatalog, profiles, promptForApiKey, readProviderSettings } from "./config";
+import { activeProfile, clearApiKey, configuredModels, currentSelection, fetchModelCatalog, pickModel, profileCatalogs, profiles, promptForApiKey, readProviderSettings } from "./config";
+import type { ModelSelection } from "./providerSelection";
 import { RunViewProvider } from "./ui/runViewProvider";
 import { renderPage } from "./ui/pageHtml";
 import { SessionController } from "./ui/sessionController";
@@ -28,7 +29,7 @@ const MODE_STATE_KEY = "kronyx.mode";
 const MODELS_CACHE_KEY = "kronyx.modelsCache";
 const HISTORY_KEY = "kronyx.history";
 const KNOWN_MODEL_KEY = "kronyx.knownModel";
-let pendingGate: string | undefined; // prior model to restore if a gated eval run fails
+let pendingGate: ModelSelection | undefined; // prior provider + model pick to restore if a gated eval run fails
 let syncWorker: UsageSync | undefined; // usage sync worker (set in activate)
 let rightController: SessionController | undefined; // the session in the dedicated right sidebar view
 let gateSuppressed = false; // set briefly while reverting modelId
@@ -123,10 +124,14 @@ export function activate(context: vscode.ExtensionContext): void {
 		accountStatus.show();
 		deps.viewState = { ...deps.viewState, signedIn, userEmail: user?.email };
 		for (const surface of deps.surfaces) surface.setState(deps.viewState);
+		if (signedIn) syncWorker?.resume(); // flush any rows queued while signed out
 	};
 	onAuthChanged((user) => {
 		void applyAuthState(user);
-		if (user) void settingsSync.pull().then(() => settingsSync.push());
+		if (user) {
+			syncWorker?.resume(); // clear any 401 pause and flush queued rows now
+			void settingsSync.pull().then(() => settingsSync.push());
+		}
 	});
 	void currentUser(context).then(applyAuthState);
 	// Soft-required onboarding: one-time prompt on first activation when signed out.
@@ -240,7 +245,7 @@ export function activate(context: vscode.ExtensionContext): void {
 	const refreshModels = (force = false): Promise<void> => {
 		// Dedupe concurrent callers — activation + requestState can race to the network.
 		if (!force && refreshInFlight) return refreshInFlight;
-		refreshInFlight = doRefreshModels(force).finally(() => {
+		refreshInFlight = doRefreshModels(force).then(() => refreshGroups(force)).finally(() => {
 			refreshInFlight = undefined;
 		});
 		return refreshInFlight;
@@ -266,6 +271,7 @@ export function activate(context: vscode.ExtensionContext): void {
 		if (!force && cached) {
 			log("models", `using cached catalog (${cached.length} models)`);
 			deps.viewState = {
+				...deps.viewState,
 				modelId: settings.modelId,
 				models: cached.some((m) => m.id === settings.modelId) ? cached : [{ id: settings.modelId }, ...cached],
 			};
@@ -300,7 +306,13 @@ export function activate(context: vscode.ExtensionContext): void {
 		const merged = models.some((m) => m.id === settings.modelId)
 			? models
 			: [{ id: settings.modelId }, ...models];
-		deps.viewState = { modelId: settings.modelId, models: merged };
+		deps.viewState = { ...deps.viewState, modelId: settings.modelId, models: merged };
+		for (const surface of deps.surfaces) surface.setState(deps.viewState);
+	};
+
+	const refreshGroups = async (force: boolean): Promise<void> => {
+		const groups = await profileCatalogs(context.secrets, force);
+		deps.viewState = { ...deps.viewState, groups };
 		for (const surface of deps.surfaces) surface.setState(deps.viewState);
 	};
 
@@ -335,8 +347,8 @@ export function activate(context: vscode.ExtensionContext): void {
 						const root = await storeRoot;
 						const cases = root ? await loadSuite(root).catch(() => []) : [];
 						if (cases.length === 0) return;
-						const model = vscode.workspace.getConfiguration("kronyx").get<string>("provider.modelId", "");
-						const prior = context.globalState.get<string>(KNOWN_MODEL_KEY, "");
+						const model = currentSelection()?.modelId ?? "";
+						const prior = context.globalState.get<ModelSelection>(KNOWN_MODEL_KEY);
 						if (gate === "always") {
 							pendingGate = prior;
 							void vscode.commands.executeCommand("kronyx.runEvals");
@@ -406,20 +418,18 @@ export function activate(context: vscode.ExtensionContext): void {
 				const report = await writeReport(root, results);
 				const passed = results.filter((r) => r.passed).length;
 				output.appendLine(`Evals: ${passed}/${results.length} passed → ${report}`);
-				const currentModel = vscode.workspace.getConfiguration("kronyx").get<string>("provider.modelId", "");
-				if (passed === results.length) {
-					await context.globalState.update(KNOWN_MODEL_KEY, currentModel);
+				const current = currentSelection();
+				if (passed === results.length && current) {
+					await context.globalState.update(KNOWN_MODEL_KEY, current);
 				}
 				const revertTo = pendingGate;
 				pendingGate = undefined;
-				if (revertTo && passed < results.length) {
+				if (revertTo?.profile && revertTo.modelId && passed < results.length) {
 					gateSuppressed = true;
 					setTimeout(() => (gateSuppressed = false), 15_000);
-					await vscode.workspace
-						.getConfiguration("kronyx")
-						.update("provider.modelId", revertTo, vscode.ConfigurationTarget.Global);
+					await pickModel(revertTo.modelId, revertTo.profile);
 					void vscode.window.showErrorMessage(
-						`Kronyx eval gate: ${passed}/${results.length} passed — model reverted to ${revertTo}.`,
+						`Kronyx eval gate: ${passed}/${results.length} passed — model reverted to ${revertTo.modelId} (${revertTo.profile}).`,
 					);
 					return;
 				}

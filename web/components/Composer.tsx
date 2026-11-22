@@ -5,6 +5,7 @@ import { Cpu, GitBranch, Info, Paperclip, Plus, SendHorizontal, Settings2, Squar
 import { useEffect, useRef, useState } from "react";
 import { apiFetch } from "@/lib/api";
 import { Modal } from "@/components/Modal";
+import { filterModelGroups } from "@/lib/modelGroups";
 import type { ModelGroup, ModelOption } from "@/lib/types";
 
 export type Mode = "ask" | "plan" | "agent" | "multi";
@@ -104,6 +105,7 @@ export function Composer({
 	const [modelProfile, setModelProfile] = useState("");
 	const [repoQuery, setRepoQuery] = useState("");
 	const [modelQuery, setModelQuery] = useState("");
+	const [providerFilter, setProviderFilter] = useState("");
 	const [branches, setBranches] = useState<string[]>([]);
 	const [branchQuery, setBranchQuery] = useState("");
 	const [envPage, setEnvPage] = useState<"menu" | "branch">("menu");
@@ -130,7 +132,19 @@ export function Composer({
 	useEffect(() => {
 		void (async () => {
 			const res = await apiFetch("/api/models", user);
-			if (res.ok) setGroups(((await res.json()) as { groups: ModelGroup[] }).groups ?? []);
+			if (res.ok) {
+				const remote = ((await res.json()) as { groups: ModelGroup[] }).groups ?? [];
+				// Inside the IDE the extension seeds local BYOK profiles — use them
+				// when the backend has no synced provider settings yet.
+				if (remote.length) {
+					setGroups(remote);
+				} else {
+					try {
+						const seeded = JSON.parse(localStorage.getItem("kronyx.modelGroups") ?? "[]") as ModelGroup[];
+						if (seeded.length) setGroups(seeded);
+					} catch { /* ignore malformed seed */ }
+				}
+			}
 		})();
 		const saved = typeof window !== "undefined" ? localStorage.getItem("kronyx.modelId") : null;
 		if (saved) setModelId(saved);
@@ -211,8 +225,10 @@ export function Composer({
 	const submit = () => {
 		const task = text.trim();
 		if (!task || running) return;
-		if (modelId && env) localStorage.setItem("kronyx.modelId", modelId);
-		if (modelId) localStorage.setItem("kronyx.modelId", modelId);
+		// A send always names the model and the provider it belongs to — no defaults.
+		if (!modelId || !modelProfile) return;
+		localStorage.setItem("kronyx.modelId", modelId);
+		localStorage.setItem("kronyx.modelProfile", modelProfile);
 		// Resolve mention tokens: @plan: → refs.planSlug (backend "Implement this
 		// plan"), @file: → a referenced-paths line, @memory:/@run: → context blocks.
 		let planSlug: string | undefined;
@@ -291,9 +307,12 @@ export function Composer({
 	const repoFiltered = repos.filter((r) => r.repo.toLowerCase().includes(repoQuery.toLowerCase()));
 	// Selected repo only, until the user searches or nothing is selected.
 	const repoShown = env?.repo && !repoQuery ? repoFiltered.filter((r) => r.repo === env.repo) : repoFiltered;
-	const modelFiltered = groups
-		.map((g) => ({ ...g, models: g.models.filter((m) => m.id.toLowerCase().includes(modelQuery.toLowerCase())).slice(0, 60) }))
-		.filter((g) => g.models.length > 0);
+	const modelFiltering = !!(providerFilter || modelQuery.trim());
+	const modelFiltered = filterModelGroups(groups, providerFilter, modelQuery).map((g) => ({ ...g, models: modelFiltering ? g.models : g.models.slice(0, 60) }));
+	const providerChips = [
+		{ profile: "", label: "All", count: groups.reduce((n, g) => n + g.models.length, 0) },
+		...groups.map((g) => ({ profile: g.profile, label: g.active ? `${g.profile} · active` : g.profile, count: g.models.length })),
+	];
 	const modelLabel = modelId || "Model";
 
 	const fmtCtx = (n?: number) => (n ? (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : `${Math.round(n / 1000)}k`) : "");
@@ -699,11 +718,25 @@ export function Composer({
 					</div>
 					<div className="anchor">
 						<button className="chip-btn" onClick={() => toggleMenu("model")}>
-							<Cpu size={12} /> {modelLabel.length > 26 ? `${modelLabel.slice(0, 24)}…` : modelLabel}
+							<Cpu size={12} />{modelProfile && <span className="muted">{modelProfile} · </span>}{modelLabel.length > 26 ? `${modelLabel.slice(0, 24)}…` : modelLabel}
 						</button>
 						{menu === "model" && (
 							<div className="pop" style={{ left: "auto", right: 0, minWidth: 340 }} onClick={(e) => e.stopPropagation()}>
 								<input className="pop-search" placeholder="Search models" value={modelQuery} onChange={(e) => setModelQuery(e.target.value)} />
+								{groups.length > 1 && (
+									<div style={{ display: "flex", flexWrap: "wrap", gap: 4, padding: "6px 8px 0" }}>
+										{providerChips.map((f) => (
+											<button
+												key={f.profile || "all"}
+												className="chip-btn"
+												style={providerFilter === f.profile ? { color: "var(--fg)", borderColor: "var(--border-strong)" } : undefined}
+												onClick={() => setProviderFilter(f.profile)}
+											>
+												{f.label} <span className="muted">{f.count}</span>
+											</button>
+										))}
+									</div>
+								)}
 								<div className="pop-scroll">
 									{modelFiltered.map((g) => (
 										<div key={g.profile}>
@@ -735,7 +768,7 @@ export function Composer({
 						</span>
 					) : (
 						<span className="send-btn">
-							<button onClick={submit} disabled={!text.trim()} title="Send">
+							<button onClick={submit} disabled={!text.trim() || !modelId || !modelProfile} title={modelId && modelProfile ? "Send" : "Pick a model and its provider first"}>
 								<SendHorizontal size={14} />
 							</button>
 						</span>

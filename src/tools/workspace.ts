@@ -13,6 +13,7 @@ export const IGNORED_DIRS = new Set([
 	".next",
 	".turbo",
 	"coverage",
+	".devhost",
 ]);
 
 export class WorkspaceGuard {

@@ -24306,6 +24306,12 @@
     ] }) });
   }
 
+  // web/lib/modelGroups.ts
+  function filterModelGroups(groups, profile, query) {
+    const q2 = query.trim().toLowerCase();
+    return groups.filter((g) => !profile || g.profile === profile).map((g) => ({ ...g, models: g.models.filter((m) => !q2 || `${m.id} ${m.label ?? ""} ${m.owner ?? ""}`.toLowerCase().includes(q2)) })).filter((g) => g.models.length > 0);
+  }
+
   // web/components/Composer.tsx
   var import_jsx_runtime2 = __toESM(require_jsx_runtime());
   var emptyEnv = { repo: "", base: "", startRef: "", prLabel: "", installationId: null, extraRepos: [], template: "", securityProfile: "agent" };
@@ -24354,6 +24360,7 @@
     const [modelProfile, setModelProfile] = (0, import_react6.useState)("");
     const [repoQuery, setRepoQuery] = (0, import_react6.useState)("");
     const [modelQuery, setModelQuery] = (0, import_react6.useState)("");
+    const [providerFilter, setProviderFilter] = (0, import_react6.useState)("");
     const [branches, setBranches] = (0, import_react6.useState)([]);
     const [branchQuery, setBranchQuery] = (0, import_react6.useState)("");
     const [envPage, setEnvPage] = (0, import_react6.useState)("menu");
@@ -24377,7 +24384,18 @@
     (0, import_react6.useEffect)(() => {
       void (async () => {
         const res = await apiFetch("/api/models", user);
-        if (res.ok) setGroups((await res.json()).groups ?? []);
+        if (res.ok) {
+          const remote = (await res.json()).groups ?? [];
+          if (remote.length) {
+            setGroups(remote);
+          } else {
+            try {
+              const seeded = JSON.parse(localStorage.getItem("kronyx.modelGroups") ?? "[]");
+              if (seeded.length) setGroups(seeded);
+            } catch {
+            }
+          }
+        }
       })();
       const saved = typeof window !== "undefined" ? localStorage.getItem("kronyx.modelId") : null;
       if (saved) setModelId(saved);
@@ -24440,8 +24458,9 @@
     const submit = () => {
       const task = text.trim();
       if (!task || running) return;
-      if (modelId && env) localStorage.setItem("kronyx.modelId", modelId);
-      if (modelId) localStorage.setItem("kronyx.modelId", modelId);
+      if (!modelId || !modelProfile) return;
+      localStorage.setItem("kronyx.modelId", modelId);
+      localStorage.setItem("kronyx.modelProfile", modelProfile);
       let planSlug;
       const files = [];
       const memBlocks = [];
@@ -24521,7 +24540,12 @@ ${runBlocks.join("\n\n")}`;
     const slashFiltered = SLASH_COMMANDS.filter((c2) => c2.name.startsWith(text.slice(1).toLowerCase()));
     const repoFiltered = repos.filter((r) => r.repo.toLowerCase().includes(repoQuery.toLowerCase()));
     const repoShown = env?.repo && !repoQuery ? repoFiltered.filter((r) => r.repo === env.repo) : repoFiltered;
-    const modelFiltered = groups.map((g) => ({ ...g, models: g.models.filter((m) => m.id.toLowerCase().includes(modelQuery.toLowerCase())).slice(0, 60) })).filter((g) => g.models.length > 0);
+    const modelFiltering = !!(providerFilter || modelQuery.trim());
+    const modelFiltered = filterModelGroups(groups, providerFilter, modelQuery).map((g) => ({ ...g, models: modelFiltering ? g.models : g.models.slice(0, 60) }));
+    const providerChips = [
+      { profile: "", label: "All", count: groups.reduce((n, g) => n + g.models.length, 0) },
+      ...groups.map((g) => ({ profile: g.profile, label: g.active ? `${g.profile} \xB7 active` : g.profile, count: g.models.length }))
+    ];
     const modelLabel = modelId || "Model";
     const fmtCtx = (n) => n ? n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : `${Math.round(n / 1e3)}k` : "";
     const fmtPrice = (p) => {
@@ -24900,11 +24924,28 @@ ${runBlocks.join("\n\n")}`;
         /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "anchor", children: [
           /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("button", { className: "chip-btn", onClick: () => toggleMenu("model"), children: [
             /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Cpu, { size: 12 }),
-            " ",
+            modelProfile && /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("span", { className: "muted", children: [
+              modelProfile,
+              " \xB7 "
+            ] }),
             modelLabel.length > 26 ? `${modelLabel.slice(0, 24)}\u2026` : modelLabel
           ] }),
           menu === "model" && /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pop", style: { left: "auto", right: 0, minWidth: 340 }, onClick: (e) => e.stopPropagation(), children: [
             /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("input", { className: "pop-search", placeholder: "Search models", value: modelQuery, onChange: (e) => setModelQuery(e.target.value) }),
+            groups.length > 1 && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { style: { display: "flex", flexWrap: "wrap", gap: 4, padding: "6px 8px 0" }, children: providerChips.map((f) => /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(
+              "button",
+              {
+                className: "chip-btn",
+                style: providerFilter === f.profile ? { color: "var(--fg)", borderColor: "var(--border-strong)" } : void 0,
+                onClick: () => setProviderFilter(f.profile),
+                children: [
+                  f.label,
+                  " ",
+                  /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "muted", children: f.count })
+                ]
+              },
+              f.profile || "all"
+            )) }),
             /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pop-scroll", children: [
               modelFiltered.map((g) => /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { children: [
                 /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pop-title", children: [
@@ -24923,7 +24964,7 @@ ${runBlocks.join("\n\n")}`;
             ] })
           ] })
         ] }),
-        running || stopping ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "send-btn stop", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("button", { onClick: onStop, disabled: stopping, title: stopping ? "Stopping\u2026" : "Stop", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Square, { size: 14 }) }) }) : /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "send-btn", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("button", { onClick: submit, disabled: !text.trim(), title: "Send", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(SendHorizontal, { size: 14 }) }) })
+        running || stopping ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "send-btn stop", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("button", { onClick: onStop, disabled: stopping, title: stopping ? "Stopping\u2026" : "Stop", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Square, { size: 14 }) }) }) : /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "send-btn", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("button", { onClick: submit, disabled: !text.trim() || !modelId || !modelProfile, title: modelId && modelProfile ? "Send" : "Pick a model and its provider first", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(SendHorizontal, { size: 14 }) }) })
       ] })
     ] }) });
   }
@@ -26707,99 +26748,8 @@ Please report this to https://github.com/markedjs/marked.`, e) {
     );
   }
 
-  // web/lib/agentLanes.ts
-  function fanoutEventFor(events, runId) {
-    for (let k = events.length - 1; k >= 0; k--) {
-      const e = events[k];
-      if (e.event.type === "fanout" && (!runId || e.runId === runId)) return e;
-    }
-    return void 0;
-  }
-  function sliceTitle(events, i, runId) {
-    const s = fanoutEventFor(events, runId)?.event.slices?.find(
-      (x2) => x2.index === i
-    );
-    return s?.title ?? `Slice ${i}`;
-  }
-  function sliceStatus(events, runs, i, runId) {
-    const fromRun = runs?.find((r) => r.runId === runId)?.slices?.find((s) => s.index === i)?.status;
-    if (fromRun) return fromRun;
-    for (let k = events.length - 1; k >= 0; k--) {
-      const e = events[k];
-      if (e.event.type === "slice-status" && e.event.index === i && (!runId || e.runId === runId)) return String(e.event.status);
-    }
-    return "queued";
-  }
-  function sliceSummary(events, runs, i, runId) {
-    const fromRun = runs?.find((r) => r.runId === runId)?.slices?.find((s) => s.index === i)?.summary;
-    if (fromRun) return fromRun;
-    for (let k = events.length - 1; k >= 0; k--) {
-      const e = events[k];
-      if (e.event.type === "slice-status" && e.event.index === i && (!runId || e.runId === runId) && e.event.summary)
-        return String(e.event.summary);
-    }
-    return "";
-  }
-  function agentVitals(events, ai, runId) {
-    let lastAct = "";
-    let usage = null;
-    let files = 0;
-    let startedAt = 0;
-    let endedAt = 0;
-    for (const e of events) {
-      if ((e.event.agentIndex ?? 0) !== ai || runId && e.runId !== runId) continue;
-      const ev = e.event;
-      if (ev.type === "run-started") startedAt = Date.parse(e.at ?? "") || startedAt;
-      if (ev.type === "run-finished" || ev.type === "run-failed") endedAt = Date.parse(e.at ?? "") || endedAt;
-      if (ev.type === "usage") usage = ev;
-      if (ev.type === "file-changed") {
-        files++;
-        lastAct = `edited ${String(ev.path ?? "")}`;
-      }
-      if (ev.type === "tool-started") {
-        const inp = ev.input ?? {};
-        lastAct = `${String(ev.name)} ${String(inp.path ?? inp.file ?? inp.command ?? inp.url ?? inp.query ?? inp.slug ?? "")}`.trim();
-      }
-      if (ev.type === "assistant-text") lastAct = String(ev.text ?? "").split("\n")[0].slice(0, 100);
-      if (ev.type === "run-finished") lastAct = "finished";
-      if (ev.type === "run-failed") lastAct = `failed: ${String(ev.error ?? "").slice(0, 80)}`;
-    }
-    const secs = startedAt ? Math.round(((endedAt || Date.now()) - startedAt) / 1e3) : 0;
-    const dur = secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`;
-    return { lastAct, tin: usage?.inputTokens ?? 0, tout: usage?.outputTokens ?? 0, ctxPct: usage?.contextPct ?? 0, files, dur: startedAt ? dur : "", secs };
-  }
-  function sliceIcon(title) {
-    if (/test|spec|qa\b|coverage/i.test(title)) return "\u{1F9EA}";
-    if (/doc|readme|guide/i.test(title)) return "\u{1F4C4}";
-    if (/secur|auth|audit|vuln/i.test(title)) return "\u{1F6E1}";
-    if (/analy|review|scan|explor|investigat/i.test(title)) return "\u{1F50D}";
-    if (/ui|css|style|front|design/i.test(title)) return "\u{1F3A8}";
-    return "</>";
-  }
-
-  // web/components/Timeline.tsx
-  var import_jsx_runtime7 = __toESM(require_jsx_runtime());
-  var KIND = {
-    "run-started": "Task",
-    "assistant-text": "Kronyx",
-    reasoning: "Thought process",
-    "tool-started": "Tool",
-    "tool-finished": "Result",
-    "file-changed": "File",
-    check: "Check",
-    "cloud-status": "Cloud",
-    info: "Info",
-    setup: "Setup",
-    "plan-ready": "Plan",
-    "ui-screenshot": "Screenshot",
-    "mode-blocked": "Mode",
-    "loop-detected": "Stopped",
-    "run-stopping": "Stopping",
-    "run-finished": "Summary",
-    "run-completed": "Completed",
-    "run-failed": "Failed"
-  };
-  var WRITE_TOOLS = /* @__PURE__ */ new Set(["file_editor", "write_file", "edit_file", "append_file", "insert_lines"]);
+  // web/lib/timelineModel.ts
+  var TRANSPARENT = /* @__PURE__ */ new Set(["usage", "info", "memory", "cloud-status", "setup", "check", "agent-message", "agent-message-chunk"]);
   function fold(events) {
     const items = [];
     const lanes = /* @__PURE__ */ new Map();
@@ -26860,6 +26810,10 @@ Please report this to https://github.com/markedjs/marked.`, e) {
             iteration: iter
           });
         }
+        continue;
+      }
+      if (TRANSPARENT.has(t)) {
+        items.push({ kind: "event", e, key: `e${e.runId}-${e.seq}` });
         continue;
       }
       if (l.openReasoning && t !== "reasoning-delta") {
@@ -27021,6 +26975,267 @@ Please report this to https://github.com/markedjs/marked.`, e) {
     close();
     return out;
   }
+  function normText(s) {
+    return s.replace(/\s+/g, " ").trim();
+  }
+  function summaryTexts(events) {
+    const m = /* @__PURE__ */ new Map();
+    for (const e of events) {
+      const t = e.event.type;
+      if (t !== "run-finished" && t !== "run-completed") continue;
+      const rid = e.runId ?? "";
+      const text = String(e.event.summary ?? e.event.text ?? "");
+      if (rid && text.trim() && !m.has(rid)) m.set(rid, normText(text));
+    }
+    return m;
+  }
+  function buildTimeline(events) {
+    const items = pair(fold(events));
+    const seen = [];
+    const seenSigs = /* @__PURE__ */ new Set();
+    for (const b of items) {
+      const sig = b.kind === "stream" ? `s:${b.streamKind}:${normText(b.text).slice(0, 120)}` : b.kind === "event" ? `e:${b.e.runId}:${b.e.seq}` : `${b.kind}:${b.key}`;
+      if (b.kind !== "event" && seenSigs.has(sig)) continue;
+      seenSigs.add(sig);
+      seen.push(b);
+    }
+    const lastActIdx = /* @__PURE__ */ new Map();
+    seen.forEach((b, i) => {
+      if (b.kind === "stream" || b.kind === "action") lastActIdx.set(`${b.runId ?? ""}:${b.agentIndex ?? 0}`, i);
+    });
+    const summaries = summaryTexts(events);
+    for (let i = 0; i < seen.length; i++) {
+      const b = seen[i];
+      if (b.kind === "stream" && b.streamKind === "assistant") {
+        b.final = i === lastActIdx.get(`${b.runId ?? ""}:${b.agentIndex ?? 0}`);
+        const sum = b.runId ? summaries.get(b.runId) : void 0;
+        if (b.done && sum && normText(b.text) === sum) b.hidden = true;
+      }
+      if (b.kind === "event") {
+        const t = b.e.event.type;
+        if (t === "agent-message" || t === "agent-message-chunk") b.hidden = true;
+        else if (t === "cloud-status" || t === "setup") b.hidden = true;
+        else if (t === "check" && b.e.event.ok !== false) b.hidden = true;
+        else if (t === "info") {
+          const meta = b.e.event.meta;
+          if (meta?.kind !== "context_compaction" && meta?.kind !== "sandbox_recreated") b.hidden = true;
+        }
+      }
+    }
+    return seen.filter((i) => !i.hidden && i.kind !== "preflight");
+  }
+  function turnMergeable(t) {
+    if (!t.done) return false;
+    return t.items.every(
+      (i) => i.kind === "action" && i.output !== void 0 && i.ok !== false || i.kind === "stream" && i.done && !(i.streamKind === "assistant" && i.final) || i.kind === "event"
+    );
+  }
+  function workedStats(turns) {
+    let ms = 0;
+    let actions = 0;
+    let added = 0;
+    let removed = 0;
+    let fails = 0;
+    const fileSet = /* @__PURE__ */ new Set();
+    for (const t of turns) {
+      const s = Date.parse(t.at ?? "");
+      const e = Date.parse(t.endAt ?? "");
+      ms += !Number.isNaN(s) && !Number.isNaN(e) && e > s ? e - s : t.fallbackMs ?? 0;
+      for (const i of t.items) {
+        if (i.kind !== "action") continue;
+        actions++;
+        if (i.ok === false) fails++;
+        if (i.diff !== void 0 || (i.added ?? 0) + (i.removed ?? 0) > 0)
+          fileSet.add(i.path ?? i.key);
+        added += i.added ?? 0;
+        removed += i.removed ?? 0;
+      }
+    }
+    return { secs: Math.round(ms / 1e3), actions, files: fileSet.size, added, removed, fails };
+  }
+  function groupWorked(items) {
+    const out = [];
+    let buf = [];
+    const flush = () => {
+      if (!buf.length) return;
+      if (buf.length === 1) out.push(buf[0]);
+      else out.push({ kind: "worked", turns: buf, key: `w-${buf[0].key}` });
+      buf = [];
+    };
+    for (const it2 of items) {
+      if (it2.kind === "turn" && it2.items.length > 0 && it2.items.every((x2) => x2.kind === "stream")) {
+        flush();
+        for (const s of it2.items) out.push(s);
+        continue;
+      }
+      if (it2.kind === "turn" && turnMergeable(it2)) {
+        buf.push(it2);
+        continue;
+      }
+      flush();
+      out.push(it2);
+    }
+    flush();
+    return out;
+  }
+  var TOOL_META = {
+    read_file: { icon: "\u{1F4C4}", verb: "Read" },
+    write_file: { icon: "\u{1F4DD}", verb: "Wrote" },
+    edit_file: { icon: "\u270F\uFE0F", verb: "Edited" },
+    append_file: { icon: "\u{1F4DD}", verb: "Appended" },
+    insert_lines: { icon: "\u{1F4DD}", verb: "Inserted" },
+    file_editor: { icon: "\u270F\uFE0F", verb: "Edited" },
+    run_command: { icon: "\u25B6", verb: "Ran" },
+    search_files: { icon: "\u{1F50D}", verb: "Searched" },
+    list_files: { icon: "\u{1F4C1}", verb: "Listed" },
+    browser_use: { icon: "\u{1F310}", verb: "Browsed" },
+    load_skill: { icon: "\u{1F9E9}", verb: "Loaded skill" },
+    use_tool: { icon: "\u{1F527}", verb: "Used" },
+    save_plan: { icon: "\u{1F4CB}", verb: "Saved plan" },
+    switch_environment: { icon: "\u{1F500}", verb: "Switched env" },
+    recall_context: { icon: "\u{1F9E0}", verb: "Recalled" },
+    memory_write: { icon: "\u{1F9E0}", verb: "Remembered" }
+  };
+  function toolMeta(name) {
+    if (TOOL_META[name]) return TOOL_META[name];
+    if (name.startsWith("mcp_")) return { icon: "\u{1F50C}", verb: name.slice(4).replace(/_/g, " ") };
+    return { icon: "\u{1F527}", verb: name.replace(/_/g, " ") };
+  }
+  function trunc2(s, n = 48) {
+    return s.length > n ? `${s.slice(0, n)}\u2026` : s;
+  }
+  function toolTarget(item) {
+    const inp = item.input ?? {};
+    if (item.name === "run_command") return trunc2(String(inp.command ?? inp.cmd ?? ""), 64);
+    if (item.path) {
+      const p = item.path;
+      return p.includes("/") ? p.split("/").pop() : p;
+    }
+    const base = (s2) => {
+      const p = s2.includes("/") ? s2.split("/").pop() : s2;
+      return trunc2(p, 56);
+    };
+    const fileIn = String(inp.path ?? inp.file ?? "");
+    if (fileIn) return base(fileIn);
+    const target = String(inp.query ?? inp.pattern ?? inp.url ?? inp.slug ?? inp.name ?? "");
+    if (target) return trunc2(target, 56);
+    const s = typeof item.input === "string" ? item.input : JSON.stringify(item.input ?? {});
+    return trunc2(s === "{}" ? "" : s, 56);
+  }
+  var FILE_TOOLS = /* @__PURE__ */ new Set(["read_file", "list_files", "search_files"]);
+  function toolPath(item) {
+    if (!FILE_TOOLS.has(item.name)) return void 0;
+    const inp = item.input ?? {};
+    const p = String(inp.path ?? inp.file ?? "").trim();
+    if (item.name === "list_files") return p && p !== "." ? p : "repo root";
+    return p || void 0;
+  }
+  function toolDetail(item) {
+    const lines = (item.output ?? "").split("\n").filter((l) => l.trim());
+    const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+    if (!lines.length) return "";
+    if (item.name === "read_file") {
+      const n = lines.filter((l) => /^\s*\d+\|/.test(l)).length;
+      return n ? plural(n, "line", "lines") : "";
+    }
+    if (item.name === "list_files") return plural(lines.length, "entry", "entries");
+    if (item.name === "search_files") return plural(lines.filter((l) => /:\d+:/.test(l)).length, "match", "matches");
+    return "";
+  }
+
+  // web/lib/agentLanes.ts
+  function fanoutEventFor(events, runId) {
+    for (let k = events.length - 1; k >= 0; k--) {
+      const e = events[k];
+      if (e.event.type === "fanout" && (!runId || e.runId === runId)) return e;
+    }
+    return void 0;
+  }
+  function sliceTitle(events, i, runId) {
+    const s = fanoutEventFor(events, runId)?.event.slices?.find(
+      (x2) => x2.index === i
+    );
+    return s?.title ?? `Slice ${i}`;
+  }
+  function sliceStatus(events, runs, i, runId) {
+    const fromRun = runs?.find((r) => r.runId === runId)?.slices?.find((s) => s.index === i)?.status;
+    if (fromRun) return fromRun;
+    for (let k = events.length - 1; k >= 0; k--) {
+      const e = events[k];
+      if (e.event.type === "slice-status" && e.event.index === i && (!runId || e.runId === runId)) return String(e.event.status);
+    }
+    return "queued";
+  }
+  function sliceSummary(events, runs, i, runId) {
+    const fromRun = runs?.find((r) => r.runId === runId)?.slices?.find((s) => s.index === i)?.summary;
+    if (fromRun) return fromRun;
+    for (let k = events.length - 1; k >= 0; k--) {
+      const e = events[k];
+      if (e.event.type === "slice-status" && e.event.index === i && (!runId || e.runId === runId) && e.event.summary)
+        return String(e.event.summary);
+    }
+    return "";
+  }
+  function agentVitals(events, ai, runId) {
+    let lastAct = "";
+    let usage = null;
+    let files = 0;
+    let startedAt = 0;
+    let endedAt = 0;
+    for (const e of events) {
+      if ((e.event.agentIndex ?? 0) !== ai || runId && e.runId !== runId) continue;
+      const ev = e.event;
+      if (ev.type === "run-started") startedAt = Date.parse(e.at ?? "") || startedAt;
+      if (ev.type === "run-finished" || ev.type === "run-failed") endedAt = Date.parse(e.at ?? "") || endedAt;
+      if (ev.type === "usage") usage = ev;
+      if (ev.type === "file-changed") {
+        files++;
+        lastAct = `edited ${String(ev.path ?? "")}`;
+      }
+      if (ev.type === "tool-started") {
+        const inp = ev.input ?? {};
+        lastAct = `${String(ev.name)} ${String(inp.path ?? inp.file ?? inp.command ?? inp.url ?? inp.query ?? inp.slug ?? "")}`.trim();
+      }
+      if (ev.type === "assistant-text") lastAct = String(ev.text ?? "").split("\n")[0].slice(0, 100);
+      if (ev.type === "run-finished") lastAct = "finished";
+      if (ev.type === "run-failed") lastAct = `failed: ${String(ev.error ?? "").slice(0, 80)}`;
+    }
+    const secs = startedAt ? Math.round(((endedAt || Date.now()) - startedAt) / 1e3) : 0;
+    const dur = secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`;
+    return { lastAct, tin: usage?.inputTokens ?? 0, tout: usage?.outputTokens ?? 0, ctxPct: usage?.contextPct ?? 0, files, dur: startedAt ? dur : "", secs };
+  }
+  function sliceIcon(title) {
+    if (/test|spec|qa\b|coverage/i.test(title)) return "\u{1F9EA}";
+    if (/doc|readme|guide/i.test(title)) return "\u{1F4C4}";
+    if (/secur|auth|audit|vuln/i.test(title)) return "\u{1F6E1}";
+    if (/analy|review|scan|explor|investigat/i.test(title)) return "\u{1F50D}";
+    if (/ui|css|style|front|design/i.test(title)) return "\u{1F3A8}";
+    return "</>";
+  }
+
+  // web/components/Timeline.tsx
+  var import_jsx_runtime7 = __toESM(require_jsx_runtime());
+  var KIND = {
+    "run-started": "Task",
+    "assistant-text": "Kronyx",
+    reasoning: "Thought process",
+    "tool-started": "Tool",
+    "tool-finished": "Result",
+    "file-changed": "File",
+    check: "Check",
+    "cloud-status": "Cloud",
+    info: "Info",
+    setup: "Setup",
+    "plan-ready": "Plan",
+    "ui-screenshot": "Screenshot",
+    "mode-blocked": "Mode",
+    "loop-detected": "Stopped",
+    "run-stopping": "Stopping",
+    "run-finished": "Summary",
+    "run-completed": "Completed",
+    "run-failed": "Failed"
+  };
+  var WRITE_TOOLS = /* @__PURE__ */ new Set(["file_editor", "write_file", "edit_file", "append_file", "insert_lines"]);
   function Md({ text }) {
     return /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("div", { className: "md", dangerouslySetInnerHTML: { __html: x.parse(text) } });
   }
@@ -27185,11 +27400,11 @@ Please report this to https://github.com/markedjs/marked.`, e) {
     const open = toggled ?? !done;
     const actionLabel = (a3) => {
       const inp = a3.input ?? {};
-      const trunc2 = (s, n = 40) => s.length > n ? `${s.slice(0, n)}\u2026` : s;
-      if (a3.name === "run_command") return `$ ${trunc2(String(inp.command ?? inp.cmd ?? ""))}`;
+      const trunc3 = (s, n = 40) => s.length > n ? `${s.slice(0, n)}\u2026` : s;
+      if (a3.name === "run_command") return `$ ${trunc3(String(inp.command ?? inp.cmd ?? ""))}`;
       if (a3.path) return `edit ${a3.path.split("/").pop()}`;
       const target = String(inp.path ?? inp.file ?? inp.query ?? inp.url ?? inp.slug ?? "");
-      return trunc2(target ? `${a3.name} ${target}` : a3.name);
+      return trunc3(target ? `${a3.name} ${target}` : a3.name);
     };
     const achieved = actions.map((a3) => ({ ok: a3.ok !== false, label: actionLabel(a3) }));
     const MAX_ACHIEVED = 3;
@@ -27198,7 +27413,7 @@ Please report this to https://github.com/markedjs/marked.`, e) {
     return /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("div", { className: "step", id, children: [
       /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("div", { className: "step-rail", children: /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "step-num", children: turn.num ?? "\u2022" }) }),
       /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("div", { className: "step-card", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("div", { className: "step-achieved", children: achieved.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)(import_jsx_runtime7.Fragment, { children: [
+        !open && /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("div", { className: "step-achieved", children: achieved.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)(import_jsx_runtime7.Fragment, { children: [
           achieved.slice(0, MAX_ACHIEVED).map((a3, i) => /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("span", { className: "worked-done-item", children: [
             /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { style: { color: a3.ok ? "var(--ok)" : "var(--err)" }, children: a3.ok ? "\u2713" : "\u2717" }),
             " ",
@@ -27261,6 +27476,50 @@ Please report this to https://github.com/markedjs/marked.`, e) {
         ),
         !open && note && /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("div", { className: "step-note worked-note", children: /* @__PURE__ */ (0, import_jsx_runtime7.jsx)(Md, { text: note.text }) })
       ] })
+    ] });
+  }
+  function WorkedBlock({
+    turns,
+    settled,
+    frozen,
+    renderItem
+  }) {
+    const stats = workedStats(turns);
+    const done = settled || turns.every((t) => t.done);
+    const [open, setOpen] = (0, import_react11.useState)(!done);
+    (0, import_react11.useEffect)(() => setOpen(!done), [done]);
+    return /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("details", { className: `worked${done ? "" : " live"}`, open, onToggle: (e) => setOpen(e.currentTarget.open), children: [
+      /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("summary", { className: "worked-head", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "caret", children: open ? "\u25BE" : "\u25B8" }),
+        done ? /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("span", { children: [
+          "Worked",
+          stats.secs >= 1 ? ` for ${fmtDur(stats.secs * 1e3)}` : ""
+        ] }) : /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { children: "Working\u2026" }),
+        (stats.added > 0 || stats.removed > 0) && /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("span", { className: "worked-diff", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("span", { className: "fd-add", children: [
+            "+",
+            stats.added
+          ] }),
+          " ",
+          /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("span", { className: "fd-del", children: [
+            "\u2212",
+            stats.removed
+          ] })
+        ] }),
+        /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("span", { className: "worked-stats muted", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("span", { children: [
+            stats.actions,
+            " action",
+            stats.actions === 1 ? "" : "s"
+          ] }),
+          stats.files > 0 && /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("span", { children: [
+            stats.files,
+            " file",
+            stats.files === 1 ? "" : "s"
+          ] })
+        ] })
+      ] }),
+      /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("div", { className: "worked-body", children: turns.flatMap((t) => t.items).map((ch) => /* @__PURE__ */ (0, import_jsx_runtime7.jsx)(import_react11.Fragment, { children: renderItem(ch, frozen) }, ch.key)) })
     ] });
   }
   function TermCard({ item, frozen }) {
@@ -27349,6 +27608,42 @@ Please report this to https://github.com/markedjs/marked.`, e) {
         preview: toolInput(item.input),
         live: item.output === void 0,
         failed: item.output !== void 0 && item.ok === false
+      }
+    );
+  }
+  function ToolRow({ item, frozen }) {
+    const meta = toolMeta(item.name);
+    const target = toolTarget(item);
+    const path = toolPath(item);
+    const detail = toolDetail(item);
+    const done = frozen || item.output !== void 0;
+    const failed = done && item.ok === false;
+    return /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)(
+      ActionCard,
+      {
+        icon: /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "tl-tool-ico", children: meta.icon }),
+        title: /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("span", { children: [
+          meta.verb,
+          path ? /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)(import_jsx_runtime7.Fragment, { children: [
+            " ",
+            /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "mono", children: path })
+          ] }) : target && /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)(import_jsx_runtime7.Fragment, { children: [
+            " ",
+            /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "mono muted", children: target })
+          ] }),
+          detail && /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("span", { className: "muted", children: [
+            " \xB7 ",
+            detail
+          ] })
+        ] }),
+        stats: item.output !== void 0 ? item.durationMs !== void 0 && /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "muted act-stat", children: fmtDur(item.durationMs) }) : /* @__PURE__ */ (0, import_jsx_runtime7.jsx)(Elapsed, {}),
+        status: item.output !== void 0 ? item.ok === false ? /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "act-pill err", children: "Failed" }) : /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "act-pill ok", children: "Done" }) : /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "act-pill run", children: "Running" }),
+        done,
+        failed,
+        children: [
+          toolInput(item.input) && /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("pre", { className: "act-out", style: { maxHeight: 120 }, children: toolInput(item.input) }),
+          /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("pre", { className: "act-out", children: prettyOut(item.output ?? item.liveOutput ?? "").slice(0, 4e3) || "\u2026" })
+        ]
       }
     );
   }
@@ -27441,6 +27736,7 @@ Please report this to https://github.com/markedjs/marked.`, e) {
     const ev = e.event;
     const kind = KIND[ev.type] ?? ev.type;
     const cls = ev.type === "run-failed" ? "failed" : ev.type === "cloud-status" || ev.type === "info" || ev.type === "setup" ? "status" : "";
+    if (ev.type === "agent-message" || ev.type === "agent-message-chunk") return null;
     if (ev.type === "run-started") {
       const raw = String(ev.task ?? "");
       const split = raw.split(/\n\nAttached context:\n/);
@@ -27524,15 +27820,26 @@ Please report this to https://github.com/markedjs/marked.`, e) {
     }
     if (ev.type === "check") return /* @__PURE__ */ (0, import_jsx_runtime7.jsx)(CheckRow, { e });
     if (ev.type === "tool-finished") {
-      const out = String(ev.output ?? "");
-      if (!out.trim()) return null;
-      return /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("div", { className: "ev", children: /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("details", { children: [
-        /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("summary", { children: [
+      const ok = ev.ok !== false;
+      return /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("div", { className: "ev-line muted", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "dot", style: { background: ok ? "var(--ok)" : "var(--err)" } }),
+        /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("span", { children: [
           "Result ",
-          ev.ok === false && /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { style: { color: "var(--err)" }, children: "(error)" })
-        ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("pre", { className: "tool-out", children: out.slice(0, 4e3) })
-      ] }) });
+          ok ? "\u2713" : "\u2717",
+          " ",
+          String(ev.name ?? "tool")
+        ] })
+      ] });
+    }
+    if (ev.type === "memory") {
+      const n = Array.isArray(ev.items) ? ev.items.length : Number(ev.hits ?? 0);
+      return /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("div", { className: "ev-line muted", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "dot" }),
+        /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("span", { children: [
+          "Memory recalled",
+          n ? ` \xB7 ${n} item${n === 1 ? "" : "s"}` : ""
+        ] })
+      ] });
     }
     if (ev.type === "file-changed") {
       return /* @__PURE__ */ (0, import_jsx_runtime7.jsx)(
@@ -27657,9 +27964,9 @@ Please report this to https://github.com/markedjs/marked.`, e) {
     focus: focusProp,
     onFocusChange
   }) {
-    const items = pair(fold(events));
-    const seqOf = (item) => item.kind === "event" ? item.e.seq : item.seq ?? 0;
-    const runIdOf = (item) => item.kind === "event" ? item.e.runId : item.runId;
+    const items = buildTimeline(events);
+    const seqOf = (item) => item.kind === "event" ? item.e.seq : item.kind === "worked" ? item.turns[0]?.seq ?? 0 : item.seq ?? 0;
+    const runIdOf = (item) => item.kind === "event" ? item.e.runId : item.kind === "worked" ? item.turns[0]?.runId : item.runId;
     const isLate = (item) => !!lateAfter && runIdOf(item) === lateAfter.runId && seqOf(item) > lateAfter.seq;
     const [innerFocus, setInnerFocus] = (0, import_react11.useState)(null);
     const focus = onFocusChange ? focusProp ?? null : innerFocus;
@@ -27682,25 +27989,20 @@ Please report this to https://github.com/markedjs/marked.`, e) {
       }).catch(() => {
       });
     }, [focus, usageRuns, sessionId, user]);
-    const seen = [];
-    const seenSigs = /* @__PURE__ */ new Set();
-    for (const b of items) {
-      const sig = b.kind === "stream" ? `s:${b.streamKind}:${b.text.slice(0, 120)}` : b.kind === "event" ? `e:${b.e.runId}:${b.e.seq}` : `${b.kind}:${b.key}`;
-      if (b.kind !== "event" && seenSigs.has(sig)) continue;
-      seenSigs.add(sig);
-      seen.push(b);
-    }
-    const lastActIdx = /* @__PURE__ */ new Map();
-    seen.forEach((b, i) => {
-      if (b.kind === "stream" || b.kind === "action") lastActIdx.set(`${b.runId ?? ""}:${b.agentIndex ?? 0}`, i);
-    });
-    const nonFinalAssistant = /* @__PURE__ */ new Set();
-    seen.forEach((b, i) => {
-      if (b.kind === "stream" && b.streamKind === "assistant" && i !== lastActIdx.get(`${b.runId ?? ""}:${b.agentIndex ?? 0}`))
-        nonFinalAssistant.add(b.key);
-    });
     const [turnToggles, setTurnToggles] = (0, import_react11.useState)(/* @__PURE__ */ new Map());
     const renderItem = (item, frozen = false) => {
+      if (item.kind === "worked") {
+        return /* @__PURE__ */ (0, import_jsx_runtime7.jsx)(
+          WorkedBlock,
+          {
+            turns: item.turns,
+            settled: frozen || !active,
+            frozen,
+            renderItem
+          },
+          item.key
+        );
+      }
       if (item.kind === "turn") {
         return /* @__PURE__ */ (0, import_jsx_runtime7.jsx)(
           TurnCard,
@@ -27722,16 +28024,26 @@ Please report this to https://github.com/markedjs/marked.`, e) {
       if (item.kind === "stream") {
         const done = item.done || frozen;
         if (item.streamKind === "reasoning") {
-          return done ? /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("details", { className: "ev thinking", children: [
-            /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("summary", { children: "Thoughts" }),
-            /* @__PURE__ */ (0, import_jsx_runtime7.jsx)(Md, { text: item.text })
-          ] }, item.key) : /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("div", { className: "ev thinking streaming", children: [
+          if (done) {
+            const firstLine = item.text.split("\n").find((l) => l.trim()) ?? "";
+            return /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("details", { className: "ev thinking tl-thought", children: [
+              /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("summary", { children: [
+                "Thoughts",
+                firstLine ? /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("span", { className: "tl-thought-preview", children: [
+                  " \u2014 ",
+                  firstLine.slice(0, 80)
+                ] }) : ""
+              ] }),
+              /* @__PURE__ */ (0, import_jsx_runtime7.jsx)(Md, { text: item.text })
+            ] }, item.key);
+          }
+          return /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("div", { className: "ev thinking streaming", children: [
             /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("div", { className: "ev-kind", children: "Thinking\u2026" }),
             /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "stream-text", children: item.text }),
             /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "stream-cursor" })
           ] }, item.key);
         }
-        if (done && nonFinalAssistant.has(item.key)) {
+        if (done && !item.final) {
           return /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("div", { className: "step-note", children: /* @__PURE__ */ (0, import_jsx_runtime7.jsx)(Md, { text: item.text }) }, item.key);
         }
         return /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("div", { className: "msg-row", children: [
@@ -27744,60 +28056,13 @@ Please report this to https://github.com/markedjs/marked.`, e) {
         ] }, item.key);
       }
       if (item.kind === "action") {
-        const isWrite = WRITE_TOOLS.has(item.name) || !!item.path;
+        const isWrite = WRITE_TOOLS.has(item.name) || !!item.path && !!item.diff;
         if (isWrite) return /* @__PURE__ */ (0, import_jsx_runtime7.jsx)(EditCard, { item }, item.key);
         if (item.name === "run_command") return /* @__PURE__ */ (0, import_jsx_runtime7.jsx)(TermCard, { item, frozen }, item.key);
-        return /* @__PURE__ */ (0, import_jsx_runtime7.jsx)(
-          ActionCard,
-          {
-            icon: "\u25B6",
-            title: /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("span", { className: "mono", children: [
-              item.name,
-              " ",
-              /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "muted", children: (() => {
-                const inp = item.input ?? {};
-                const target = String(inp.path ?? inp.file ?? inp.query ?? inp.url ?? inp.slug ?? toolInput(item.input));
-                return target.length > 120 ? `${target.slice(0, 120)}\u2026` : target;
-              })() })
-            ] }),
-            stats: item.output !== void 0 ? item.durationMs !== void 0 && /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "muted act-stat", children: fmtDur(item.durationMs) }) : /* @__PURE__ */ (0, import_jsx_runtime7.jsx)(Elapsed, {}),
-            status: item.output !== void 0 ? item.ok === false ? /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "act-pill err", children: "Failed" }) : /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "act-pill ok", children: "Done" }) : /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "act-pill run", children: "Running" }),
-            done: frozen || item.output !== void 0,
-            failed: item.output !== void 0 && item.ok === false,
-            children: /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("pre", { className: "act-out", children: prettyOut(item.output ?? item.liveOutput ?? "").slice(0, 4e3) || "\u2026" })
-          },
-          item.key
-        );
+        return /* @__PURE__ */ (0, import_jsx_runtime7.jsx)(ToolRow, { item, frozen }, item.key);
       }
       if (item.kind === "perm") return /* @__PURE__ */ (0, import_jsx_runtime7.jsx)(PermissionCard, { user, item, active: !!active && !lateAfter }, item.key);
-      if (item.kind === "preflight") {
-        const ok = item.checks.filter((c2) => c2.event.ok !== false).length;
-        const allOk = ok === item.checks.length;
-        return /* @__PURE__ */ (0, import_jsx_runtime7.jsx)(
-          ActionCard,
-          {
-            icon: /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { style: { color: allOk ? "var(--ok)" : "var(--err)" }, children: allOk ? "\u2713" : "\u2717" }),
-            title: /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "muted", children: "Environment checks" }),
-            status: /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("span", { className: `act-pill ${allOk ? "ok" : "err"}`, children: [
-              ok,
-              "/",
-              item.checks.length,
-              " passed"
-            ] }),
-            done: true,
-            failed: !allOk,
-            children: /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("div", { style: { display: "flex", flexDirection: "column", gap: 4 }, children: item.checks.map((c2, j2) => /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("div", { className: "muted", style: { display: "flex", gap: 8, fontSize: 12 }, children: [
-              /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { style: { color: c2.event.ok === false ? "var(--err)" : "var(--ok)" }, children: c2.event.ok === false ? "\u2717" : "\u2713" }),
-              /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "mono", children: String(c2.event.command ?? "").replace(/^preflight:\s*/, "") }),
-              c2.event.output ? /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("span", { style: { opacity: 0.7 }, children: [
-                "\u2014 ",
-                String(c2.event.output)
-              ] }) : null
-            ] }, j2)) })
-          },
-          item.key
-        );
-      }
+      if (item.kind === "preflight") return null;
       const et2 = item.e.event.type;
       if (et2 === "slice-status") return null;
       if (et2 === "multi-plan") {
@@ -28052,15 +28317,14 @@ Please report this to https://github.com/markedjs/marked.`, e) {
     const vitalsOf = (ai, runId) => agentVitals(events, ai, runId);
     const titleOf = (i, runId) => sliceTitle(events, i, runId);
     const SlicePill = ({ i, runId }) => /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: `slice-pill ${stOf(i, runId)}`, children: stOf(i, runId) });
-    const lateItems = lateAfter ? seen.filter(isLate) : [];
-    const normalItems = lateAfter ? seen.filter((i) => !isLate(i)) : seen;
     const laneKeyOf = (item) => {
       if (item.kind === "event") return { runId: item.e.runId ?? "", ai: item.e.event.agentIndex ?? 0 };
       return { runId: item.runId ?? "", ai: item.agentIndex ?? 0 };
     };
     const laneItems = /* @__PURE__ */ new Map();
     const mainItems = [];
-    for (const i of normalItems) {
+    for (const i of items) {
+      if (isLate(i)) continue;
       const { runId, ai } = laneKeyOf(i);
       if (ai > 0) {
         const k = `${runId}:${ai}`;
@@ -28071,13 +28335,14 @@ Please report this to https://github.com/markedjs/marked.`, e) {
         mainItems.push(i);
       }
     }
+    const lateItems = lateAfter ? items.filter((i) => isLate(i)) : [];
     const [laneToggles, setLaneToggles] = (0, import_react11.useState)(/* @__PURE__ */ new Map());
     const isFailItem = (i) => i.kind === "action" && i.ok === false || i.kind === "event" && (i.e.event.type === "tool-finished" || i.e.event.type === "check") && i.e.event.ok === false;
     const jumpToFailures = (runId) => {
       const failedTurns = [];
       const failedLanes = /* @__PURE__ */ new Set();
       const scan = (list, laneKey) => {
-        for (const i of list) {
+        for (const i of group(list)) {
           if (i.kind === "turn") {
             if (i.items.some((x2) => isFailItem(x2) && laneKeyOf(x2).runId === runId)) {
               failedTurns.push(i.key);
@@ -28139,7 +28404,7 @@ Please report this to https://github.com/markedjs/marked.`, e) {
                 " events"
               ] })
             ] }),
-            /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("div", { className: "slice-lane-body", children: group(litems).map((item) => renderItem(item, !!lateAfter)) })
+            /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("div", { className: "slice-lane-body", children: groupWorked(group(litems)).map((item) => renderItem(item, !!lateAfter)) })
           ]
         },
         k
@@ -28232,13 +28497,13 @@ Please report this to https://github.com/markedjs/marked.`, e) {
             o.diff && /* @__PURE__ */ (0, import_jsx_runtime7.jsx)(DiffBody, { diff: o.diff })
           ] }, o.path))
         ] }),
-        focusItems.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("div", { className: "muted", style: { padding: 20 }, children: "No events yet for this agent." }) : group(focusItems).map((item) => renderItem(item, !!lateAfter)),
+        focusItems.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("div", { className: "muted", style: { padding: 20 }, children: "No events yet for this agent." }) : groupWorked(group(focusItems)).map((item) => renderItem(item, !!lateAfter)),
         lateAfter && /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("div", { className: `stop-banner${lateAfter.halted ? " halted" : ""}`, children: lateAfter.halted ? "\u23F8 Stopped" : "\u23F8 Stopping \u2014 waiting for the run to halt\u2026" })
       ] });
     }
     return /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("div", { className: "timeline", children: [
       items.length === 0 && /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("div", { className: "muted", style: { padding: 20 }, children: "Waiting for events\u2026" }),
-      group(mainItems).map((item) => /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)(import_react11.Fragment, { children: [
+      groupWorked(group(mainItems)).map((item) => /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)(import_react11.Fragment, { children: [
         renderItem(item, !!lateAfter),
         item.kind === "event" && item.e.event.type === "fanout" ? lanesBlock(item.e.runId) : null
       ] }, item.key)),
@@ -28275,7 +28540,7 @@ Please report this to https://github.com/markedjs/marked.`, e) {
                   " events"
                 ] })
               ] }),
-              /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("div", { className: "slice-lane-body", children: group(litems).map((item) => renderItem(item, !!lateAfter)) })
+              /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("div", { className: "slice-lane-body", children: groupWorked(group(litems)).map((item) => renderItem(item, !!lateAfter)) })
             ] }, k);
           })
         ] });
@@ -28691,8 +28956,8 @@ Please report this to https://github.com/markedjs/marked.`, e) {
           mode,
           attachmentIds,
           planSlug: refs?.planSlug,
-          modelId: modelId || void 0,
-          profile: modelProfile || void 0,
+          modelId,
+          profile: modelProfile,
           repo: env?.repo || void 0,
           installationId: env?.installationId ?? void 0,
           startRef: env?.startRef || void 0,
@@ -29076,6 +29341,7 @@ Please report this to https://github.com/markedjs/marked.`, e) {
       await start(task, attachmentIds, env);
     };
     const start = async (task, attachmentIds, e, m = mode) => {
+      if (!modelId || !modelProfile) return setError("Pick a model and its provider before starting.");
       setBusy(true);
       setError("");
       const res = await apiFetch("/api/sessions", user, {
@@ -29085,8 +29351,8 @@ Please report this to https://github.com/markedjs/marked.`, e) {
           base: e.base,
           startRef: e.startRef || e.base,
           mode: m,
-          modelId: modelId || void 0,
-          profile: modelProfile || void 0,
+          modelId,
+          profile: modelProfile,
           title: task.slice(0, 80),
           template: e.template || void 0,
           extraRepos: e.extraRepos,
@@ -29101,7 +29367,7 @@ Please report this to https://github.com/markedjs/marked.`, e) {
       const { session } = await res.json();
       await apiFetch(`/api/sessions/${session.sessionId}/messages`, user, {
         method: "POST",
-        body: JSON.stringify({ task, mode: m, attachmentIds, modelId: modelId || void 0, profile: modelProfile || void 0 })
+        body: JSON.stringify({ task, mode: m, attachmentIds, modelId, profile: modelProfile })
       });
       router.push(`/sessions/${session.sessionId}`);
     };
@@ -29391,24 +29657,36 @@ Please report this to https://github.com/markedjs/marked.`, e) {
     container?.remove();
     container = document.createElement("div");
     container.id = "kronyx-session-root";
+    container.classList.add("kronyx-ide");
     document.body.appendChild(container);
     root = (0, import_client.createRoot)(container);
     root.render(el);
   }
-  function seedModel(modelId) {
-    if (modelId && !localStorage.getItem("kronyx.modelId")) localStorage.setItem("kronyx.modelId", modelId);
+  function seedModel(modelId, modelProfile) {
+    if (modelId && modelProfile) {
+      localStorage.setItem("kronyx.modelId", modelId);
+      localStorage.setItem("kronyx.modelProfile", modelProfile);
+    } else {
+      localStorage.removeItem("kronyx.modelId");
+      localStorage.removeItem("kronyx.modelProfile");
+    }
+  }
+  function seedGroups(groups) {
+    if (groups?.length) localStorage.setItem("kronyx.modelGroups", JSON.stringify(groups));
   }
   globalThis.KronyxSession = {
     mount(cfg2) {
       configure({ apiBase: cfg2.apiBase, webBase: cfg2.webBase, token: cfg2.token });
       setSessionParams({ id: cfg2.sessionId });
-      seedModel(cfg2.modelId);
+      seedModel(cfg2.modelId, cfg2.modelProfile);
+      seedGroups(cfg2.groups);
       render((0, import_react15.createElement)(SessionView));
     },
     // The web's new-session page (repo/branch/mode/environment composer).
     showNew(cfg2) {
       configure({ apiBase: cfg2.apiBase, webBase: cfg2.webBase, token: cfg2.token });
-      seedModel(cfg2.modelId);
+      seedModel(cfg2.modelId, cfg2.modelProfile);
+      seedGroups(cfg2.groups);
       render((0, import_react15.createElement)(SessionsLanding));
     },
     unmount() {

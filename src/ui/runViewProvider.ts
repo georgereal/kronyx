@@ -1,12 +1,13 @@
 import * as vscode from "vscode";
 import type { AgentMode, RunViewEvent } from "../agent/runner";
-import type { ModelOption } from "../config";
+import type { ModelOption, ProfileCatalog } from "../config";
 import { renderPage } from "./pageHtml";
 
 export type { AgentMode, ModelOption };
 
 export type WebviewMessage =
 	| { type: "run"; task: string; mode: AgentMode }
+	| { type: "continue" }
 	| { type: "stop" }
 	| { type: "compact" }
 	| { type: "clearContext" }
@@ -14,7 +15,7 @@ export type WebviewMessage =
 	| { type: "setApiKey" }
 	| { type: "requestState" }
 	| { type: "setMode"; mode: AgentMode }
-	| { type: "setModel"; modelId: string }
+	| { type: "setModel"; modelId: string; profile?: string }
 	| { type: "attach"; kind: "file" | "directory" | "upload" }
 	| { type: "newSession" }
 	| { type: "switchSession"; name: string }
@@ -39,6 +40,10 @@ export interface ViewState {
 	mode: AgentMode;
 	modelId: string;
 	models: ModelOption[];
+	/** Per-provider catalogs for the provider filter; `models` is the active profile's flat list. */
+	groups?: ProfileCatalog[];
+	/** Provider profile the last composer pick belongs to; empty = the Settings default. */
+	modelProfile?: string;
 	signedIn?: boolean;
 	userEmail?: string;
 	cloudRepo?: string;

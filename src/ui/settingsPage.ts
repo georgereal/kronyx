@@ -159,7 +159,7 @@ async function profileModels(
 	if (!msg.baseUrl) return { models: [], error: "No base URL" };
 	const apiKey = (await profileApiKey(context.secrets, msg.name)) || (await context.secrets.get(API_KEY_SECRET)) || "";
 	log("models", `fetch "${msg.name}": GET ${msg.baseUrl}/models (key ${apiKey ? "set" : "not set"})`);
-	const result = await fetchModelCatalog({ providerId: "openai-compatible", baseUrl: msg.baseUrl, modelId: "", apiKey, maxIterations: 1 });
+	const result = await fetchModelCatalog({ baseUrl: msg.baseUrl, apiKey });
 	log("models", `fetch "${msg.name}": ${result.models.length} model(s)${result.error ? ` — ${result.error}` : ""}`);
 	if (result.models.length > 0) {
 		// Persist the catalog on the profile so the Models page renders from cache until refreshed.

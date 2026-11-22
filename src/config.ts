@@ -2,6 +2,9 @@ import * as vscode from "vscode";
 import { log } from "./log";
 import type { ProviderSettings } from "./agent/runner";
 import { isProviderKey, providerKeyToField, saveUserConfig, userConfig, type UserProviderConfig } from "./userConfig";
+import { selectProvider, type ModelSelection, type ProviderError } from "./providerSelection";
+
+export { providerErrorMessage, type ProviderError } from "./providerSelection";
 
 const API_KEY_SECRET = "kronyx.provider.apiKey";
 
@@ -10,9 +13,17 @@ export interface ProviderProfile {
 	providerId?: string;
 	baseUrl?: string;
 	modelId?: string;
+	enabled?: boolean;
 	/** Last fetched model catalog, persisted so the Models page renders without re-fetching. */
 	models?: ModelOption[];
 	modelsFetchedAt?: number;
+}
+
+/** A provider profile's model catalog, as shown by the composer's provider filter. */
+export interface ProfileCatalog {
+	profile: string;
+	active: boolean;
+	models: ModelOption[];
 }
 
 export function profiles(): ProviderProfile[] {
@@ -25,78 +36,49 @@ export function activeProfile(): ProviderProfile | undefined {
 	return name ? profiles().find((p) => p.name === name) : undefined;
 }
 
-/** Typed error describing why a provider config isn't runnable. */
-export type ProviderError =
-	| { reason: "no-provider" }
-	| { reason: "no-active-profile"; providers: string[] }
-	| { reason: "missing-field"; provider: string; field: string }
-	| { reason: "no-api-key"; provider: string };
-
-export function providerErrorMessage(err: ProviderError): string {
-	switch (err.reason) {
-		case "no-provider":
-			return "No provider configured — add one in Settings → Provider (or fill in the default provider).";
-		case "no-active-profile":
-			return `No active provider — select one in Settings → Provider (${err.providers.join(", ")}).`;
-		case "missing-field":
-			if (err.field === "modelId") return "No model selected — pick one in the composer or Settings → Models.";
-			return `Provider "${err.provider}" is missing ${err.field} — complete it in Settings → Provider.`;
-		case "no-api-key":
-			return `No API key for provider "${err.provider}" — set it in Settings → Provider.`;
-	}
+/** The pick saved in ~/.kronyx/config.json; undefined until the user chooses a model. */
+export function currentSelection(): ModelSelection | undefined {
+	const { modelProfile, modelId } = userConfig();
+	return modelProfile && modelId ? { profile: modelProfile, modelId } : undefined;
 }
 
-/** Resolve the runnable provider config, or a typed error when it isn't fully configured. */
-export async function resolveProvider(secrets: vscode.SecretStorage): Promise<{ settings?: ProviderSettings; error?: ProviderError }> {
-	const config = vscode.workspace.getConfiguration("kronyx");
-	const maxIterations = config.get<number>("agent.maxIterations", 40);
+/** Resolve the runnable config for the composer's pick (or an explicit selection). Strict: see selectProvider. */
+export async function resolveProvider(
+	secrets: vscode.SecretStorage,
+	selection = currentSelection(),
+): Promise<{ settings?: ProviderSettings; error?: ProviderError }> {
+	const maxIterations = vscode.workspace.getConfiguration("kronyx").get<number>("agent.maxIterations", 40);
+	return selectProvider(profiles(), selection, (name) => profileApiKey(secrets, name), maxIterations);
+}
+
+/**
+ * Record the composer's pick: the model and the provider profile it belongs to.
+ * This pair is the only selection runs use; the Settings default (activeProfile) is untouched.
+ */
+export async function pickModel(modelId: string, profile: string): Promise<void> {
+	await vscode.workspace.getConfiguration("kronyx").update("provider.modelId", modelId, vscode.ConfigurationTarget.Global);
+	await saveUserConfig({ modelId, modelProfile: profile });
+}
+
+/** Catalog for every enabled profile: cached per profile, fetched when missing or when forced. */
+export async function profileCatalogs(secrets: vscode.SecretStorage, force: boolean): Promise<ProfileCatalog[]> {
 	const list = profiles();
-	if (list.length === 0) {
-		// Simple mode: the top-level provider.* config is the unnamed provider.
-		const apiKey = sanitizeApiKey((await secrets.get(API_KEY_SECRET)) || "");
-		const settings: ProviderSettings = {
-			providerId: config.get<string>("provider.id", "openai-compatible"),
-			baseUrl: config.get<string>("provider.baseUrl", "https://ai-gateway.vercel.sh/v1"),
-			modelId: config.get<string>("provider.modelId", "anthropic/claude-sonnet-4.6"),
-			maxIterations,
-			apiKey,
-		};
-		if (!settings.baseUrl) return { error: { reason: "missing-field", provider: "default", field: "baseUrl" } };
-		if (!settings.modelId) return { error: { reason: "missing-field", provider: "default", field: "modelId" } };
-		if (!apiKey) return { error: { reason: "no-api-key", provider: "default" } };
-		settings.contextWindow = modelContextWindow(settings.modelId, undefined);
-		return { settings };
-	}
-	const name = userConfig().activeProfile;
-	if (!name) return { error: { reason: "no-active-profile", providers: list.map((p) => p.name) } };
-	const profile = list.find((p) => p.name === name);
-	if (!profile) return { error: { reason: "no-active-profile", providers: list.map((p) => p.name) } };
-	// The composer picker is the single source of truth for the model — settings only pre-fill it.
-	const modelId = userConfig().modelId || profile.modelId || config.get<string>("provider.modelId", "");
-	const field = !profile.providerId ? "providerId" : !profile.baseUrl ? "baseUrl" : !modelId ? "modelId" : "";
-	if (field) return { error: { reason: "missing-field", provider: name, field } };
-	const apiKey = await profileApiKey(secrets, name);
-	if (!apiKey) return { error: { reason: "no-api-key", provider: name } };
-	return {
-		settings: {
-			providerId: profile.providerId!,
-			baseUrl: profile.baseUrl!,
-			modelId,
-			profile: name,
-			maxIterations,
-			apiKey,
-			contextWindow: modelContextWindow(modelId, profile),
-		},
-	};
-}
-
-/** Context window for a model, from the profile's cached catalog or configured models. */
-function modelContextWindow(modelId: string, profile: ProviderProfile | undefined): number | undefined {
-	return (
-		profile?.models?.find((m) => m.id === modelId)?.contextWindow ??
-		configuredModels().find((m) => m.id === modelId)?.contextWindow ??
-		profiles().flatMap((p) => p.models ?? []).find((m) => m.id === modelId)?.contextWindow
+	const active = userConfig().activeProfile;
+	const results = await Promise.all(
+		list
+			.filter((p) => p.enabled !== false && p.baseUrl)
+			.map(async (p) => {
+				if (!force && p.models?.length) return { name: p.name, models: p.models, fetched: false };
+				const { models, error } = await fetchModelCatalog({ baseUrl: p.baseUrl!, apiKey: await profileApiKey(secrets, p.name) });
+				if (error) log("models", `${p.name}: ${error}`);
+				return { name: p.name, models: models.length ? models : (p.models ?? []), fetched: models.length > 0 };
+			}),
 	);
+	const fresh = new Map(results.filter((r) => r.fetched).map((r) => [r.name, r.models]));
+	if (fresh.size) {
+		await saveUserConfig({ profiles: list.map((p) => (fresh.has(p.name) ? { ...p, models: fresh.get(p.name), modelsFetchedAt: Date.now() } : p)) });
+	}
+	return results.map((r) => ({ profile: r.name, active: r.name === active, models: r.models }));
 }
 
 /** Write a provider-related value to the shared user config; other keys stay in VS Code settings. */
@@ -159,22 +141,9 @@ export async function renameProfileKey(secrets: vscode.SecretStorage, oldName: s
 	}
 }
 
-/** Read provider settings for non-run paths (model list, indexing). Returns undefined when not runnable. */
+/** Settings for non-run reads (model list, indexing) — the same strict selection as runs. */
 export async function readProviderSettings(secrets: vscode.SecretStorage): Promise<ProviderSettings | undefined> {
-	const { settings } = await resolveProvider(secrets);
-	if (settings) return settings;
-	// Allow non-run reads with whatever partial config exists (e.g. fetchModels without a key).
-	const config = vscode.workspace.getConfiguration("kronyx");
-	const profile = activeProfile();
-	if (!profile && profiles().length > 0) return undefined;
-	return {
-		providerId: profile?.providerId ?? config.get<string>("provider.id", "openai-compatible"),
-		baseUrl: profile?.baseUrl ?? config.get<string>("provider.baseUrl", "https://ai-gateway.vercel.sh/v1"),
-		modelId: profile?.modelId ?? config.get<string>("provider.modelId", "anthropic/claude-sonnet-4.6"),
-		profile: profile?.name,
-		maxIterations: config.get<number>("agent.maxIterations", 40),
-		apiKey: profile ? await profileApiKey(secrets, profile.name) : sanitizeApiKey((await secrets.get(API_KEY_SECRET)) || ""),
-	};
+	return (await resolveProvider(secrets)).settings;
 }
 
 export function autoApproveWrites(): boolean {
@@ -296,7 +265,7 @@ export interface ModelCatalog {
  * Fetch the model catalog from an OpenAI-compatible `GET {baseUrl}/models`.
  * Many gateways (e.g. Vercel AI Gateway) serve this endpoint without a key.
  */
-export async function fetchModelCatalog(settings: ProviderSettings): Promise<ModelCatalog> {
+export async function fetchModelCatalog(settings: Pick<ProviderSettings, "baseUrl" | "apiKey">): Promise<ModelCatalog> {
 	const base = settings.baseUrl.replace(/\/+$/, "");
 	// Header values must be Latin-1 ByteStrings; a key with stray Unicode (e.g. an
 	// em-dash from copy-paste) makes fetch throw before the request is sent.

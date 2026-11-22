@@ -9,7 +9,7 @@ import { catalogPart, llmRecipe, mergeParts, scanRepo, scanResult, STACK_CATALOG
 
 const EMITTER_KEYS = new Set(STACK_CATALOG.map((c) => c.key));
 import { installationToken } from "../lib/githubApp";
-import { loadUserSettings } from "../worker/settings";
+import { loadUserSettings, resolveProvider } from "../worker/settings";
 import { getProvider, type ProviderCreds } from "../../../src/sandbox/provider";
 
 /** GET /api/templates — baked images + provider templates + recipes + flags. */
@@ -246,6 +246,8 @@ export async function scanTemplate(req: Request): Promise<Response> {
 		ref?: string;
 		stacks?: string[];
 		versions?: Record<string, string>;
+		profile?: string;
+		modelId?: string;
 	};
 	const versions = body && typeof body.versions === "object" && body.versions
 		? Object.fromEntries(Object.entries(body.versions).filter(([k, v]) => EMITTER_KEYS.has(k) && /^[\d.]{1,10}$/.test(String(v))).map(([k, v]) => [k, String(v)]))
@@ -281,14 +283,12 @@ export async function scanTemplate(req: Request): Promise<Response> {
 
 	let recipe = ruled;
 	if (!recipe) {
+		// LLM recipe only with an explicit provider + model from the caller — no account defaults.
 		const settings = await loadUserSettings(await getDb(), uid).catch(swallow("templates", "op", null));
-		if (settings) {
+		const selected = settings && body.profile && body.modelId ? resolveProvider(settings, { profile: body.profile, modelId: body.modelId }).settings : undefined;
+		if (selected) {
 			const merged = Object.assign({}, ...[...byDir.values()]);
-			recipe = await llmRecipe(repo, merged, {
-				baseUrl: settings.data.baseUrl as string | undefined,
-				apiKey: settings.secrets.providerApiKey,
-				modelId: settings.data.modelId as string | undefined,
-			});
+			recipe = await llmRecipe(repo, merged, selected);
 		}
 	}
 	return json({

@@ -78,12 +78,23 @@ const sessionCtx = await esbuild.context({
 	...shared,
 });
 
+// media/highlight.js — syntax highlighting for file-change cards in the local session webview
+const highlightCtx = await esbuild.context({
+	entryPoints: ["src/ui/webviewHighlight.ts"],
+	bundle: true,
+	format: "iife",
+	platform: "browser",
+	target: "es2022",
+	outfile: "media/highlight.js",
+	...shared,
+});
+
 if (watch) {
-	await Promise.all([ctx.watch(), sessionCtx.watch()]);
+	await Promise.all([ctx.watch(), sessionCtx.watch(), highlightCtx.watch()]);
 } else {
-	await Promise.all([ctx.rebuild(), sessionCtx.rebuild()]);
+	await Promise.all([ctx.rebuild(), sessionCtx.rebuild(), highlightCtx.rebuild()]);
 	// sql.js wasm binary for the Kronyx store
 	mkdirSync("dist", { recursive: true });
 	copyFileSync("node_modules/sql.js/dist/sql-wasm.wasm", "dist/sql-wasm.wasm");
-	await Promise.all([ctx.dispose(), sessionCtx.dispose()]);
+	await Promise.all([ctx.dispose(), sessionCtx.dispose(), highlightCtx.dispose()]);
 }

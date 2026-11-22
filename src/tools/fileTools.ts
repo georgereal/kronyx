@@ -1,7 +1,7 @@
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import type { AgentTool } from "@cline/shared";
-import { computeHunks, formatHunks } from "../diff/hunks";
+import { computeHunks, formatUnifiedWithContext } from "../diff/hunks";
 import { isRunSummaryFact } from "../agent/taskGuard";
 import { adaptIndentation, findMatches, lineNumberAt, mostSimilarRegion } from "./matching";
 import { IGNORED_DIRS, WorkspaceGuard } from "./workspace";
@@ -92,7 +92,7 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 			options.onFileChanged(abs, existed ? "modified" : "created", {
 				added,
 				removed,
-				diff: formatHunks(hunks),
+				diff: formatUnifiedWithContext(before ?? "", text),
 			});
 		}
 		return existed;
@@ -334,9 +334,12 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 				if (entry.dir) continue;
 				const rel = guard.relative(entry.path);
 				if (glob && !glob.test(rel)) continue;
-				const stat = await fs.stat(entry.path);
-				if (stat.size > MAX_FILE_BYTES) continue;
-				const buffer = await fs.readFile(entry.path);
+				const stat = await fs.stat(entry.path).catch(() => undefined);
+				// Sockets, FIFOs and devices can't be read — skip anything that
+				// isn't a regular file (e.g. .devhost's *.sock files).
+				if (!stat?.isFile() || stat.size > MAX_FILE_BYTES) continue;
+				const buffer = await fs.readFile(entry.path).catch(() => undefined);
+				if (!buffer) continue;
 				if (buffer.includes(0)) continue;
 				const lines = normalizeEol(buffer.toString("utf8")).split("\n");
 				const printed = new Set<number>();

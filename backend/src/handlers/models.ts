@@ -3,7 +3,7 @@ import { getDb } from "../lib/mongo";
 import { fetchModels, type ModelOption } from "../lib/models";
 import { swallow } from "../lib/log";
 import { json } from "../routes";
-import { loadUserSettings } from "../worker/settings";
+import { activeProviderCreds, loadUserSettings } from "../worker/settings";
 
 const TTL_MS = 60 * 60_000;
 const cache = new Map<string, { at: number; models: ModelOption[] }>();
@@ -14,9 +14,9 @@ export async function modelPricing(req: Request): Promise<Response> {
 	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
 	const db = await getDb();
 	const settings = await loadUserSettings(db, uid).catch(swallow("models", "op", null));
-	const baseUrl = typeof settings?.data.baseUrl === "string" ? settings.data.baseUrl : "";
-	const apiKey = settings?.secrets.providerApiKey ?? "";
-	if (!baseUrl || !apiKey) return json({ pricing: {} });
+	const creds = settings ? activeProviderCreds(settings) : undefined;
+	if (!creds) return json({ pricing: {} });
+	const { baseUrl, apiKey } = creds;
 	const key = `${uid}|${baseUrl}`;
 	const hit = cache.get(key);
 	const models = hit && Date.now() - hit.at < TTL_MS ? hit.models : await fetchModels(baseUrl, apiKey).catch(() => [] as ModelOption[]);

@@ -4,6 +4,7 @@ import { renderCloudPage } from "./cloudPageHtml";
 import { RunViewProvider } from "./runViewProvider";
 import { CloudController } from "./cloudController";
 import { SessionController, type SessionDeps } from "./sessionController";
+import { currentSelection } from "../config";
 
 let counter = 0;
 const panels = new Map<vscode.WebviewPanel, SessionController>();
@@ -93,6 +94,8 @@ export function openCloudSessionPanel(context: vscode.ExtensionContext, deps: Se
 		mode: deps.modeRef.current,
 		modelId: deps.viewState.modelId,
 		models: deps.viewState.models,
+		groups: deps.viewState.groups,
+		modelProfile: currentSelection()?.profile ?? "",
 		workspaceName: vscode.workspace.workspaceFolders?.[0]?.name ?? "",
 	});
 	deps.surfaces.add(surface);
@@ -142,6 +145,8 @@ function wire(
 		mode: deps.modeRef.current,
 		modelId: deps.viewState.modelId,
 		models: deps.viewState.models,
+		groups: deps.viewState.groups,
+		modelProfile: currentSelection()?.profile ?? "",
 		workspaceName: vscode.workspace.workspaceFolders?.[0]?.name ?? "",
 	});
 	deps.surfaces.add(surface);

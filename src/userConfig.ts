@@ -11,6 +11,8 @@ export interface UserProviderConfig {
 	modelId?: string;
 	profiles?: ProviderProfile[];
 	activeProfile?: string;
+	/** Provider profile of the composer's model pick — the run's provider, paired with modelId. */
+	modelProfile?: string;
 	/** MCP servers to expose to the agent (`mcp_<server>_<tool>`). */
 	mcpServers?: McpServerConfig[];
 }

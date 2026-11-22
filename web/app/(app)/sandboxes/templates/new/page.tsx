@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useMemo, useState } from "react";
 import { apiFetch, useUser } from "@/lib/api";
+import type { ModelGroup } from "@/lib/types";
 
 interface RepoOpt { repo: string; defaultBranch: string; installationId: number }
 interface RecipeMeta { key: string; imageName: string; base?: string; tools?: string[]; description?: string }
@@ -118,6 +119,8 @@ function Wizard() {
 	const [includeRepo, setIncludeRepo] = useState(true);
 	const [defaultForRepo, setDefaultForRepo] = useState(true);
 	const [builtin, setBuiltin] = useState<RecipeMeta[]>([]);
+	const [groups, setGroups] = useState<ModelGroup[]>([]);
+	const [pick, setPick] = useState<{ profile: string; modelId: string } | null>(null);
 	const [msg, setMsg] = useState("");
 	const [building, setBuilding] = useState<{ name: string; kind: "api-build" | "repo" } | null>(null);
 	const [buildDoc, setBuildDoc] = useState<{ status?: string; error?: string; bakedAt?: string } | null>(null);
@@ -129,7 +132,27 @@ function Wizard() {
 	const selProjects = useMemo(() => projects.filter((p) => selDirs.has(p.dir)), [projects, selDirs]);
 	const firstWithScripts = selProjects.find((p) => p.scripts && Object.keys(p.scripts).length);
 	const scriptNames = useMemo(() => Object.keys(firstWithScripts?.scripts ?? {}).filter((s) => ["build", "dev", "start", "test"].includes(s)), [firstWithScripts]);
+	const choosePick = (value: string) => {
+		const [profile, modelId] = value ? (JSON.parse(value) as [string, string]) : ["", ""];
+		setPick(profile && modelId ? { profile, modelId } : null);
+		if (profile && modelId) {
+			localStorage.setItem("kronyx.modelProfile", profile);
+			localStorage.setItem("kronyx.modelId", modelId);
+		}
+	};
 	const allTools = useMemo(() => [...new Set(selProjects.flatMap((p) => p.tools))], [selProjects]);
+
+	// The composer's model pick is shared with the web composer; it writes the recipe the scan may generate.
+	useEffect(() => {
+		const profile = localStorage.getItem("kronyx.modelProfile") ?? "";
+		const modelId = localStorage.getItem("kronyx.modelId") ?? "";
+		if (profile && modelId) setPick({ profile, modelId });
+	}, []);
+
+	useEffect(() => {
+		if (!user) return;
+		void apiFetch("/api/models", user).then(async (r) => r.ok && setGroups(((await r.json()) as { groups?: ModelGroup[] }).groups ?? [])).catch(() => undefined);
+	}, [user]);
 
 	useEffect(() => {
 		if (!user) return;
@@ -158,7 +181,7 @@ function Wizard() {
 		if (!user || !repo || !inst) return;
 		setScanning(true);
 		setScan(null);
-		void apiFetch("/api/templates/scan", user, { method: "POST", body: JSON.stringify({ repo, installationId: inst.installationId, ref: branch || undefined, versions: Object.keys(versions).length ? versions : undefined }) })
+		void apiFetch("/api/templates/scan", user, { method: "POST", body: JSON.stringify({ repo, installationId: inst.installationId, ref: branch || undefined, versions: Object.keys(versions).length ? versions : undefined, profile: pick?.profile, modelId: pick?.modelId }) })
 			.then(async (r) => {
 				if (!r.ok) return;
 				const b = (await r.json()) as ScanRes;
@@ -171,7 +194,7 @@ function Wizard() {
 				}
 			})
 			.finally(() => setScanning(false));
-	}, [user, repo, branch, inst, versions]);
+	}, [user, repo, branch, inst, versions, pick]);
 
 	// Branches for the picked repo.
 	useEffect(() => {
@@ -375,6 +398,19 @@ function Wizard() {
 										</label>
 									</div>
 
+									<label style={{ display: "block", marginTop: 12 }}>
+										<span className="muted" style={{ fontSize: 12 }}>Model — writes the environment recipe when no built-in recipe matches</span>
+										<select className="input" style={{ width: "100%" }} value={pick ? JSON.stringify([pick.profile, pick.modelId]) : ""} onChange={(e) => choosePick(e.target.value)}>
+											<option value="">Select a model…</option>
+											{groups.map((g) => (
+												<optgroup key={g.profile} label={`${g.profile}${g.active ? " · active" : ""}`}>
+													{g.models.map((m) => (
+														<option key={`${g.profile}:${m.id}`} value={JSON.stringify([g.profile, m.id])}>{m.label ?? m.id}</option>
+													))}
+												</optgroup>
+											))}
+										</select>
+									</label>
 									{scanning && <p className="muted" style={{ fontSize: 12, marginTop: 16 }}>Scanning repository manifests…</p>}
 									{scan && (
 										<div className="wiz-detect">

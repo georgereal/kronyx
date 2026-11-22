@@ -35,20 +35,20 @@ export async function listCloudSessions(endpoint: string, key: string): Promise<
 export async function createCloudSession(
 	endpoint: string,
 	key: string,
-	opts: { repo: string; title?: string; mode?: "agent" | "plan" | "ask" | "multi"; modelId?: string },
+	opts: { repo: string; title?: string; mode?: "agent" | "plan" | "ask" | "multi"; modelId?: string; profile?: string },
 ): Promise<string> {
 	const body = await req<{ session: { sessionId: string } }>(endpoint, key, "/api/sessions", {
 		method: "POST",
-		body: JSON.stringify({ repo: opts.repo, title: opts.title?.slice(0, 120), mode: opts.mode ?? "agent", modelId: opts.modelId }),
+		body: JSON.stringify({ repo: opts.repo, title: opts.title?.slice(0, 120), mode: opts.mode ?? "agent", modelId: opts.modelId, profile: opts.profile }),
 	});
 	return body.session.sessionId;
 }
 
 /** Enqueue a task for the session — the worker picks it up, same as the web composer. */
-export async function sendTask(endpoint: string, key: string, sessionId: string, task: string): Promise<void> {
+export async function sendTask(endpoint: string, key: string, sessionId: string, task: string, pick: { modelId?: string; profile?: string } = {}): Promise<void> {
 	await req(endpoint, key, `/api/sessions/${sessionId}/messages`, {
 		method: "POST",
-		body: JSON.stringify({ task }),
+		body: JSON.stringify({ task, ...pick }),
 	});
 }
 
