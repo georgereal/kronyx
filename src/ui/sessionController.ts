@@ -23,6 +23,7 @@ import type { AgentMessage } from "@cline/shared";
 import { checksOnFinish, runChecks } from "../checks";
 import { E2bSandbox, sandboxBackend, sandboxEnabled } from "./e2b";
 import { appendFact, createIdeRecallScorer, indexFile, loadMemoryContext, logEpisode } from "./memory";
+import { buildRunIndex, indexRunDigests, searchRunDigests } from "./runMemory";
 import { createFileTools } from "../tools/fileTools";
 import { FileEventLog } from "../harness/eventLog";
 import { OpenAIModelPort } from "../harness/adapters/openai";
@@ -426,6 +427,11 @@ export class SessionController {
 				const p = this.pendingPermissions.get(message.id);
 				if (p) {
 					this.pendingPermissions.delete(message.id);
+					// save_plan's card shows an editable path — an edited value becomes
+					// the tool input's path so the plan lands where the user put it.
+					if (p.toolName === "save_plan" && typeof message.path === "string" && message.path.trim()) {
+						(p.input as { path?: string }).path = message.path.trim().replace(/^\/+/, "");
+					}
 					p.resolve(message.decision);
 				}
 				break;
@@ -480,9 +486,7 @@ export class SessionController {
 				}
 				break;
 			case "implementPlan": {
-				this.deps.modeRef.current = "code";
-				this.surface.setState({ mode: "code" });
-				await this.startRun(implementPrompt(message.path), "code");
+				await this.implementPlan(message.path);
 				break;
 			}
 			case "newSession":
@@ -822,6 +826,14 @@ export class SessionController {
 	}
 
 	/** `pick` is the composer chip's pair; the run uses exactly that pair, or none of them. */
+	/** "Implement this plan" — from the plan-ready card or the editor CodeLens:
+	 *  flips to code mode and runs the implement prompt on this session. */
+	public async implementPlan(planPath: string): Promise<void> {
+		this.deps.modeRef.current = "code";
+		this.surface.setState({ mode: "code" });
+		await this.startRun(implementPrompt(planPath), "code");
+	}
+
 	private async startRun(task: string, mode?: AgentMode, pick?: { modelId: string; profile: string }, engine: EngineKind = this.engineKind): Promise<void> {
 		const freshRunner = false;
 		const active = await this.getRunner(engine);
@@ -1085,6 +1097,14 @@ export class SessionController {
 		const assembled = this.engineHost ? await assembleToolSet(this.engineHost, settings, task, () => this.harnessAbort?.abort()) : undefined;
 		const tools = assembled?.tools ?? (await this.engineHost?.tools?.()) ?? [];
 		const log = await FileEventLog.open(this.harnessFile());
+		// Index earlier runs' digests into run memory BEFORE the loop starts — the
+		// model's recall_context scope 'runs' must not race a fire-and-forget index.
+		const priorEvents = await log.read();
+		try {
+			await indexRunDigests(root, this.name, "", priorEvents, settings.baseUrl, settings.apiKey);
+		} catch {
+			/* indexing is best-effort */
+		}
 		const provider = { providerId: settings.providerId, baseUrl: settings.baseUrl, apiKey: settings.apiKey, modelId: settings.modelId, maxOutputTokens: settings.maxTokens };
 		// The transport is the model side only; the loop is always the harness.
 		const model = transport === "openai" ? new OpenAIModelPort(provider) : new ClineModelPort(provider);
@@ -1103,7 +1123,18 @@ export class SessionController {
 			},
 			confirm: (name, input) => this.confirmWrite(root, name, input),
 		});
-		const toolPort = withRecall(withExplore(withReadCache(withBatchReads(basePort)), model), log);
+		const toolPort = withRecall(
+			withExplore(withReadCache(withBatchReads(basePort)), model),
+			log,
+			async (query, chunks) => {
+				const s = await readProviderSettings(this.deps.context.secrets);
+				return s ? createIdeRecallScorer(root, s.baseUrl, s.apiKey)(query, chunks) : undefined;
+			},
+			async (query, filter) => {
+				const s = await readProviderSettings(this.deps.context.secrets);
+				return s ? searchRunDigests(root, s.baseUrl, s.apiKey, query, filter) : undefined;
+			},
+		);
 		this.runEngine = "harness";
 		this.runTransport = transport;
 		const abort = new AbortController();
@@ -1111,8 +1142,14 @@ export class SessionController {
 		// Stable system prompt (same builder as the Cline loop). Per-run memory and dev context go in the user message.
 		const system =
 			buildSystemPrompt(root, mode, "", this.engineHost?.environment, undefined, assembled?.available) +
-			"\n\nHarness notes: a task checklist is maintained automatically — focus on the work, not on planning tools. Batch independent reads into one read_files call; elided tool results are recovered with log_slice or recall_context.";
-		const memory = resume ? "" : (await this.engineHost?.memory?.context?.(task, settings)) ?? "";
+			"\n\nHarness notes: a task checklist is maintained automatically — focus on the work, not on planning tools. Batch independent reads into one read_files call; elided tool results are recovered with log_slice or recall_context. " +
+			"Earlier runs are indexed in memory — recall_context with scope 'runs' searches their digests (prompts, task outcomes, final reports, compaction briefs) across this and previous sessions; narrow with runId or task. Prefer it over re-reading files for prior work.";
+		// Memory injection on resumes too — but keep it small: rules + facts +
+		// a compact run index (not semantic snippet dumps). The model drills into
+		// prior runs with recall_context scope 'runs' when the index isn't enough.
+		const baseMemory = (await this.engineHost?.memory?.context?.("", settings)) ?? "";
+		const runIndex = buildRunIndex(priorEvents, this.name);
+		const memory = [baseMemory, runIndex].filter(Boolean).join("\n\n");
 		const digests = resume ? [] : (this.runner?.runDigests ?? []);
 		const digestBlock = digests.length
 			? `Earlier runs in this session (oldest first):\n${digests.map((d, i) => `${i + 1}) ${d.task} — ${d.status}. ${d.summary.slice(0, 800)}${d.filesChanged.length ? ` Files: ${d.filesChanged.join(", ")}.` : ""}`).join("\n")}`
@@ -1124,7 +1161,37 @@ export class SessionController {
 			// board IS the deliverable; signals for unavailable tools are stripped.
 			const plan = !isConversationalTask(task);
 			const images = attachments.flatMap((a) => (a.data?.byteLength && a.mediaType.startsWith("image/") ? [{ mediaType: a.mediaType, base64: Buffer.from(a.data).toString("base64") }] : []));
-			const outcome = await runHarness({ runId: this.runId, log, model, tools: toolPort, verifier, emit: (e) => this.onEvent(e), signal: abort.signal, system, nudgeWrites, writable: WRITE_MODES.has(mode), debug: vscode.workspace.getConfiguration("kronyx").get<boolean>("harness.debug", false), onLoop: (l) => (this.activeHarnessLoop = l) }, task, displayTask, { resume, context, images, plan });
+			const outcome = await runHarness(
+				{
+					runId: this.runId,
+					log,
+					model,
+					tools: toolPort,
+					verifier,
+					emit: (e) => this.onEvent(e),
+					signal: abort.signal,
+					system,
+					nudgeWrites,
+					writable: WRITE_MODES.has(mode),
+					limits: { maxTurns: settings.maxIterations },
+					// Hit the turn cap → ask in chat instead of silently pausing.
+					// "Always" answers auto-continue future windows for this run.
+					onTurnLimit: (used, limit, kind = "turns", contextTokens) =>
+						this.confirmWrite(root, "continue_run", {
+							command:
+								kind === "input_tokens"
+									? `Total spend ${Math.round(used / 1000)}k of the ${Math.round(limit / 1000)}k input budget${contextTokens ? ` — context compacted to ~${Math.round(contextTokens / 1000)}k` : ""}. Continue with a fresh allowance?`
+									: `Run reached ${used} turns (limit ${limit}). Continue for another ${limit}?`,
+						}),
+					// Steering "ask" verdicts (plan.drift) go through the same in-chat card.
+					onSteerAsk: (question) => this.confirmWrite(root, "steer_ask", { command: question }),
+					debug: vscode.workspace.getConfiguration("kronyx").get<boolean>("harness.debug", false),
+					onLoop: (l) => (this.activeHarnessLoop = l),
+				},
+				task,
+				displayTask,
+				{ resume, context, images, plan },
+			);
 			this.harnessPaused = outcome.status === "paused";
 			void this.queueHarnessReport();
 		} finally {
@@ -1138,8 +1205,13 @@ export class SessionController {
 		try {
 			const root = this.runnerRoot ?? "";
 			const log = await FileEventLog.open(this.harnessFile());
-			const report = buildHarnessReport(await log.read(), { runId: this.runId });
+			const events = await log.read();
+			const report = buildHarnessReport(events, { runId: this.runId });
 			upsertHarnessReport(await openStore(root), { runId: this.runId, session: this.name, report }, root);
+			// Persist the run's digest (prompt + task outcomes + final report) into the
+			// vector store so later runs recall it via recall_context scope 'runs'.
+			const s = await readProviderSettings(this.deps.context.secrets);
+			if (s) await indexRunDigests(root, this.name, this.runId, events, s.baseUrl, s.apiKey);
 		} catch (err) {
 			log("harness", `report queue failed: ${err instanceof Error ? err.message : String(err)}`);
 		}
@@ -1165,14 +1237,37 @@ export class SessionController {
 		this.surface.post({ type: "info", text: "Context cleared. The next task starts fresh; the task board and log are kept." });
 	}
 
+	/** Best-guess plan dir for save_plan cards: the configured dir wins; else the
+	 *  first conventional folder that already holds markdown (plans/, docs/plans/,
+	 *  docs/, .kronyx/plans/); else "plans". */
+	private async detectPlanDir(root: string): Promise<string> {
+		const configured = planDir();
+		if (configured && configured !== "plans") return configured;
+		for (const rel of ["plans", "docs/plans", "docs", ".kronyx/plans"]) {
+			try {
+				const names = await fs.readdir(path.join(root, rel));
+				if (names.some((n) => n.endsWith(".md"))) return rel;
+			} catch {
+				/* keep looking */
+			}
+		}
+		return configured || "plans";
+	}
+
 	private async confirmWrite(root: string, toolName: string, input: unknown): Promise<boolean> {
 		if (autoApproveWrites() || this.approveAll || this.permittedTools.has(toolName)) return true;
-		const file =
+		let file =
 			(input as { path?: string })?.path ??
-			(toolName === "run_command" ? (input as { command?: string })?.command : undefined) ??
+			(input as { command?: string })?.command ??
 			(input as { pattern?: string })?.pattern ??
 			(toolName.startsWith("mcp_") ? JSON.stringify(input ?? {}).slice(0, 300) : undefined) ??
 			"(unknown file)";
+		// save_plan with only a slug resolves to <detected plan dir>/<slug>.md —
+		// the card shows (and can edit) that resolved path.
+		if (toolName === "save_plan" && !(input as { path?: string })?.path) {
+			const slug = String((input as { slug?: string })?.slug || "plan").replace(/[^\w-]+/g, "-").slice(0, 60) || "plan";
+			file = `${await this.detectPlanDir(root)}/${slug}.md`;
+		}
 		const id = `perm-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 		const diff = await this.pendingDiff(root, file, toolName, input);
 		const event = { type: "permission-request" as const, id, tool: toolName, path: file, diff };

@@ -46,4 +46,43 @@ describe("recall_context on the harness (step 4)", () => {
 		const port = withRecall(base, await sessionLog());
 		expect(await port.execute("anything", {})).toEqual({ ok: true, output: "base" });
 	});
+
+	it("ranks hits semantically when a scorer is wired, and falls back to keyword search", async () => {
+		const scorer = async (_q: string, chunks: { idx: number; role: string; text: string }[]) =>
+			chunks.filter((c) => c.text.includes("FULL OUTPUT")).map((c) => ({ idx: c.idx, score: 0.9 }));
+		const port = withRecall(base, await sessionLog(), scorer);
+		const result = await port.execute(RECALL_TOOL, { query: "semantic query with no literal match" });
+		expect(result.ok).toBe(true);
+		expect(result.output).toMatch(/score 0\.90/);
+		expect(result.output).toContain("FULL OUTPUT TEXT");
+		// Scorer returning nothing → keyword path still applies.
+		const empty = withRecall(base, await sessionLog(), async () => []);
+		expect((await empty.execute(RECALL_TOOL, { query: "parser" })).output).toMatch(/seq 1 \(user\.input\)/);
+		// Scorer throwing → same fallback.
+		const broken = withRecall(base, await sessionLog(), async () => {
+			throw new Error("no embeddings");
+		});
+		expect((await broken.execute(RECALL_TOOL, { query: "parser" })).output).toMatch(/seq 1 \(user\.input\)/);
+	});
+
+	it("scope 'runs' queries the run-memory store and honors runId/task filters", async () => {
+		const seen: { runId?: string; task?: string }[] = [];
+		const searchRuns = async (_q: string, filter: { runId?: string; task?: string }) => {
+			seen.push(filter);
+			return [{ label: "Session-8 · abc12345", text: "Run abc12345 of session \"Session-8\" — final report: tool surface audit", score: 0.87 }];
+		};
+		const port = withRecall(base, await sessionLog(), undefined, searchRuns);
+		const result = await port.execute(RECALL_TOOL, { query: "tool surface audit", scope: "runs" });
+		expect(result.ok).toBe(true);
+		expect(result.output).toMatch(/Session-8 · abc12345 \(score 0\.87\)/);
+		expect(result.output).toContain("tool surface audit");
+		// runId/task args imply runs scope without an explicit scope.
+		await port.execute(RECALL_TOOL, { query: "x", runId: "abc123", task: "t2" });
+		expect(seen.at(-1)).toEqual({ runId: "abc123", task: "t2" });
+		// Missing dep → clear refusal; empty hits → plain message.
+		const none = withRecall(base, await sessionLog());
+		expect((await none.execute(RECALL_TOOL, { query: "x", scope: "runs" })).output).toMatch(/not indexed/);
+		const empty = withRecall(base, await sessionLog(), undefined, async () => []);
+		expect((await empty.execute(RECALL_TOOL, { query: "x", scope: "runs" })).output).toBe("No run-memory matches.");
+	});
 });

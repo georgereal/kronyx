@@ -60,7 +60,8 @@ describe("HarnessLoop: happy path", () => {
 		const { loop, log, scripted } = harness({
 			verifier: passingVerifier,
 			tools: fakeTools([noopSpec]),
-			script: [...finishTaskScript("parser"), finish("parser is done")],
+			// Task completion queues a recap — this entry is consumed by makeRecap.
+			script: [...finishTaskScript("parser"), { text: "parser task brief" }, finish("parser is done")],
 		});
 		const outcome = await loop.run("add a parser");
 		expect(outcome).toMatchObject({ status: "completed" });
@@ -156,7 +157,7 @@ describe("HarnessLoop: steering", () => {
 		const { loop } = harness({
 			verifier: passingVerifier,
 			tools: fakeTools([noopSpec]),
-			script: [...finishTaskScript("a"), acting(call("rm", "task_remove", { id: "a" })), finish()],
+			script: [...finishTaskScript("a"), { text: "task a brief" }, acting(call("rm", "task_remove", { id: "a" })), finish()],
 		});
 		await loop.run("x");
 		expect(loop.projection.ledger.order).toEqual(["a"]);
@@ -185,18 +186,21 @@ describe("HarnessLoop: budgets and terminal states", () => {
 		expect(scripted.remaining()).toBe(0);
 	});
 
-	it("pauses when the input budget is spent and warns once at 80%", async () => {
+	it("auto-extends the input allowance (recap + note) instead of pausing, and warns once at 80%", async () => {
 		const { loop, log } = harness({
 			limits: { maxInputTokens: 1000 },
 			script: [
 				{ text: "", calls: [call("c1", "noop", {})], usage: { inputTokens: 850, outputTokens: 1, cachedTokens: 0 } },
 				{ text: "", calls: [call("c2", "noop", {})], usage: { inputTokens: 200, outputTokens: 1, cachedTokens: 0 } },
+				finish("done"),
 			],
 			tools: fakeTools([{ name: "noop", description: "", inputSchema: {} }]),
 		});
-		expect(await loop.run("x")).toMatchObject({ status: "paused", reason: "input_budget" });
-		const warnings = (await log.read()).filter((e) => e.type === "budget.warning");
-		expect(warnings).toHaveLength(1);
+		expect(await loop.run("x")).toMatchObject({ status: "completed" });
+		const events = await log.read();
+		expect(events.filter((e) => e.type === "budget.warning")).toHaveLength(1);
+		// Too few messages to recap (boundary is 0) — the allowance still extends with a note.
+		expect(events.some((e) => e.type === "steer.note" && e.rule === "context.budget")).toBe(true);
 	});
 
 	it("treats a failing external tool as a result the model can react to", async () => {
@@ -346,5 +350,59 @@ describe("HarnessLoop: loop controller (M5)", () => {
 		await loop.run("x");
 		const levels = (await log.read()).filter((e) => e.type === "loop.verdict").map((e) => (e.type === "loop.verdict" ? e.level : ""));
 		expect(levels).toEqual(["warn", "none", "warn"]);
+	});
+});
+
+describe("HarnessLoop: steering ask verdicts", () => {
+	const askRegistry = async () => {
+		const registry = new (await import("../../src/harness/steering")).SteeringRegistry();
+		registry.add("beforeModel", { id: "always-ask", point: "beforeModel", order: 0, decide: () => ({ kind: "ask", question: "drift — continue?" }) });
+		return registry;
+	};
+
+	it("pauses with the question when no onSteerAsk hook is supplied", async () => {
+		const { scripted } = harness({ script: [finish()] });
+		const paused = new HarnessLoop({ runId: "r", log: new MemoryEventLog(() => 1), model: scripted.model, tools: fakeTools(), steering: await askRegistry() });
+		expect(await paused.run("x")).toMatchObject({ status: "paused", reason: "drift — continue?" });
+	});
+
+	it("pauses when the host declines the ask", async () => {
+		const { scripted } = harness({ script: [finish()] });
+		const paused = new HarnessLoop({ runId: "r", log: new MemoryEventLog(() => 1), model: scripted.model, tools: fakeTools(), steering: await askRegistry(), onSteerAsk: async () => false });
+		expect(await paused.run("x")).toMatchObject({ status: "paused", reason: "drift — continue?" });
+	});
+
+	it("continues when the host approves the ask", async () => {
+		const { scripted } = harness({ script: [finish("kept going")] });
+		let asked = 0;
+		const live = new HarnessLoop({ runId: "r", log: new MemoryEventLog(() => 1), model: scripted.model, tools: fakeTools(), steering: await askRegistry(), onSteerAsk: async () => (++asked, true) });
+		expect(await live.run("x")).toMatchObject({ status: "completed" });
+		expect(asked).toBeGreaterThan(0);
+	});
+});
+
+describe("HarnessLoop: automatic recap", () => {
+	it("writes a context.recap after a task closes, before the next model call", async () => {
+		const { loop, log } = harness({
+			verifier: passingVerifier,
+			tools: fakeTools([noopSpec]),
+			// Task closes at stop-check; the following script entry is consumed by makeRecap.
+			script: [...finishTaskScript("a"), { text: "task a brief: parser written and verified" }, finish("wrapped up")],
+		});
+		const outcome = await loop.run("x");
+		expect(outcome.status).toBe("completed");
+		const recaps = (await log.read()).filter((e) => e.type === "context.recap");
+		expect(recaps.length).toBe(1);
+		expect(recaps[0]?.type === "context.recap" && recaps[0].text).toContain("parser written");
+	});
+
+	it("does not auto-recap when no task closed and no budget pressure", async () => {
+		const { loop, log } = harness({
+			tools: fakeTools([noopSpec]),
+			script: [acting(call("r1", "noop", {})), finish("done")],
+		});
+		await loop.run("x");
+		const recaps = (await log.read()).filter((e) => e.type === "context.recap");
+		expect(recaps.length).toBe(0);
 	});
 });

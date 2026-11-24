@@ -76,11 +76,11 @@ describe("repeat guard", () => {
 });
 
 describe("save_plan guard", () => {
-	it("plan mode allows, other modes deny before rules apply", async () => {
+	it("plan mode allows directly; other modes fall through to permission rules", async () => {
 		expect((await harness({ mode: "plan" }).run("save_plan", { slug: "x" })).kind).toBe("allow");
-		// Even with a repo allow-rule, code mode denies (runs before permissionGuard).
+		// In code mode a repo allow-rule now governs save_plan like any write.
 		const h = harness({ mode: "code", layers: { project: { ...empty, allow: ["save_plan"] } } });
-		expect((await h.run("save_plan", {})).kind).toBe("deny");
+		expect((await h.run("save_plan", {})).kind).toBe("allow");
 	});
 });
 

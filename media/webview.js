@@ -223,6 +223,69 @@
 	 *  plan-reuse run doesn't inherit the previous run's blocked counts. */
 	let boardActive = false;
 	const boardTasks = new Map();
+	/** callId → {name, ok} for every tool card in the session — feeds the board
+	 *  tree's compact call rows and the off-plan feed badges. */
+	const callInfo = new Map();
+	/** callId → "t1/s2" tentative attribution while a step is in progress. The
+	 *  step's callIds (from step.updated) are authoritative once locked. */
+	const callGuess = new Map();
+	/** Call ids belonging to the current run — tools persists across runs for
+	 *  jump-to-card, but off-plan/attribution is per-run like the board. */
+	const runCalls = new Set();
+	/** "tN/sM" of the in-progress step calls tentatively serve. */
+	let liveAnchor = null;
+	/** callId → "t1/s2" locked attribution, rebuilt from step.callIds each board. */
+	const attributed = new Map();
+	/** Rebuild the locked call→step map from the latest board snapshot. */
+	const rebuildAttribution = () => {
+		attributed.clear();
+		for (const t of boardTasks.values())
+			for (const s of t.steps || []) for (const cid of s.callIds || []) attributed.set(cid, `${t.id}/${s.id}`);
+		// Locked ids win — drop guesses the board now confirms.
+		for (const [cid, ref] of [...callGuess]) if (attributed.get(cid) === ref) callGuess.delete(cid);
+		// The in-progress step is what new calls tentatively serve.
+		liveAnchor = null;
+		for (const t of boardTasks.values()) {
+			const s = (t.steps || []).find((x) => x.status === "in_progress");
+			if (t.status === "in_progress" && s) liveAnchor = `${t.id}/${s.id}`;
+		}
+	};
+	/** A compact call row inside a board step; click jumps to the feed card. */
+	const callRow = (cid, tentative) => {
+		const info = callInfo.get(cid) || {};
+		const row = el("li", `call-row${tentative ? " tentative" : ""}${info.ok === false ? " failed" : ""}`);
+		const [icon, verb] = toolVerb(info.name || "?");
+		row.appendChild(el("span", "tool-icon", icon));
+		row.appendChild(el("span", "call-verb", verb));
+		row.appendChild(el("span", `call-ok${info.ok === undefined ? "" : info.ok ? " ok" : " err"}`, info.ok === undefined ? "…" : info.ok ? "✓" : "✗"));
+		row.title = `${info.name || cid} — click to jump to the call`;
+		row.addEventListener("click", (e) => {
+			e.stopPropagation();
+			tools.get(cid)?.scrollIntoView({ block: "center", behavior: "smooth" });
+		});
+		return row;
+	};
+	/** Step chips on cited calls, off-plan badges on finished-but-uncited ones. */
+	const markCards = () => {
+		for (const [cid, card] of tools) {
+			card.querySelectorAll(".step-chip, .off-plan").forEach((n) => n.remove());
+			const info = callInfo.get(cid);
+			if (!info || /^task_/.test(info.name) || info.name === "log_slice") continue;
+			const head = card.querySelector(":scope > summary, :scope > .diff-editor-head");
+			if (!head) continue;
+			const ref = attributed.get(cid) ?? callGuess.get(cid);
+			if (ref) {
+				const stepId = ref.split("/")[1];
+				const chip = el("span", `ref-chip step-chip${attributed.has(cid) ? "" : " tentative"}`, clip(stepId, 8));
+				chip.title = `${ref} · ${stepText(stepId)}`;
+				head.appendChild(chip);
+			} else if (info.ok !== undefined && boardActive && runCalls.has(cid)) {
+				const badge = el("span", "off-plan", "off-plan");
+				badge.title = "No plan step cited this call";
+				head.appendChild(badge);
+			}
+		}
+	};
 	/** @type {any} */
 	let progressEl = null;
 	/** Newest plan doc this session produced — the result card links back to it. */
@@ -419,7 +482,9 @@
 	};
 
 	const collapseAux = () => {
-		runGroup?.querySelectorAll(".thoughts-group").forEach((t) => (t.open = false));
+		// Fold every inner details — batches, tool cards, thoughts — so the
+		// collapsed group expands to one line per batch, not the open wall.
+		runGroup?.querySelectorAll(".thoughts-group, details.tool-batch, details.step.tool").forEach((t) => (t.open = false));
 	};
 
 	const closeGroup = (label) => {
@@ -427,7 +492,8 @@
 		collapseAux();
 		collapseEditCards();
 		updateGroupTitle(label);
-		runGroup.open = false;
+		// The section stays open — every card inside is already a collapsed line,
+		// so the run reads as a clean list of steps, not a folded blob.
 		runGroup = null;
 		batchEl = null;
 	};
@@ -1494,6 +1560,10 @@
 				thoughts = null;
 				groupStats = { added: 0, removed: 0, files: new Set() };
 				boardTasks.clear();
+				callInfo.clear();
+				callGuess.clear();
+				runCalls.clear();
+				liveAnchor = null;
 				tools.clear();
 				pendingEdits.length = 0;
 				attachments.clear();
@@ -1543,6 +1613,9 @@
 				boardEl = null;
 				boardSig = "";
 				boardActive = false;
+				callGuess.clear();
+				runCalls.clear();
+				liveAnchor = null;
 				progressEl = null;
 				// Streaming/thought elements from a run that ended mid-delta point
 				// inside its collapsed card — clear them or the new run's text is
@@ -1641,6 +1714,9 @@
 			}
 			case "tool-started": {
 				ensureSegment();
+				callInfo.set(msg.id, { name: msg.name, ok: undefined });
+				runCalls.add(msg.id);
+				if (liveAnchor) callGuess.set(msg.id, liveAnchor);
 				const [icon, verb] = toolVerb(msg.name);
 				lastVerb = `${verb} ${describeInput(msg.name, msg.input)}…`;
 				setStatus("Running...");
@@ -1683,6 +1759,9 @@
 				break;
 			}
 			case "tool-finished": {
+				const info = callInfo.get(msg.id);
+				if (info) info.ok = msg.ok;
+				markCards();
 				const card = tools.get(msg.id);
 				if (!card) break;
 				if (card.classList.contains("diff-editor")) {
@@ -1747,17 +1826,21 @@
 					if (result.text) resultBox.appendChild(el("pre", `io${msg.ok ? "" : " io-err"}`, result.text));
 					resultBox.appendChild(el("div", `tool-exit${msg.ok ? "" : " failed"}`, `${msg.ok ? "Exited" : "Failed"} with code ${result.code}`));
 					card.appendChild(resultBox);
-					card.open = true;
+					card.open = false;
 				} else {
 					const cleanOutput = prettyOut(String(msg.output || "")).replace(/\x1b\[[0-9;]*m/g, "").trim();
 					if (cleanOutput) {
 						if (msg.ok && READ_TOOLS.has(msg.name)) card.appendChild(renderReadOutput(cleanOutput));
 						else card.appendChild(el("pre", `io${msg.ok ? "" : " io-err"}`, cleanOutput));
 					}
-					card.open = !msg.ok;
+					card.open = false;
 				}
 				const batch = card.closest(".tool-batch");
-				if (batch) updateBatch(batch);
+				if (batch) {
+					updateBatch(batch);
+					// Every call in the batch is done — fold it to one line.
+					if (!batch.querySelector(".step.tool.running")) batch.open = false;
+				}
 				lastVerb = "";
 				break;
 			}
@@ -1779,6 +1862,7 @@
 				}
 				boardTasks.clear();
 				for (const t of tasks) boardTasks.set(t.id, t);
+				rebuildAttribution();
 				const head = el("div", "board-head");
 				head.appendChild(el("span", "board-label", "Plan"));
 				const counts = tasks.reduce((acc, t) => ((acc[t.status] = (acc[t.status] || 0) + 1), acc), {});
@@ -1792,18 +1876,46 @@
 					),
 				);
 				const rows = tasks.map((t) => {
-					const row = el("div", `board-task ${t.status}`);
-					const title = el("div", "board-title");
+					const row = el("details", `board-task ${t.status}`);
+					row.open = true;
+					const title = el("summary", "board-title");
+					title.appendChild(el("span", "twisty", "›"));
 					title.appendChild(el("span", "board-name", t.title));
 					if (t.from) title.appendChild(el("span", "board-adopt", `↩ run ${String(t.from).slice(0, 8)}`));
 					title.appendChild(el("span", `board-pill ${t.status}`, t.status.replace("_", " ")));
 					row.appendChild(title);
 					const list = el("ul", "board-steps");
-					for (const s of t.steps || []) list.appendChild(el("li", `board-step ${s.status}`, `${s.text} · ${s.status}`));
+					for (const s of t.steps || []) {
+						const li = el("li", `board-step ${s.status}`, `${s.text} · ${s.status}`);
+						// The step's tool-call subtree: locked callIds, plus calls
+						// tentatively serving it while it's in progress.
+						const calls = el("ul", "call-list");
+						for (const cid of s.callIds || []) calls.appendChild(callRow(cid));
+						for (const [cid, ref] of callGuess) if (ref === `${t.id}/${s.id}` && !(s.callIds || []).includes(cid)) calls.appendChild(callRow(cid, true));
+						if (calls.childNodes.length) li.appendChild(calls);
+						list.appendChild(li);
+					}
 					row.appendChild(list);
 					return row;
 				});
+				// Off-plan calls: finished, cited by no step, still in the feed.
+				const orphans = [...runCalls].filter((cid) => {
+					const i = callInfo.get(cid);
+					return i && i.ok !== undefined && !/^task_/.test(i.name) && i.name !== "log_slice" && !attributed.has(cid) && !callGuess.has(cid);
+				});
+				if (orphans.length) {
+					const det = el("details", "board-task offplan");
+					const summ = el("summary", "board-title");
+					summ.appendChild(el("span", "twisty", "›"));
+					summ.appendChild(el("span", "board-name", `Off-plan calls (${orphans.length})`));
+					det.appendChild(summ);
+					const list = el("ul", "call-list");
+					for (const cid of orphans) list.appendChild(callRow(cid));
+					det.appendChild(list);
+					rows.push(det);
+				}
 				boardEl.replaceChildren(head, ...rows);
+				markCards();
 				scrollMaybe(true);
 				break;
 			}
@@ -1960,11 +2072,23 @@
 					commandHead.appendChild(copy);
 				}
 				card.appendChild(commandHead);
-				card.appendChild(el("code", "perm-body", msg.path));
+				let editedPath;
+				if (msg.tool === "save_plan") {
+					// Editable target — the detected plan dir is prefilled; the user may
+					// point the save anywhere inside the workspace.
+					const pathInput = el("input", "perm-body perm-path-input");
+					pathInput.type = "text";
+					pathInput.value = String(msg.path || "");
+					pathInput.spellcheck = false;
+					card.appendChild(pathInput);
+					editedPath = () => pathInput.value.trim();
+				} else {
+					card.appendChild(el("code", "perm-body", msg.path));
+				}
 				if (msg.diff) card.appendChild(renderEditorDiff(msg.diff, msg.path));
 				const btns = el("div", "perm-btns");
 				const resolve = (decision, label) => {
-					vscode.postMessage({ type: "permissionResponse", id: msg.id, decision });
+					vscode.postMessage({ type: "permissionResponse", id: msg.id, decision, ...(editedPath ? { path: editedPath() } : {}) });
 					btns.remove();
 					card.appendChild(el("span", "perm-decision", label));
 				};
@@ -2053,9 +2177,11 @@
 				break;
 			case "run-finished": {
 				retirePaused();
+				const stopped = msg.status === "stopped" || msg.status === "interrupted";
+				// Fold the run's steps into one expandable line before the result card.
+				closeGroup(stopped ? "Stopped · worked for" : "Finished · worked for");
 				const secs = startedAt ? Math.round((Date.now() - startedAt) / 1000) : 0;
 				const issues = runStats.toolsFailed + runStats.checksFailed;
-				const stopped = msg.status === "stopped" || msg.status === "interrupted";
 				settlePending("Interrupted");
 				// Zero-diff churn (binary/.pyc) isn't a meaningful change.
 				const files = [...runStats.files.values()].filter((f) => f.added + f.removed > 0);

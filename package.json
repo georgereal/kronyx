@@ -391,6 +391,11 @@
 					"minimum": 1,
 					"description": "Maximum agent steps per run."
 				},
+				"kronyx.agent.planDir": {
+					"type": "string",
+					"default": "plans",
+					"description": "Workspace-relative folder where save_plan writes plan documents (git-trackable)."
+				},
 				"kronyx.sandbox.enabled": {
 					"type": "boolean",
 					"default": false,
@@ -503,7 +508,7 @@
 				"kronyx.memory.embeddingModel": {
 					"type": "string",
 					"default": "",
-					"description": "Embedding model for semantic memory/code search (e.g. text-embedding-3-small). Empty disables the vector tier."
+					"description": "Embedding model for semantic memory/code search (e.g. text-embedding-3-small). Empty uses the built-in local model (ONNX, no API needed)."
 				},
 				"kronyx.memory.topK": {
 					"type": "number",
@@ -565,7 +570,9 @@
 				},
 				"kronyx.network.allowHosts": {
 					"type": "array",
-					"items": { "type": "string" },
+					"items": {
+						"type": "string"
+					},
 					"default": [],
 					"description": "Hosts the fetch_url and browser tools may reach even though they are private or local — e.g. \"localhost:3000\" to verify a dev server, or \"*.corp.internal\". Private, loopback and link-local addresses are refused otherwise."
 				},
@@ -637,6 +644,7 @@
 	"dependencies": {
 		"@cline/agents": "^0.2.0",
 		"@cline/shared": "^0.2.0",
+		"@huggingface/transformers": "^4.3.2",
 		"@modelcontextprotocol/sdk": "^1.32.2",
 		"@opentelemetry/api": "~1.10.0",
 		"@types/better-sqlite3": "^9.6.0",

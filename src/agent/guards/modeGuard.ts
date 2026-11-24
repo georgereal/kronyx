@@ -2,7 +2,7 @@
  * Mode guards — the policy stages that used to live inline in the runner's
  * beforeTool hook, kept in their original order:
  *
- *   savePlanGuard   save_plan is plan-mode-only (runs BEFORE rule evaluation).
+ *   savePlanGuard   save_plan is auto-allowed in plan mode; other modes fall through to permissions/approval.
  *   writeModeGuard  file_editor read commands bypass; non-writes pass;
  *                   ask/plan deny writes (one-shot mode-blocked notice);
  *                   smart/bypass allow; code-mode writes delegate to the
@@ -18,11 +18,9 @@ import type { AgentMode } from "../runner";
 
 export function createSavePlanGuard(currentMode: () => AgentMode): PreTool {
 	return async (call, next) => {
-		if (call.name === "save_plan") {
-			return currentMode() === "plan"
-				? { kind: "allow" }
-				: { kind: "deny", reason: "Plans are saved in Plan mode only." };
-		}
+		if (call.name === "save_plan" && currentMode() === "plan") return { kind: "allow" };
+		// Outside plan mode, save_plan falls through to permissions/approval —
+		// saving a plan deliverable mid-run is a normal approved write.
 		return next();
 	};
 }

@@ -27,7 +27,7 @@ export type WebviewMessage =
 	| { type: "acceptChange"; path: string }
 	| { type: "rejectChange"; path: string }
 	| { type: "showHistory" }
-	| { type: "permissionResponse"; id: string; decision: "allow" | "always" | "deny" | "alwaysTool" | "alwaysRule" }
+	| { type: "permissionResponse"; id: string; decision: "allow" | "always" | "deny" | "alwaysTool" | "alwaysRule"; path?: string }
 	| { type: "openFile"; path: string }
 	| { type: "implementPlan"; path: string }
 	| { type: "runInTerminal"; command: string }

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { HookRule } from "../../src/harness/contracts";
 import { emptyLedger } from "../../src/harness/taskLedger";
 import { builtinRules, SteeringError, SteeringRegistry, type SteerContext } from "../../src/harness/steering";
+import { isReadOnlyCommand } from "../../src/harness/shellReadOnly";
 
 const beforeTool = (call = { callId: "c", name: "read", input: {} }): SteerContext["beforeTool"] => ({ call, ledger: emptyLedger(), outcomes: {} });
 const rule = (id: string, order: number, decide: () => unknown): HookRule<unknown> => ({ id, point: "beforeTool", order, decide: decide as HookRule<unknown>["decide"] });
@@ -225,5 +226,145 @@ describe("reads.wander rule", () => {
 		const turns = ["search_files", "list_files", "explore_codebase", "log_slice", "recall_context"].map((t) => [t]);
 		const padded = [...reads(11), ...turns];
 		expect(await r.decide(ctx(padded))).toMatchObject({ kind: "deny" });
+	});
+});
+
+describe("shell read classification in steering", () => {
+	const mctx = (turns: Array<{ calls: string[]; readOnly?: boolean[]; text?: string }>): SteerContext["beforeModel"] => ({
+		turn: turns.length,
+		ledger: emptyLedger(),
+		recentTurns: turns,
+	});
+	const roShell = (command: string, text?: string) => ({ calls: ["run_command"], readOnly: [isReadOnlyCommand(command)], ...(text ? { text } : {}) });
+	const rule = (id: string) => builtinRules().find((r) => r.rule.id === id)!.rule as HookRule<SteerContext["beforeModel"]>;
+
+	it("read-only run_commands count toward the wander streak — shell reads can't hide", async () => {
+		const r = rule("reads.wander");
+		const turns = Array.from({ length: 16 }, () => roShell("sed -n '1,40p' f.ts"));
+		expect(await r.decide(mctx(turns))).toMatchObject({ kind: "deny", reason: expect.stringContaining("Wandering") });
+	});
+
+	it("a non-read-only run_command breaks the streak", async () => {
+		const r = rule("reads.wander");
+		const turns = [...Array.from({ length: 16 }, () => roShell("cat f.ts")), { calls: ["run_command"], readOnly: [isReadOnlyCommand("npm test")] }];
+		expect(await r.decide(mctx(turns))).toEqual({ kind: "allow" });
+	});
+
+	it("turns without readOnly flags keep the old behavior", async () => {
+		const r = rule("reads.wander");
+		const turns = Array.from({ length: 20 }, () => ({ calls: ["run_command"] }));
+		expect(await r.decide(mctx(turns))).toEqual({ kind: "allow" });
+	});
+});
+
+describe("reads.converge rule", () => {
+	const rule = () => builtinRules().find((r) => r.rule.id === "reads.converge")!.rule as HookRule<SteerContext["beforeModel"]>;
+	const ctx = (turns: Array<{ calls: string[]; readOnly?: boolean[]; text?: string }>): SteerContext["beforeModel"] => ({
+		turn: turns.length,
+		ledger: emptyLedger(),
+		recentTurns: turns,
+	});
+	const roShell = (text?: string) => ({ calls: ["run_command"], readOnly: [true], ...(text ? { text } : {}) });
+
+	it("notes once when the model declares it has enough but keeps reading", async () => {
+		const r = rule();
+		const turns = [
+			roShell("Let me read the tool files."),
+			roShell("Now the remaining files."),
+			roShell("I have a good picture of the tool surface."),
+			roShell("Let me check the remaining pieces."),
+		];
+		expect(await r.decide(ctx(turns))).toMatchObject({ kind: "note", text: expect.stringContaining("enough context") });
+	});
+
+	it("denies after repeated declarations across a long read-only streak", async () => {
+		const r = rule();
+		const turns = [
+			roShell("I have most of the picture."),
+			roShell(),
+			roShell("I have a good picture now — let me do a final check."),
+			roShell(),
+			roShell("Let me check the remaining pieces."),
+			roShell(),
+			roShell(),
+			roShell("One last file and I'm done."),
+		];
+		expect(await r.decide(ctx(turns))).toMatchObject({ kind: "deny", reason: expect.stringContaining("Stop reading") });
+	});
+
+	it("stays quiet on plain exploration without declarations", async () => {
+		const r = rule();
+		const turns = Array.from({ length: 8 }, () => roShell("Let me look at the tool wiring."));
+		expect(await r.decide(ctx(turns))).toEqual({ kind: "allow" });
+	});
+
+	it("a write turn resets the streak", async () => {
+		const r = rule();
+		const turns = [roShell("I have a good picture."), roShell("Final check."), { calls: ["write_file"], readOnly: [false] }, roShell()];
+		expect(await r.decide(ctx(turns))).toEqual({ kind: "allow" });
+	});
+});
+
+describe("reads.shell nudge", () => {
+	const rule = () => builtinRules().find((r) => r.rule.id === "reads.shell")!.rule as HookRule<SteerContext["beforeTool"]>;
+	const tctx = (name: string, input: unknown): SteerContext["beforeTool"] => ({ call: { callId: "c", name, input }, ledger: emptyLedger(), outcomes: {} });
+
+	it("notes after three read-only shell calls, ignores writes and repeats", async () => {
+		const r = rule();
+		expect(await r.decide(tctx("run_command", { command: "cat a" }))).toEqual({ kind: "allow" });
+		expect(await r.decide(tctx("run_command", { command: "sed -n '1,5p' b" }))).toEqual({ kind: "allow" });
+		expect(await r.decide(tctx("run_command", { command: "npm test" }))).toEqual({ kind: "allow" });
+		expect(await r.decide(tctx("run_command", { command: "grep x c" }))).toMatchObject({ kind: "note", text: expect.stringContaining("read_file") });
+		// Once only.
+		expect(await r.decide(tctx("run_command", { command: "head d" }))).toEqual({ kind: "allow" });
+	});
+});
+
+describe("plan.drift rule", () => {
+	const rule = () => builtinRules({ runId: "r1" }).find((r) => r.rule.id === "plan.drift")!.rule as HookRule<SteerContext["beforeModel"]>;
+	const ledger = (stepStatus: "in_progress" | "done" = "in_progress") => ({
+		order: ["t1"],
+		tasks: {
+			t1: { id: "t1", title: "t", acceptance: { kind: "none" as const }, dependsOn: [], status: "in_progress" as const, steps: [{ id: "s1", text: "x", status: stepStatus, callIds: [] }], evidence: [], runId: "r1" },
+		},
+		verified: [] as string[],
+	});
+	const ctx = (l: ReturnType<typeof ledger>, calls = ["run_command"]): SteerContext["beforeModel"] => ({ turn: 1, ledger: l, recentTurns: [{ calls }] });
+	const drain = async (r: HookRule<SteerContext["beforeModel"]>, n: number, l = ledger()) => {
+		let last;
+		for (let i = 0; i < n; i++) last = await r.decide(ctx(l));
+		return last;
+	};
+
+	it("nudges the model to explain itself before ever asking the user", async () => {
+		const r = rule();
+		await drain(r, 1); // baseline signature
+		expect(await drain(r, 5)).toEqual({ kind: "allow" });
+		const note = await r.decide(ctx(ledger())); // 6th unproductive turn
+		expect(note).toMatchObject({ kind: "note", text: expect.stringContaining("Explain the discrepancy") });
+	});
+
+	it("escalates to ask only after several ignored nudges", async () => {
+		const r = rule();
+		const kinds: string[] = [];
+		await r.decide(ctx(ledger())); // baseline
+		for (let i = 0; i < 15; i++) kinds.push((await r.decide(ctx(ledger()))).kind);
+		expect(kinds.filter((k) => k === "note").length).toBe(3);
+		expect(kinds[kinds.length - 1]).toBe("ask");
+	});
+
+	it("any board change resets the counter — replanning counts as an answer", async () => {
+		const r = rule();
+		await drain(r, 1);
+		expect(await drain(r, 6)).toMatchObject({ kind: "note" });
+		// Step closes → signature changes → drift resolved.
+		expect(await r.decide(ctx(ledger("done")))).toEqual({ kind: "allow" });
+		// Streak restarts from zero.
+		expect(await drain(r, 5, ledger("done"))).toEqual({ kind: "allow" });
+	});
+
+	it("skips runs with no board", async () => {
+		const r = rule();
+		for (let i = 0; i < 20; i++) expect(await r.decide({ turn: i, ledger: emptyLedger(), recentTurns: [{ calls: ["write_file"], readOnly: [false] }] })).toEqual({ kind: "allow" });
 	});
 });

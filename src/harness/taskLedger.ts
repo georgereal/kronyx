@@ -239,6 +239,13 @@ const ACCEPTANCE_SCHEMA = {
 	required: ["kind", "command"],
 };
 
+const SIGNAL_SCHEMA = {
+	type: "object",
+	description: "The tool call predicted to prove this step: tool name, optional repo-relative path glob. The harness closes the step when a matching call finishes ok.",
+	properties: { tool: { type: "string" }, path: { type: "string" } },
+	required: ["tool"],
+};
+
 export const TASK_TOOLS: readonly ToolSpec[] = [
 	{
 		name: TASK_TOOL_NAMES.create,
@@ -250,7 +257,7 @@ export const TASK_TOOLS: readonly ToolSpec[] = [
 				title: { type: "string" },
 				acceptance: ACCEPTANCE_SCHEMA,
 				dependsOn: { type: "array", items: { type: "string" } },
-				steps: { type: "array", items: { type: "object", properties: { id: { type: "string" }, text: { type: "string" } }, required: ["id", "text"] } },
+				steps: { type: "array", items: { type: "object", properties: { id: { type: "string" }, text: { type: "string" }, signal: SIGNAL_SCHEMA }, required: ["id", "text"] } },
 			},
 			required: ["id", "title", "acceptance", "steps"],
 		},
@@ -260,7 +267,7 @@ export const TASK_TOOLS: readonly ToolSpec[] = [
 		description: "Add a step to an open task.",
 		inputSchema: {
 			type: "object",
-			properties: { taskId: { type: "string" }, id: { type: "string" }, text: { type: "string" } },
+			properties: { taskId: { type: "string" }, id: { type: "string" }, text: { type: "string" }, signal: SIGNAL_SCHEMA },
 			required: ["taskId", "id", "text"],
 		},
 	},
@@ -324,7 +331,7 @@ export function parseTaskStepAddInput(value: unknown): { taskId: string; step: S
 	const o = expectObject(value, "input");
 	return {
 		taskId: expectString(o.taskId, "input.taskId"),
-		step: parseStep({ id: o.id, text: o.text, status: "pending", callIds: [] }, "input"),
+		step: parseStep({ id: o.id, text: o.text, status: "pending", callIds: [], ...(o.signal === undefined ? {} : { signal: o.signal }) }, "input"),
 	};
 }
 

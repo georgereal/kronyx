@@ -52,12 +52,10 @@ describe("harness event to run-view mapping", () => {
 		expect(mapDebug(e).at(-1)).toMatchObject({ type: "info", text: "turn 3 — 45.0K in / 900 out · 1 call", meta: { kind: "harness" } });
 	});
 
-	it("surfaces recaps and clears only in debug mode", () => {
+	it("surfaces recaps and clears as info lines", () => {
 		const recap = { ...meta, seq: 9, type: "context.recap", covers: 8, text: "brief" } as SessionEvent;
 		const cleared = { ...meta, seq: 10, type: "context.cleared" } as SessionEvent;
-		expect(map(recap)).toEqual([]);
-		expect(map(cleared)).toEqual([]);
-		expect(mapDebug(recap)[0]).toMatchObject({ type: "info", text: "recap covered 8 messages" });
-		expect(mapDebug(cleared)[0]).toMatchObject({ type: "info", text: "context cleared" });
+		expect(map(recap)[0]).toMatchObject({ type: "info", text: "Context compacted — recap covers the first 8 messages." });
+		expect(map(cleared)[0]).toMatchObject({ type: "info", text: "context cleared" });
 	});
 });

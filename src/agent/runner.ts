@@ -526,10 +526,11 @@ export class AgentRunner implements AgentEngine {
 				break;
 			case "tool-finished": {
 				if (event.toolCall.toolName === "save_plan") {
-					const slug = String((event.toolCall.input as { slug?: string })?.slug || "plan").replace(/[^\w-]+/g, "-").slice(0, 60);
+					const inp = event.toolCall.input as { slug?: string; path?: string };
+					const slug = String(inp.slug || "plan").replace(/[^\w-]+/g, "-").slice(0, 60);
 					this.host.emit({
 						type: "plan-ready",
-						path: `${(this.host.planDir ?? ".kronyx/plans").replace(/\/+$/, "")}/${slug}.md`,
+						path: inp.path?.trim() || `${(this.host.planDir ?? "plans").replace(/\/+$/, "")}/${slug}.md`,
 					});
 				}
 				const result = event.message.content.find((part) => part.type === "tool-result") as

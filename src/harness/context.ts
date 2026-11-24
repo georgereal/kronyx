@@ -117,7 +117,7 @@ export function compactHistory(messages: readonly Message[]): Message[] {
 	});
 }
 
-function estimateChars(messages: readonly Message[]): number {
+export function estimateChars(messages: readonly Message[]): number {
 	let total = 0;
 	for (const m of messages) {
 		if (m.kind === "tool") total += m.output.length + m.name.length + 32;

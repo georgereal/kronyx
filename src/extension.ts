@@ -3,7 +3,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import type { AgentMode, RunDigest } from "./agent/runner";
 import type { PriorTranscript } from "./agent/recall";
-import { activeProfile, clearApiKey, configuredModels, currentSelection, fetchModelCatalog, pickModel, profileCatalogs, profiles, promptForApiKey, readProviderSettings } from "./config";
+import { activeProfile, clearApiKey, configuredModels, currentSelection, fetchModelCatalog, pickModel, planDir, profileCatalogs, profiles, promptForApiKey, readProviderSettings } from "./config";
 import type { ModelSelection } from "./providerSelection";
 import { RunViewProvider } from "./ui/runViewProvider";
 import { renderPage } from "./ui/pageHtml";
@@ -521,6 +521,24 @@ export function activate(context: vscode.ExtensionContext): void {
 			log("cmd", `openSession "${name}"`);
 			const session = await sessionSurface(context, deps, name);
 			if (deps.isSidebar?.(session)) await session.openSession(name);
+		}),
+		// "Implement this plan" — editor CodeLens on plan markdown: continues the
+		// current session (or opens one) in code mode with the implement prompt.
+		vscode.commands.registerCommand("kronyx.implementPlan", async (planPath: string) => {
+			const root = await storeRoot;
+			const rel = planPath.startsWith("/") && root ? path.relative(root, planPath).split(path.sep).join("/") : planPath;
+			const session = await sessionSurface(context, deps);
+			await session.implementPlan(rel);
+		}),
+		// CodeLens "▶ Implement this plan" on plan markdown — planDir's own files
+		// plus the conventional dirs detection already checks.
+		vscode.languages.registerCodeLensProvider({ language: "markdown" }, {
+			provideCodeLenses(doc) {
+				const rel = vscode.workspace.asRelativePath(doc.uri);
+				const dir = planDir().replace(/\/+$/, "");
+				if (!rel.startsWith(`${dir}/`) && !rel.startsWith("plans/") && !rel.startsWith("docs/plans/") && !rel.startsWith(".kronyx/plans/")) return [];
+				return [new vscode.CodeLens(new vscode.Range(0, 0, 0, 0), { title: "$(play) Implement this plan — Kronyx", command: "kronyx.implementPlan", arguments: [rel] })];
+			},
 		}),
 		vscode.commands.registerCommand("kronyx.checkCloudSetup", () => checkCloudSetup(context)),
 		vscode.commands.registerCommand("kronyx.newCloudSession", (task?: string) =>

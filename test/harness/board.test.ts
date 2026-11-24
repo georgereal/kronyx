@@ -378,3 +378,36 @@ describe("usage accounting", () => {
 		expect(loop.projection.counters.inputTokens).toBe(700);
 	});
 });
+
+describe("boardOf attribution", () => {
+	it("emits step callIds so the UI can nest calls under steps", async () => {
+		const { boardOf } = await import("../../src/harness/runner");
+		const { project } = await import("../../src/harness/projections");
+		const log = new MemoryEventLog(() => 1);
+		await log.append({
+			type: "task.created",
+			runId: "r1",
+			task: {
+				id: "t1",
+				title: "plan",
+				acceptance: { kind: "none" },
+				dependsOn: [],
+				status: "pending",
+				steps: [
+					{ id: "s1", text: "explore", status: "pending", callIds: [] },
+					{ id: "s2", text: "implement", status: "pending", callIds: [] },
+				],
+				evidence: [],
+			},
+		});
+		await log.append({ type: "task.updated", runId: "r1", id: "t1", to: "in_progress" });
+		await log.append({ type: "tool.finished", runId: "r1", callId: "c1", name: "read_file", ok: true, output: "ok" });
+		await log.append({ type: "tool.finished", runId: "r1", callId: "c2", name: "read_file", ok: true, output: "ok" });
+		await log.append({ type: "step.updated", runId: "r1", taskId: "t1", stepId: "s1", to: "in_progress", callIds: [] });
+		await log.append({ type: "step.updated", runId: "r1", taskId: "t1", stepId: "s1", to: "done", callIds: ["c1", "c2"] });
+		await log.append({ type: "step.updated", runId: "r1", taskId: "t1", stepId: "s2", to: "in_progress", callIds: [] });
+		const board = boardOf(project(await log.read()), "r1");
+		expect(board[0]?.steps[0]).toMatchObject({ id: "s1", callIds: ["c1", "c2"] });
+		expect(board[0]?.steps[1]).toMatchObject({ id: "s2", callIds: [] });
+	});
+});

@@ -43,7 +43,7 @@ describe("task board (step 8)", () => {
 		// The harness advances the board itself, then marks the task blocked at
 		// close-out: no verifier exists here, so the acceptance can never pass.
 		expect(boardOf(loop.projection)).toEqual([
-			{ id: "a", title: "Parser", status: "blocked", steps: [{ id: "s1", text: "write it", status: "in_progress" }] },
+			{ id: "a", title: "Parser", status: "blocked", steps: [{ id: "s1", text: "write it", status: "in_progress", callIds: [] }] },
 		]);
 	});
 });

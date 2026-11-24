@@ -155,7 +155,7 @@ describe("scenario: malformed input", () => {
 });
 
 describe("scenario: budgets", () => {
-	it("pauses when the input budget is spent, before another model call", async () => {
+	it("auto-extends the input allowance and continues when the budget is spent", async () => {
 		const r = await run({
 			limits: { maxInputTokens: 500 },
 			steps: [
@@ -163,8 +163,8 @@ describe("scenario: budgets", () => {
 				finish(),
 			],
 		});
-		expect(r.outcome).toMatchObject({ status: "paused", reason: "input_budget" });
-		expect(r.left()).toBe(1);
+		expect(r.outcome).toMatchObject({ status: "completed" });
+		expect(r.left()).toBe(0);
 	});
 });
 

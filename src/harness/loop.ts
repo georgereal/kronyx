@@ -27,14 +27,14 @@ import {
 } from "./contracts";
 import { callFingerprint } from "./canonical";
 import { expandBraces, ownsMatch } from "../agent/decompose";
-import { buildContext, KEEP_RECENT_MESSAGES, LOG_SLICE, LOG_SLICE_SPEC, SYSTEM_INSTRUCTIONS } from "./context";
+import { buildContext, CONTEXT_BUDGET_CHARS, estimateChars, KEEP_RECENT_MESSAGES, LOG_SLICE, LOG_SLICE_SPEC, SYSTEM_INSTRUCTIONS } from "./context";
 import { makePlan } from "./planner";
 import { READ_FILES } from "./batchReads";
 import { makeRecap } from "./recap";
 import type { EventLog } from "./eventLog";
 import { detect, levelForStrikes, type LoopReason } from "./loopControl";
 import { initialState, project, reduce, type HarnessState } from "./projections";
-import { builtinRules, SteeringRegistry } from "./steering";
+import { builtinRules, callIsReadOnly, SteeringRegistry } from "./steering";
 import {
 	applyLedgerEvent,
 	checkAdopt,
@@ -131,6 +131,12 @@ export interface HarnessDeps {
 	tools: ToolPort;
 	verifier?: VerifierPort;
 	limits?: Partial<HarnessLimits>;
+	/** Called when a window hits maxTurns or the session input budget. Returning
+	 *  true extends the ceiling by the configured amount; false/undefined pauses. */
+	onTurnLimit?: (used: number, limit: number, kind?: "turns" | "input_tokens", contextTokens?: number) => Promise<boolean>;
+	/** Rules out a steering "ask" verdict (e.g. plan.drift). True continues the
+	 *  run; false or absent pauses with the question as the reason. */
+	onSteerAsk?: (question: string) => Promise<boolean>;
 	loop?: Partial<LoopDetectorConfig>;
 	/** Defaults to the built-in rules. Pass a registry to add or replace rules. */
 	steering?: SteeringRegistry;
@@ -173,10 +179,20 @@ export class HarnessLoop {
 	private reason: string | undefined;
 	private window = { turns: 0, refusals: 0, calls: 0, nudged: false };
 	private forceRecap = false;
+	/** Set when a task closes: the next model call writes a recap so the finished
+	 *  task's span compresses to a brief instead of staying raw in context. */
+	private taskRecapPending = false;
 	private pendingCalls: ToolCall[] = [];
 	private budgetWarned = false;
+	/** Last request's input usage — the real context size, unlike the cumulative counter. */
+	private lastInputTokens = 0;
+	private lastCachedTokens = 0;
 	private running = false;
 	private readonly limits: HarnessLimits;
+	/** Per-extension quantum when the user continues past a turn limit. */
+	private readonly turnWindow: number;
+	/** Per-extension quantum when the user continues past the input budget. */
+	private readonly tokenWindow: number;
 	private readonly loopCfg: LoopDetectorConfig;
 	/** Every spec the loop can handle, including harness-reserved task tools (kept for back-compat calls). */
 	private readonly tools: readonly ToolSpec[];
@@ -190,6 +206,8 @@ export class HarnessLoop {
 		deps.signal?.addEventListener("abort", () => this.abort.abort(), { once: true });
 		if (deps.signal?.aborted) this.abort.abort();
 		this.limits = { ...DEFAULT_LIMITS, ...deps.limits };
+		this.turnWindow = this.limits.maxTurns;
+		this.tokenWindow = this.limits.maxInputTokens;
 		this.loopCfg = { ...DEFAULT_LOOP_DETECTOR, ...deps.loop };
 		this.steering = deps.steering ?? defaultSteering(deps.writable !== false, deps.runId);
 		this.system = deps.system ?? SYSTEM_INSTRUCTIONS;
@@ -350,6 +368,12 @@ export class HarnessLoop {
 	/** Continues a paused run with a fresh window of turns and refusals. Loop strikes persist. */
 	async resume(): Promise<RunOutcome> {
 		if (this.phase !== "Paused") throw new Error(`cannot resume from ${this.phase}`);
+		// Resuming past a spent input budget would pause again on the first call —
+		// a resume is an explicit continue, so extend the ceiling first.
+		if (this.state.counters.inputTokens >= this.limits.maxInputTokens) {
+			this.limits.maxInputTokens += this.tokenWindow;
+			this.budgetWarned = false;
+		}
 		this.begin();
 		await this.emit({ type: "run.status", status: "running" });
 		this.enter("ModelCall");
@@ -380,6 +404,7 @@ export class HarnessLoop {
 	private async emit(body: EventBody): Promise<void> {
 		const event = await this.deps.log.append({ ...body, runId: this.deps.runId });
 		this.state = reduce(this.state, event);
+		if (body.type === "task.updated" && body.to === "done") this.taskRecapPending = true;
 		this.deps.onState?.(this.state, event);
 	}
 
@@ -458,13 +483,35 @@ export class HarnessLoop {
 	private async modelCall(): Promise<void> {
 		const turn = this.state.counters.turns + 1;
 		const recentTurns = this.state.messages
-			.flatMap((m) => (m.kind === "assistant" ? [{ calls: m.toolCalls.map((c) => c.name) }] : []))
+			.flatMap((m) =>
+				m.kind === "assistant"
+					? [{ calls: m.toolCalls.map((c) => c.name), readOnly: m.toolCalls.map((c) => callIsReadOnly(c.name, c.input)), text: m.text }]
+					: [],
+			)
 			.slice(-24);
 		const before = await this.steering.run("beforeModel", { turn, ledger: this.state.ledger, recentTurns });
 		await this.noteAll(before.notes);
 		if (before.verdict.kind === "deny") return this.pause(before.verdict.reason);
-		if (this.window.turns >= this.limits.maxTurns) return this.pause("max_turns");
-		if (this.state.counters.inputTokens >= this.limits.maxInputTokens) return this.pause("input_budget");
+		if (before.verdict.kind === "ask") {
+			const proceed = this.deps.onSteerAsk ? await this.deps.onSteerAsk(before.verdict.question) : false;
+			if (!proceed) return this.pause(before.verdict.question);
+		}
+		if (this.window.turns >= this.limits.maxTurns) {
+			const proceed = this.deps.onTurnLimit ? await this.deps.onTurnLimit(this.window.turns, this.limits.maxTurns, "turns") : false;
+			if (!proceed) return this.pause("max_turns");
+			this.limits.maxTurns += this.turnWindow;
+		}
+		if (this.state.counters.inputTokens >= this.limits.maxInputTokens) {
+			// Spend crossing the allowance is not a user decision — compact so the
+			// context stays small, note the extension, and keep going. Turns still
+			// ask; runaway cost is bounded by maxTurns and per-call context size.
+			this.forceRecap = true;
+			await this.maybeRecap();
+			const contextTokens = Math.ceil(estimateChars(buildContext(this.state, this.offered, this.system, this.deps.runId).messages) / 4);
+			this.limits.maxInputTokens += this.tokenWindow;
+			this.budgetWarned = false;
+			await this.emit({ type: "steer.note", rule: "context.budget", text: `Session input spend crossed ${Math.round(this.state.counters.inputTokens / 1000)}k tokens — context compacted to ~${Math.round(contextTokens / 1000)}k, allowance extended to ${Math.round(this.limits.maxInputTokens / 1000)}k.` });
+		}
 		// Strip level (after two flagged calls) removes tools for the next model turn; derived from strikes so it survives recovery.
 		await this.maybeRecap();
 		const context = buildContext(this.state, this.offered, this.system, this.deps.runId);
@@ -473,6 +520,8 @@ export class HarnessLoop {
 		const ids = new Set(response.toolCalls.map((c) => c.callId));
 		if (ids.size !== response.toolCalls.length) throw new Error("model returned duplicate tool call ids");
 		const usage: Usage | undefined = response.usage;
+		if (usage?.inputTokens) this.lastInputTokens = usage.inputTokens;
+		if (usage?.cachedTokens) this.lastCachedTokens = usage.cachedTokens;
 		await this.emit({ type: "model.response", turn, text: response.text, toolCalls: response.toolCalls, ...(usage ? { usage } : {}), ...(response.reasoning ? { reasoning: response.reasoning } : {}) });
 		this.window.turns++;
 		await this.checkBudgetWarning();
@@ -485,17 +534,24 @@ export class HarnessLoop {
 	 * failed recap is not fatal: the older messages simply stay stubbed.
 	 */
 	private async maybeRecap(): Promise<void> {
-		// Recap is manual-only (the Compact control): no automatic summarizing calls.
+		// Triggers: the manual Compact control, a just-closed task (per-task
+		// summarization), or context pressure — the last request exceeding the
+		// projected-context design budget. This keys off the per-call context
+		// size (which recaps actually shrink), not cumulative spend.
+		const pressured = this.lastInputTokens * 4 > CONTEXT_BUDGET_CHARS;
+		const taskDone = this.taskRecapPending;
+		this.taskRecapPending = false;
 		const forced = this.forceRecap;
 		this.forceRecap = false;
-		if (!forced) return;
+		if (!forced && !taskDone && !pressured) return;
 		const boundary = Math.max(0, this.state.messages.length - KEEP_RECENT_MESSAGES);
 		const covered = this.state.recap?.covers ?? 0;
 		if (boundary <= covered) return;
 		let recap: Awaited<ReturnType<typeof makeRecap>>;
 		try {
 			recap = await makeRecap(this.deps.model, this.state.recap?.text, this.state.messages.slice(covered, boundary), this.abort.signal);
-		} catch {
+		} catch (err) {
+			await this.emit({ type: "steer.note", rule: "context.recap", text: `compaction failed — continuing without it (${err instanceof Error ? err.message : String(err)})` });
 			return;
 		}
 		if (!recap) return;

@@ -4,6 +4,7 @@ import * as vscode from "vscode";
 import { chunkTextInfo, contentHash, cosine, topK as topKOf } from "../agent/vector";
 import type { RecallScorer } from "../agent/recall";
 import { isTrivialTask } from "../agent/taskGuard";
+import { embedLocal } from "./localEmbed";
 
 /** Recall ranking knobs, aligned with the backend scorer (backend/src/worker/memory.ts). */
 const RECALL_CHUNK_CHARS = 1500;
@@ -96,13 +97,15 @@ export function topK(): number {
  */
 export function createIdeRecallScorer(root: string, baseUrl: string, apiKey: string): RecallScorer {
 	return async (query, chunks) => {
-		const model = embeddingModel();
-		if (!model) return undefined;
+		if (!memoryEnabled()) return undefined;
 		const [qv] = await embedTexts(baseUrl, apiKey, [query], "recall_context", root);
 		if (!qv) return undefined;
-		const usable = chunks.filter((c) => c.text.trim().length >= RECALL_MIN_CHARS);
+		// Cap embedded chunks; prefer the tail — recall targets recent context, and
+		// with ~300 logged events a first-N cap would never rank late turns.
+		const maxEmbeds = embeddingModel() ? RECALL_MAX_EMBEDS : 300;
+		const usable = chunks.filter((c) => c.text.trim().length >= RECALL_MIN_CHARS).slice(-maxEmbeds);
 		const texts = usable.map((c) => c.text.slice(0, RECALL_CHUNK_CHARS));
-		const vectors = await embedChunksCached(baseUrl, apiKey, texts, root, "recall_context", RECALL_MAX_EMBEDS);
+		const vectors = await embedChunksCached(baseUrl, apiKey, texts, root, "recall_context", maxEmbeds);
 		const scored = usable
 			.map((c, i) => ({ idx: c.idx, score: vectors[i] ? cosine(qv, vectors[i]!) : 0 }))
 			.filter((h) => h.score >= RECALL_MIN_SCORE);
@@ -112,7 +115,10 @@ export function createIdeRecallScorer(root: string, baseUrl: string, apiKey: str
 
 export async function embedTexts(baseUrl: string, apiKey: string, texts: string[], op = "memory", root = ""): Promise<Float32Array[]> {
 	const model = embeddingModel();
-	if (!model) return [];
+	// No API model configured → zero-config local ONNX embeddings (models cached
+	// in ~/.kronyx/models). Dimension differs from API models — search paths
+	// filter out mismatched vectors.
+	if (!model) return embedLocal(texts);
 	const t0 = Date.now();
 	let status = "failed";
 	let tokensIn = 0;
@@ -152,7 +158,7 @@ async function embedChunksCached(
 ): Promise<(Float32Array | undefined)[]> {
 	const { openStore, getEmbeddingCache, putEmbeddingCache } = await import("../store");
 	const d = await openStore(root);
-	const model = embeddingModel() ?? "";
+	const model = embeddingModel() || "local";
 	const out: (Float32Array | undefined)[] = new Array(chunks.length);
 	const missIdx: number[] = [];
 	chunks.forEach((c, i) => {
@@ -191,7 +197,7 @@ export async function indexFile(
 	apiKey: string,
 	log: (line: string) => void = () => {},
 ): Promise<void> {
-	if (!embeddingModel()) return;
+	if (!memoryEnabled()) return;
 	const abs = path.join(root, rel);
 	const { openStore, deleteChunks, upsertChunk, kvSet, insertMemoryEvent } = await import("../store");
 	const d = await openStore(root);
@@ -227,7 +233,7 @@ export async function indexWorkspace(
 	apiKey: string,
 	log: (line: string) => void = () => {},
 ): Promise<number> {
-	if (!embeddingModel()) return 0;
+	if (!memoryEnabled()) return 0;
 	const { openStore, deleteChunks, upsertChunk, kvGet, kvSet, insertMemoryEvent, listIndexedPaths } = await import("../store");
 	const d = await openStore(root);
 	if (!d) return 0;
@@ -294,7 +300,7 @@ async function* walkWorkspace(root: string, rel: string): AsyncGenerator<string>
 
 /** Semantic search over the local chunk index; returns top-k snippets. */
 export async function searchMemory(root: string, query: string, baseUrl: string, apiKey: string): Promise<string[]> {
-	if (!embeddingModel()) return [];
+	if (!memoryEnabled()) return [];
 	const t0 = Date.now();
 	const { openStore, listChunks, insertMemoryEvent } = await import("../store");
 	const d = await openStore(root);
@@ -309,7 +315,12 @@ export async function searchMemory(root: string, query: string, baseUrl: string,
 		return [];
 	}
 	// Bounded top-k: candidates beyond the best k are dropped during the scan, not sorted.
-	const scored = topKOf(chunks, topK(), (c) => cosine(qv, c.embedding)).map((r) => ({ ...r.item, score: r.score }));
+	// Vectors from a different embedding model (e.g. local vs API) are incomparable.
+	const scored = topKOf(
+		chunks.filter((c) => c.embedding.length === qv.length),
+		topK(),
+		(c) => cosine(qv, c.embedding),
+	).map((r) => ({ ...r.item, score: r.score }));
 	const hits = scored.map((c) => `// ${c.path}\n${c.text.slice(0, 800)}`);
 	insertMemoryEvent(d, {
 		op: "memory_search",

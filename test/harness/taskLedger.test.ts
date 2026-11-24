@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyLedgerEvent, blockedTasks, checkRemove, checkTransition, emptyLedger, LedgerError, openTasks, type Ledger } from "../../src/harness/taskLedger";
+import { applyLedgerEvent, blockedTasks, checkRemove, checkTransition, emptyLedger, LedgerError, openTasks, parseTaskStepAddInput, type Ledger } from "../../src/harness/taskLedger";
 import type { EventBody, Task } from "../../src/harness/contracts";
 
 const task = (id: string, dependsOn: string[] = []): Task => ({ id, title: id, acceptance: { kind: "command", command: "true" }, dependsOn, status: "pending", steps: [], evidence: [] });
@@ -82,5 +82,12 @@ describe("task ledger rules", () => {
 		done = apply(done, { type: "task.updated", id: "a", to: "in_progress" });
 		done = apply(verified(done, "a"), { type: "task.updated", id: "a", to: "done" });
 		expect(() => apply(done, { type: "task.adopted", id: "a", runId: "run-2" })).toThrow(LedgerError);
+	});
+});
+
+describe("task_step_add signal", () => {
+	it("keeps a declared signal so mid-run steps can auto-close", () => {
+		const { step } = parseTaskStepAddInput({ taskId: "t1", id: "s9", text: "verify it", signal: { tool: "run_command", path: undefined } });
+		expect(step.signal).toEqual({ tool: "run_command" });
 	});
 });

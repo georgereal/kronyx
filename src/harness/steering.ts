@@ -8,10 +8,14 @@
  */
 
 import type { HookPoint, HookRule, ToolCall } from "./contracts";
+import { isReadOnlyCommand } from "./shellReadOnly";
 import { openSteps, openTasks, TASK_TOOL_NAMES, TASK_TOOL_SET, type Ledger } from "./taskLedger";
 
 export interface SteerContext {
-	beforeModel: { turn: number; ledger: Ledger; recentTurns: ReadonlyArray<{ calls: readonly string[] }> };
+	/** `readOnly[i]` marks call i as provably read-only — a read tool, or a shell
+	 *  call (`run_command`/`start_process`) whose command classifies read-only.
+	 *  Shell reads can't hide behind run_command this way. */
+	beforeModel: { turn: number; ledger: Ledger; recentTurns: ReadonlyArray<{ calls: readonly string[]; readOnly?: readonly boolean[]; text?: string }> };
 	beforeTool: { call: ToolCall; ledger: Ledger; outcomes: Readonly<Record<string, boolean>> };
 	afterTool: { call: ToolCall; ok: boolean; ledger: Ledger };
 	onStop: { ledger: Ledger };
@@ -97,6 +101,16 @@ const READ_TOOL_NAMES = new Set([
  *  these is "exploration" for the wandering detector. */
 export const READ_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([...READ_TOOL_NAMES, "explore_codebase", "log_slice"]);
 
+/** Shell tools whose `command` input is classified read-only by isReadOnlyCommand. */
+const SHELL_TOOLS = new Set(["run_command", "start_process"]);
+
+/** True when a tool call is provably read-only: a read tool, or a shell call whose command classifies read-only. */
+export const callIsReadOnly = (name: string, input: unknown): boolean =>
+	READ_ONLY_TOOL_NAMES.has(name) || (SHELL_TOOLS.has(name) && isReadOnlyCommand(String((input as { command?: unknown })?.command ?? "")));
+
+const turnIsReadOnly = (t: { calls: readonly string[]; readOnly?: readonly boolean[] }): boolean =>
+	t.calls.length > 0 && t.calls.every((c, i) => READ_ONLY_TOOL_NAMES.has(c) || t.readOnly?.[i] === true);
+
 /** Streak of lone-read turns that arms the batch-force deny. */
 const BATCH_FORCE_AT = 10;
 
@@ -118,8 +132,8 @@ const readsBatchRules = (): { detector: HookRule<SteerContext["beforeModel"]>; e
 		decide: ({ recentTurns }) => {
 			let streak = 0;
 			for (let i = recentTurns.length - 1; i >= 0; i--) {
-				const calls = recentTurns[i]!.calls;
-				if (calls.length === 1 && READ_TOOL_NAMES.has(calls[0]!)) streak++;
+				const t = recentTurns[i]!;
+				if (t.calls.length === 1 && (READ_TOOL_NAMES.has(t.calls[0]!) || t.readOnly?.[0] === true)) streak++;
 				else break;
 			}
 			forced = streak >= BATCH_FORCE_AT;
@@ -145,8 +159,8 @@ const readsBatchRules = (): { detector: HookRule<SteerContext["beforeModel"]>; e
 		point: "beforeTool",
 		order: 15,
 		decide: ({ call }) =>
-			forced && call.name === "read_file"
-				? { kind: "deny", reason: "You've been reading one file per turn — batch the remaining paths into one read_files call (up to 8), or delegate the investigation to explore_codebase. Do not emit another lone read_file." }
+			forced && (call.name === "read_file" || (SHELL_TOOLS.has(call.name) && callIsReadOnly(call.name, call.input)))
+				? { kind: "deny", reason: "You've been reading one file per turn — batch the remaining paths into one read_files call (up to 8), or delegate the investigation to explore_codebase. Do not emit another lone read." }
 				: { kind: "allow" },
 	};
 	return { detector, enforcer };
@@ -228,8 +242,7 @@ const readsWander = (writable: boolean, runId?: string): HookRule<SteerContext["
 			const wording = writable || delivered;
 			let streak = 0;
 			for (let i = recentTurns.length - 1; i >= 0; i--) {
-				const calls = recentTurns[i]!.calls;
-				if (calls.length > 0 && calls.every((c) => READ_ONLY_TOOL_NAMES.has(c))) streak++;
+				if (turnIsReadOnly(recentTurns[i]!)) streak++;
 				else break;
 			}
 			if (!progressing && streak >= denyThreshold && streak > lastDeniedStreak + WANDER_DENY_HYSTERESIS) {
@@ -248,6 +261,121 @@ const readsWander = (writable: boolean, runId?: string): HookRule<SteerContext["
 					text: wording
 						? `Still exploring after ${streak} read-only turns. If you have enough context, stop reading and make the change — every extra read costs tokens.`
 						: `Still exploring after ${streak} read-only turns. If you have enough context, stop reading and finish — every extra read costs tokens.`,
+				};
+			}
+			return { kind: "allow" };
+		},
+	};
+};
+
+/** Narration that declares the exploration is (or should be) over — "I have a
+ *  good picture", "final check", "then I'll report". Intent, not just calls. */
+const CONVERGE_RE =
+	/\b(?:have (?:most of|a good|the full|enough)[^\n.!?]{0,40}(?:picture|context|understanding|view)|final checks?|one (?:last|final) (?:check|look|thing)|(?:remaining|last|final) (?:pieces?|files?|bits?|details?)|almost (?:there|done|finished)|time to (?:report|summari[sz]e|wrap up)|then (?:report|summari[sz]e|i'?ll (?:report|summari[sz]e|write)))\b/i;
+
+/**
+ * Convergence detector. Call patterns show *what* the model did; its own
+ * narration shows *why* — and when the narration keeps declaring "I have the
+ * picture" while the turns stay read-only, intent and behavior have diverged.
+ * Note once early; deny when declarations keep piling up (that's a paused
+ * run with a clear reason, like reads.wander).
+ */
+const readsConverge = (): HookRule<SteerContext["beforeModel"]> => {
+	let noted = false;
+	let lastDenied = 0;
+	return {
+		id: "reads.converge",
+		point: "beforeModel",
+		order: 32,
+		decide: ({ recentTurns }) => {
+			let streak = 0;
+			let declared = 0;
+			for (let i = recentTurns.length - 1; i >= 0; i--) {
+				const t = recentTurns[i]!;
+				if (!turnIsReadOnly(t)) break;
+				streak++;
+				if (t.text && CONVERGE_RE.test(t.text)) declared++;
+			}
+			if (streak >= 8 && declared >= 3 && streak > lastDenied) {
+				lastDenied = streak;
+				return {
+					kind: "deny",
+					reason: `You've declared you have the picture ${declared} times across ${streak} read-only turns and kept exploring anyway. Stop reading — report what you found.`,
+				};
+			}
+			if (streak >= 4 && declared >= 1 && !noted) {
+				noted = true;
+				return { kind: "note", text: "You said you have enough context — write the answer or make the change now instead of reading more. If something specific is still missing, name it." };
+			}
+			return { kind: "allow" };
+		},
+	};
+};
+
+const DRIFT_NOTE_AT = 6;
+/** After a nudge the streak must grow this much before the next nudge. */
+const DRIFT_NUDGE_EVERY = 4;
+/** Escalate to the user after this many ignored nudges — that's confusion. */
+const DRIFT_NUDGES_BEFORE_ASK = 3;
+
+/**
+ * Plan-drift detector. The plan declares intent: each task's steps say what
+ * will be done and (via signal) which call proves it. Drift is calls that move
+ * nothing on the board — the model is working, just not on the plan it wrote.
+ *
+ * Escalation is model-first: each nudge asks the model to explain itself —
+ * realign with the board, update the plan to match the work, or name the
+ * blocker. Progress is any board-signature change (transitions, steps added,
+ * verification), so replanning resets the counter. Only after repeated
+ * ignored nudges does the rule ask the user — that's the confusion case.
+ * Reads-only wandering stays with reads.wander; this catches write/other
+ * calls that serve no step.
+ */
+const planDrift = (runId?: string): HookRule<SteerContext["beforeModel"]> => {
+	const signature = (ledger: Ledger): string =>
+		ledger.order
+			.filter((id) => runId === undefined || ledger.tasks[id]?.runId === runId)
+			.map((id) => {
+				const t = ledger.tasks[id]!;
+				return `${id}:${t.status}:${t.steps.map((s) => s.status).join("")}`;
+			})
+			.join("|") + `#${ledger.verified.length}`;
+	let lastSig = "";
+	let unprod = 0;
+	let nudged = 0;
+	let lastNudgeAt = 0;
+	let lastAsked = 0;
+	return {
+		id: "plan.drift",
+		point: "beforeModel",
+		order: 33,
+		decide: ({ ledger, recentTurns }) => {
+			const scoped = ledger.order.some((id) => runId === undefined || ledger.tasks[id]?.runId === runId);
+			if (!scoped) return { kind: "allow" };
+			const sig = signature(ledger);
+			if (sig !== lastSig) {
+				lastSig = sig;
+				unprod = 0;
+				nudged = 0;
+				return { kind: "allow" };
+			}
+			const lastTurnCalls = recentTurns.length ? recentTurns[recentTurns.length - 1]!.calls.length > 0 : true;
+			if (lastTurnCalls) unprod++;
+			// The user is asked only after repeated nudges go unanswered — the
+			// model had its chances to realign, replan, or explain itself.
+			if (nudged >= DRIFT_NUDGES_BEFORE_ASK && unprod > lastAsked + DRIFT_NUDGE_EVERY) {
+				lastAsked = unprod;
+				return {
+					kind: "ask",
+					question: `Plan drift: ${unprod} tool-calling turns changed nothing on the task board, and ${nudged} realign nudges went unanswered. Continue anyway, or stop here?`,
+				};
+			}
+			if (unprod >= DRIFT_NOTE_AT && unprod >= lastNudgeAt + DRIFT_NUDGE_EVERY) {
+				lastNudgeAt = unprod;
+				nudged++;
+				return {
+					kind: "note",
+					text: `Your last ${unprod} turns made calls but moved no plan step. Explain the discrepancy: realign with the board (finish the in-progress step), update the plan with task_step_add/task_update if the work changed, or state plainly what is blocking you.`,
 				};
 			}
 			return { kind: "allow" };
@@ -294,14 +422,34 @@ export function builtinRules(opts: { writable?: boolean; runId?: string } = {}):
 			},
 		};
 	};
+	/** run_command/start_process calls that classify read-only hide exploration
+	 *  from the read streaks and cost more than the dedicated tools — nudge once. */
+	const shellReads = (): HookRule<SteerContext["beforeTool"]> => {
+		let count = 0;
+		let noted = false;
+		return {
+			id: "reads.shell",
+			point: "beforeTool",
+			order: 14,
+			decide: ({ call }) => {
+				if (noted || !SHELL_TOOLS.has(call.name) || !callIsReadOnly(call.name, call.input)) return { kind: "allow" };
+				if (++count < 3) return { kind: "allow" };
+				noted = true;
+				return { kind: "note", text: "Prefer read_file / read_files / search_files over reading through the shell — they're cached, batch into one turn, and don't need command approval. Reserve run_command for things the file tools can't do." };
+			},
+		};
+	};
 	const reads = readsBatchRules();
 	return [
 		{ point: "onStop", rule: finishOpenWork as HookRule<unknown> },
 		{ point: "beforeTool", rule: stepGrounding as HookRule<unknown> },
 		{ point: "beforeTool", rule: listRepeat() as HookRule<unknown> },
+		{ point: "beforeTool", rule: shellReads() as HookRule<unknown> },
 		{ point: "beforeTool", rule: reads.enforcer as HookRule<unknown> },
 		{ point: "beforeModel", rule: reads.detector as HookRule<unknown> },
 		{ point: "beforeModel", rule: readsWander(writable, opts.runId) as HookRule<unknown> },
+		{ point: "beforeModel", rule: readsConverge() as HookRule<unknown> },
+		{ point: "beforeModel", rule: planDrift(opts.runId) as HookRule<unknown> },
 		{ point: "beforeModel", rule: treeRecount() as HookRule<unknown> },
 	];
 }

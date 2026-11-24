@@ -158,7 +158,7 @@ export function networkAllowHosts(): string[] {
 }
 
 export function planDir(): string {
-	return vscode.workspace.getConfiguration("kronyx").get<string>("agent.planDir", ".kronyx/plans");
+	return vscode.workspace.getConfiguration("kronyx").get<string>("agent.planDir", "plans");
 }
 
 export function implementPrompt(path: string): string {

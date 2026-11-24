@@ -631,22 +631,27 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 		},
 	};
 
-	const savePlan: AgentTool<{ content: string; slug?: string }, string> = {
+	const savePlan: AgentTool<{ content: string; slug?: string; path?: string }, string> = {
 		name: "save_plan",
 		description:
-			"Save the implementation plan to .kronyx/plans/<slug>.md. Only usable in Plan mode. Ends the planning phase — the user reviews the plan and starts implementation.",
+			"Save a plan/deliverable document as a markdown file (default <planDir>/<slug>.md, planDir defaults to plans/). " +
+			"In Plan mode it ends the planning phase; in other modes it asks for approval like any write. Use it whenever a run's output is a plan or report meant to be kept and tracked in git.",
 		inputSchema: {
 			type: "object",
 			properties: {
 				content: { type: "string", description: "The plan as markdown: summary, numbered steps, files to modify, verification." },
 				slug: { type: "string", description: "Optional filename slug for the plan file (no extension)." },
+				path: { type: "string", description: "Optional explicit workspace-relative path override (e.g. plans/tool-audit.md)." },
 			},
 			required: ["content"],
 		},
 		async execute(input) {
 			const slug = (input.slug || "plan").replace(/[^\w-]+/g, "-").slice(0, 60) || "plan";
-			const rel = `${(options.planDir?.() ?? ".kronyx/plans").replace(/\/+$/, "")}/${slug}.md`;
-			const abs = path.join(options.root, rel);
+			const rel = (typeof input.path === "string" && input.path.trim())
+				? input.path.trim().replace(/^\/+/, "")
+				: `${(options.planDir?.() ?? "plans").replace(/\/+$/, "")}/${slug}.md`;
+			const abs = path.resolve(options.root, rel);
+			if (!abs.startsWith(path.resolve(options.root) + path.sep)) return `save_plan: "${rel}" is outside the workspace.`;
 			await fs.mkdir(path.dirname(abs), { recursive: true });
 			await fs.writeFile(abs, input.content, "utf8");
 			options.onFileChanged?.(abs, (await exists(abs)) ? "modified" : "created", { added: 0, removed: 0, diff: "" });

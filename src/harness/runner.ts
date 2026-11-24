@@ -22,6 +22,11 @@ export interface HarnessRunDeps {
 	tools: ToolPort;
 	verifier?: VerifierPort;
 	limits?: Partial<HarnessLimits>;
+	/** Ask the host whether to continue when a run hits its turn limit or the
+	 *  session input budget. Absent → pause. */
+	onTurnLimit?: (used: number, limit: number, kind?: "turns" | "input_tokens", contextTokens?: number) => Promise<boolean>;
+	/** Ask the host to rule on a steering "ask" verdict (e.g. plan drift). Absent → pause. */
+	onSteerAsk?: (question: string) => Promise<boolean>;
 	emit: (event: RunViewEvent) => void;
 	signal?: AbortSignal;
 	system?: string;
@@ -143,9 +148,9 @@ export function toViewEvents(e: SessionEvent, st: Tracker, _limit: number, debug
 		case "steer.note":
 			return [{ type: "info", text: debug ? `[${e.rule}] ${e.text}` : e.text, meta: { kind: "harness", rule: e.rule } }];
 		case "context.recap":
-			return debug ? [{ type: "info", text: `recap covered ${e.covers} messages`, meta: { kind: "harness" } }] : [];
+			return [{ type: "info", text: `Context compacted — recap covers the first ${e.covers} messages.`, meta: { kind: "harness" } }];
 		case "context.cleared":
-			return debug ? [{ type: "info", text: "context cleared", meta: { kind: "harness" } }] : [];
+			return [{ type: "info", text: "context cleared", meta: { kind: "harness" } }];
 		case "budget.warning":
 			return [{ type: "info", text: `Input tokens at ${e.used} of ${e.limit}.` }];
 		case "stop.refused":
@@ -183,6 +188,8 @@ export async function runHarness(deps: HarnessRunDeps, task: string, displayTask
 		tools: deps.tools,
 		verifier: deps.verifier,
 		limits: deps.limits,
+		onTurnLimit: deps.onTurnLimit,
+		onSteerAsk: deps.onSteerAsk,
 		signal: deps.signal,
 		system: deps.system,
 		nudgeWrites: deps.nudgeWrites,
@@ -199,9 +206,9 @@ export async function runHarness(deps: HarnessRunDeps, task: string, displayTask
 }
 
 /** Task board snapshot for the UI: this run's tasks in creation order with their steps. */
-export function boardOf(state: { ledger: { order: string[]; tasks: Record<string, { id: string; title: string; status: string; runId?: string; adoptedFrom?: string; steps: Array<{ id: string; text: string; status: string }> }> } }, runId?: string) {
+export function boardOf(state: { ledger: { order: string[]; tasks: Record<string, { id: string; title: string; status: string; runId?: string; adoptedFrom?: string; steps: Array<{ id: string; text: string; status: string; callIds?: string[] }> }> } }, runId?: string) {
 	return state.ledger.order.filter((id) => runId === undefined || state.ledger.tasks[id]?.runId === runId).map((id) => {
 		const t = state.ledger.tasks[id]!;
-		return { id: t.id, title: t.title, status: t.status, ...(t.adoptedFrom ? { from: t.adoptedFrom } : {}), steps: t.steps.map((s) => ({ id: s.id, text: s.text, status: s.status })) };
+		return { id: t.id, title: t.title, status: t.status, ...(t.adoptedFrom ? { from: t.adoptedFrom } : {}), steps: t.steps.map((s) => ({ id: s.id, text: s.text, status: s.status, callIds: s.callIds ?? [] })) };
 	});
 }
