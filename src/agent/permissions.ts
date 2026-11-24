@@ -85,6 +85,7 @@ export function ruleTarget(toolName: string, input: unknown): string {
 	const str = (k: string) => (typeof rec[k] === "string" ? rec[k] : undefined);
 	switch (toolName) {
 		case "run_command":
+		case "start_process":
 			return str("command") ?? "";
 		case "browser_use":
 			return str("url") ?? str("task") ?? "";
@@ -113,10 +114,12 @@ const PATH_TOOLS = new Set([
 export function globToRe(glob: string, isPath: boolean): RegExp {
 	const esc = glob.replace(/[.+^${}()|[\]\\]/g, "\\$&");
 	const re = esc
+		.replace(/\*\*\//g, "\uE001")
 		.replace(/\*\*/g, "\uE000")
+		.replace(/\?/g, ".")
 		.replace(/\*/g, isPath ? "[^/]*" : ".*")
 		.replace(/\uE000/g, ".*")
-		.replace(/\?/g, ".");
+		.replace(/\uE001/g, "(?:.*/)?");
 	return new RegExp(`^${re}$`);
 }
 

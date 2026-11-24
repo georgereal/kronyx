@@ -32,6 +32,13 @@ describe("ownsMatch", () => {
 		expect(ownsMatch(["src/**"], "src/../secret.ts")).toBe(false);
 		expect(ownsMatch(["src/**"], "src/../../x")).toBe(false);
 	});
+	it("expands {a,b} brace alternatives", () => {
+		expect(ownsMatch(["**/{package.json,Cargo.toml}"], "package.json")).toBe(true);
+		expect(ownsMatch(["**/{package.json,Cargo.toml}"], "crates/x/Cargo.toml")).toBe(true);
+		expect(ownsMatch(["**/{package.json,Cargo.toml}"], "go.mod")).toBe(false);
+		expect(ownsMatch(["src/{a,b}/**.ts"], "src/b/x.ts")).toBe(true);
+		expect(ownsMatch(["{a,{b,c}}.txt"], "c.txt")).toBe(true);
+	});
 });
 
 describe("parseSlices", () => {

@@ -1,10 +1,11 @@
+import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import type { AgentTool } from "@cline/shared";
 import { computeHunks, formatUnifiedWithContext } from "../diff/hunks";
 import { isRunSummaryFact } from "../agent/taskGuard";
 import { adaptIndentation, findMatches, lineNumberAt, mostSimilarRegion } from "./matching";
-import { IGNORED_DIRS, WorkspaceGuard } from "./workspace";
+import { IGNORED_DIRS, isSensitivePath, localIgnoreIndex, secretFileStub, WorkspaceGuard } from "./workspace";
 
 export type FileChangeKind = "created" | "modified";
 
@@ -29,11 +30,15 @@ export const WRITE_TOOL_NAMES = new Set([
 	"append_file",
 	"insert_lines",
 	"run_command",
+	"start_process",
+	"stop_process",
 	"file_editor",
 	"rename_symbol",
 ]);
 
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
+/** A repeat read within this many model turns of the original is deduplicated (the original is still in context). */
+const DEDUPE_TURNS = 8;
 const CMD_HEAD_CHARS = 2_000;
 const CMD_TAIL_CHARS = 5_000;
 
@@ -52,7 +57,10 @@ interface EditInput {
 // biome-ignore lint/suspicious/noExplicitAny: tool inputs vary per tool
 export function createFileTools(options: FileToolOptions): AgentTool<any, string>[] {
 	const guard = new WorkspaceGuard(options.root);
+	const ignoreIndex = localIgnoreIndex(guard.root);
 	const maxReadLines = options.maxReadLines ?? 2000;
+	/** Per-run read ledger: `path:range` → content hash and the call that returned it. */
+	const seenReads = new Map<string, { hash: string; toolCallId?: string; turn: number }>();
 
 	const assertWritable = (abs: string) => {
 		if (options.isDirty?.(abs)) {
@@ -113,9 +121,11 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 			},
 			required: ["path"],
 		},
-		async execute(input) {
+		async execute(input, context) {
 			const abs = guard.resolve(input.path);
 			const text = normalizeEol(await readText(abs));
+			const secret = secretFileStub(guard.relative(abs), text, await ignoreIndex());
+			if (secret) return secret;
 			const lines = text.split("\n");
 			if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
 			const start = Math.max(1, input.start_line ?? 1);
@@ -123,13 +133,23 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 			// Unbounded reads page at 400 lines; explicit ranges get maxReadLines.
 			const page = input.end_line === undefined ? Math.min(maxReadLines, 400) : maxReadLines;
 			const end = Math.min(requestedEnd, start + page - 1);
+			const rel = guard.relative(abs);
+			// Re-reading unchanged content shortly after it was returned adds nothing new; point at the earlier result.
+			const key = `${rel}:${start}-${end}`;
+			const hash = createHash("sha1").update(text).digest("hex");
+			const prior = seenReads.get(key);
+			const turn = context?.iteration ?? 0;
+			if (prior && prior.hash === hash && prior.toolCallId && prior.toolCallId !== context?.toolCallId && turn - prior.turn <= DEDUPE_TURNS) {
+				return `${rel} (lines ${start}-${end} of ${lines.length}) is unchanged since your earlier read_file (toolCallId "${prior.toolCallId}") — reuse that result. If it was elided, recall_context with that toolCallId returns the full text.`;
+			}
+			seenReads.set(key, { hash, toolCallId: context?.toolCallId, turn });
 			const width = String(end).length;
 			const body = lines
 				.slice(start - 1, end)
 				.map((line, i) => `${String(start + i).padStart(width)}| ${line}`)
 				.join("\n");
 			const more = end < lines.length ? ` More lines follow; call again with start_line=${end + 1}.` : "";
-			return `${guard.relative(abs)} (lines ${start}-${end} of ${lines.length}).${more}\n${body}`;
+			return `${rel} (lines ${start}-${end} of ${lines.length}).${more}\n${body}`;
 		},
 	};
 
@@ -274,13 +294,13 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 		inputSchema: {
 			type: "object",
 			properties: {
-				path: { type: "string", description: "Folder relative to the workspace root. Defaults to the root." },
+				path: { type: "string", description: "Folder to list, relative to the workspace root ('.' for the root)." },
 				recursive: { type: "boolean", description: "List sub-folders too. Defaults to false." },
 				max_entries: { type: "integer", minimum: 1, description: "Maximum entries to return. Defaults to 500." },
 			},
 		},
 		async execute(input) {
-			const abs = guard.resolve(input.path ?? ".");
+			const abs = guard.resolve(input.path || ".");
 			const limit = input.max_entries ?? 500;
 			const entries: string[] = [];
 			let truncated = false;
@@ -292,7 +312,11 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 				entries.push(guard.relative(entry.path) + (entry.dir ? "/" : ""));
 			}
 			if (entries.length === 0) return `${guard.relative(abs)} is empty.`;
-			return entries.join("\n") + (truncated ? `\n... truncated at ${limit} entries.` : "");
+			let out = entries.join("\n");
+			if (truncated) out += `\n... truncated at ${limit} entries.`;
+			if (!input.recursive && entries.some((e) => e.endsWith("/")))
+				out += `\n(${entries.length} entries — non-recursive; pass recursive: true for the full tree, or a path to drill into a folder.)`;
+			return out;
 		},
 	};
 
@@ -307,7 +331,7 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 			type: "object",
 			properties: {
 				pattern: { type: "string", description: "Text or regular expression to find." },
-				path: { type: "string", description: "Folder to search, relative to the root. Defaults to the root." },
+				path: { type: "string", description: "Folder to search, relative to the root ('.' for the root). A file path is fine too — it searches within that file." },
 				regex: { type: "boolean", description: "Treat pattern as a regular expression. Defaults to false." },
 				context_lines: { type: "integer", minimum: 0, description: "Lines of context around each match (shown with '-' instead of ':')." },
 				file_glob: { type: "string", description: "Only search files whose path matches this glob, e.g. '**/*.ts'." },
@@ -316,7 +340,7 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 			required: ["pattern"],
 		},
 		async execute(input) {
-			const abs = guard.resolve(input.path ?? ".");
+			const abs = guard.resolve(input.path || ".");
 			// Invalid regex falls back to literal search instead of throwing.
 			let matcher: RegExp | undefined;
 			if (input.regex) {
@@ -330,10 +354,22 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 			const limit = input.max_results ?? 100;
 			const ctx = Math.min(20, Math.max(0, Math.floor(input.context_lines ?? 0)));
 			const results: string[] = [];
-			for await (const entry of walk(abs, true)) {
+			// Models regularly pass a file where a folder is expected — searching
+			// the file directly is what they meant, and beats erroring.
+			const rootStat = await fs.stat(abs).catch(() => undefined);
+			const source: AsyncIterable<{ path: string; dir: boolean }> | { path: string; dir: boolean }[] = rootStat?.isFile()
+				? [{ path: abs, dir: false }]
+				: walk(abs, true);
+			const index = await ignoreIndex();
+			for await (const entry of source) {
 				if (entry.dir) continue;
 				const rel = guard.relative(entry.path);
 				if (glob && !glob.test(rel)) continue;
+				// Secret-looking and gitignored files never contribute matches — a search would print their values.
+				if (isSensitivePath(rel, index)) {
+					if (rootStat?.isFile()) return `${rel} is a credentials/gitignored file — search results are withheld for it.`;
+					continue;
+				}
 				const stat = await fs.stat(entry.path).catch(() => undefined);
 				// Sockets, FIFOs and devices can't be read — skip anything that
 				// isn't a regular file (e.g. .devhost's *.sock files).
@@ -494,6 +530,8 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 			switch (cmd) {
 				case "view": {
 					const text = normalizeEol(await readText(abs));
+					const secret = secretFileStub(guard.relative(abs), text, await ignoreIndex());
+					if (secret) return secret;
 					const lines = text.split("\n");
 					const [s, e] = input.view_range ?? [1, lines.length];
 					const start = Math.max(1, s);
@@ -504,7 +542,10 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 						.join("\n");
 				}
 				case "symbols": {
-					const lines = normalizeEol(await readText(abs)).split("\n");
+					const text = normalizeEol(await readText(abs));
+					const secret = secretFileStub(guard.relative(abs), text, await ignoreIndex());
+					if (secret) return secret;
+					const lines = text.split("\n");
 					const out: string[] = [];
 					lines.forEach((l, i) => {
 						const m = l.match(SYMBOL_RE);

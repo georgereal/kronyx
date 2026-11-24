@@ -1,8 +1,21 @@
 import * as vscode from "vscode";
 import { apiKey, webAppUrl } from "./auth";
 import { deviceName, getDeviceId } from "./settingsSync";
-import { listUnsyncedApiCalls, listUnsyncedMemoryEvents, listUnsyncedPrs, listUnsyncedRunEvents, listUnsyncedRuns, listUnsyncedSandboxEvents, markApiCallsSynced, markMemoryEventsSynced, markPrsSynced, markRunEventsSynced, markRunsSynced, markSandboxEventsSynced, type Store } from "./store";
+import { listUnsyncedApiCalls, listUnsyncedHarnessReports, listUnsyncedMemoryEvents, listUnsyncedPrs, listUnsyncedRunEvents, listUnsyncedRuns, listUnsyncedSandboxEvents, markApiCallsSynced, markHarnessReportsSynced, markMemoryEventsSynced, markPrsSynced, markRunEventsSynced, markRunsSynced, markSandboxEventsSynced, type Store } from "./store";
 import { log } from "./log";
+import { capEventForWire, safeJson } from "./wireCap";
+
+export interface SyncStatus {
+	enabled: boolean;
+	endpoint: string;
+	signedIn: boolean;
+	flushing: boolean;
+	/** Backoff pause — flush won't run before this time (MAX_SAFE_INTEGER = auth pause). */
+	pausedUntil: number;
+	lastOkAt: number;
+	lastError: string;
+	lastUploaded: string;
+}
 
 const BATCH_SIZE = 200;
 const FLUSH_INTERVAL_MS = 60_000;
@@ -26,6 +39,24 @@ export class UsageSync implements vscode.Disposable {
 		private readonly getStore: () => Promise<Store | undefined>,
 	) {
 		this.timer = setInterval(() => void this.flush(), FLUSH_INTERVAL_MS);
+	}
+
+	/** Last-flush bookkeeping, surfaced on the Usage page's sync card. */
+	private lastOkAt = 0;
+	private lastError = "";
+	private lastUploaded = "";
+
+	async status(): Promise<SyncStatus> {
+		return {
+			enabled: this.enabled(),
+			endpoint: webAppUrl(),
+			signedIn: !!(await apiKey(this.context).catch(() => "")),
+			flushing: this.flushing,
+			pausedUntil: this.nextAttemptAt,
+			lastOkAt: this.lastOkAt,
+			lastError: this.lastError,
+			lastUploaded: this.lastUploaded,
+		};
 	}
 
 	/** New rows landed — flush shortly after, coalescing bursts of usage events. */
@@ -70,24 +101,27 @@ export class UsageSync implements vscode.Disposable {
 			const prs = listUnsyncedPrs(d, 100);
 			const sandboxes = listUnsyncedSandboxEvents(d, 200);
 			const memory = listUnsyncedMemoryEvents(d, 200);
+			const harnessReports = listUnsyncedHarnessReports(d, 50);
 			const deviceId = rows.length + memory.length ? await getDeviceId(this.context).catch(() => "") : "";
-			if (rows.length + runs.length + events.length + prs.length + sandboxes.length + memory.length === 0) return;
+			if (rows.length + runs.length + events.length + prs.length + sandboxes.length + memory.length + harnessReports.length === 0) return;
 			const res = await fetch(`${endpoint}/api/ingest`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
 				body: JSON.stringify({
 					calls: rows.map((r) => toWire(r, deviceId)),
 					runs: runs.map((r) => ({ runId: r.run_id, task: r.task, session: r.session, status: r.status, durationMs: r.duration_ms, at: r.at, tokensIn: r.tokens_in, tokensOut: r.tokens_out, workspace: r.root || undefined })),
-					events: events.map((r) => ({ runId: r.run_id, seq: r.id, session: r.session, event: safeJson(r.event), workspace: r.root || undefined })),
+					events: events.map((r) => ({ runId: r.run_id, seq: r.id, session: r.session, event: capEventForWire(r.event), workspace: r.root || undefined })),
 					prs: prs.map((r) => ({ runId: r.run_id, session: r.session, task: r.task, repo: r.repo, branch: r.branch, url: r.url, title: r.title, status: r.status, at: r.at, workspace: r.root || undefined })),
 					sandboxes: sandboxes.map((r) => ({ sandboxId: r.sandbox_id, device: r.device, deviceId: r.device_id, template: r.template, repo: r.repo, runId: r.run_id, event: r.event, at: r.at, workspace: r.root || undefined })),
-					memory: memory.map((r) => ({ clientRowId: r.id, session: r.session, runId: r.run_id, at: r.at, op: r.op, detail: safeJson(r.detail), device: deviceName(), deviceId: r.device_id || deviceId, workspace: r.root || undefined })),
+					memory: memory.map((r) => ({ clientRowId: r.id, session: r.session, runId: r.run_id, at: r.at, op: r.op, detail: capEventForWire(r.detail), device: deviceName(), deviceId: r.device_id || deviceId, workspace: r.root || undefined })),
+					harnessReports: harnessReports.map((r) => ({ runId: r.run_id, session: r.session, report: safeJson(r.report), at: r.at, workspace: r.root || undefined })),
 				}),
 				signal: AbortSignal.timeout(15_000),
 			});
 			if (res.status === 401 || res.status === 403) {
 				// Key revoked or invalid — stop retrying until the key changes.
 				this.nextAttemptAt = Number.MAX_SAFE_INTEGER;
+				this.lastError = "API key rejected (401) — sign in again";
 				log("sync", "API key rejected (401) — sync paused until you sign in again");
 				void vscode.window
 					.showWarningMessage("Kronyx: API key rejected — usage sync paused.", "Sign in")
@@ -101,12 +135,17 @@ export class UsageSync implements vscode.Disposable {
 			markPrsSynced(d, prs.map((r) => Number(r.id)));
 			markSandboxEventsSynced(d, sandboxes.map((r) => Number(r.id)));
 			markMemoryEventsSynced(d, memory.map((r) => Number(r.id)));
+			markHarnessReportsSynced(d, harnessReports.map((r) => Number(r.id)));
 			this.backoffMs = 0;
-			log("sync", `uploaded ${rows.length} call(s), ${runs.length} run(s), ${events.length} event(s), ${prs.length} pr(s), ${memory.length} memory`);
+			this.lastOkAt = Date.now();
+			this.lastError = "";
+			this.lastUploaded = `${rows.length} call(s), ${runs.length} run(s), ${events.length} event(s), ${prs.length} pr(s), ${sandboxes.length} sandbox, ${memory.length} memory, ${harnessReports.length} harness report(s)`;
+			log("sync", `uploaded ${this.lastUploaded}`);
 		} catch (error) {
 			this.backoffMs = Math.min(MAX_BACKOFF_MS, Math.max(15_000, this.backoffMs * 2));
 			this.nextAttemptAt = Date.now() + this.backoffMs;
-			log("sync", `flush failed (${error instanceof Error ? error.message : error}) — retry in ${this.backoffMs / 1000}s`);
+			this.lastError = error instanceof Error ? error.message : String(error);
+			log("sync", `flush failed (${this.lastError}) — retry in ${this.backoffMs / 1000}s`);
 		} finally {
 			this.flushing = false;
 		}
@@ -118,13 +157,7 @@ export class UsageSync implements vscode.Disposable {
 	}
 }
 
-function safeJson(v: unknown): unknown {
-	try {
-		return JSON.parse(String(v));
-	} catch {
-		return v;
-	}
-}
+
 
 /** sql.js row → ingest wire shape (camelCase, includes local id for dedupe). */
 function toWire(r: Record<string, unknown>, fallbackDeviceId = ""): Record<string, unknown> {

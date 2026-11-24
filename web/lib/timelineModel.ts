@@ -92,6 +92,8 @@ export interface EventItem {
 	key: string;
 	/** Durable-only records (agent-message) and lifecycle chatter the chat feed hides. */
 	hidden?: boolean;
+	/** Consecutive same-kind rows folded into this one ("compacted ×N"). */
+	count?: number;
 }
 
 export type Item = StreamItem | ActionItem | TurnItem | PermItem | PreflightItem | EventItem;
@@ -424,7 +426,27 @@ export function buildTimeline(events: RunEvent[]): Item[] {
 		}
 	}
 	// Preflight cards duplicate the header Environment panel — drop them.
-	return seen.filter((i) => !i.hidden && i.kind !== "preflight");
+	const visible = seen.filter((i) => !i.hidden && i.kind !== "preflight");
+	// Roll up context-compaction lines per run — a thrashing run emits one per
+	// turn, interleaved with tool rows, so the first notice absorbs the rest:
+	// it shows the latest stats and a ×N count.
+	const isCompaction = (i: Item) => i.kind === "event" && (i.e.event.meta as { kind?: string } | undefined)?.kind === "context_compaction";
+	const firstByRun = new Map<string, EventItem>();
+	const out: Item[] = [];
+	for (const i of visible) {
+		if (i.kind === "event" && isCompaction(i)) {
+			const rid = i.e.runId ?? "";
+			const first = firstByRun.get(rid);
+			if (first) {
+				first.e = i.e;
+				first.count = (first.count ?? 1) + 1;
+				continue;
+			}
+			firstByRun.set(rid, i);
+		}
+		out.push(i);
+	}
+	return out;
 }
 
 /** Turn is mergeable into a "Worked" block: finished, no failures, no final reply. */

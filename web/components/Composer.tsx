@@ -747,7 +747,10 @@ export function Composer({
 											{g.models.map((m) => (
 												<button key={`${g.profile}:${m.id}`} className="pop-item" onClick={() => pickModel(m, g.profile)}>
 													<span style={{ flex: 1, minWidth: 0 }}>
-														<span className="mono" style={{ display: "block", fontSize: 12 }}>{m.label ?? m.id}</span>
+														<span className="mono" style={{ display: "block", fontSize: 12 }}>
+													<span className="muted">{g.profile} / </span>
+													{m.label ?? m.id}
+												</span>
 														{modelDesc(m) && <span className="muted" style={{ display: "block", fontSize: 10.5 }}>{modelDesc(m)}</span>}
 													</span>
 													{modelId === m.id && modelProfile === g.profile && <span className="right">✓</span>}

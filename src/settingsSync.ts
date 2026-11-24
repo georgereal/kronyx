@@ -121,6 +121,24 @@ export class SettingsSync implements vscode.Disposable {
 			const { settings } = (await res.json()) as {
 				settings?: { updatedAt?: string; data?: Record<string, unknown>; secrets?: Record<string, string> };
 			};
+			// Secrets reconcile on every pull, not just when the doc is newer —
+			// otherwise a previously stamped doc can never repair a missing key.
+			// (The providerKeys opt-in only gates the push direction.)
+			if (settings?.secrets) {
+				for (const [name, key] of Object.entries(settings.secrets)) {
+					// The web stores profile keys as "profile.apiKey.<name>"; the
+					// extension pushes them bare. Normalize to the bare name or the
+					// stored key lands at a double-prefixed secret nobody reads.
+					const bare = name.startsWith("profile.apiKey.") ? name.slice("profile.apiKey.".length) : name;
+					const secretKey =
+						bare === "e2bApiKey"
+							? "kronyx.sandbox.e2bApiKey"
+							: bare === "githubToken"
+								? "kronyx.github.token"
+								: `kronyx.profile.apiKey.${bare}`;
+					await this.context.secrets.store(secretKey, key);
+				}
+			}
 			const remoteAt = settings?.updatedAt ? new Date(settings.updatedAt).getTime() : 0;
 			const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 			const localStamp = root ? (kvGet<number>(await openStore(root), SYNC_STAMP) ?? 0) : 0;
@@ -138,19 +156,6 @@ export class SettingsSync implements vscode.Disposable {
 					parsePermissionsText(JSON.stringify(settings.data.permissions)),
 					parseModePermissions(settings.data.permissions),
 				).catch(() => {});
-			}
-			// Secrets set on the web are user-explicit — always apply on pull
-			// (the providerKeys opt-in only gates the push direction).
-			if (settings.secrets) {
-				for (const [name, key] of Object.entries(settings.secrets)) {
-					const secretKey =
-						name === "e2bApiKey"
-							? "kronyx.sandbox.e2bApiKey"
-							: name === "githubToken"
-								? "kronyx.github.token"
-								: `kronyx.profile.apiKey.${name}`;
-					await this.context.secrets.store(secretKey, key);
-				}
 			}
 			await this.stamp(remoteAt);
 			log("settingsSync", `pulled settings (updated ${settings.updatedAt})`);

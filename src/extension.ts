@@ -12,16 +12,19 @@ import { initLog, log } from "./log";
 import { refreshUserConfig, saveUserConfig, seedUserConfig, setUserConfigSavedListener, userConfigDir } from "./userConfig";
 import { SettingsSync, deviceName, getDeviceId } from "./settingsSync";
 import { loadSuite, runSuite, writeReport } from "./evals";
+import type { EngineKind } from "./agent/engine";
 import { appendEvent, clearEvents, insertApiCall, insertRun, insertTranscript, insertUsage, kvGet, kvSet, listEvents, listRuns, listSessions, listTranscripts, openStore, refreshStore, migrateLegacyStore, setStorageDir, setWasmDir, storeError } from "./store";
 import { RunLock, type SessionDeps } from "./ui/sessionController";
 import { RunComments } from "./ui/comments";
 import { DiffReview, ORIGINAL_SCHEME } from "./ui/diffReview";
 import { openCloudSessionPanel, openSessionPanel, registerSessionSerializer } from "./ui/sessionPanel";
 import { openAgentsPanel, disposeAgentsPanel } from "./ui/agentsPanel";
+import { manageMcpServers } from "./ui/mcpSetup";
 import { AgentsView } from "./ui/agentsView";
 import { checkCloudSetup } from "./ui/cloudController";
 import { openSettingsPage, openSettingsWindow, setProviderSavedListener } from "./ui/settingsPage";
 import { openUsagePage } from "./ui/usagePage";
+import { openHarnessPage } from "./ui/harnessPage";
 import { currentUser, handleAuthUri, onAuthChanged, signIn, signOut, webAppUrl } from "./auth";
 import { UsageSync } from "./sync";
 
@@ -123,7 +126,7 @@ export function activate(context: vscode.ExtensionContext): void {
 		accountStatus.text = signedIn ? `$(account) ${user!.email ?? user!.name ?? "account"}` : "$(account) Sign in";
 		accountStatus.show();
 		deps.viewState = { ...deps.viewState, signedIn, userEmail: user?.email };
-		for (const surface of deps.surfaces) surface.setState(deps.viewState);
+		pushViewState();
 		if (signedIn) syncWorker?.resume(); // flush any rows queued while signed out
 	};
 	onAuthChanged((user) => {
@@ -147,6 +150,11 @@ export function activate(context: vscode.ExtensionContext): void {
 		await context.globalState.update("kronyx.onboarded", true);
 		if (pick === "Sign in") void vscode.commands.executeCommand("kronyx.signIn");
 	})();
+	/** The composer pick lives in the shared config — every surface reads it from there, never from a copy. */
+	const selectionOf = () => ({ modelId: currentSelection()?.modelId ?? "", modelProfile: currentSelection()?.profile ?? "" });
+	const pushViewState = (): void => {
+		for (const surface of deps.surfaces) surface.setState({ ...deps.viewState, ...selectionOf() });
+	};
 	const deps: SessionDeps = {
 		context,
 		output,
@@ -154,8 +162,9 @@ export function activate(context: vscode.ExtensionContext): void {
 		diffReview,
 		comments,
 		modeRef: { current: context.globalState.get<AgentMode>(MODE_STATE_KEY, defaultMode) },
-		viewState: { modelId: "", models: [] },
+		viewState: { models: [] },
 		surfaces: new Set<RunViewProvider>(),
+		pushViewState,
 		recordRun: (entry) => {
 			const history = context.workspaceState.get<typeof entry[]>(HISTORY_KEY, []);
 			history.unshift(entry);
@@ -199,8 +208,11 @@ export function activate(context: vscode.ExtensionContext): void {
 			return root ? (listTranscripts(await openStore(root), session, root) as unknown as PriorTranscript[]) : [];
 		},
 		persistEvent: (session, event, runId) => {
+			// Stamp wall-clock time so replays can show when each event happened
+			// rather than the moment they were re-rendered.
+			const stamped = { ts: Date.now(), ...event };
 			void storeRoot.then((root) => {
-				if (root) void openStore(root).then((d) => appendEvent(d, session, event, root, runId));
+				if (root) void openStore(root).then((d) => appendEvent(d, session, stamped, root, runId));
 			});
 		},
 		loadEvents: async (session) => {
@@ -252,6 +264,10 @@ export function activate(context: vscode.ExtensionContext): void {
 	};
 
 	const doRefreshModels = async (force: boolean): Promise<void> => {
+		// userConfig() is a sync view over ~/.kronyx/config.json — make sure the
+		// initial read has landed before profiles/catalogs are computed, or the
+		// provider groups come back empty until the next refresh.
+		await refreshUserConfig();
 		const settings = await readProviderSettings(context.secrets);
 		if (!settings) {
 			log("models", "skipped — no runnable provider settings (saved profiles exist but none is active)");
@@ -272,10 +288,9 @@ export function activate(context: vscode.ExtensionContext): void {
 			log("models", `using cached catalog (${cached.length} models)`);
 			deps.viewState = {
 				...deps.viewState,
-				modelId: settings.modelId,
 				models: cached.some((m) => m.id === settings.modelId) ? cached : [{ id: settings.modelId }, ...cached],
 			};
-			for (const surface of deps.surfaces) surface.setState(deps.viewState);
+			pushViewState();
 			return;
 		}
 		log("models", `fetching ${settings.baseUrl}/models (key ${settings.apiKey ? "set" : "not set"})`);
@@ -306,14 +321,14 @@ export function activate(context: vscode.ExtensionContext): void {
 		const merged = models.some((m) => m.id === settings.modelId)
 			? models
 			: [{ id: settings.modelId }, ...models];
-		deps.viewState = { ...deps.viewState, modelId: settings.modelId, models: merged };
-		for (const surface of deps.surfaces) surface.setState(deps.viewState);
+		deps.viewState = { ...deps.viewState, models: merged };
+		pushViewState();
 	};
 
 	const refreshGroups = async (force: boolean): Promise<void> => {
 		const groups = await profileCatalogs(context.secrets, force);
 		deps.viewState = { ...deps.viewState, groups };
-		for (const surface of deps.surfaces) surface.setState(deps.viewState);
+		pushViewState();
 	};
 
 	context.subscriptions.push(
@@ -410,10 +425,11 @@ export function activate(context: vscode.ExtensionContext): void {
 					return;
 				}
 				output.show();
-				output.appendLine(`Running ${cases.length} eval case(s) with ${settings.modelId}...`);
+				const engines = vscode.workspace.getConfiguration("kronyx").get<EngineKind[]>("eval.engines", ["cline"]);
+				output.appendLine(`Running ${cases.length} eval case(s) × ${engines.join(", ")} with ${settings.modelId}...`);
 				const results = await vscode.window.withProgress(
 					{ location: vscode.ProgressLocation.Notification, title: "Kronyx: running evals", cancellable: false },
-					() => runSuite(root, settings, (line) => output.appendLine(line)),
+					() => runSuite(root, settings, (line) => output.appendLine(line), engines),
 				);
 				const report = await writeReport(root, results);
 				const passed = results.filter((r) => r.passed).length;
@@ -428,6 +444,7 @@ export function activate(context: vscode.ExtensionContext): void {
 					gateSuppressed = true;
 					setTimeout(() => (gateSuppressed = false), 15_000);
 					await pickModel(revertTo.modelId, revertTo.profile);
+					pushViewState();
 					void vscode.window.showErrorMessage(
 						`Kronyx eval gate: ${passed}/${results.length} passed — model reverted to ${revertTo.modelId} (${revertTo.profile}).`,
 					);
@@ -459,12 +476,7 @@ export function activate(context: vscode.ExtensionContext): void {
 							void controller.handle(m);
 						});
 						surface.attach(view.webview);
-						surface.setState({
-							mode: deps.modeRef.current,
-							modelId: deps.viewState.modelId,
-							models: deps.viewState.models,
-							workspaceName: vscode.workspace.workspaceFolders?.[0]?.name ?? "",
-						});
+						surface.setState({ ...deps.viewState, ...selectionOf(), mode: deps.modeRef.current });
 						output.appendLine(`[store] ${viewId} resolved session "${name}"`);
 						view.onDidDispose(() => {
 							deps.surfaces.delete(surface);
@@ -516,6 +528,7 @@ export function activate(context: vscode.ExtensionContext): void {
 			openCloudSessionPanel(context, deps, task),
 		),
 		vscode.commands.registerCommand("kronyx.openAgents", () => openAgentsPanel(context, deps)),
+		vscode.commands.registerCommand("kronyx.manageMcp", () => manageMcpServers(context)),
 		vscode.commands.registerCommand("kronyx.exitAgentMode", () => disposeAgentsPanel()),
 		vscode.commands.registerCommand("kronyx.openSettings", () =>
 			vscode.commands.executeCommand("workbench.action.openSettings", "@ext:kronyx.kronyx"),
@@ -525,7 +538,10 @@ export function activate(context: vscode.ExtensionContext): void {
 			openSettingsPage(context);
 		}),
 		vscode.commands.registerCommand("kronyx.openSettingsWindow", () => void openSettingsWindow(context)),
-		vscode.commands.registerCommand("kronyx.showUsage", () => openUsagePage(context)),
+		vscode.commands.registerCommand("kronyx.showUsage", () =>
+			openUsagePage(context, { status: () => syncWorker?.status() ?? Promise.resolve(undefined), flush: () => syncWorker?.flush() ?? Promise.resolve() }),
+		),
+		vscode.commands.registerCommand("kronyx.harnessReport", () => openHarnessPage(context)),
 		vscode.commands.registerCommand("kronyx.account", async () => {
 			const user = await currentUser(context);
 			if (!user) return void vscode.commands.executeCommand("kronyx.signIn");

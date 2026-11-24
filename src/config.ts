@@ -47,7 +47,7 @@ export async function resolveProvider(
 	secrets: vscode.SecretStorage,
 	selection = currentSelection(),
 ): Promise<{ settings?: ProviderSettings; error?: ProviderError }> {
-	const maxIterations = vscode.workspace.getConfiguration("kronyx").get<number>("agent.maxIterations", 40);
+	const maxIterations = vscode.workspace.getConfiguration("kronyx").get<number>("agent.maxIterations", 300);
 	return selectProvider(profiles(), selection, (name) => profileApiKey(secrets, name), maxIterations);
 }
 
@@ -60,7 +60,8 @@ export async function pickModel(modelId: string, profile: string): Promise<void>
 	await saveUserConfig({ modelId, modelProfile: profile });
 }
 
-/** Catalog for every enabled profile: cached per profile, fetched when missing or when forced. */
+/** Catalog for every enabled profile: cached per profile, fetched when missing, stale, or forced. */
+const CATALOG_TTL_MS = 24 * 60 * 60 * 1000;
 export async function profileCatalogs(secrets: vscode.SecretStorage, force: boolean): Promise<ProfileCatalog[]> {
 	const list = profiles();
 	const active = userConfig().activeProfile;
@@ -68,7 +69,8 @@ export async function profileCatalogs(secrets: vscode.SecretStorage, force: bool
 		list
 			.filter((p) => p.enabled !== false && p.baseUrl)
 			.map(async (p) => {
-				if (!force && p.models?.length) return { name: p.name, models: p.models, fetched: false };
+				const stale = !p.modelsFetchedAt || Date.now() - p.modelsFetchedAt > CATALOG_TTL_MS;
+				if (!force && p.models?.length && !stale) return { name: p.name, models: p.models, fetched: false };
 				const { models, error } = await fetchModelCatalog({ baseUrl: p.baseUrl!, apiKey: await profileApiKey(secrets, p.name) });
 				if (error) log("models", `${p.name}: ${error}`);
 				return { name: p.name, models: models.length ? models : (p.models ?? []), fetched: models.length > 0 };
@@ -148,6 +150,11 @@ export async function readProviderSettings(secrets: vscode.SecretStorage): Promi
 
 export function autoApproveWrites(): boolean {
 	return vscode.workspace.getConfiguration("kronyx").get<boolean>("approval.autoApproveWrites", false);
+}
+
+/** Private hosts the fetch and browser tools may reach (kronyx.network.allowHosts). */
+export function networkAllowHosts(): string[] {
+	return vscode.workspace.getConfiguration("kronyx").get<string[]>("network.allowHosts", []);
 }
 
 export function planDir(): string {

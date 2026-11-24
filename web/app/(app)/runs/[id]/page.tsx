@@ -6,6 +6,7 @@ import { useEffect, useState } from "react";
 import { StatusPill } from "@/components/StatusPill";
 import { apiFetch, useUser } from "@/lib/api";
 import { fmtDur } from "@/lib/usage";
+import { HarnessReportSection, type HarnessReport } from "./HarnessReport";
 
 interface RunDoc {
 	runId: string;
@@ -44,6 +45,7 @@ export default function RunDetail() {
 	const [run, setRun] = useState<RunDoc | null>(null);
 	const [pr, setPr] = useState<{ url?: string; status?: string; title?: string } | null>(null);
 	const [events, setEvents] = useState<Ev[]>([]);
+	const [harnessReport, setHarnessReport] = useState<HarnessReport | null>(null);
 	const [notFound, setNotFound] = useState(false);
 
 	useEffect(() => {
@@ -55,9 +57,10 @@ export default function RunDetail() {
 			if (!alive) return;
 			if (res.status === 404) return setNotFound(true);
 			if (!res.ok) return;
-			const body = (await res.json()) as { run: RunDoc | null; pr: { url?: string; status?: string; title?: string } | null; events: Ev[] };
+			const body = (await res.json()) as { run: RunDoc | null; pr: { url?: string; status?: string; title?: string } | null; events: Ev[]; harnessReport?: HarnessReport | null };
 			setRun(body.run);
 			setPr(body.pr);
+			if (body.harnessReport !== undefined) setHarnessReport(body.harnessReport);
 			if (body.events.length) {
 				setEvents((prev) => [...prev, ...body.events]);
 				after = body.events[body.events.length - 1].seq;
@@ -116,6 +119,7 @@ export default function RunDetail() {
 				})}
 				{events.length === 0 && <div className="muted">Waiting for events…</div>}
 			</div>
+			{harnessReport && <HarnessReportSection report={harnessReport} />}
 		</div>
 	);
 }

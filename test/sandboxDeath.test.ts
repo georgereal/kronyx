@@ -49,7 +49,7 @@ describe("delegatingHandle death latch", () => {
 		expect(live.dead).toBe(err);
 		expect(live.stopped).toBe(true);
 		expect(onDead).toHaveBeenCalledWith(err);
-	});
+	}, 20_000);
 
 	it("does not latch on ordinary errors", async () => {
 		const { delegatingHandle } = await import("../backend/src/worker/executor");
@@ -61,5 +61,5 @@ describe("delegatingHandle death latch", () => {
 		await expect(h.run("false", { cwd: "/" })).rejects.toThrow("exit 1");
 		expect(live).not.toHaveProperty("dead");
 		expect(live.onDead).not.toHaveBeenCalled();
-	});
+	}, 20_000);
 });

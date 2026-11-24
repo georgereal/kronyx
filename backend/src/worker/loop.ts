@@ -151,7 +151,7 @@ async function runJob(job: CloudJob): Promise<void> {
 			.collection("runs")
 			.findOne({ uid: job.uid, runId: job.runId }, { projection: { control: 1, status: 1 } })
 			.catch(swallow("loop", "op", null));
-		const status = stopped || cur?.control === "stop_requested" || cur?.status === "stopped" ? "stopped" : "completed";
+		const status = stopped || cur?.control === "stop_requested" || cur?.status === "stopped" ? "stopped" : executor.paused ? "paused" : "completed";
 		await sink.patchRun({ status, finishedAt: new Date() });
 		await db.collection("cloud_jobs").updateOne({ jobId: job.jobId }, { $set: { status: stopped ? "stopped" : "done", finishedAt: new Date() } });
 		log(`job ${job.jobId} ${status}`);

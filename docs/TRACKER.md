@@ -2,7 +2,7 @@
 
 Every plan and decision, open or closed. Rules in [PROCESS.md](PROCESS.md).
 
-Open: 18 | Closed: 0
+Open: 19 | Closed: 0
 
 | ID | Title | Type | Status | Owner | Created | Decided | Closed |
 |---|---|---|---|---|---|---|---|
@@ -24,3 +24,4 @@ Open: 18 | Closed: 0
 | [PLAN-008](plans/PLAN-008-eval-harness.md) | Eval harness | Plan | Proposed | Jacob | 2026-10-31 | - | - |
 | [PLAN-009](plans/PLAN-009-learning-loop.md) | Learning loop | Plan | Proposed | Jacob | 2026-10-31 | - | - |
 | [PLAN-010](plans/PLAN-010-context-memory-hierarchy.md) | Context and memory hierarchy (compaction, handoff, recall) | Plan | Proposed | Jacob | 2026-11-04 | - | - |
+| [PLAN-019](plans/PLAN-019-harness-rewrite.md) | Agent harness rewrite: host-owned state, task ledger, steering | Plan | In progress | Jacob | 2026-11-23 | 2026-11-23 | - |

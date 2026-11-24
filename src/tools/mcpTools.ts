@@ -23,6 +23,11 @@ export interface McpServerConfig {
 	args?: string[];
 	env?: Record<string, string>;
 	url?: string;
+	/** Extra HTTP headers for remote servers (Authorization etc). Values may
+	 *  use ${ENV_VAR} and ${secret:NAME} expansion like every other field. */
+	headers?: Record<string, string>;
+	/** Skip this server entirely — keep it in config, out of the tool list. */
+	disabled?: boolean;
 	/** Per-server connect timeout (default 15s). */
 	connectTimeoutMs?: number;
 }
@@ -32,6 +37,8 @@ export interface McpToolsOptions {
 	/** Receives every substituted ${ENV_VAR} value so hosts can mask them in
 	 *  logs/run_events (worker → RunSink.mask). */
 	onSecret?: (value: string) => void;
+	/** Resolves ${secret:NAME} references — IDE SecretStorage, worker secrets map. */
+	resolveSecret?: (name: string) => Promise<string | undefined>;
 	log?: (msg: string) => void;
 }
 
@@ -52,6 +59,33 @@ export function expandEnv(value: string, onSecret?: (v: string) => void): string
 	});
 }
 
+const SECRET_RE = /\$\{secret:([^}]+)\}/g;
+
+/** Async pre-pass: `${secret:NAME}` → host secret store, before ${ENV} expansion. */
+async function expandSecrets(value: string, opts: McpToolsOptions): Promise<string> {
+	if (!opts.resolveSecret || !SECRET_RE.test(value)) return value;
+	SECRET_RE.lastIndex = 0;
+	const parts: (string | Promise<string>)[] = [];
+	let last = 0;
+	for (const m of value.matchAll(SECRET_RE)) {
+		parts.push(value.slice(last, m.index));
+		parts.push(
+			opts.resolveSecret!(m[1]).then((v) => {
+				if (v) opts.onSecret?.(v);
+				return v ?? "";
+			}),
+		);
+		last = m.index + m[0].length;
+	}
+	parts.push(value.slice(last));
+	return (await Promise.all(parts)).join("");
+}
+
+/** MCP tools the server marked `readOnlyHint: true`. Anything else is treated
+ *  as a write (the MCP spec default is non-read-only). */
+const readOnlyMcpTools = new WeakSet<object>();
+export const isReadOnlyMcpTool = (tool: object): boolean => readOnlyMcpTools.has(tool);
+
 /** Permission rules key off `mcp_<server>` — the server part must stay a
  *  single word or the canonical split in permissions.ts breaks. */
 const sanitizeName = (name: string): string => name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "server";
@@ -69,16 +103,21 @@ async function connectOne(cfg: McpServerConfig, opts: McpToolsOptions): Promise<
 	const timeout = cfg.connectTimeoutMs ?? 15_000;
 	if (remote) {
 		if (!cfg.url) throw new Error(`MCP server "${cfg.name}": url type requires url`);
-		const url = expandEnv(cfg.url, opts.onSecret);
-		const transport = new StreamableHTTPClientTransport(new URL(url));
+		const url = expandEnv(await expandSecrets(cfg.url, opts), opts.onSecret);
+		const headers: Record<string, string> = {};
+		for (const [k, v] of Object.entries(cfg.headers ?? {})) headers[k] = expandEnv(await expandSecrets(v, opts), opts.onSecret);
+		const transport = new StreamableHTTPClientTransport(
+			new URL(url),
+			Object.keys(headers).length ? { requestInit: { headers } } : undefined,
+		);
 		await client.connect(transport, { timeout });
 	} else {
 		if (!cfg.command) throw new Error(`MCP server "${cfg.name}": stdio type requires command`);
 		const env: Record<string, string> = {};
-		for (const [k, v] of Object.entries(cfg.env ?? {})) env[k] = expandEnv(v, opts.onSecret);
+		for (const [k, v] of Object.entries(cfg.env ?? {})) env[k] = expandEnv(await expandSecrets(v, opts), opts.onSecret);
 		const transport = new StdioClientTransport({
-			command: expandEnv(cfg.command, opts.onSecret),
-			args: (cfg.args ?? []).map((a) => expandEnv(a, opts.onSecret)),
+			command: expandEnv(await expandSecrets(cfg.command, opts), opts.onSecret),
+			args: await Promise.all((cfg.args ?? []).map(async (a) => expandEnv(await expandSecrets(a, opts), opts.onSecret))),
 			env,
 			stderr: "pipe",
 		});
@@ -93,6 +132,7 @@ export async function createMcpTools(opts: McpToolsOptions): Promise<McpToolSet>
 	const tools: AgentTool<any, string>[] = [];
 	const closers: (() => Promise<void>)[] = [];
 	for (const raw of opts.servers) {
+		if (raw.disabled) continue;
 		const cfg = { ...raw, name: sanitizeName(raw.name) };
 		try {
 			const { client, close } = await connectOne(cfg, opts);
@@ -100,7 +140,7 @@ export async function createMcpTools(opts: McpToolsOptions): Promise<McpToolSet>
 			const listed = await client.listTools();
 			for (const t of listed.tools ?? []) {
 				const remote = t.name;
-				tools.push({
+				const tool: AgentTool<any, string> = {
 					name: `mcp_${cfg.name}_${remote.replace(/[^\w-]+/g, "_")}`,
 					executionMode: "sequential",
 					description: `[MCP ${cfg.name}] ${t.description ?? remote}`,
@@ -109,7 +149,9 @@ export async function createMcpTools(opts: McpToolsOptions): Promise<McpToolSet>
 						const out = await client.callTool({ name: remote, arguments: input });
 						return toolResultText(out);
 					},
-				});
+				};
+				if (t.annotations?.readOnlyHint === true) readOnlyMcpTools.add(tool);
+				tools.push(tool);
 			}
 		} catch (err) {
 			opts.log?.(`MCP server "${cfg.name}" unavailable: ${err instanceof Error ? err.message : String(err)}`);

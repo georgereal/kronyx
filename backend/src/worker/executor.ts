@@ -9,7 +9,7 @@ import { getProvider, type ProviderCreds, type SandboxHandle, type SandboxProvid
 import { SandboxCore, openPr } from "../../../src/sandbox/sandboxCore";
 import { isSandboxDeath, isSandboxUnresponsive } from "../../../src/sandbox/errors";
 import { createRemoteFileTools } from "../../../src/tools/remoteFileTools";
-import { createFetchTools } from "../../../src/tools/fetchTools";
+import { createFetchTools, type WebSearchConfig } from "../../../src/tools/fetchTools";
 import { BROWSER_DRIVER, BROWSER_DRIVER_PATH, SCREENSHOT_PATH, createBrowserTools } from "../../../src/tools/browserTools";
 import { createEnvTools } from "../../../src/tools/envTools";
 import { createMcpTools, type McpServerConfig, type McpToolSet } from "../../../src/tools/mcpTools";
@@ -70,6 +70,8 @@ export interface CloudJob {
 	profile?: string;
 	attachmentIds?: string[];
 	kind?: "run" | "push-plan" | "open-pr" | "bake" | "template-build";
+	/** Set on a continue job: resume this paused run on its own agent instead of starting a task. */
+	resumeRunId?: string;
 	planSlug?: string | null;
 	/** Image recipe key (kind: "bake") or template name (kind: "template-build"). */
 	recipe?: string;
@@ -230,6 +232,8 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	private embedProvider: EmbedProvider | undefined;
 	/** Per-run usage ledger for usage_events rows (web runs bypass /api/ingest). */
 	private runProvider: ProviderSettings | undefined;
+	/** Known secret values — scrubbed from model-facing tool output (RunnerHost.secretValues). */
+	private redactValues = new Set<string>();
 	private modelPricing: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number } | undefined;
 	/** Catalog entry for the run's model — contextWindow/maxTokens/pricing. */
 	private modelMeta: ModelOption | undefined;
@@ -261,6 +265,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			const set = await createMcpTools({
 				servers,
 				onSecret: (v) => secrets.add(v),
+				resolveSecret: async (n) => settings.secrets[n],
 				log: (m) => dbg("mcp", m),
 			});
 			entry = { set, secrets, lastUsedAt: Date.now() };
@@ -283,13 +288,22 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		}
 		entry.lastUsedAt = Date.now();
 		for (const s of entry.secrets) this.sink.mask(s);
+		this.redactFrom(entry.secrets);
 		return entry.set.tools;
+	}
+	private redactFrom(values: Iterable<string | undefined>): void {
+		for (const v of values) if (v) this.redactValues.add(v);
 	}
 	/** The run's current sandbox (rebound on switch_environment) + its keepalive. */
 	private activeSbx: SandboxCore | undefined;
 	private keepaliveTimer: ReturnType<typeof setInterval> | undefined;
 	/** Agent's run-finished text — carried into the run-completed card. */
 	private lastRunSummary = "";
+	/** The run parked at its step cap: the job ends without the push/PR tail or run-completed. */
+	private pausedRun = false;
+	get paused(): boolean {
+		return this.pausedRun;
+	}
 	/** Per-run outcome rollup for the run-completed event. */
 	private lastPrUrl: string | undefined;
 	private lastPushed = false;
@@ -790,6 +804,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				},
 			},
 			currentMode: () => mode,
+			secretValues: () => this.redactValues,
 			planDir: kind === "ask" ? undefined : PLAN_DIR,
 			memory: {
 				context: async (task) => {
@@ -1178,12 +1193,15 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		this.lastHeadSha = undefined;
 		this.runChecks.length = 0;
 		this.lastCompaction = undefined;
+		this.pausedRun = false;
 		try {
 			if (job.kind === "push-plan") await this.pushPlan(job, session, settings);
 			else if (job.kind === "open-pr") await this.openPrJob(job, session, settings);
 			else if (job.mode === "ask") await this.ask(job, session, settings);
 			else if (job.mode === "multi") await this.multi(job, session, settings);
 			else await this.sandboxed(job, session, settings);
+			// Paused: the run isn't finished — no outcome, no run-completed. A continue job finishes it.
+			if (this.pausedRun) return;
 			if (!this.stopRequested) await this.recordMemoryOutcome(job, "completed");
 			// True job end — the UI's single "completed" signal. run-finished is
 			// only the agent's summary; this fires after push/PR/verify all land.
@@ -1257,12 +1275,13 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		this.runProvider = s;
 		await this.loadPricing(s);
 		this.sink.mask(s.apiKey);
+		this.redactFrom([s.apiKey, ...Object.values(settings.secrets ?? {})]);
 		this.embedProvider = this.embedProviderFor(job, s);
 		const atts = await this.attachments(job);
 		const { runner } = await this.ensureRunner(job, session, "ask", "ask", () =>
 			Promise.resolve([
 				memoryWriteTool(this.db, job.uid, job.sessionId, job.runId, this.embedProvider, { repo: session.repo ?? undefined, branch: session.base }, this.memoryReport),
-				...createFetchTools(),
+				...createFetchTools(settings.data.webSearch as WebSearchConfig | undefined),
 			]),
 		);
 		this.throwIfStopped();
@@ -2171,6 +2190,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		this.runProvider = provider;
 		await this.loadPricing(provider);
 		this.sink.mask(provider.apiKey);
+		this.redactFrom([provider.apiKey, ...Object.values(settings.secrets ?? {})]);
 		this.embedProvider = this.embedProviderFor(job, provider);
 		// Stamp sandbox activity — the janitor's idle-pause reads this, not ticks.
 		if (session.sandboxId) {
@@ -2286,7 +2306,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				}),
 				memoryWriteTool(this.db, job.uid, job.sessionId, job.runId, this.embedProvider, { repo: session.repo ?? undefined, branch: session.base }, this.memoryReport),
 				// fetch_url runs worker-side — readable text for URLs the user links.
-				...createFetchTools(),
+				...createFetchTools(settings.data.webSearch as WebSearchConfig | undefined),
 				// browser_use drives a UI sub-agent; skip in plan mode (read-only).
 				...(mode === "plan"
 					? []
@@ -2379,7 +2399,8 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			let preservedWorktree = false;
 			for (;;) {
 				live.dead = undefined;
-				await runner.run(
+				if (job.resumeRunId && !resumed) await runner.resume(provider);
+				else await runner.run(
 					resumed
 						? preservedWorktree
 							? "The sandbox VM running your tools stopped responding and was recovered — its disk was preserved, so the worktree (including uncommitted changes) should be intact. Check git status and the files you were editing, then continue the task."
@@ -2423,6 +2444,11 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			if (tokenRefresh) clearInterval(tokenRefresh);
 		}
 		this.throwIfStopped();
+		if (runner.isPaused) {
+			this.pausedRun = true;
+			await this.sink.patchRun({ status: "paused" }).catch(swallow("executor", "op"));
+			return;
+		}
 		// HEAD now = the point this run's work rests on; afterRun stamps it
 		// onto the run's digests so a later restore can verify ancestry.
 		const head = await sbx.runIn(REPO_DIR, "git rev-parse HEAD", 15_000).catch(swallow("executor", "op"));
@@ -3136,6 +3162,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				},
 			},
 			currentMode: () => mode,
+			secretValues: () => this.redactValues,
 			// Identical env string across slices → identical system-prompt
 			// prefix → provider-side prompt caching can share it. Index-specific
 			// context lives in the task text instead.
@@ -3175,8 +3202,8 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 					this.pendingSaves.push(saveTranscript(this.db, job.uid, job.sessionId, job.runId, messages, agentIndex).catch(swallow("executor", "op")));
 				},
 			},
-			tools: () =>
-				Promise.resolve([
+			tools: async () =>
+				[
 					// save_plan is runner-gated to plan mode anyway — dropping it here
 					// keeps a dead tool out of the slice schema.
 					...createRemoteFileTools(handle, dir, {
@@ -3188,8 +3215,8 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 						onReadPlan: (slug) => loadPlan(this.db, job.uid, job.sessionId, slug).then((p) => p?.markdown ?? null).catch(swallow("executor", "op", null)),
 					}).filter((t) => t.name !== "save_plan"),
 					memoryWriteTool(this.db, job.uid, job.sessionId, sliceRunId, mem.embed, { repo: session.repo ?? undefined, branch: session.base }, sliceReport),
-					...createFetchTools(),
-				]) as Promise<never>,
+					...createFetchTools((await loadUserSettings(this.db, job.uid).catch(() => undefined))?.data.webSearch as WebSearchConfig | undefined),
+				] as never[],
 			emit: (e) => {
 				if (e.type === "run-finished") finishText.value = String(e.text ?? "");
 				if (e.type === "run-failed") finishText.failed = String(e.error ?? "Run failed");

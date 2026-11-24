@@ -2,7 +2,19 @@ import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { AgentRunner, type AgentMode, type RunnerAttachment, type RunDigest } from "../agent/runner";
+import { AgentRunner, type AgentMode, type ProviderSettings, type RunnerAttachment, type RunDigest, type RunnerHost } from "../agent/runner";
+import type { AgentEngine, EngineKind } from "../agent/engine";
+import { OpenAIEngine } from "../agent/openaiEngine";
+import { chooseTransport, type TransportKind } from "../harness/transport";
+import { buildSystemPrompt } from "../agent/systemPrompt";
+import { assembleToolSet } from "../agent/toolSet";
+import { withExplore } from "../harness/explore";
+import { withBatchReads } from "../harness/batchReads";
+import { withReadCache } from "../harness/readCache";
+import { withRecall } from "../harness/recall";
+import { WRITE_MODES } from "../agent/runner";
+import { isConversationalTask } from "../agent/taskGuard";
+import { deriveMessages, type KronyxEvent } from "../agent/events";
 import { acceptsImages } from "../agent/vision";
 import { evaluate, parsePermissionsText, ruleFor, type PermissionLayers, type PermissionRules } from "../agent/permissions";
 import { readGlobalModePermissions, readGlobalPermissions } from "../permStore";
@@ -12,12 +24,24 @@ import { checksOnFinish, runChecks } from "../checks";
 import { E2bSandbox, sandboxBackend, sandboxEnabled } from "./e2b";
 import { appendFact, createIdeRecallScorer, indexFile, loadMemoryContext, logEpisode } from "./memory";
 import { createFileTools } from "../tools/fileTools";
+import { FileEventLog } from "../harness/eventLog";
+import { OpenAIModelPort } from "../harness/adapters/openai";
+import { ClineModelPort } from "../harness/adapters/cline";
+import { createHarnessToolPort } from "../harness/toolPort";
+import { CommandVerifier } from "../harness/verifier";
+import { shellExec } from "../harness/exec";
+import { runHarness } from "../harness/runner";
+import { buildHarnessReport } from "../harness/report";
+import type { HarnessLoop } from "../harness/loop";
+import { PLAN_VISIBLE, READ_ONLY_HIDDEN } from "../agent/toolSet";
 import { createFetchTools } from "../tools/fetchTools";
 import { createMcpTools, type McpServerConfig } from "../tools/mcpTools";
+import { createProcessTools, type ProcTools } from "../tools/procTools";
+import { createLocalBrowserTools, type LocalBrowserTools } from "../tools/localBrowserTools";
 import { userConfig } from "../userConfig";
-import { insertMemoryEvent, openStore } from "../store";
+import { insertMemoryEvent, openStore, upsertHarnessReport } from "../store";
 import { createIdeTools } from "./ideTools";
-import { autoApproveWrites, estimateCostUsd, implementPrompt, modelPricing, pickModel, planDir, type ProfileCatalog, profiles, promptForApiKey, providerErrorMessage, readProviderSettings, resolveProvider } from "../config";
+import { autoApproveWrites, currentSelection, estimateCostUsd, implementPrompt, modelPricing, networkAllowHosts, pickModel, planDir, type ProfileCatalog, profiles, promptForApiKey, providerErrorMessage, readProviderSettings, resolveProvider } from "../config";
 import { log } from "../log";
 import type { ApiCallRow } from "../store";
 import * as git from "../git";
@@ -74,12 +98,21 @@ export interface RunRecord {
 	runId?: string;
 }
 
+/** Per-workspace tab strip state; `engines` remembers each session's execution engine. */
+interface TabState {
+	last?: string;
+	tabs?: string[];
+	engines?: Record<string, EngineKind>;
+}
+
 export interface SessionDeps {
 	context: vscode.ExtensionContext;
 	output: vscode.OutputChannel;
 	runLock: RunLock;
 	modeRef: { current: AgentMode };
-	viewState: { modelId: string; models: ModelOption[]; groups?: ProfileCatalog[]; signedIn?: boolean; userEmail?: string };
+	viewState: { models: ModelOption[]; groups?: ProfileCatalog[]; signedIn?: boolean; userEmail?: string };
+	/** Re-push the composer pick (read from config) and catalogs to every surface. */
+	pushViewState: () => void;
 	surfaces: Set<RunViewProvider>;
 	diffReview: DiffReview;
 	comments: RunComments;
@@ -98,7 +131,7 @@ export interface SessionDeps {
 	/** Persisted local sessions (for the sidebar tab strip), most recent first. */
 	listSessions?: () => Promise<{ name: string; title: string }[]>;
 	/** Per-workspace tab-strip state: last active session + open tab names. */
-	tabState?: { get(): { last?: string; tabs?: string[] }; set(v: { last?: string; tabs?: string[] }): void };
+	tabState?: { get(): TabState; set(v: TabState): void };
 	setStatus: (state: "idle" | "running" | "failed") => void;
 	syncSettings?: () => Promise<void>;
 	refreshModels: () => Promise<void>;
@@ -153,15 +186,48 @@ function diagCounts(): { errors: number; warnings: number } {
 /** Owns one session surface (sidebar view or editor tab): runner, messages, git hooks. */
 export class SessionController {
 	private runner: AgentRunner | undefined;
+	/** OpenAI-compatible engine for this session; recreated when the session changes (it owns a per-session transcript). */
+	private openai: OpenAIEngine | undefined;
+	private engineHost: RunnerHost | undefined;
+	private engineKind: EngineKind = "cline";
+	/** Engine of the run in flight (or last run); stamped on api_calls rows for comparison. */
+	private runEngine: EngineKind = "cline";
+	private runTransport: TransportKind = "cline";
+	/** Usage-row tag: harness runs are split by transport so the comparison can tell them apart. */
+	private engineTag(): string {
+		return this.runEngine === "harness" ? `harness:${this.runTransport}` : this.runEngine;
+	}
+	/** Aborts the harness run in flight (Stop). Set only while a harness run is active. */
+	private harnessAbort: AbortController | undefined;
+	/** True when the last harness run paused (Continue resumes it from its log). */
+	private harnessPaused = false;
+	/** The harness loop of the run in flight, for compact-now. */
+	private activeHarnessLoop: HarnessLoop | undefined;
+	private lastTransport: TransportKind = "cline";
 	/** MCP connections are per-session: config change rebuilds on next runner. */
 	private mcp: { key: string; tools: import("@cline/shared").AgentTool<any, string>[] } | undefined;
+	/** Per-root background process registry — disposed at each run's end. */
+	private procs: ProcTools | undefined;
+	/** Host-side headless browser for local verification — disposed per run. */
+	private browserTools: LocalBrowserTools | undefined;
+	/** Values resolved from SecretStorage — scrubbed from tool output before the model sees it. */
+	private knownSecrets = new Set<string>();
 
 	private async mcpTools(): Promise<import("@cline/shared").AgentTool<any, string>[]> {
 		const servers = userConfig().mcpServers as McpServerConfig[] | undefined;
 		if (!servers?.length) return [];
 		const key = JSON.stringify(servers);
 		if (this.mcp?.key !== key) {
-			this.mcp = { key, tools: (await createMcpTools({ servers, log: (m) => log("mcp", m) })).tools };
+			const secrets = this.deps.context.secrets;
+			const resolveSecret = async (n: string) => {
+				const v = await secrets.get(n);
+				if (v) this.knownSecrets.add(v);
+				return v;
+			};
+			this.mcp = {
+				key,
+				tools: (await createMcpTools({ servers, resolveSecret, log: (m) => log("mcp", m) })).tools,
+			};
 		}
 		return this.mcp.tools;
 	}
@@ -191,7 +257,7 @@ export class SessionController {
 	private openTabs: string[] = [];
 
 	private rememberTabs(): void {
-		this.deps.tabState?.set({ last: this.name, tabs: [...this.openTabs] });
+		this.deps.tabState?.set({ ...this.deps.tabState.get(), last: this.name, tabs: [...this.openTabs] });
 	}
 
 	constructor(
@@ -200,6 +266,7 @@ export class SessionController {
 		private readonly deps: SessionDeps,
 	) {
 		this.openTabs = [...new Set(deps.tabState?.get().tabs ?? [])];
+		this.engineKind = deps.tabState?.get().engines?.[name] ?? "cline";
 		if (!this.openTabs.includes(this.name)) this.openTabs.push(this.name);
 	}
 
@@ -207,7 +274,9 @@ export class SessionController {
 
 	/** Start a fresh named session in the same window — like Copilot's "new chat". */
 	async startNewSession(): Promise<void> {
-		this.runner?.reset();
+		this.resetEngines();
+		this.openai = undefined;
+		this.engineKind = "cline";
 		this.approveAll = false;
 		this.permittedTools.clear();
 		// Lowest unused N across open tabs and stored sessions — the static
@@ -241,10 +310,13 @@ export class SessionController {
 	/** Load a different persisted session into this surface (Agents view → open session). */
 	async openSession(name: string): Promise<void> {
 		if (this.name === name) return;
-		this.runner?.stop();
+		this.stopEngines();
+		this.openai = undefined;
 		this.approveAll = false;
 		this.permittedTools.clear();
 		this.name = name;
+		this.engineKind = this.deps.tabState?.get().engines?.[name] ?? "cline";
+		this.surface.setState({ engine: this.engineKind });
 		if (!this.openTabs.includes(name)) this.openTabs.push(name);
 		this.replayed = true;
 		this.surface.post({ type: "reset" });
@@ -270,7 +342,7 @@ export class SessionController {
 		if (task) this.runTask = task;
 		// Do not close a run that is genuinely active in another surface of the
 		// same extension host; after a VS Code restart the lock is empty.
-		if (active && !this.runner?.isRunning && this.deps.runLock.current !== this.name) {
+		if (active && !this.isRunning && this.deps.runLock.current !== this.name) {
 			this.runTask = task;
 			const recovery = {
 				type: "run-finished" as const,
@@ -303,29 +375,52 @@ export class SessionController {
 	}
 
 	get isRunning(): boolean {
-		return this.runner?.isRunning ?? false;
+		return !!(this.runner?.isRunning || this.openai?.isRunning);
+	}
+
+	private activeEngine(): AgentEngine | undefined {
+		return this.engineKind === "openai" ? this.openai : this.runner;
+	}
+
+	private stopEngines(): void {
+		this.runner?.stop();
+		this.openai?.stop();
+		this.harnessAbort?.abort();
+	}
+
+	private resetEngines(): void {
+		this.procs?.dispose();
+		void this.browserTools?.dispose();
+		this.runner?.reset();
+		this.openai?.reset();
+	}
+
+	private setEngineKind(kind: EngineKind): void {
+		if (this.engineKind === kind) return;
+		this.engineKind = kind;
+		const tabs = this.deps.tabState;
+		tabs?.set({ ...tabs.get(), engines: { ...tabs.get().engines, [this.name]: kind } });
+		this.surface.setState({ engine: kind });
 	}
 
 	async handle(message: WebviewMessage): Promise<void> {
 		switch (message.type) {
 			case "run":
-				await this.startRun(message.task, message.mode);
+				await this.startRun(message.task, message.mode, message.pick, message.engine);
 				break;
-			case "continue":
-				if (!this.isRunning) {
-					await this.startRun("Continue from where the previous run stopped.", this.deps.modeRef.current);
-				}
+			case "resumeRun":
+				await this.resumeRun();
 				break;
 			case "stop":
-				this.runner?.stop();
+				this.stopEngines();
 				for (const p of this.pendingPermissions.values()) p.resolve("deny");
 				this.pendingPermissions.clear();
 				break;
 			case "compact":
-				if (!this.runner?.requestCompact()) this.deps.output.appendLine("[ctx] no running agent to compact");
+				this.harnessCompact();
 				break;
 			case "clearContext":
-				if (!this.runner?.clearContext()) this.deps.output.appendLine("[ctx] nothing to clear (agent idle or absent)");
+				void this.harnessClear();
 				break;
 			case "permissionResponse": {
 				const p = this.pendingPermissions.get(message.id);
@@ -336,7 +431,7 @@ export class SessionController {
 				break;
 			}
 			case "new":
-				this.runner?.reset();
+				this.resetEngines();
 				this.approveAll = false;
 				this.permittedTools.clear();
 				this.surface.post({ type: "reset" });
@@ -347,6 +442,7 @@ export class SessionController {
 				await this.deps.refreshModels();
 				break;
 			case "requestState":
+				this.surface.setState({ engine: this.engineKind });
 				if (!this.replayed) {
 					this.replayed = true;
 					const count = await this.replayStoredEvents();
@@ -354,6 +450,9 @@ export class SessionController {
 				}
 				await this.deps.refreshModels();
 				void this.pushTabs();
+				break;
+			case "setEngine":
+				this.setEngineKind(message.engine);
 				break;
 			case "setMode":
 				this.deps.modeRef.current = message.mode;
@@ -364,15 +463,20 @@ export class SessionController {
 				// A pick is always a model together with the provider it belongs to.
 				if (!message.modelId || !message.profile) break;
 				await pickModel(message.modelId, message.profile);
-				this.surface.setState({ modelId: message.modelId, modelProfile: message.profile });
+				this.deps.pushViewState();
 				break;
 			case "attach":
 				await this.attach(message.kind);
 				break;
 			case "openFile":
-				if (this.runnerRoot) {
-					const abs = this.toAbs(message.path);
-					if (abs) await vscode.window.showTextDocument(vscode.Uri.file(abs));
+				{
+					// Absolute paths (plan dirs may live outside the root, e.g. a tmp dir) open as-is.
+					const abs = path.isAbsolute(message.path) ? message.path : this.toAbs(message.path);
+					if (abs) {
+						await vscode.window
+							.showTextDocument(vscode.Uri.file(abs))
+							.then(undefined, () => vscode.window.showWarningMessage(`Kronyx: can't open ${message.path}`));
+					}
 				}
 				break;
 			case "implementPlan": {
@@ -439,7 +543,7 @@ export class SessionController {
 		}
 	}
 
-	private async getRunner(): Promise<AgentRunner | undefined> {
+	private async getRunner(kind: EngineKind): Promise<AgentEngine | undefined> {
 		const folder = vscode.workspace.workspaceFolders?.[0];
 		if (!folder) {
 			void vscode.window.showErrorMessage("Kronyx: open a folder first.");
@@ -449,7 +553,12 @@ export class SessionController {
 		if (!this.runner || this.runnerRoot !== root) {
 			this.runnerRoot = root;
 			this.permLayers = await this.loadPermissionLayers(root);
-			this.runner = new AgentRunner({
+			this.procs = createProcessTools({ root });
+			this.browserTools = createLocalBrowserTools({ root, allowHosts: networkAllowHosts });
+			const host: RunnerHost = {
+				ideTools: true,
+				webSearch: userConfig().webSearch,
+				secretValues: () => this.knownSecrets,
 				workspaceRoot: root,
 				relativePath: (abs) => path.relative(root, abs).split(path.sep).join("/"),
 				isDirty: (abs) =>
@@ -481,7 +590,9 @@ export class SessionController {
 								insertMemoryEvent(st, { op: String(d.op ?? "ide_context"), detail: d, session: this.name }, root),
 							),
 					}),
-					...createFetchTools(),
+					...createFetchTools(userConfig().webSearch, { allowHosts: networkAllowHosts() }),
+					...(this.procs?.tools ?? []),
+					...(this.browserTools?.tools ?? []),
 					...(await this.mcpTools()),
 				],
 				memory: {
@@ -518,13 +629,23 @@ export class SessionController {
 				},
 				emit: (event) => this.onEvent(event),
 				events: { record: (e) => this.deps.persistEvent(this.name, e as Parameters<RunViewProvider["post"]>[0], this.runId) },
-			});
+			};
+			this.engineHost = host;
+			this.runner = new AgentRunner(host);
+			this.openai = undefined;
 			void this.deps.loadDigest?.(this.name).then((d) => this.runner?.setRunDigests(d));
 			void this.deps.loadTranscripts?.(this.name).then((t) => {
 				this.transcripts = t;
 			});
 		}
-		return this.runner;
+		if (!this.openai && this.engineHost) {
+			this.openai = new OpenAIEngine({
+				...this.engineHost,
+				resume: { resumeLog: async () => deriveMessages((await this.deps.loadEvents(this.name)) as KronyxEvent[]) },
+			});
+			void this.deps.loadDigest?.(this.name).then((d) => this.openai?.setRunDigests(d));
+		}
+		return kind === "openai" ? this.openai : this.runner;
 	}
 
 	/** Re-indexes a changed file after 500 ms of quiet, so rapid agent edits embed once. */
@@ -543,6 +664,9 @@ export class SessionController {
 	}
 
 	private onEvent(event: Parameters<RunViewProvider["post"]>[0]): void {
+		// Wall-clock stamp at emission: the live UI shows this exact time and the
+		// persisted copy carries it into replays.
+		(event as { ts?: number }).ts ??= Date.now();
 		this.surface.post(event);
 		// Delta events are transient streaming frames — final messages persist separately.
 		if (event.type !== "assistant-delta" && event.type !== "reasoning-delta" && event.type !== "usage") {
@@ -600,6 +724,7 @@ export class SessionController {
 				model: p?.modelId,
 				profile: p?.profile,
 				keyLabel: p?.profile ?? "default",
+				engine: this.engineTag(),
 				tokensIn: delta.inputTokens,
 				tokensOut: delta.outputTokens,
 				cacheRead: delta.cacheReadTokens,
@@ -624,6 +749,8 @@ export class SessionController {
 			void this.pushTabs();
 		}
 		if (event.type === "run-finished") {
+			this.procs?.dispose();
+			void this.browserTools?.dispose();
 			this.deps.setStatus("idle");
 			this.deps.recordRun({
 				task: this.runTask,
@@ -648,6 +775,8 @@ export class SessionController {
 			void this.onFinished(event.status);
 		}
 		if (event.type === "run-failed") {
+			this.procs?.dispose();
+			void this.browserTools?.dispose();
 			// The failing request never reports usage — still log it so the ledger
 			// shows non-2xx calls like a provider dashboard would.
 			if (this.lastUsageAt || this.runStartedAt) {
@@ -662,6 +791,7 @@ export class SessionController {
 					model: p?.modelId,
 					profile: p?.profile,
 					keyLabel: p?.profile ?? "default",
+					engine: this.engineTag(),
 					tokensIn: 0,
 					tokensOut: 0,
 					durationMs: Date.now() - (this.lastUsageAt || this.runStartedAt),
@@ -685,13 +815,16 @@ export class SessionController {
 		const files = [...this.changedPaths].map((abs) =>
 			this.runnerRoot ? path.relative(this.runnerRoot, abs).split(path.sep).join("/") : abs,
 		);
-		this.runner?.addRunDigest({ task: this.runTask, status, summary, filesChanged: files, at: Date.now() });
+		const digest = { task: this.runTask, status, summary, filesChanged: files, at: Date.now() };
+		this.runner?.addRunDigest(digest);
+		this.openai?.addRunDigest(digest);
 		this.deps.saveDigest?.(this.name, this.runner?.runDigests ?? []);
 	}
 
-	private async startRun(task: string, mode?: AgentMode): Promise<void> {
-		const freshRunner = this.runner === undefined;
-		const active = await this.getRunner();
+	/** `pick` is the composer chip's pair; the run uses exactly that pair, or none of them. */
+	private async startRun(task: string, mode?: AgentMode, pick?: { modelId: string; profile: string }, engine: EngineKind = this.engineKind): Promise<void> {
+		const freshRunner = false;
+		const active = await this.getRunner(engine);
 		if (!active) return;
 		if (!this.deps.runLock.tryAcquire(this.name)) {
 			this.surface.post({
@@ -702,10 +835,26 @@ export class SessionController {
 		}
 		try {
 			if (mode) this.deps.modeRef.current = mode;
-			const { settings, error } = await resolveProvider(this.deps.context.secrets);
+			if (pick && (!pick.modelId || !pick.profile)) {
+				this.surface.post({ type: "run-failed", error: "No model selected — pick a provider and model in the composer." });
+				return;
+			}
+			const { settings, error } = await resolveProvider(this.deps.context.secrets, pick ?? currentSelection());
 			if (!settings) {
 				this.surface.post({ type: "run-failed", error: providerErrorMessage(error!) });
 				return;
+			}
+			const choice = chooseTransport(settings.providerId, engine === "openai" ? "openai" : "cline");
+			if (!choice.ok) {
+				this.surface.post({ type: "run-failed", error: choice.message });
+				return;
+			}
+			this.setEngineKind(engine);
+			this.runEngine = engine;
+			const shown = currentSelection();
+			if (pick && (shown?.modelId !== pick.modelId || shown?.profile !== pick.profile)) {
+				await pickModel(pick.modelId, pick.profile);
+				this.deps.pushViewState();
 			}
 			this.runProvider = {
 				providerId: settings.providerId,
@@ -731,7 +880,37 @@ export class SessionController {
 				this.surface.post({ type: "run-failed", error: `${settings.modelId} can't view images — pick a vision-capable model or remove the attached images.` });
 				return;
 			}
-			await active.run(expanded, settings, attachments);
+			this.lastTransport = choice.transport;
+			await this.runOnHarness(expanded, settings, task, choice.transport, false, attachments);
+		} finally {
+			this.deps.runLock.release(this.name);
+		}
+	}
+
+	/** Continue a run paused at the step cap on its own agent. Refuses if the composer pick changed since the run started. */
+	private async resumeRun(): Promise<void> {
+		if (!this.harnessPaused) {
+			this.surface.post({ type: "run-failed", error: "Nothing to continue — start a new task." });
+			return;
+		}
+		const { settings, error } = await resolveProvider(this.deps.context.secrets);
+		const started = this.runProvider;
+		if (!settings || (started && (settings.modelId !== started.modelId || settings.profile !== started.profile))) {
+			this.surface.post({
+				type: "run-failed",
+				error: settings ? `The model changed while this run was paused — stop it and start again on ${settings.modelId}.` : providerErrorMessage(error!),
+			});
+			return;
+		}
+		if (!this.deps.runLock.tryAcquire(this.name)) {
+			this.surface.post({
+				type: "run-failed",
+				error: `A run is already active in "${this.deps.runLock.current}". Stop it or wait for it to finish.`,
+			});
+			return;
+		}
+		try {
+			await this.runOnHarness("", settings, "", this.lastTransport, true);
 		} finally {
 			this.deps.runLock.release(this.name);
 		}
@@ -809,9 +988,12 @@ export class SessionController {
 	}
 
 	private toAbs(rel: string): string | undefined {
-		if (!this.runnerRoot) return undefined;
-		const abs = path.resolve(this.runnerRoot, rel);
-		return abs.startsWith(this.runnerRoot + path.sep) || abs === this.runnerRoot ? abs : undefined;
+		// Harness sessions never build an engine runner — fall back to the
+		// workspace folder so file links still resolve.
+		const root = this.runnerRoot ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+		if (!root) return undefined;
+		const abs = path.resolve(root, rel);
+		return abs.startsWith(root + path.sep) || abs === root ? abs : undefined;
 	}
 
 	private pendingPermissions = new Map<
@@ -887,12 +1069,109 @@ export class SessionController {
 		return undefined;
 	}
 
+	/** One task on the harness loop (the composer's Harness engine). Local only. Acceptance commands need approval before they run. */
+	private async runOnHarness(task: string, settings: ProviderSettings, displayTask: string, transport: TransportKind, resume = false, attachments: RunnerAttachment[] = []): Promise<void> {
+		const root = this.runnerRoot ?? "";
+		const mode = this.deps.modeRef.current;
+		// Plan mode keeps the plan-visible exceptions offered (write_file scoped,
+		// run_command behind approval); ask mode hides all write tools.
+		const hidden =
+			mode === "plan"
+				? new Set([...READ_ONLY_HIDDEN].filter((n) => !PLAN_VISIBLE.has(n)))
+				: mode === "ask"
+					? READ_ONLY_HIDDEN
+					: new Set<string>();
+		// Same tool set and policy pipeline as the Cline loop: mode hiding, write-mode and permission guards, parallel markers.
+		const assembled = this.engineHost ? await assembleToolSet(this.engineHost, settings, task, () => this.harnessAbort?.abort()) : undefined;
+		const tools = assembled?.tools ?? (await this.engineHost?.tools?.()) ?? [];
+		const log = await FileEventLog.open(this.harnessFile());
+		const provider = { providerId: settings.providerId, baseUrl: settings.baseUrl, apiKey: settings.apiKey, modelId: settings.modelId, maxOutputTokens: settings.maxTokens };
+		// The transport is the model side only; the loop is always the harness.
+		const model = transport === "openai" ? new OpenAIModelPort(provider) : new ClineModelPort(provider);
+		const run = shellExec(root);
+		const verifier = new CommandVerifier(async (command) =>
+			(await this.confirmWrite(root, "run_command", { command })) ? run(command) : { ok: false, output: "Acceptance command was not approved." },
+		);
+		const pipeline = assembled?.pipeline;
+		const basePort = createHarnessToolPort({
+			tools,
+			hidden,
+			check: async (name, input) => {
+				if (!pipeline) return evaluate(this.permLayers, name, input, mode) ?? "ask";
+				const verdict = await pipeline.runPre({ name, input });
+				return verdict.kind === "allow" ? "allow" : verdict.kind === "deny" ? "deny" : "ask";
+			},
+			confirm: (name, input) => this.confirmWrite(root, name, input),
+		});
+		const toolPort = withRecall(withExplore(withReadCache(withBatchReads(basePort)), model), log);
+		this.runEngine = "harness";
+		this.runTransport = transport;
+		const abort = new AbortController();
+		this.harnessAbort = abort;
+		// Stable system prompt (same builder as the Cline loop). Per-run memory and dev context go in the user message.
+		const system =
+			buildSystemPrompt(root, mode, "", this.engineHost?.environment, undefined, assembled?.available) +
+			"\n\nHarness notes: a task checklist is maintained automatically — focus on the work, not on planning tools. Batch independent reads into one read_files call; elided tool results are recovered with log_slice or recall_context.";
+		const memory = resume ? "" : (await this.engineHost?.memory?.context?.(task, settings)) ?? "";
+		const digests = resume ? [] : (this.runner?.runDigests ?? []);
+		const digestBlock = digests.length
+			? `Earlier runs in this session (oldest first):\n${digests.map((d, i) => `${i + 1}) ${d.task} — ${d.status}. ${d.summary.slice(0, 800)}${d.filesChanged.length ? ` Files: ${d.filesChanged.join(", ")}.` : ""}`).join("\n")}`
+			: "";
+		const context = [memory, digestBlock].filter(Boolean).join("\n\n") || undefined;
+		try {
+			const nudgeWrites = WRITE_MODES.has(mode) && !isConversationalTask(task);
+			// Every real task gets a board, in every mode — in plan/ask mode the
+			// board IS the deliverable; signals for unavailable tools are stripped.
+			const plan = !isConversationalTask(task);
+			const images = attachments.flatMap((a) => (a.data?.byteLength && a.mediaType.startsWith("image/") ? [{ mediaType: a.mediaType, base64: Buffer.from(a.data).toString("base64") }] : []));
+			const outcome = await runHarness({ runId: this.runId, log, model, tools: toolPort, verifier, emit: (e) => this.onEvent(e), signal: abort.signal, system, nudgeWrites, writable: WRITE_MODES.has(mode), debug: vscode.workspace.getConfiguration("kronyx").get<boolean>("harness.debug", false), onLoop: (l) => (this.activeHarnessLoop = l) }, task, displayTask, { resume, context, images, plan });
+			this.harnessPaused = outcome.status === "paused";
+			void this.queueHarnessReport();
+		} finally {
+			this.harnessAbort = undefined;
+			this.activeHarnessLoop = undefined;
+		}
+	}
+
+	/** Post-run: queue the harness report for this run — the sync worker uploads it to the dashboard in batches. */
+	private async queueHarnessReport(): Promise<void> {
+		try {
+			const root = this.runnerRoot ?? "";
+			const log = await FileEventLog.open(this.harnessFile());
+			const report = buildHarnessReport(await log.read(), { runId: this.runId });
+			upsertHarnessReport(await openStore(root), { runId: this.runId, session: this.name, report }, root);
+		} catch (err) {
+			log("harness", `report queue failed: ${err instanceof Error ? err.message : String(err)}`);
+		}
+	}
+
+	/** Session log for the harness: one JSONL file per session. */
+	private harnessFile(): string {
+		return path.join(this.runnerRoot ?? "", ".kronyx", "harness", `${this.name.replace(/[^\w-]+/g, "-")}.jsonl`);
+	}
+
+	private harnessCompact(): void {
+		if (!this.activeHarnessLoop?.requestCompact()) this.deps.output.appendLine("[ctx] no running harness run to compact");
+	}
+
+	/** Clear context between runs: appends to the log, so the next run's replay starts empty. Ledger and log are kept. */
+	private async harnessClear(): Promise<void> {
+		if (this.activeHarnessLoop) {
+			this.surface.post({ type: "info", text: "Clear context works between runs. Stop the run first." });
+			return;
+		}
+		const log = await FileEventLog.open(this.harnessFile());
+		await log.append({ type: "context.cleared", runId: this.runId });
+		this.surface.post({ type: "info", text: "Context cleared. The next task starts fresh; the task board and log are kept." });
+	}
+
 	private async confirmWrite(root: string, toolName: string, input: unknown): Promise<boolean> {
 		if (autoApproveWrites() || this.approveAll || this.permittedTools.has(toolName)) return true;
 		const file =
 			(input as { path?: string })?.path ??
 			(toolName === "run_command" ? (input as { command?: string })?.command : undefined) ??
 			(input as { pattern?: string })?.pattern ??
+			(toolName.startsWith("mcp_") ? JSON.stringify(input ?? {}).slice(0, 300) : undefined) ??
 			"(unknown file)";
 		const id = `perm-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 		const diff = await this.pendingDiff(root, file, toolName, input);

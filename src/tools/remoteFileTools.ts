@@ -3,6 +3,7 @@ import type { SandboxHandle } from "../sandbox/provider";
 import { isSharedManifest, ownsMatch } from "../agent/decompose";
 import { computeHunks, formatHunks } from "../diff/hunks";
 import { adaptIndentation, findMatches, mostSimilarRegion } from "./matching";
+import { ignoreIndexLoader, isSensitivePath, secretFileStub } from "./workspace";
 
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 const CMD_HEAD_CHARS = 2_000;
@@ -67,6 +68,7 @@ export function createRemoteFileTools(sandbox: SandboxHandle, workdir: string, o
 
 	// Single-quote escape — double quotes leave $vars/backticks expanded.
 	const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+	const ignoreIndex = ignoreIndexLoader(() => runOnce("git ls-files --others --ignored --exclude-standard --directory -z 2>/dev/null").then((r) => r.stdout));
 
 	// ripgrep when present: gitignore-aware, faster, saner output. Stock
 	// templates may lack it — detect once and fall back to grep/find.
@@ -133,7 +135,10 @@ export function createRemoteFileTools(sandbox: SandboxHandle, workdir: string, o
 			required: ["path"],
 		},
 		async execute(input) {
-			const lines = (await readText(input.path)).split("\n");
+			const text = await readText(input.path);
+			const secret = secretFileStub(input.path, text, await ignoreIndex());
+			if (secret) return secret;
+			const lines = text.split("\n");
 			if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
 			const start = Math.max(1, input.start_line ?? 1);
 			const requestedEnd = Math.min(lines.length, input.end_line ?? lines.length);
@@ -282,7 +287,7 @@ export function createRemoteFileTools(sandbox: SandboxHandle, workdir: string, o
 		inputSchema: {
 			type: "object",
 			properties: {
-				path: { type: "string", description: "Folder relative to the workspace root. Defaults to the root." },
+				path: { type: "string", description: "Folder to list, relative to the workspace root ('.' for the root)." },
 				recursive: { type: "boolean", description: "List sub-folders too. Defaults to false." },
 				max_entries: { type: "integer", minimum: 1, description: "Maximum entries to return. Defaults to 500." },
 			},
@@ -291,7 +296,7 @@ export function createRemoteFileTools(sandbox: SandboxHandle, workdir: string, o
 			const limit = input.max_entries ?? 500;
 			// rg --files honors .gitignore — the right answer for recursive lists.
 			if (input.recursive && (await rgAvailable())) {
-				const r = await run(`rg --files ${q(input.path ?? ".")} 2>/dev/null | head -${limit}`);
+				const r = await run(`rg --files ${q(input.path || ".")} 2>/dev/null | head -${limit}`);
 				if (r.exitCode <= 1) {
 					const lines = r.stdout
 						.split("\n")
@@ -303,7 +308,7 @@ export function createRemoteFileTools(sandbox: SandboxHandle, workdir: string, o
 			const depth = input.recursive ? "" : " -maxdepth 1";
 			// One round trip: -printf marks dirs with a trailing slash.
 			const r = await run(
-				`find ${q(input.path ?? ".")}${depth} \\( -name .git -o -name node_modules -o -name dist -o -name .next -o -name build -o -name coverage -o -name .turbo \\) -prune -o \\( -type d -printf '%p/\\n' -o -type f -print \\) | head -${limit}`,
+				`find ${q(input.path || ".")}${depth} \\( -name .git -o -name node_modules -o -name dist -o -name .next -o -name build -o -name coverage -o -name .turbo \\) -prune -o \\( -type d -printf '%p/\\n' -o -type f -print \\) | head -${limit}`,
 			);
 			if (r.exitCode !== 0 && !r.stdout.trim()) {
 				return `Error listing files: ${(r.stderr || `exit ${r.exitCode}`).slice(0, 300)}`;
@@ -312,7 +317,12 @@ export function createRemoteFileTools(sandbox: SandboxHandle, workdir: string, o
 				.split("\n")
 				.filter((l) => l && l !== input.path && l !== `${input.path}/`)
 				.map((l) => l.replace(/^\.\//, ""));
-			return lines.slice(0, limit).join("\n") || "Empty.";
+			const shown = lines.slice(0, limit);
+			if (shown.length === 0) return "Empty.";
+			let out = shown.join("\n");
+			if (!input.recursive && shown.some((e) => e.endsWith("/")))
+				out += `\n(${shown.length} entries — non-recursive; pass recursive: true for the full tree, or a path to drill into a folder.)`;
+			return out;
 		},
 	};
 
@@ -328,7 +338,7 @@ export function createRemoteFileTools(sandbox: SandboxHandle, workdir: string, o
 			type: "object",
 			properties: {
 				pattern: { type: "string", description: "Text or regular expression (ERE syntax) to find." },
-				path: { type: "string", description: "Folder to search, relative to the root. Defaults to the root." },
+				path: { type: "string", description: "Folder to search, relative to the root ('.' for the root). A file path is fine too — it searches within that file." },
 				file_glob: { type: "string", description: "Only search files matching this path glob, e.g. '**/*.ts' or 'src/ui/**'." },
 				context_lines: { type: "integer", minimum: 0, description: "Lines of context around each match." },
 				regex: { type: "boolean", description: "Treat pattern as a regular expression. Defaults to true; false searches literal text." },
@@ -338,7 +348,7 @@ export function createRemoteFileTools(sandbox: SandboxHandle, workdir: string, o
 			required: ["pattern"],
 		},
 		async execute(input) {
-			const dir = input.path ?? ".";
+			const dir = input.path || ".";
 			const limit = input.max_results ?? 100;
 			const ctx = input.context_lines ? `-C ${Math.min(20, Math.max(0, Math.floor(input.context_lines)))}` : "";
 			// Models emit PCRE inline flags ((?i)pat) — strip and map to -i.
@@ -367,10 +377,13 @@ export function createRemoteFileTools(sandbox: SandboxHandle, workdir: string, o
 			// instead of erroring — the model meant text, not syntax.
 			if (!wantLiteral && r.exitCode > 1 && /regex|regular expression|syntax/i.test(r.stderr)) r = await run(build(true));
 			if (r.exitCode > 1) return `Error searching: ${(r.stderr || `exit ${r.exitCode}`).slice(0, 300)}`;
+			// Matches from secret-looking or gitignored files never reach the model.
+			const index = await ignoreIndex();
 			const out = r.stdout
 				.split("\n")
 				.filter(Boolean)
-				.map((l) => l.replace(/^\.\//, "").slice(0, 300));
+				.map((l) => l.replace(/^\.\//, "").slice(0, 300))
+				.filter((l) => !isSensitivePath(/^(.*?)[:-]\d+[:-]/.exec(l)?.[1] ?? "", index));
 			return out.length > 0 ? out.join("\n") : "No matches.";
 		},
 	};

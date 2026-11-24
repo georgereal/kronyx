@@ -15,6 +15,9 @@ export interface UserProviderConfig {
 	modelProfile?: string;
 	/** MCP servers to expose to the agent (`mcp_<server>_<tool>`). */
 	mcpServers?: McpServerConfig[];
+	/** Provider for the web_search tool. Missing/empty apiKey falls back to a
+	 *  keyless best-effort scraper. */
+	webSearch?: { provider?: "tavily" | "brave" | "duckduckgo"; apiKey?: string };
 }
 
 let cached: UserProviderConfig | undefined;

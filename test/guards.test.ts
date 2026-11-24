@@ -12,6 +12,7 @@ const WRITE_TOOLS = new Set(["write_file", "edit_file", "file_editor", "run_comm
 
 interface HarnessOpts {
 	mode?: AgentMode;
+	root?: string;
 	layers?: Partial<PermissionLayers>;
 	confirm?: (tool: string, input: unknown) => Promise<boolean>;
 	onLoop?: (tool: string, count: number) => void;
@@ -32,7 +33,7 @@ function harness(opts: HarnessOpts = {}) {
 	p.pre(createRepeatGuard({ onLoopDetected: opts.onLoop, onStop: opts.onStop }));
 	p.pre(createSavePlanGuard(mode));
 	p.pre(createPermissionGuard(async (t, i) => evaluate(layers, t, i, opts.mode)));
-	p.pre(createWriteModeGuard({ currentMode: mode, writeTools: WRITE_TOOLS, onModeBlocked: opts.onBlocked }));
+	p.pre(createWriteModeGuard({ currentMode: mode, writeTools: WRITE_TOOLS, root: opts.root, onModeBlocked: opts.onBlocked }));
 	p.pre(createApprovalGuard(opts.confirm ? { confirm: opts.confirm } : undefined));
 	return {
 		run: (name: string, input: unknown = {}) => p.runPre({ name, input }),
@@ -119,6 +120,22 @@ describe("write-mode guard", () => {
 		expect((await h.run("read_file", { path: "a" })).kind).toBe("allow");
 	});
 
+	it("ask and plan refuse memory_write and browser interaction; code allows them", async () => {
+		const noPrompt = async () => {
+			throw new Error("must not prompt");
+		};
+		for (const mode of ["ask", "plan"] as const) {
+			const h = harness({ mode, confirm: noPrompt });
+			for (const name of ["memory_write", "browser_click", "browser_type", "browser_eval"]) {
+				expect((await h.run(name, {})).kind).toBe("deny");
+			}
+			expect((await h.run("browser_snapshot", {})).kind).toBe("allow");
+		}
+		const code = harness({ mode: "code", confirm: noPrompt });
+		expect((await code.run("browser_click", { ref: "e1" })).kind).toBe("allow");
+		expect((await code.run("memory_write", { fact: "x" })).kind).toBe("allow");
+	});
+
 	it("file_editor view/symbols bypass even under a deny rule", async () => {
 		const h = harness({
 			mode: "code",
@@ -141,12 +158,43 @@ describe("write-mode guard", () => {
 		expect((await h.run("file_editor", { command: "view" })).kind).toBe("allow");
 	});
 
-	it("ask/plan deny writes with a one-shot mode-blocked notice", async () => {
+	it("plan mode allows scoped writes free and sends repo writes to approval", async () => {
+		const os = await import("node:os");
+		const h = harness({ mode: "plan", root: "/repo" });
+		expect((await h.run("write_file", { path: ".kronyx/plans/x.md" })).kind).toBe("allow");
+		expect((await h.run("write_file", { path: `${os.tmpdir()}/scratch.md` })).kind).toBe("allow");
+		// Out-of-scope writes ask the user instead of dead-ending.
+		const yes = harness({ mode: "plan", root: "/repo", confirm: async () => true });
+		expect((await yes.run("write_file", { path: "src/x.ts" })).kind).toBe("allow");
+		const no = harness({ mode: "plan", root: "/repo", confirm: async () => false });
+		expect((await no.run("write_file", { path: "src/x.ts" })).kind).toBe("deny");
+		expect((await no.run("write_file", { path: "../escape.md" })).kind).toBe("deny");
+		// Ask mode gets no write scope at all.
+		const ask = harness({ mode: "ask", root: "/repo" });
+		expect((await ask.run("write_file", { path: ".kronyx/plans/x.md" })).kind).toBe("deny");
+	});
+
+	it("plan mode sends run_command to approval instead of denying", async () => {
+		const allowed = harness({ mode: "plan", root: "/repo", confirm: async () => true });
+		expect((await allowed.run("run_command", { command: "git log --oneline" })).kind).toBe("allow");
+		const refused = harness({ mode: "plan", root: "/repo", confirm: async () => false });
+		expect((await refused.run("run_command", { command: "git log --oneline" })).kind).toBe("deny");
+		// Ask mode still denies it outright.
+		const ask = harness({ mode: "ask", root: "/repo", confirm: async () => true });
+		expect((await ask.run("run_command", { command: "ls" })).kind).toBe("deny");
+	});
+
+	it("ask mode denies writes with a one-shot mode-blocked notice; plan asks instead", async () => {
 		const blocked: AgentMode[] = [];
-		const h = harness({ mode: "plan", onBlocked: (m) => blocked.push(m) });
+		const h = harness({ mode: "ask", onBlocked: (m) => blocked.push(m) });
 		expect((await h.run("write_file", {})).kind).toBe("deny");
 		expect((await h.run("write_file", {})).kind).toBe("deny");
-		expect(blocked).toEqual(["plan"]);
+		expect(blocked).toEqual(["ask"]);
+		// Plan mode never dead-ends: without an approval channel the call is
+		// refused by the approval stage, and no mode-blocked notice fires.
+		const plan = harness({ mode: "plan", onBlocked: (m) => blocked.push(m) });
+		expect((await plan.run("write_file", {})).kind).toBe("deny");
+		expect(blocked).toEqual(["ask"]);
 	});
 
 	it("smart/bypass allow writes without approval", async () => {

@@ -9,11 +9,11 @@
 	const attachBtn = /** @type {HTMLButtonElement} */ (document.getElementById("attach"));
 	const cloudStatus = /** @type {HTMLElement} */ (document.getElementById("cloudstatus"));
 	const mentionBtn = /** @type {HTMLButtonElement} */ (document.getElementById("mention"));
-	const workspaceBtn = /** @type {HTMLButtonElement} */ (document.getElementById("workspace"));
-	const workspaceLabel = /** @type {HTMLElement} */ (document.getElementById("workspace-label"));
 	const modeBtn = /** @type {HTMLButtonElement} */ (document.getElementById("mode"));
 	const modelBtn = /** @type {HTMLButtonElement} */ (document.getElementById("model"));
 	const modeLabel = /** @type {HTMLElement} */ (document.getElementById("mode-label"));
+	const engineBtn = /** @type {HTMLButtonElement} */ (document.getElementById("engine"));
+	const engineLabel = /** @type {HTMLElement} */ (document.getElementById("engine-label"));
 	const modelLabel = /** @type {HTMLElement} */ (document.getElementById("model-label"));
 	const status = /** @type {HTMLElement} */ (document.getElementById("status"));
 	const tokchip = /** @type {HTMLElement} */ (document.getElementById("tokchip"));
@@ -49,8 +49,12 @@
 	const persisted = vscode.getState() || {};
 	/** @type {string} */
 	let mode = persisted.mode || "code";
+	const ENGINES = ["cline", "openai"];
+	let engine = ENGINES.includes(persisted.engine) ? persisted.engine : "cline";
 	/** @type {string} */
-	let modelId = persisted.modelId || "";
+	// The composer pick (modelId + modelProfile) is host state only — never restored
+	// from webview storage, so a stale id can't pair with the wrong provider.
+	let modelId = "";
 	/** @type {import("../src/config").ModelOption[]} */
 	let models = persisted.models || [];
 	/** Per-provider catalogs from the host; `models` stays the active profile's flat list. @type {{profile: string, active?: boolean, models: any[]}[]} */
@@ -78,7 +82,7 @@
 
 	const persist = () => {
 		drafts[activeSession] = task.value;
-		vscode.setState({ mode, modelId, models, recentModels, drafts, authDismissed, cloudEnv });
+		vscode.setState({ mode, engine, models, recentModels, drafts, authDismissed, cloudEnv });
 	};
 
 	let cloudEnv = persisted.cloudEnv === true;
@@ -207,6 +211,23 @@
 	};
 
 	let runGroup = null;
+	/** The current run's top-level section — bubble, worked group and result
+	 *  card all live inside it so nothing escapes into a sibling run's area. */
+	let runEl = null;
+	/** @type {any} */
+	let batchEl = null;
+	/** @type {any} */
+	let boardEl = null;
+	let boardSig = "";
+	/** True once the current run has emitted a board — stats read it, so a
+	 *  plan-reuse run doesn't inherit the previous run's blocked counts. */
+	let boardActive = false;
+	const boardTasks = new Map();
+	/** @type {any} */
+	let progressEl = null;
+	/** Newest plan doc this session produced — the result card links back to it. */
+	let lastPlanPath = "";
+	let lastCompactEl = null;
 	let groupStats = { added: 0, removed: 0, files: new Set() };
 	let streamMsg = null;
 	let streamText = "";
@@ -222,7 +243,11 @@
 	const add = (node) => {
 		setEmptyMode(false);
 		timeline.querySelector(".empty")?.remove();
-		const target = runGroup?.querySelector(".group-body") ?? timeline;
+		if (runGroup && !runGroup.isConnected) runGroup = null;
+		if (runEl && !runEl.isConnected) runEl = null;
+		// Work goes into the run's open group; run-level cards go into the run's
+		// section; only content outside any run reaches the bare timeline.
+		const target = runGroup?.querySelector(".group-body") ?? runEl ?? timeline;
 		target.appendChild(node);
 		scrollMaybe(true);
 		persist();
@@ -240,13 +265,14 @@
 		groupStats = { added: 0, removed: 0, files: new Set() };
 		lastReasoningNorm = "";
 		runGroup = group;
+		batchEl = null;
 		streamMsg = null;
 		streamText = "";
 		streamReasoning = null;
 		reasoningText = "";
 		thoughts = null;
 		timeline.querySelector(".empty")?.remove();
-		timeline.appendChild(group);
+		(runEl ?? timeline).appendChild(group);
 	};
 
 	const fmtDur = (secs) => {
@@ -268,15 +294,97 @@
 		runGroup.querySelector(".group-title").textContent = `${title}${diff}${files}`;
 	};
 
-	// First line of assistant text becomes a bold header; the rest renders as markdown.
-	const narrationNodes = (text) => {
-		const idx = text.indexOf("\n");
-		const rawHead = (idx === -1 ? text : text.slice(0, idx)).trim();
+	// Ledger refs (t1, s3, s3–s4) render as small chips — the id stays terse and
+	// the task/step it points at shows as a hover tooltip.
+	const clip = (s, n) => (s.length > n ? `${s.slice(0, n)}…` : s);
+	const stepText = (id) => {
+		for (const t of boardTasks.values()) {
+			const s = (t.steps || []).find((x) => x.id === id);
+			if (s) return s.text;
+		}
+		return "";
+	};
+	// {t1}/{s3} braces are explicit refs — always resolved. Bare t1/s3 resolves
+	// only when it names a real board id, so prose like "the s3 bucket" or a
+	// stray "t2" in code talk is left alone.
+	const REF_RE = /\{[ts]\d+(?:\s*[–-]\s*s?\d+)?\}|\bt\d+\b|\bs\d+(?:\s*[–-]\s*s?\d+)?/g;
+	const REF_TEST = /\{[ts]\d|\bt\d+\b|\bs\d+/;
+	const refTip = (ref) =>
+		ref[0] === "t"
+			? boardTasks.get(ref)?.title
+			: (ref.match(/s\d+/g) || []).map(stepText).filter(Boolean).join(" / ");
+	const refChip = (ref, braced) => {
+		// Step ids repeat across tasks — a bare "s3" is just prose (AWS S3 says hi);
+		// steps resolve only through explicit {s3} braces. Task ids are board-unique.
+		if (!braced && ref[0] === "s") return document.createTextNode(ref);
+		const tip = refTip(ref);
+		// An unresolvable bare token isn't a ref — emit it as ordinary text.
+		if (!tip && !braced) return document.createTextNode(ref);
+		const chip = el("span", "ref-chip");
+		// Ledger ids are internal — the chip shows the work's name, the id stays in the tooltip.
+		chip.textContent = tip ? clip(tip, 32) : ref;
+		if (tip) chip.title = `${ref} · ${tip}`;
+		return chip;
+	};
+	/** Split text into text nodes and ref chips. */
+	const refNodes = (text) => {
+		const nodes = [];
+		let last = 0;
+		for (const m of text.matchAll(REF_RE)) {
+			const braced = m[0].startsWith("{");
+			const id = braced ? m[0].slice(1, -1) : m[0];
+			if (m.index > last) nodes.push(document.createTextNode(text.slice(last, m.index)));
+			nodes.push(refChip(id, braced));
+			last = m.index + m[0].length;
+		}
+		if (last < text.length) nodes.push(document.createTextNode(text.slice(last)));
+		return nodes;
+	};
+	/** Wrap refs inside a rendered markdown tree; skips code and links. */
+	const chipify = (root) => {
+		const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+			acceptNode: (n) => (REF_TEST.test(n.nodeValue) ? (n.parentElement?.closest("code, pre, a") ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT) : NodeFilter.FILTER_SKIP),
+		});
+		const targets = [];
+		while (walker.nextNode()) targets.push(walker.currentNode);
+		for (const n of targets) {
+			const frag = document.createDocumentFragment();
+			for (const part of refNodes(n.nodeValue)) frag.appendChild(part);
+			n.parentNode.replaceChild(frag, n);
+		}
+	};
+
+	// Inline `code` spans that spell a workspace file path open the file on click —
+	// so "approve the plan at `.kronyx/plans/x.md`" is a link, not dead text.
+	const PATH_EXT = /\.(md|ts|tsx|js|jsx|mjs|cjs|json|css|html|py|go|rs|toml|yaml|yml|txt|sh|sql|java|c|cc|cpp|h|hpp|rb|swift|kt|env|ini|cfg|xml|lock)$/i;
+	const linkifyPaths = (root) => {
+		for (const code of root.querySelectorAll("code")) {
+			if (code.closest("pre")) continue;
+			const t = code.textContent.trim();
+			if (t.length < 3 || t.length > 240 || /\s/.test(t)) continue;
+			if (!t.includes("/") && !PATH_EXT.test(t)) continue;
+			code.classList.add("file-link");
+			code.title = `Open ${t}`;
+			code.addEventListener("click", () => vscode.postMessage({ type: "openFile", path: t }));
+		}
+	};
+
+	// First line of assistant text becomes a header line; the rest renders as markdown.
+	const narrationNodes = (rawText) => {
+		const idx = rawText.indexOf("\n");
+		const rawHead = (idx === -1 ? rawText : rawText.slice(0, idx)).trim();
 		const head = rawHead.length > 140 ? rawHead.slice(0, 140) + "…" : rawHead || "…";
-		const nodes = [el("div", "narration-head", head)];
+		const headEl = el("div", "narration-head");
+		headEl.append(...refNodes(head));
+		const nodes = [headEl];
 		if (idx !== -1) {
-			const body = text.slice(idx + 1).trim();
-			if (body) nodes.push(renderMd(body));
+			const body = rawText.slice(idx + 1).trim();
+			if (body) {
+				const md = renderMd(body);
+				chipify(md);
+				linkifyPaths(md);
+				nodes.push(md);
+			}
 		}
 		return nodes;
 	};
@@ -321,12 +429,50 @@
 		updateGroupTitle(label);
 		runGroup.open = false;
 		runGroup = null;
+		batchEl = null;
 	};
 
 	// Work events lazily open a segment; assistant text closes it — yielding
 	// sequential "Worked for Xs" sections interleaved with messages.
 	const ensureSegment = () => {
+		// A session reset/reload wipes the timeline but leaves runGroup pointing
+		// at a detached node — appends there are invisible (timeline can't scroll
+		// to them). Re-anchor when the group is no longer in the document.
+		if (runGroup && !runGroup.isConnected) runGroup = null;
 		if (!runGroup) startGroup();
+	};
+
+	// Tool calls from one model turn share a batch card: a count and duration on the
+	// header, one row per call underneath. Calls without a turn number render alone.
+	/** @param {any} batch */
+	const updateBatch = (batch) => {
+		const total = batch.querySelectorAll(":scope > .batch-body > .step.tool").length;
+		const running = batch.querySelectorAll(":scope > .batch-body > .step.tool.running").length;
+		// A one-call batch is its own card — hide the redundant header row.
+		batch.classList.toggle("single", total === 1);
+		const label = `${total} operation${total === 1 ? "" : "s"}`;
+		const secs = Math.round((Date.now() - Number(batch.dataset.startedAt)) / 1000);
+		batch.querySelector(".batch-title").textContent = running ? `Running ${label}…` : secs > 0 ? `${label} · ${fmtDur(secs)}` : label;
+	};
+
+	/** @param {any} card @param {any} iteration */
+	const addToolCard = (card, iteration) => {
+		if (iteration === undefined || iteration === null) return add(card);
+		if (!batchEl || !batchEl.isConnected || batchEl.dataset.iteration !== String(iteration)) {
+			batchEl = el("details", "tool-batch");
+			batchEl.open = true;
+			batchEl.dataset.iteration = String(iteration);
+			batchEl.dataset.startedAt = String(Date.now());
+			const head = el("summary");
+			head.appendChild(el("span", "twisty", "›"));
+			head.appendChild(el("span", "batch-title", ""));
+			batchEl.appendChild(head);
+			batchEl.appendChild(el("div", "batch-body"));
+			add(batchEl);
+		}
+		batchEl.querySelector(".batch-body").appendChild(card);
+		updateBatch(batchEl);
+		scrollMaybe(true);
 	};
 
 	const setRunning = (running) => {
@@ -337,6 +483,13 @@
 	};
 
 	const fmt = (n) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
+	// Events are stamped at persist time; replayed ones keep their real clock
+	// time instead of all showing the replay moment.
+	const evTime = (msg) =>
+		new Date(typeof msg?.ts === "number" ? msg.ts : Date.now()).toLocaleTimeString([], {
+			hour: "numeric",
+			minute: "2-digit",
+		});
 
 	let statusText = "Idle";
 	let elapsedTimer = 0;
@@ -344,6 +497,7 @@
 	const activityFill = document.getElementById("activity-fill");
 	const RING_C = 2 * Math.PI * 6; // r=6 in the 16x16 activity svg
 	const contextWindow = () =>
+		groups.find((g) => g.profile === modelProfile)?.models?.find((m) => m.id === modelId)?.contextWindow ||
 		models.find((m) => m.id === modelId)?.contextWindow ||
 		groups.flatMap((g) => g.models || []).find((m) => m.id === modelId)?.contextWindow ||
 		0;
@@ -492,6 +646,11 @@
 		if (name === "list_files") return p === "." ? "repo root" : String(p);
 		if (name === "read_file" && input.start_line) return `${p} (${input.start_line}-${input.end_line ?? "end"})`;
 		if (name === "edit_file" && Array.isArray(input.edits)) return `${p} (${input.edits.length} edit(s))`;
+		if (name === "read_files" && Array.isArray(input.files)) {
+			const names = input.files.map((f) => String(f?.path ?? "")).filter(Boolean);
+			const list = names.join(", ");
+			return list.length > 90 ? `${names[0]} +${names.length - 1} more` : list;
+		}
 		return String(p);
 	};
 
@@ -607,7 +766,7 @@
 		if (truncated) pre.appendChild(el("div", "fd-trunc", "…truncated…"));
 		return pre;
 	};
-	/** Parses formatUnifiedWithContext / formatHunks text. Numbers appear only when the text has @@ headers. */
+	// Parses formatUnifiedWithContext / formatHunks text. Numbers appear only when the text has @@ headers.
 	const parseDiffRows = (diff, cap = 400) => {
 		const rows = [];
 		let oldN = 0, newN = 0, truncated = false, numbered = false;
@@ -634,6 +793,59 @@
 	const renderEditorDiff = (diff, path) => {
 		const { rows, truncated } = parseDiffRows(diff);
 		return renderDiffRows(rows, fileLang(path).lang, truncated);
+	};
+
+	const READ_TOOLS = new Set(["read_file", "read_files"]);
+	/** Read results as an editor view: one highlighted, numbered block per file
+	 *  (### path sections from read_files; bare "path (lines a-b of n)" for read_file). */
+	const renderReadOutput = (text, cap = 400) => {
+		const wrap = el("div", "readout");
+		const rawChunks = [];
+		// Split into sections; text before the first ### belongs to the first (unnamed) section.
+		const parts = String(text).split(/^### /m);
+		for (const [pi, part] of parts.entries()) {
+			if (!part.trim()) continue;
+			let section = pi === 0 ? part : part; // header text is part of the section lines
+			let headPath = "";
+			if (pi > 0) {
+				const nl = section.indexOf("\n");
+				headPath = (nl === -1 ? section : section.slice(0, nl)).replace(/\s+\(failed\)\s*$/, "").trim();
+				section = nl === -1 ? "" : section.slice(nl + 1);
+			}
+			const lines = section.split("\n");
+			let path = headPath, meta = "";
+			// Meta line: "path (lines a-b of n)." — may repeat the section path or stand alone.
+			const metaMatch = lines[0] && /^(.*?) \(lines \d+[-–](?:\d+|end) of \d+\)/.exec(lines[0]);
+			if (metaMatch) {
+				path = path || metaMatch[1].trim();
+				meta = /\(lines .*$/.exec(lines[0])?.[0] || "";
+				lines.shift();
+			}
+			const rows = [];
+			const rest = [];
+			let truncated = false;
+			for (const l of lines) {
+				const m = /^\s*(\d+)\| ?(.*)$/.exec(l);
+				if (m) {
+					if (rows.length >= cap) truncated = true;
+					else rows.push({ num: Number(m[1]), cls: "fd-l-ctx", text: m[2] });
+				} else if (l.trim()) rest.push(l);
+			}
+			if (!rows.length) {
+				rawChunks.push((pi > 0 ? `### ${part}` : part).trim());
+				continue;
+			}
+			if (path || meta) {
+				const head = el("div", "ro-head");
+				head.appendChild(el("span", "ro-path", path));
+				if (meta) head.appendChild(el("span", "ro-meta", meta));
+				wrap.appendChild(head);
+			}
+			wrap.appendChild(renderDiffRows(rows, fileLang(path).lang, truncated));
+			if (rest.length) wrap.appendChild(el("pre", "io", rest.join("\n")));
+		}
+		for (const chunk of rawChunks) wrap.appendChild(el("pre", "io", chunk));
+		return wrap;
 	};
 
 	const EDIT_TOOLS = new Set(["edit_file", "write_file", "append_file", "insert_lines"]);
@@ -725,6 +937,11 @@
 		if (diff) card.appendChild(renderEditorDiff(diff, path));
 	};
 	/** Marks edit cards whose result never arrived (stop, failure, or restore mid-edit). */
+	// A paused run's Continue/Stop only works while its agent is alive; any
+	// terminal event (or a replayed one) retires those buttons.
+	const retirePaused = () => {
+		for (const n of timeline.querySelectorAll(".paused-actions")) n.remove();
+	};
 	const settlePending = (label) => {
 		for (const { card } of pendingEdits) {
 			if (card.dataset.state !== "pending") continue;
@@ -740,17 +957,18 @@
 	const resetRunStats = () => { runStats = { toolsFailed: 0, checksPassed: 0, checksFailed: 0, files: new Map() }; };
 
 	const TOOL_STYLE = {
-		read_file: ["📄", "Read"],
-		list_files: ["🔍", "Listed"],
-		search_files: ["🔍", "Searched"],
-		write_file: ["✎", "Wrote"],
-		edit_file: ["✎", "Edited"],
-		append_file: ["✎", "Appended"],
-		insert_lines: ["✎", "Edited"],
-		run_command: ["›_", "Ran"],
-		memory_write: ["✦", "Saved"],
+		read_file: ["📄", "Read", "Reading"],
+		read_files: ["📄", "Read", "Reading"],
+		list_files: ["🔍", "Listed", "Listing"],
+		search_files: ["🔍", "Searched", "Searching"],
+		write_file: ["✎", "Wrote", "Writing"],
+		edit_file: ["✎", "Edited", "Editing"],
+		append_file: ["✎", "Appended", "Appending"],
+		insert_lines: ["✎", "Edited", "Editing"],
+		run_command: ["›_", "Ran", "Running"],
+		memory_write: ["✦", "Saved", "Saving"],
 	};
-	const toolVerb = (name) => TOOL_STYLE[name] || ["⛭", name];
+	const toolVerb = (name) => TOOL_STYLE[name] || ["⛭", name, name];
 
 	const showEmpty = () => {
 		setEmptyMode(true);
@@ -795,7 +1013,7 @@
 	const submit = () => {
 		const text = task.value.trim();
 		if (!text || sendBtn.hidden) return;
-		vscode.postMessage(cloudEnv ? { type: "runCloud", task: text, mode } : { type: "run", task: text, mode });
+		vscode.postMessage(cloudEnv ? { type: "runCloud", task: text, mode } : { type: "run", task: text, mode, pick: { modelId, profile: modelProfile }, engine });
 		task.value = "";
 		attachments.clear();
 		attachmentPreviews.replaceChildren();
@@ -929,6 +1147,14 @@
 
 	const modeLabelFor = (id) => MODES.find((m) => m.id === id)?.label ?? id;
 
+	/** @type {Record<string, string>} */
+	const ENGINE_LABELS = { cline: "Cline SDK", openai: "OpenAI" };
+	/** @type {Record<string, string>} */
+	const ENGINE_DESCS = {
+		cline: "Cline SDK transport: any provider, including Anthropic",
+		openai: "OpenAI transport: Responses for OpenAI, chat completions elsewhere",
+	};
+
 	const MODE_ICONS = { code: "</>", smart: "✦", ask: "◯", plan: "≡", bypass: "⛨" };
 	const svg = (paths) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${paths}</svg>`;
 	const MODE_SVGS = {
@@ -946,9 +1172,17 @@
 
 	const refreshChips = () => {
 		modeLabel.textContent = modeLabelFor(mode);
+		engineLabel.textContent = ENGINE_LABELS[engine];
 		document.getElementById("mode-icon").innerHTML = MODE_SVGS[mode] || MODE_SVGS.code;
-		const found = models.find((m) => m.id === modelId);
-		modelLabel.textContent = found?.label || modelId || "Model";
+		// Selection identity is the pair profile|modelId — look up the label in
+		// the picked profile's catalog first so a same-id model elsewhere can't win.
+		const found = groups.find((g) => g.profile === modelProfile)?.models?.find((m) => m.id === modelId) ||
+			groups.flatMap((g) => g.models || []).find((m) => m.id === modelId) ||
+			models.find((m) => m.id === modelId);
+		const name = found?.label || modelId || "Model";
+		// Only prefix the picked profile — never guess it from a first-match in
+		// another group (the same model id can exist under multiple providers).
+		modelLabel.textContent = modelProfile ? `${modelProfile} · ${name}` : name;
 		task.placeholder = MODE_PLACEHOLDERS[mode] || "Ask, plan, or describe a change…";
 	};
 
@@ -969,6 +1203,22 @@
 		});
 	});
 
+	engineBtn.addEventListener("click", () => {
+		openMenu(engineBtn, {
+			items: ENGINES.map((id) => ({
+				label: ENGINE_LABELS[id],
+				desc: ENGINE_DESCS[id],
+				checked: id === engine,
+				onPick: () => {
+					engine = id;
+					refreshChips();
+					persist();
+					vscode.postMessage({ type: "setEngine", engine });
+				},
+			})),
+		});
+	});
+
 	const reopenModelMenu = () => {
 		menu.dataset.anchor = "";
 		showModelMenu();
@@ -978,7 +1228,8 @@
 		const scoped = pool.filter((g) => !providerFilter || g.profile === providerFilter);
 		const all = scoped.flatMap((g) => g.models.map((m) => ({ m, profile: g.profile })));
 		const recent = recentModels
-			.map((id) => all.find((e) => e.m.id === id && e.profile === modelProfile) || all.find((e) => e.m.id === id))
+			// Entries are {id, profile}; legacy persisted entries are bare ids — resolve those against the current profile.
+			.map((r) => all.find((e) => e.m.id === (typeof r === "string" ? r : r.id) && e.profile === (typeof r === "string" ? modelProfile : r.profile)))
 			.filter(Boolean);
 		const items = [];
 		if (recent.length > 0) {
@@ -1028,7 +1279,7 @@
 	const chooseModel = (m, profile) => {
 		modelId = m.id;
 		modelProfile = profile || "";
-		recentModels = [m.id, ...recentModels.filter((id) => id !== m.id)].slice(0, 3);
+		recentModels = [{ id: m.id, profile: modelProfile }, ...recentModels.filter((r) => (typeof r === "string" ? r : r.id) !== m.id || (typeof r === "string" ? modelProfile : r.profile) !== modelProfile)].slice(0, 3);
 		refreshChips();
 		updateActivityRing();
 		persist();
@@ -1036,9 +1287,9 @@
 	};
 
 	const modelItem = (m, profile) => ({
-		label: m.label || m.id,
+		label: profile ? `${profile} / ${m.label || m.id}` : m.label || m.id,
 		desc: modelDesc(m) || m.description?.slice(0, 120),
-		checked: m.id === modelId && (!profile || profile === modelProfile),
+		checked: m.id === modelId && (modelProfile ? profile === modelProfile : !profile),
 		onInfo: () => showModelDetail(m, profile),
 		onPick: () => chooseModel(m, profile),
 	});
@@ -1142,20 +1393,27 @@
 
 	// ---------- events ----------
 
+	// Run-scoped step counter: iteration fields on this run's events give the
+	// true span, so old stored run-finished payloads (which recorded the
+	// session-cumulative turn) don't misreport.
+	let iterMin = 0;
+	let iterMax = 0;
+
 	window.addEventListener("message", (event) => {
 		const msg = event.data;
+		if (typeof msg.iteration === "number" && msg.iteration > 0) {
+			iterMax = Math.max(iterMax, msg.iteration);
+			iterMin = iterMin ? Math.min(iterMin, msg.iteration) : msg.iteration;
+		}
 		switch (msg.type) {
 			case "state":
+				if (ENGINES.includes(msg.engine)) engine = msg.engine;
 				mode = msg.mode || mode;
-				modelId = msg.modelId || modelId;
+				if (typeof msg.modelId === "string") modelId = msg.modelId;
 				models = msg.models || models;
 				groups = msg.groups || groups;
 				if (typeof msg.modelProfile === "string") modelProfile = msg.modelProfile;
 				if (typeof msg.signedIn === "boolean") signedIn = msg.signedIn;
-				if (typeof msg.workspaceName === "string") {
-					workspaceLabel.textContent = msg.workspaceName;
-					workspaceBtn.hidden = !msg.workspaceName;
-				}
 				if (Array.isArray(msg.sessions)) {
 					sessionTabs = msg.sessions;
 					moreTabs = Array.isArray(msg.moreSessions) ? msg.moreSessions : [];
@@ -1221,6 +1479,21 @@
 				break;
 			case "reset":
 				showEmpty();
+				// Timeline was just wiped — every cached element is detached now.
+				// Clear them or new events append into dead DOM.
+				runGroup = null;
+				runEl = null;
+				batchEl = null;
+				boardEl = null;
+				boardSig = "";
+				progressEl = null;
+				streamMsg = null;
+				streamText = "";
+				streamReasoning = null;
+				reasoningText = "";
+				thoughts = null;
+				groupStats = { added: 0, removed: 0, files: new Set() };
+				boardTasks.clear();
 				tools.clear();
 				pendingEdits.length = 0;
 				attachments.clear();
@@ -1240,8 +1513,19 @@
 				setRunning(false);
 				stopTimer();
 				setStatus("Idle");
+				lastCompactEl = null;
 				break;
 			case "run-started": {
+				retirePaused();
+				// A previous group left open (missing terminal event, mid-run
+				// reload) would swallow this run's bubble and cards inside its
+				// collapsed body — close it before the new bubble lands.
+				closeGroup("Worked for");
+				// Each run owns a section; its bubble, work group and result all
+				// mount inside it and can't bleed into neighbouring runs.
+				runEl = el("div", "run-section");
+				timeline.appendChild(runEl);
+				iterMin = iterMax = 0;
 				startedAt = Date.now();
 				startTimer();
 				const card = el("div", "step task");
@@ -1250,10 +1534,27 @@
 				bubble.appendChild(el("div", "bubble-text", msg.task));
 				card.appendChild(bubble);
 				card.appendChild(
-					el("span", "msg-time", new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })),
+					el("span", "msg-time", evTime(msg)),
 				);
 				add(card);
 				resetRunStats();
+				// Each run owns one plan board and one progress card; refs persist
+				// so narration can still resolve ids to titles between boards.
+				boardEl = null;
+				boardSig = "";
+				boardActive = false;
+				progressEl = null;
+				// Streaming/thought elements from a run that ended mid-delta point
+				// inside its collapsed card — clear them or the new run's text is
+				// written into dead, invisible DOM ("content on top of content").
+				streamMsg = null;
+				streamText = "";
+				streamReasoning = null;
+				reasoningText = "";
+				lastReasoningNorm = "";
+				thoughts = null;
+				lastCompactEl = null;
+				batchEl = null;
 				setRunning(true);
 				setStatus("Running...");
 				break;
@@ -1292,16 +1593,18 @@
 				}
 				reasoningText += msg.text;
 				streamReasoning.textContent = reasoningText;
+				streamReasoning.scrollTop = streamReasoning.scrollHeight;
 				setThoughtPreview(reasoningText);
 				scrollMaybe();
 				break;
 			}
 			case "assistant-text": {
-				closeGroup("Worked for");
 				streamMsg = null;
 				streamText = "";
-				const card = el("div", "step assistant");
-				card.appendChild(el("span", "k-avatar", "K"));
+				// Interim narration is a working note — it folds into the current
+				// worked group; only a tool-free reply gets its own top-level card.
+				const hasWork = !!runGroup?.querySelector(".step.tool, .tool-batch, .thoughts-group");
+				const card = el("div", `step assistant${hasWork ? " narration-note" : ""}`);
 				const body = el("div", "k-body");
 				for (const n of narrationNodes(msg.text)) body.appendChild(n);
 				card.appendChild(body);
@@ -1309,17 +1612,21 @@
 					el(
 						"span",
 						"msg-time",
-						new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }),
+						evTime(msg),
 					),
 				);
-				add(card);
+				if (hasWork) add(card);
+				else {
+					closeGroup("Worked for");
+					add(card);
+				}
 				break;
 			}
 			case "assistant-delta": {
 				if (!streamMsg) {
-					closeGroup("Worked for");
-					streamMsg = el("div", "step assistant");
-					streamMsg.appendChild(el("span", "k-avatar", "K"));
+					const hasWork = !!runGroup?.querySelector(".step.tool, .tool-batch, .thoughts-group");
+					if (!hasWork) closeGroup("Worked for");
+					streamMsg = el("div", `step assistant${hasWork ? " narration-note" : ""}`);
 					streamMsg.appendChild(el("div", "k-body"));
 					add(streamMsg);
 				}
@@ -1348,6 +1655,7 @@
 					break;
 				}
 				const card = el("details", "step tool running");
+				card.dataset.tool = msg.name;
 				const summary = el("summary");
 				summary.appendChild(el("span", "twisty", "›"));
 				summary.appendChild(el("span", "tool-icon", icon));
@@ -1371,7 +1679,7 @@
 				card.open = true;
 				input.open = true;
 				openToolCard = card;
-				add(card);
+				addToolCard(card, msg.iteration);
 				break;
 			}
 			case "tool-finished": {
@@ -1442,10 +1750,97 @@
 					card.open = true;
 				} else {
 					const cleanOutput = prettyOut(String(msg.output || "")).replace(/\x1b\[[0-9;]*m/g, "").trim();
-					if (cleanOutput) card.appendChild(el("pre", `io${msg.ok ? "" : " io-err"}`, cleanOutput));
+					if (cleanOutput) {
+						if (msg.ok && READ_TOOLS.has(msg.name)) card.appendChild(renderReadOutput(cleanOutput));
+						else card.appendChild(el("pre", `io${msg.ok ? "" : " io-err"}`, cleanOutput));
+					}
 					card.open = !msg.ok;
 				}
+				const batch = card.closest(".tool-batch");
+				if (batch) updateBatch(batch);
 				lastVerb = "";
+				break;
+			}
+			case "task-board": {
+				boardActive = true;
+				const tasks = msg.tasks || [];
+				// Same plan → update the existing card in place. A different task
+				// set means the model wrote a new plan — only then append a card.
+				const sig = tasks.map((t) => t.id).join(",");
+				if (sig !== boardSig || !boardEl || !boardEl.isConnected) {
+					boardEl = el("div", "step taskboard");
+					add(boardEl);
+					boardSig = sig;
+				} else {
+					// Move the live card to the current position so progress isn't
+					// buried in a collapsed earlier segment.
+					const target = runGroup?.querySelector(".group-body") ?? runEl ?? timeline;
+					if (boardEl.parentNode !== target) add(boardEl);
+				}
+				boardTasks.clear();
+				for (const t of tasks) boardTasks.set(t.id, t);
+				const head = el("div", "board-head");
+				head.appendChild(el("span", "board-label", "Plan"));
+				const counts = tasks.reduce((acc, t) => ((acc[t.status] = (acc[t.status] || 0) + 1), acc), {});
+				head.appendChild(
+					el(
+						"span",
+						"board-rollup",
+						Object.entries(counts)
+							.map(([s, n]) => `${n} ${s.replace("_", " ")}`)
+							.join(" · "),
+					),
+				);
+				const rows = tasks.map((t) => {
+					const row = el("div", `board-task ${t.status}`);
+					const title = el("div", "board-title");
+					title.appendChild(el("span", "board-name", t.title));
+					if (t.from) title.appendChild(el("span", "board-adopt", `↩ run ${String(t.from).slice(0, 8)}`));
+					title.appendChild(el("span", `board-pill ${t.status}`, t.status.replace("_", " ")));
+					row.appendChild(title);
+					const list = el("ul", "board-steps");
+					for (const s of t.steps || []) list.appendChild(el("li", `board-step ${s.status}`, `${s.text} · ${s.status}`));
+					row.appendChild(list);
+					return row;
+				});
+				boardEl.replaceChildren(head, ...rows);
+				scrollMaybe(true);
+				break;
+			}
+			case "task-progress": {
+				ensureSegment();
+				// Progress is a live snapshot — update one card in place rather
+				// than stacking a new card per update.
+				const fresh = !progressEl || !progressEl.isConnected;
+				const card = fresh ? el("div", "step progress") : progressEl;
+				card.replaceChildren();
+				card.appendChild(el("div", "progress-objective", msg.objective || "Progress"));
+				/** @param {string} label @param {string[] | undefined} items */
+				const section = (label, items) => {
+					if (!items?.length) return;
+					const wrap = el("div", "progress-section");
+					wrap.appendChild(el("div", "progress-label", label));
+					const list = el("ul", "progress-list");
+					for (const item of items) list.appendChild(el("li", "", item));
+					wrap.appendChild(list);
+					card.appendChild(wrap);
+				};
+				section("Done", msg.completed);
+				section("In progress", msg.inProgress);
+				section("Next", msg.next);
+				section("Blockers", msg.blockers);
+				if (fresh) {
+					progressEl = card;
+					add(card);
+				} else {
+					// Keep the card at the current position across segments.
+					const target = runGroup?.querySelector(".group-body") ?? runEl ?? timeline;
+					if (card.parentNode !== target) add(card);
+					else {
+						scrollMaybe(true);
+						persist();
+					}
+				}
 				break;
 			}
 			case "mode-blocked": {
@@ -1471,10 +1866,23 @@
 				closeGroup("Stopped · worked for");
 				setStatus("Stopped (loop detected)");
 				break;
-			case "info":
+			case "info": {
 				ensureSegment();
-				add(el("div", "step info", `ⓘ ${msg.text}`));
+				// Collapse consecutive compaction notices into the last one — a
+				// long run can fire one per turn and bury the real timeline.
+				const compact = msg.meta?.kind === "context_compaction";
+				const target = runGroup?.querySelector(".group-body") ?? runEl ?? timeline;
+				if (compact && lastCompactEl && target.lastElementChild === lastCompactEl) {
+					lastCompactEl.textContent = `ⓘ ${msg.text}`;
+					scrollMaybe(true);
+					persist();
+					break;
+				}
+				const n = el("div", msg.meta?.kind === "harness" ? "step info harness" : "step info", `ⓘ ${msg.text}`);
+				if (compact) lastCompactEl = n;
+				add(n);
 				break;
+			}
 			case "file-changed": {
 				ensureSegment();
 				groupStats.added += msg.added || 0;
@@ -1611,6 +2019,9 @@
 				break;
 			}
 			case "plan-ready": {
+				// The deliverable — keep it top-level, not folded into the work group.
+				lastPlanPath = msg.path || lastPlanPath;
+				closeGroup("Finished · worked for");
 				const card = el("div", "step plan-ready");
 				card.appendChild(el("div", "perm-title", "Plan ready"));
 				card.appendChild(el("code", "perm-body", msg.path));
@@ -1641,6 +2052,7 @@
 				setStatus("Running...");
 				break;
 			case "run-finished": {
+				retirePaused();
 				const secs = startedAt ? Math.round((Date.now() - startedAt) / 1000) : 0;
 				const issues = runStats.toolsFailed + runStats.checksFailed;
 				const stopped = msg.status === "stopped" || msg.status === "interrupted";
@@ -1662,20 +2074,15 @@
 				title.appendChild(pill);
 				card.appendChild(title);
 				if (issues) card.appendChild(el("div", "result-issues", `${issues} command${issues > 1 ? "s" : ""} or check${issues > 1 ? "s" : ""} failed during this run — expand the cards above to inspect.`));
+				const blocked = boardActive ? [...boardTasks.values()].filter((t) => t.status === "blocked").length : 0;
+				if (blocked) card.appendChild(el("div", "result-issues blocked", `${blocked} plan task${blocked > 1 ? "s" : ""} could not be completed this run — see the plan card above.`));
 				if (msg.text) {
 					const rs = el("div", "result-summary");
-					rs.appendChild(renderMd(msg.text));
+					const md = renderMd(msg.text);
+					chipify(md);
+					linkifyPaths(md);
+					rs.appendChild(md);
 					card.appendChild(rs);
-				}
-				if (stopped) {
-					const actions = el("div", "result-actions");
-					const cont = el("button", "continue-btn", "Continue");
-					cont.addEventListener("click", () => {
-						cont.disabled = true;
-						vscode.postMessage({ type: "continue" });
-					});
-					actions.appendChild(cont);
-					card.appendChild(actions);
 				}
 				const stats = el("div", "result-stats");
 				const stat = (val, cls, label) => {
@@ -1684,14 +2091,27 @@
 					d.appendChild(el("span", "muted", label));
 					return d;
 				};
-				if (files.length) stats.appendChild(stat(files.length, "", `File${files.length > 1 ? "s" : ""} changed`));
-				stats.appendChild(stat(`+${added}`, "stat-add", "Lines added"));
-				stats.appendChild(stat(`−${removed}`, "stat-del", "Lines removed"));
+				// Diff stats belong to code/agent runs — a plan or ask run reports
+				// checks and the plan link instead of empty +0/−0 counters.
+				const showDiff = mode !== "plan" && mode !== "ask";
+				if (showDiff && files.length) stats.appendChild(stat(files.length, "", `File${files.length > 1 ? "s" : ""} changed`));
+				if (showDiff && (added || removed)) {
+					stats.appendChild(stat(`+${added}`, "stat-add", "Lines added"));
+					stats.appendChild(stat(`−${removed}`, "stat-del", "Lines removed"));
+				}
 				if (runStats.checksPassed) stats.appendChild(stat(runStats.checksPassed, "", "Checks passed"));
 				if (issues) stats.appendChild(stat(issues, "stat-del", "Failed"));
 				card.appendChild(stats);
 				const foot = el("div", "result-foot muted");
-				foot.textContent = `${secs ? `${secs}s · ` : ""}${msg.iterations} step(s)`;
+				const steps = iterMax ? iterMax - iterMin + 1 : msg.iterations;
+				foot.textContent = `${secs ? `${secs}s · ` : ""}${steps} step(s)`;
+				if (lastPlanPath) {
+					const link = el("button", "plan-link", `plan · ${lastPlanPath.split("/").pop()}`);
+					link.title = lastPlanPath;
+					link.addEventListener("click", () => vscode.postMessage({ type: "openFile", path: lastPlanPath }));
+					foot.appendChild(document.createTextNode(" · "));
+					foot.appendChild(link);
+				}
 				card.appendChild(foot);
 				// Close the work group first so the card lands at top level —
 				// otherwise it is swallowed into the just-collapsed group.
@@ -1706,12 +2126,40 @@
 				const card = el("div", "step failed");
 				card.appendChild(el("div", "label", "Run failed"));
 				card.appendChild(el("div", "body", msg.error));
+				retirePaused();
 				settlePending("Interrupted");
 				setRunning(false);
 				stopTimer();
 				closeGroup("Failed · worked for");
 				add(card);
 				setStatus("Failed");
+				break;
+			}
+			case "run-paused": {
+				// The agent is parked at its step cap with its context intact:
+				// Continue resumes it on the same agent, Stop finalizes the run.
+				settlePending("Interrupted");
+				setRunning(false);
+				stopTimer();
+				const card = el("div", "step paused-card");
+				card.appendChild(el("div", "label", "Paused at step limit"));
+				card.appendChild(el("div", "body", `Paused after ${iterMax ? iterMax - iterMin + 1 : msg.iterations} steps — the agent's context is kept.`));
+				const actions = el("div", "result-actions paused-actions");
+				const cont = el("button", "continue-btn", "Continue");
+				cont.addEventListener("click", () => {
+					actions.remove();
+					setRunning(true);
+					setStatus("Running...");
+					startTimer();
+					vscode.postMessage({ type: "resumeRun" });
+				});
+				const stopBtnPaused = el("button", "stop-btn", "Stop");
+				stopBtnPaused.addEventListener("click", () => vscode.postMessage({ type: "stop" }));
+				actions.append(cont, stopBtnPaused);
+				card.appendChild(actions);
+				closeGroup("Paused · worked for");
+				add(card);
+				setStatus("Paused");
 				break;
 			}
 		}

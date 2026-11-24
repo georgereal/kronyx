@@ -115,6 +115,7 @@ export default function UsagePage() {
 	const [allUsers, setAllUsers] = useState(false);
 	const [tab, setTab] = useState<"requests" | "model" | "task" | "provider" | "cost">("requests");
 	const [expanded, setExpanded] = useState<number | null>(null);
+	const [expandedTask, setExpandedTask] = useState<string | null>(null);
 	const [limit, setLimit] = useState(200);
 	const [copied, setCopied] = useState(false);
 	const { calls, loading, reload, user, userNames } = useUsageCalls(range ? range * 2 : 0, allUsers);
@@ -156,7 +157,7 @@ export default function UsagePage() {
 					(!provider || (host(c.baseUrl) || c.provider) === provider) &&
 					(!status || c.status === status) &&
 					(!cachedOnly || c.cacheRead > 0 || (c.cacheWrite ?? 0) > 0) &&
-					(!search || `${c.model} ${c.runId ?? ""} ${c.session ?? ""}`.toLowerCase().includes(search.toLowerCase())),
+					(!search || `${c.model} ${c.runId ?? ""} ${c.session ?? ""} ${c.task ?? ""}`.toLowerCase().includes(search.toLowerCase())),
 			),
 		[cur, model, provider, status, cachedOnly, search],
 	);
@@ -174,13 +175,22 @@ export default function UsagePage() {
 		for (const c of filtered) m.set(c.model || "unknown", [...(m.get(c.model || "unknown") ?? []), c]);
 		return [...m.entries()].map(([key, calls]) => ({ key, calls })).sort((a, b) => sum(b.calls, (c) => c.tokensIn + c.tokensOut) - sum(a.calls, (c) => c.tokensIn + c.tokensOut));
 	}, [filtered]);
+	// One run = one user task; rows without a runId (embedding/manual ops) fall back to session.
 	const taskRows = useMemo(() => {
 		const m = new Map<string, UsageCall[]>();
 		for (const c of filtered) {
-			const k = c.session ?? "—";
+			const k = c.runId || c.session || "—";
 			m.set(k, [...(m.get(k) ?? []), c]);
 		}
-		return [...m.entries()].map(([key, calls]) => ({ key, calls })).sort((a, b) => b.calls.length - a.calls.length);
+		return [...m.entries()]
+			.map(([key, calls]) => ({
+				key,
+				task: calls.find((c) => c.task)?.task || key,
+				when: Math.max(...calls.map((c) => new Date(c.at).getTime())),
+				runId: calls.find((c) => c.runId)?.runId,
+				calls,
+			}))
+			.sort((a, b) => sum(b.calls, (c) => c.tokensIn + c.tokensOut) - sum(a.calls, (c) => c.tokensIn + c.tokensOut));
 	}, [filtered]);
 	const providerRows = useMemo(() => {
 		const m = new Map<string, UsageCall[]>();
@@ -192,9 +202,10 @@ export default function UsagePage() {
 	}, [filtered]);
 
 	const csv = () => {
-		const rows = [["time,status,model,provider,tokensIn,tokensOut,cacheRead,cacheWrite,costEst,billed,durationMs,runId,session"].join(",")];
+		const rows = [["time,status,model,provider,tokensIn,tokensOut,cacheRead,cacheWrite,costEst,billed,durationMs,runId,session,task"].join(",")];
+		const csvEsc = (s: string) => (/[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s);
 		for (const c of filtered)
-			rows.push([c.at, c.status, c.model, host(c.baseUrl) || c.provider, c.tokensIn, c.tokensOut, c.cacheRead, c.cacheWrite ?? 0, c.costUsd ?? "", c.billedCostUsd ?? "", c.durationMs, c.runId ?? "", c.session ?? ""].join(","));
+			rows.push([c.at, c.status, c.model, host(c.baseUrl) || c.provider, c.tokensIn, c.tokensOut, c.cacheRead, c.cacheWrite ?? 0, c.costUsd ?? "", c.billedCostUsd ?? "", c.durationMs, c.runId ?? "", c.session ?? "", csvEsc(c.task ?? "")].join(","));
 		const url = URL.createObjectURL(new Blob([rows.join("\n")], { type: "text/csv" }));
 		const a = document.createElement("a");
 		a.href = url;
@@ -413,10 +424,79 @@ export default function UsagePage() {
 
 			{tab === "model" && <AggTable rows={modelRows} nameLabel="Model" />}
 			{tab === "task" && (
-				<AggTable
-					nameLabel="Session"
-					rows={taskRows.map((r) => ({ key: r.key === "—" ? "—" : r.key.slice(0, 12), sub: r.calls[0]?.session ? undefined : undefined, calls: r.calls }))}
-				/>
+				<div className="card table-card">
+					<table className="sbx-table">
+						<thead>
+							<tr><th style={{ width: 26 }}></th><th>Task</th><th>When</th><th>Requests</th><th>Tokens in</th><th>Tokens out</th><th>Cached</th><th>Cost est.</th><th>Billed</th><th>Median dur.</th><th>Share</th></tr>
+						</thead>
+						<tbody>
+							{(() => {
+								const maxTot = Math.max(1, ...taskRows.map((r) => sum(r.calls, (c) => c.tokensIn + c.tokensOut)));
+								return taskRows.map((r) => {
+									const tot = sum(r.calls, (c) => c.tokensIn + c.tokensOut);
+									const cached = sum(r.calls, (c) => c.cacheRead);
+									const est = sum(r.calls, (c) => c.costUsd ?? 0);
+									const billed = sum(r.calls, (c) => c.billedCostUsd ?? 0);
+									const label = r.task.length > 80 ? `${r.task.slice(0, 80)}…` : r.task;
+									const open = expandedTask === r.key;
+									return (
+										<>
+											<tr key={r.key} onClick={() => setExpandedTask(open ? null : r.key)} style={{ cursor: "pointer" }}>
+												<td className="muted">{open ? "▾" : "▸"}</td>
+												<td style={{ maxWidth: 340 }} title={r.task}>
+													<div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{label}</div>
+													<div className="muted" style={{ fontSize: 10.5, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+														{r.key !== "—" && r.key !== r.task ? `${r.key.slice(0, 12)}` : ""}
+														{r.runId && <> · <Link href={`/runs/${r.runId}`} onClick={(e) => e.stopPropagation()}>open run ›</Link></>}
+													</div>
+												</td>
+												<td className="muted" style={{ whiteSpace: "nowrap" }}>{new Date(r.when).toLocaleString()}</td>
+												<td className="num">{r.calls.length.toLocaleString()}</td>
+												<td className="num">{fmtTok(sum(r.calls, (c) => c.tokensIn))}</td>
+												<td className="num">{fmtTok(sum(r.calls, (c) => c.tokensOut))}</td>
+												<td className="num muted">{tot ? `${Math.round((cached / tot) * 100)}%` : "—"}</td>
+												<td className="num">{fmtCost(est || null)}</td>
+												<td className="num">{fmtCost(billed || null)}</td>
+												<td className="num">{fmtDur(Math.round(median(r.calls, (c) => c.durationMs)))}</td>
+												<td style={{ width: 120 }}><span className="track" style={{ display: "block", height: 8, borderRadius: 4, background: "var(--bg)", border: "1px solid var(--border)" }}><span style={{ display: "block", height: "100%", borderRadius: 4, background: "var(--accent)", width: `${(tot / maxTot) * 100}%` }} /></span></td>
+											</tr>
+											{open && (
+												<tr>
+													<td colSpan={11} style={{ background: "var(--bg)", padding: "6px 14px 12px" }}>
+														<table className="sbx-table" style={{ margin: 0 }}>
+															<thead>
+																<tr><th>Turn</th><th>Time</th><th>Status</th><th>Model</th><th>Provider</th><th>Usage (in → out)</th><th>Cached</th><th>Duration</th><th>Cost (est.)</th><th>Billed</th></tr>
+															</thead>
+															<tbody>
+																{[...r.calls]
+																	.sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime())
+																	.map((c, j) => (
+																		<tr key={j}>
+																			<td className="muted">{c.iteration != null ? `#${c.iteration}` : "—"}</td>
+																			<td className="muted" style={{ whiteSpace: "nowrap" }}>{new Date(c.at).toLocaleTimeString()}</td>
+																			<td><StatusPill status={c.status} /></td>
+																			<td style={{ fontSize: 11.5 }}>{c.model}{c.kind === "embedding" && <span className="sess-chip muted" style={{ marginLeft: 6, fontSize: 10 }}>emb</span>}</td>
+																			<td className="muted">{host(c.baseUrl) || c.provider}</td>
+																			<td className="num">{fmtTok(c.tokensIn)} → {fmtTok(c.tokensOut)}{(c.reasoningTokens ?? 0) > 0 && <span className="muted"> ·{fmtTok(c.reasoningTokens!)}↯</span>}</td>
+																			<td className="muted">{c.cacheRead > 0 ? fmtTok(c.cacheRead) : "—"}</td>
+																			<td className="muted">{fmtDur(c.durationMs)}</td>
+																			<td className="num">{fmtCost(c.costUsd)}</td>
+																			<td className="num muted">{fmtCost(c.billedCostUsd ?? null)}</td>
+																		</tr>
+																	))}
+															</tbody>
+														</table>
+													</td>
+												</tr>
+											)}
+										</>
+									);
+								});
+							})()}
+						</tbody>
+					</table>
+					{!taskRows.length && <Empty>No data in this range.</Empty>}
+				</div>
 			)}
 			{tab === "provider" && <AggTable rows={providerRows} nameLabel="Provider" />}
 

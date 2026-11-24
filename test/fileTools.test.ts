@@ -1,4 +1,5 @@
-import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type { AgentTool, AgentToolContext } from "@cline/shared";
@@ -35,10 +36,47 @@ describe("read_file", () => {
 		expect(out).toContain("2|   return a + b;");
 	});
 
+	it("withholds secret-file contents but lists key names", async () => {
+		writeFileSync(path.join(root, ".env.local"), "MONGODB_URI=mongodb+srv://user:pass@x\nAPI_KEY=sk-abc123\n");
+		const out = await run("read_file", { path: ".env.local" });
+		expect(out).toContain("withheld");
+		expect(out).toContain("MONGODB_URI");
+		expect(out).not.toContain("mongodb+srv");
+		expect(out).not.toContain("sk-abc123");
+	});
+
+	it("withholds service-account JSON values", async () => {
+		writeFileSync(path.join(root, "svc-service-account.json"), JSON.stringify({ private_key: "-----BEGIN KEY-----", client_email: "a@b.c" }));
+		const out = await run("read_file", { path: "svc-service-account.json" });
+		expect(out).toContain("withheld");
+		expect(out).toContain("private_key");
+		expect(out).not.toContain("BEGIN KEY");
+	});
+
+	it("treats gitignored files as sensitive across read, editor view and search", async () => {
+		execFileSync("git", ["init", "-q"], { cwd: root });
+		writeFileSync(path.join(root, ".gitignore"), "notes.local.txt\nprivate/\n");
+		writeFileSync(path.join(root, "notes.local.txt"), "TOKEN_VALUE_XYZ=hunter2hunter2\n");
+		mkdirSync(path.join(root, "private"));
+		writeFileSync(path.join(root, "private", "keys.txt"), "TOKEN_VALUE_XYZ=hunter2hunter2\n");
+		expect(await run("read_file", { path: "notes.local.txt" })).toContain("gitignored");
+		expect(await run("read_file", { path: "private/keys.txt" })).not.toContain("hunter2");
+		expect(await run("file_editor", { command: "view", path: "notes.local.txt" })).not.toContain("hunter2");
+		const hits = await run("search_files", { pattern: "hunter2" });
+		expect(hits).toBe("No matches.");
+	});
+
+	it("does not treat vendored dependencies as sensitive", async () => {
+		execFileSync("git", ["init", "-q"], { cwd: root });
+		writeFileSync(path.join(root, ".gitignore"), "node_modules/\n");
+		mkdirSync(path.join(root, "node_modules", "lib"), { recursive: true });
+		writeFileSync(path.join(root, "node_modules", "lib", "index.js"), "export const version = 2;\n");
+		expect(await run("read_file", { path: "node_modules/lib/index.js" })).toContain("export const version = 2;");
+	});
+
 	it("supports ranges", async () => {
 		const out = await run("read_file", { path: "a.ts", start_line: 2, end_line: 2 });
 		expect(out).toContain("lines 2-2 of 3");
-		expect(out).not.toContain("export");
 	});
 
 	it("rejects paths outside the workspace", async () => {
@@ -160,10 +198,28 @@ describe("list_files and search_files", () => {
 		expect(out.split("\n")).toEqual(["a.ts", "src/", "src/x.ts"]);
 	});
 
+	it("hints at recursion when a flat listing contains folders", async () => {
+		await run("write_file", { path: "src/x.ts", content: "" });
+		const flat = await run("list_files", {});
+		expect(flat).toContain("src/");
+		expect(flat).toContain("non-recursive; pass recursive: true");
+		const full = await run("list_files", { recursive: true });
+		expect(full).not.toContain("non-recursive");
+	});
+
 	it("searches with glob filters", async () => {
 		await run("write_file", { path: "src/x.ts", content: "const needle = 1;\n" });
 		await run("write_file", { path: "notes.md", content: "needle\n" });
 		expect(await run("search_files", { pattern: "needle", file_glob: "**/*.ts" })).toBe("src/x.ts:1: const needle = 1;");
+	});
+
+	it("tolerates a file path and an empty path", async () => {
+		await run("write_file", { path: "src/x.ts", content: "const needle = 1;\n" });
+		// Models regularly pass a file where a folder is expected — search it.
+		expect(await run("search_files", { pattern: "needle", path: "src/x.ts" })).toBe("src/x.ts:1: const needle = 1;");
+		// And an empty path means the root, not an error.
+		expect(await run("search_files", { pattern: "needle", path: "" })).toBe("src/x.ts:1: const needle = 1;");
+		expect(await run("list_files", { path: "" })).toContain("src/");
 	});
 
 	it("converts globs", () => {

@@ -1,20 +1,12 @@
 import { Agent } from "@cline/agents";
 import { DEFAULT_MAX_IMAGE_DECODED_BYTES, SUPPORTED_IMAGE_MEDIA_TYPES } from "@cline/shared";
-import type { AgentImagePart, AgentMessage, AgentRuntimeEvent, AgentTool, AgentToolResultPart } from "@cline/shared";
-import { createFileTools, type FileChangeKind, WRITE_TOOL_NAMES } from "../tools/fileTools";
-import { createFetchTools } from "../tools/fetchTools";
-import { createDispatchTool, DEFERRED_TOOLS } from "../tools/dispatchTools";
-import { createLoadSkillTool, parseSkill, skillsIndex } from "./skills";
-import { createExploreTool } from "../tools/exploreTools";
-import { buildSystemPrompt } from "./systemPrompt";
-import { createPrepareTurn, taskContextBudget } from "./compaction";
-import { createRecallTool } from "./recall";
+import type { AgentImagePart, AgentMessage, AgentRuntimeEvent, AgentToolResultPart } from "@cline/shared";
+import type { FileChangeKind } from "../tools/fileTools";
+import { contextBudget, createPrepareTurn, sanitizeMessages } from "./compaction";
+import { classifyRunError, type RunErrorKind } from "./errorKind";
 import { countMessageTokens } from "./tokenize";
-import { ToolPipeline } from "./pipeline";
-import { createRepeatGuard } from "./guards/repeatGuard";
-import { createPermissionGuard } from "./guards/permissionGuard";
-import { createSavePlanGuard, createWriteModeGuard } from "./guards/modeGuard";
-import { createApprovalGuard } from "./guards/approvalGuard";
+import { assembleToolSet } from "./toolSet";
+import type { AgentEngine } from "./engine";
 import { isConversationalTask } from "./taskGuard";
 import type { ApprovalsProvider, EventsProvider, FilesProvider, MemoryProvider, RecallProvider, ResumeProvider, ToolsProvider, TranscriptsProvider } from "./seams";
 
@@ -27,6 +19,8 @@ export interface ProviderSettings {
 	profile?: string;
 	contextWindow?: number;
 	maxTokens?: number;
+	/** In-flight tool ceiling for parallel batches (default 6). */
+	maxParallelTools?: number;
 }
 
 /** What a finished run hands to the next task: summary + the files it touched. */
@@ -53,8 +47,8 @@ export type RunViewEvent =
 	| { type: "run-started"; task: string }
 	| { type: "assistant-text"; iteration: number; text: string }
 	| { type: "reasoning"; iteration: number; text: string; redacted?: boolean }
-	| { type: "tool-started"; id: string; name: string; input: unknown }
-	| { type: "tool-finished"; id: string; name?: string; ok: boolean; output: string; durationMs: number }
+	| { type: "tool-started"; id: string; name: string; input: unknown; iteration?: number }
+	| { type: "tool-finished"; id: string; name?: string; ok: boolean; output: string; durationMs: number; iteration?: number }
 	| { type: "file-changed"; path: string; kind: FileChangeKind; added?: number; removed?: number; diff?: string }
 	| { type: "assistant-delta"; text: string }
 	| { type: "reasoning-delta"; text: string }
@@ -62,6 +56,8 @@ export type RunViewEvent =
 	| { type: "info"; text: string; key?: string; meta?: Record<string, unknown> }
 	| { type: "check"; command: string; ok: boolean; durationMs: number; output: string }
 	| { type: "plan-ready"; path: string }
+	| { type: "task-board"; tasks: Array<{ id: string; title: string; status: string; steps: Array<{ id: string; text: string; status: string }> }> }
+	| { type: "task-progress"; objective: string; completed: string[]; inProgress: string[]; next: string[]; blockers: string[] }
 	| { type: "permission-request"; id: string; tool: string; path: string; command?: string; input?: unknown; diff?: string }
 	| { type: "permission-response"; id: string; decision: "allow" | "always" | "deny" | "alwaysTool" | "alwaysRule" | "stopped" | "timeout" }
 	| { type: "loop-detected"; tool: string; count: number }
@@ -85,7 +81,9 @@ export type RunViewEvent =
 			contextBudget?: number;
 		}
 	| { type: "run-finished"; status: string; text: string; iterations: number }
-	| { type: "run-failed"; error: string }
+	| { type: "run-failed"; error: string; errorKind?: RunErrorKind; retryable?: boolean }
+	/** The step cap was reached; the agent is kept so the user can continue or stop. */
+	| { type: "run-paused"; iterations: number; limit: number; text: string }
 	// Multi-agent orchestration events (emitted by the executor, not the runner).
 	| { type: "fanout"; slices: { index: number; title: string; owns: string[] }[] }
 	| { type: "fanin"; results: { index: number; title: string; status: "merged" | "resolved" | "failed"; detail?: string }[] }
@@ -102,10 +100,17 @@ export interface RunnerHost {
 	planDir?: string;
 	/** Environment descriptor for the system prompt, e.g. "the user's VS Code workspace". */
 	environment?: string;
+	/** Local IDE host: enables the IDE tool policy (parallel reads in ask/plan, concurrency gate, update_progress). Off for the cloud worker. */
+	ideTools?: boolean;
 	/** Diagnostic sink; optional outside the extension. */
 	log?: (tag: string, message: string) => void;
 	/** Tool provider seam: the agent's full tool set. Default: local file + fetch tools. */
 	tools?: ToolsProvider;
+	/** web_search provider config for the default fetch tools (host supplies
+	 *  userConfig locally, user settings on the worker). */
+	webSearch?: import("../tools/fetchTools").WebSearchConfig;
+	/** Known secret values, scrubbed from every tool result before the model sees it. */
+	secretValues?: () => Iterable<string>;
 	/** Approval seam: rule check + interactive confirm for writes. */
 	approvals?: ApprovalsProvider;
 	/** Memory seam: prompt context + durable fact persistence. */
@@ -126,10 +131,10 @@ const HANDOFF_FRACTION = 0.4;
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const MAX_DIGESTS = 3;
 /** Modes where a run that ends with zero tool calls gets one "proceed" nudge. */
-const WRITE_MODES: ReadonlySet<AgentMode> = new Set(["code", "smart", "bypass"]);
+export const WRITE_MODES: ReadonlySet<AgentMode> = new Set(["code", "smart", "bypass"]);
 
 /** Supported, size-capped attachments → image parts on the task's user message. */
-function imageAttachmentParts(attachments: readonly RunnerAttachment[] | undefined): AgentImagePart[] {
+export function imageAttachmentParts(attachments: readonly RunnerAttachment[] | undefined): AgentImagePart[] {
 	const parts: AgentImagePart[] = [];
 	for (const a of attachments ?? []) {
 		if (!a.data?.byteLength || !(SUPPORTED_IMAGE_MEDIA_TYPES as readonly string[]).includes(a.mediaType)) continue;
@@ -140,26 +145,14 @@ function imageAttachmentParts(attachments: readonly RunnerAttachment[] | undefin
 }
 
 /** Image parts are bulky base64 — persisted transcripts/events keep a text marker instead. */
-function omitImageParts(messages: readonly AgentMessage[]): AgentMessage[] {
+export function omitImageParts(messages: readonly AgentMessage[]): AgentMessage[] {
 	return messages.map((m) => ({
 		...m,
 		content: m.content.map((p) => (p.type === "image" ? { type: "text" as const, text: `[image attachment omitted (${p.mediaType ?? "image"})]` } : p)),
 	}));
 }
 
-const READ_ONLY_HIDDEN = new Set([
-	"write_file",
-	"edit_file",
-	"append_file",
-	"insert_lines",
-	"file_editor",
-	"run_command",
-	"browser_use",
-	"switch_environment",
-	"rename_symbol",
-]);
-
-export class AgentRunner {
+export class AgentRunner implements AgentEngine {
 	private agent: Agent | undefined;
 	private running = false;
 	/** Effective context ceiling for the current run's task profile. */
@@ -173,11 +166,17 @@ export class AgentRunner {
 	/** Restore-reconciliation note seeded into a freshly created agent. */
 	private stateNote: string | undefined;
 	private readonly toolStarts = new Map<string, number>();
+	/** Set when a run hit the step cap; the live agent is kept for continue/stop. */
+	private paused: { limit: number; iterations: number; text: string } | undefined;
 
 	constructor(private readonly host: RunnerHost) {}
 
 	get isRunning(): boolean {
 		return this.running;
+	}
+
+	get isPaused(): boolean {
+		return this.paused !== undefined;
 	}
 
 	get runDigests(): readonly RunDigest[] {
@@ -201,6 +200,7 @@ export class AgentRunner {
 	reset(): void {
 		this.agent?.abort("reset");
 		this.agent = undefined;
+		this.paused = undefined;
 		this.digests = [];
 		this.stateNote = undefined;
 	}
@@ -210,6 +210,15 @@ export class AgentRunner {
 	stop(): void {
 		this.stopRequested = true;
 		this.agent?.abort("Stopped by user");
+		if (this.paused) this.endPaused();
+	}
+
+	/** Stop a paused run: nothing is in flight, so finalize it as a deliberate stop. */
+	private endPaused(): void {
+		const paused = this.paused;
+		this.paused = undefined;
+		this.agent = undefined;
+		this.host.emit({ type: "run-finished", status: "stopped", text: paused?.text || "Stopped by user", iterations: paused?.iterations ?? 0 });
 	}
 
 	/** Manual "compact now": the next model turn runs the hard-tier compaction
@@ -225,7 +234,7 @@ export class AgentRunner {
 	/** Drop the live agent; run digests carry forward so the next task seeds a
 	 *  fresh agent (soft clear — same as the automatic handoff, on demand). */
 	clearContext(): boolean {
-		if (this.running || !this.agent) return false;
+		if (this.running || !this.agent || this.paused) return false;
 		this.agent = undefined;
 		this.host.emit({ type: "info", text: "Context cleared — the next task starts fresh, carrying run summaries forward." });
 		return true;
@@ -259,11 +268,14 @@ export class AgentRunner {
 		];
 	}
 
-	async run(task: string, settings: ProviderSettings, attachments?: RunnerAttachment[]): Promise<void> {
+	async run(task: string, settings: ProviderSettings, attachments?: RunnerAttachment[], displayTask?: string): Promise<void> {
 		if (this.running) throw new Error("A run is already in progress.");
 		this.running = true;
-		this.contextBudget = taskContextBudget(task, this.host.currentMode());
-		this.host.emit({ type: "run-started", task });
+		this.paused = undefined;
+		this.contextBudget = contextBudget(settings.contextWindow);
+		// `task` may carry injected context/expanded mentions — persist and show
+		// the user's original text instead, so nothing nests on replay/summary.
+		this.host.emit({ type: "run-started", task: displayTask ?? task });
 		try {
 			// A stop that landed before run() (e.g. during worker sandbox setup) still halts here.
 			if (this.stopRequested) {
@@ -287,8 +299,15 @@ export class AgentRunner {
 				// Resume seam: a prior run's durable log beats digest seeds.
 				const resumed = await this.host.resume?.resumeLog?.();
 				if (resumed?.length) {
-					initial = resumed;
-					this.host.events?.record({ type: "resumed-from-log", messages: resumed.length });
+					// A death mid-tool-call leaves a dangling tool-call in the
+					// durable log — repair pairs before it poisons every request.
+					const clean = sanitizeMessages(resumed);
+					initial = clean.messages;
+					this.host.events?.record({
+						type: "resumed-from-log",
+						messages: resumed.length,
+						repaired: clean.repaired || undefined,
+					});
 				}
 				if (this.stateNote) {
 					// Attach to whichever seed won (digests or resume log) — the
@@ -320,15 +339,84 @@ export class AgentRunner {
 						createdAt: Date.now(),
 					}
 				: task;
-			let result = await agent.run(input);
-			// A "completed" write-mode run with zero tool calls is almost always the
-			// model answering in prose instead of working — give it one nudge.
+			const result = await agent.run(input);
+			await this.settle(agent, result, settings.maxIterations, { task, from: beforeCount });
+		} catch (error) {
+			this.emitFailed(error);
+		} finally {
+			this.stopRequested = false;
+			this.running = false;
+		}
+	}
+
+	/**
+	 * Continue a paused run on the same agent: its context is intact and the step
+	 * budget starts over. With no live agent (a cloud worker restarted between
+	 * jobs), the agent is rebuilt from the run's durable transcript first.
+	 */
+	async resume(settings?: ProviderSettings): Promise<void> {
+		if (this.running) return;
+		let agent = this.agent;
+		if (!agent) {
+			const initial = settings ? await this.host.resume?.resumeLog?.() : undefined;
+			if (!settings || !initial?.length) {
+				this.emitFailed("Nothing to continue — start a new task.");
+				return;
+			}
+			agent = await this.createAgent(settings, "", sanitizeMessages(initial).messages);
+			this.agent = agent;
+		}
+		const limit = this.paused?.limit ?? settings?.maxIterations ?? 0;
+		this.running = true;
+		this.paused = undefined;
+		this.host.emit({ type: "info", text: `Continuing — another ${limit} steps` });
+		try {
+			await this.settle(agent, await agent.continue(), limit);
+		} catch (error) {
+			this.emitFailed(error);
+		} finally {
+			this.stopRequested = false;
+			this.running = false;
+		}
+	}
+
+	/** Terminal failure event with UI-facing classification (friendly card + Retry). */
+	private emitFailed(error: unknown): void {
+		const message = error instanceof Error ? error.message : String(error);
+		const { errorKind, retryable } = classifyRunError(message);
+		this.host.emit({ type: "run-failed", error: message, errorKind, retryable });
+	}
+
+	/** Shared run tail: the zero-tool nudge, transcript save, and the terminal or paused event. */
+	private async settle(
+		agent: Agent,
+		first: Awaited<ReturnType<Agent["run"]>>,
+		limit: number,
+		nudge?: { task: string; from: number },
+	): Promise<void> {
+		let result = first;
+		// A transcript that reached the model with a dangling tool-call
+		// (interrupted run, replayed log) fails the whole run via
+		// AI_MissingToolResultsError. prepareTurn already repairs projections;
+		// give the agent one continue before declaring the run dead.
+		if (result.status === "failed" && /tool results? (are|is) missing for tool calls?/i.test(result.error?.message ?? "")) {
+			this.host.emit({
+				type: "info",
+				text: "A tool call was missing its result (interrupted run) — transcript repaired, retrying.",
+				meta: { kind: "transcript_repaired" },
+			});
+			result = await agent
+				.continue("One earlier tool call was interrupted before its result was recorded; it has been marked as interrupted. Continue the task.")
+				.catch(() => result);
+		}
+		// A "completed" write-mode run with zero tool calls is almost always the
+		// model answering in prose instead of working — give it one nudge.
+		// Conversational tasks ("hi", "thanks") keep the agent's own reply.
+		if (nudge && result.status === "completed" && WRITE_MODES.has(this.host.currentMode()) && !isConversationalTask(nudge.task)) {
 			const toolCalls = result.messages
-				.slice(beforeCount)
+				.slice(nudge.from)
 				.reduce((n, m) => n + m.content.filter((p) => p.type === "tool-call").length, 0);
-			// Conversational tasks ("hi", "thanks") keep the agent's own reply —
-			// nudging tool use would turn a greeting into invented work.
-			if (result.status === "completed" && toolCalls === 0 && WRITE_MODES.has(this.host.currentMode()) && !isConversationalTask(task)) {
+			if (toolCalls === 0) {
 				this.host.emit({ type: "info", text: "Finished without using any tools — nudging the agent to proceed." });
 				result = await agent.continue(
 					"You ended the run without calling any tools or changing files. " +
@@ -336,115 +424,32 @@ export class AgentRunner {
 						"If you are blocked on something only the user can provide, state exactly what is missing.",
 				);
 			}
-			this.host.transcripts?.save(omitImageParts(agent.snapshot().messages));
-			if (result.status === "failed") {
-				this.host.emit({ type: "run-failed", error: result.error?.message ?? "Run failed" });
-			} else {
-				this.host.emit({
-					type: "run-finished",
-					status: result.status,
-					text: result.outputText,
-					iterations: result.iterations,
-				});
-			}
-		} catch (error) {
-			this.host.emit({ type: "run-failed", error: error instanceof Error ? error.message : String(error) });
-		} finally {
-			this.stopRequested = false;
-			this.running = false;
+		}
+		this.host.transcripts?.save(omitImageParts(agent.snapshot().messages));
+		if (result.status === "failed" && /exceeded maxIterations/.test(result.error?.message ?? "") && result.iterations >= limit) {
+			this.paused = { limit, iterations: result.iterations, text: result.outputText };
+			this.host.emit({ type: "run-paused", iterations: result.iterations, limit, text: result.outputText });
+		} else if (result.status === "failed") {
+			this.emitFailed(result.error?.message ?? "Run failed");
+		} else {
+			this.host.emit({
+				type: "run-finished",
+				status: result.status === "aborted" ? "stopped" : result.status,
+				text: result.outputText,
+				iterations: result.iterations,
+			});
 		}
 	}
 
 	private async createAgent(settings: ProviderSettings, task: string, initialMessages?: AgentMessage[]): Promise<Agent> {
-		const pipeline = new ToolPipeline();
-		pipeline.pre(
-			createRepeatGuard({
-				onLoopDetected: (tool, count) => this.host.emit({ type: "loop-detected", tool, count }),
-				onStop: () => this.stop(),
-			}),
-		);
-		pipeline.pre(createSavePlanGuard(this.host.currentMode));
-		if (this.host.approvals?.check) pipeline.pre(createPermissionGuard(this.host.approvals.check));
-		pipeline.pre(
-			createWriteModeGuard({
-				currentMode: this.host.currentMode,
-				writeTools: WRITE_TOOL_NAMES,
-				onModeBlocked: (mode) => this.host.emit({ type: "mode-blocked", mode }),
-			}),
-		);
-		pipeline.pre(createApprovalGuard(this.host.approvals));
-		const tools = this.host.tools
-			? await this.host.tools()
-			: [
-					...createFileTools({
-						root: this.host.workspaceRoot,
-						isDirty: this.host.isDirty,
-						onFileChanged: (abs, kind, stats) =>
-							this.host.emit({ type: "file-changed", path: this.host.relativePath(abs), kind, ...stats }),
-						onBeforeWrite: this.host.files?.onBeforeWrite,
-						execCommand: this.host.files?.execCommand,
-						planDir: this.host.planDir ? () => this.host.planDir! : undefined,
-						onMemoryFact: this.host.memory?.onFact,
-					}),
-					...createFetchTools(),
-				];
-		const mode = this.host.currentMode();
-		// Per-tool executionMode markers are honored only in write modes; ask/plan
-		// runs strip them to sequential so every call is an ordered boundary.
-		const allowParallel = mode !== "ask" && mode !== "plan";
-		// Read-only modes don't ship the write/env tool schemas — the hook would
-		// deny them anyway, and each schema costs tokens on every request.
-		const visible =
-			mode === "ask" || mode === "plan"
-				? tools.filter((t) => !READ_ONLY_HIDDEN.has(t.name) && (mode === "plan" || t.name !== "save_plan"))
-				: tools;
-		const execTools = (list: AgentTool<any, string>[]) =>
-			allowParallel ? list : list.map((t) => (t.executionMode === "parallel" ? { ...t, executionMode: "sequential" as const } : t));
-		// Deferred tools (browser_use, switch_environment, fetch_url) stay out of
-		// the per-request schemas; the model reaches them through use_tool.
-		const deferred = visible.filter((t) => DEFERRED_TOOLS.has(t.name));
-		// Repo skills: index into the prompt, bodies behind load_skill.
-		const skills = (
-			((await this.host.files?.listSkillFiles?.().catch(() => [])) ?? []) as { path: string; content: string }[]
-		).map((f) => parseSkill(f.path, f.content));
-		if (skills.length) deferred.push(createLoadSkillTool(skills));
-		const loaded = visible.filter((t) => !DEFERRED_TOOLS.has(t.name));
-		// aroundTool listeners wrap the tool body at registration time — the
-		// agent loop exposes before/after hooks but no around-execution hook.
-		const wrapAround = (list: AgentTool<any, string>[]): AgentTool<any, string>[] =>
-			list.map((t) =>
-				t.execute
-					? {
-							...t,
-							execute: (input: any, ctx: Parameters<NonNullable<typeof t.execute>>[1]) =>
-								pipeline.runAround({ name: t.name, input }, async () => t.execute!(input, ctx)),
-						}
-					: t,
-			);
+		const { pipeline, tools, systemPrompt } = await assembleToolSet(this.host, settings, task, () => this.stop());
 		return new Agent({
 			providerId: settings.providerId,
 			modelId: settings.modelId,
 			apiKey: settings.apiKey,
 			baseUrl: settings.baseUrl || undefined,
-			systemPrompt: buildSystemPrompt(
-				this.host.workspaceRoot,
-				mode,
-				(await this.host.memory?.context?.(task, settings)) ?? "",
-				this.host.environment,
-				skillsIndex(skills),
-			),
-			tools: wrapAround([
-				...execTools(loaded),
-				...(deferred.length ? [createDispatchTool(deferred)] : []),
-				createExploreTool({
-					settings,
-					tools: visible,
-					onEvent: (text) => this.host.emit({ type: "info", text }),
-				}),
-				...(this.host.recall?.enabled === false
-					? []
-					: execTools([createRecallTool({ priorTranscripts: this.host.recall?.transcripts, scorer: this.host.recall?.scorer })])),
-			]),
+			systemPrompt,
+			tools,
 			maxIterations: settings.maxIterations,
 			...(settings.maxTokens ? { modelOptions: { maxTokens: settings.maxTokens } } : {}),
 			toolExecution: "sequential",
@@ -516,6 +521,7 @@ export class AgentRunner {
 					id: event.toolCall.toolCallId,
 					name: event.toolCall.toolName,
 					input: event.toolCall.input,
+					iteration: event.iteration,
 				});
 				break;
 			case "tool-finished": {
@@ -533,6 +539,7 @@ export class AgentRunner {
 				this.toolStarts.delete(event.toolCall.toolCallId);
 				this.host.emit({
 					type: "tool-finished",
+					iteration: event.iteration,
 					id: event.toolCall.toolCallId,
 					name: event.toolCall.toolName,
 					ok: !result?.isError,
@@ -576,7 +583,7 @@ const SUMMARY_MAX_TOKENS = 1200;
  * condenses the oldest turns. Best-effort — callers fall back to mechanical
  * stubbing when the endpoint rejects or the shape differs.
  */
-async function summarizeMessages(settings: ProviderSettings, messages: readonly AgentMessage[]): Promise<string | undefined> {
+export async function summarizeMessages(settings: ProviderSettings, messages: readonly AgentMessage[]): Promise<string | undefined> {
 	const transcript = messages
 		.map((m) => `${m.role}: ${JSON.stringify(m.content).slice(0, 4000)}`)
 		.join("\n")
@@ -611,7 +618,7 @@ async function summarizeMessages(settings: ProviderSettings, messages: readonly 
 	return typeof text === "string" && text.trim() ? text.trim() : undefined;
 }
 
-function stringify(value: unknown): string {
+export function stringify(value: unknown): string {
 	if (value === undefined || value === null) return "";
 	const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
 	return text.length > 4000 ? `${text.slice(0, 4000)}\n... (truncated)` : text;

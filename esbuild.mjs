@@ -60,7 +60,7 @@ const ctx = await esbuild.context({
 	platform: "node",
 	target: "node22",
 	outfile: "dist/extension.js",
-	external: ["vscode", "better-sqlite3"],
+	external: ["vscode", "better-sqlite3", "playwright-core"],
 	...shared,
 });
 

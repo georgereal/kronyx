@@ -99,6 +99,10 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
 
 const emptyProfile = (): Profile => ({ name: "", providerId: "", baseUrl: "", modelId: "", enabled: true });
 
+/** Cline SDK provider ids — same preset list as the IDE settings page. Free
+ *  text stays allowed (datalist), but a typo'd id fails at run start. */
+const PROVIDER_IDS = ["vercel-ai-gateway", "openrouter", "openai", "anthropic", "azure", "ollama", "openai-compatible"];
+
 const host = (baseUrl: string) => {
 	try {
 		return new URL(baseUrl).host;
@@ -193,6 +197,7 @@ export default function SettingsPage() {
 	const [editing, setEditing] = useState<{ index: number | null; draft: Profile } | null>(null);
 	const [newSecretOpen, setNewSecretOpen] = useState(false);
 	const [newSecretKey, setNewSecretKey] = useState("");
+	const [connTest, setConnTest] = useState<Record<string, { busy?: boolean; ok?: boolean; msg: string }>>({});
 	const [msg, setMsg] = useState("");
 
 	useEffect(() => {
@@ -271,6 +276,27 @@ export default function SettingsPage() {
 	const installUrl = `https://github.com/apps/${appSlug}/installations/new`;
 
 	const setProfile = (i: number, patch: Partial<Profile>) => setProfiles((ps) => ps.map((p, j) => (j === i ? { ...p, ...patch } : p)));
+
+	const testConnection = async (p: Profile) => {
+		if (!user) return;
+		setConnTest((s) => ({ ...s, [p.name]: { busy: true, msg: "Testing…" } }));
+		try {
+			const res = await apiFetch("/api/models/test", user, {
+				method: "POST",
+				body: JSON.stringify({ name: p.name, baseUrl: p.baseUrl, apiKey: secrets[`profile.apiKey.${p.name}`] || undefined }),
+			});
+			const b = (await res.json().catch(() => ({}))) as { ok?: boolean; models?: number; error?: string; ms?: number };
+			setConnTest((s) => ({
+				...s,
+				[p.name]:
+					res.ok && b.ok
+						? { ok: true, msg: `Connected — ${b.models ?? 0} models · ${b.ms ?? 0}ms` }
+						: { ok: false, msg: `Failed — ${b.error ?? `HTTP ${res.status}`}${b.ms != null ? ` · ${b.ms}ms` : ""}` },
+			}));
+		} catch (e) {
+			setConnTest((s) => ({ ...s, [p.name]: { ok: false, msg: `Failed — ${e instanceof Error ? e.message : e}` } }));
+		}
+	};
 
 	const clearSecret = (key: string) => {
 		setDeleted((d) => new Set(d).add(key));
@@ -368,6 +394,11 @@ export default function SettingsPage() {
 
 	const llmSection = (
 		<>
+			<datalist id="kronyx-provider-ids">
+				{PROVIDER_IDS.map((id) => (
+					<option key={id} value={id} />
+				))}
+			</datalist>
 			<div className="settings-head">
 				<div>
 					<div className="chart-title">LLM Providers</div>
@@ -535,13 +566,23 @@ export default function SettingsPage() {
 								{cardTab === "config" && (
 									<div>
 										<div className="profile-grid">
-											<Field label="Provider ID"><input className="input" value={p.providerId} onChange={(e) => setProfile(i, { providerId: e.target.value })} placeholder="vercel" /></Field>
+											<Field label="Provider ID"><input className="input" list="kronyx-provider-ids" value={p.providerId} onChange={(e) => setProfile(i, { providerId: e.target.value })} placeholder="openrouter" /></Field>
 											<Field label="Name"><input className="input" value={p.name} onChange={(e) => setProfile(i, { name: e.target.value })} placeholder="openai" /></Field>
 										</div>
 										<Field label="Base URL"><input className="input mono" value={p.baseUrl} onChange={(e) => setProfile(i, { baseUrl: e.target.value })} placeholder="https://ai-gateway.vercel.sh/v1" /></Field>
 										<Field label="API key" hint={syncedKeys.has(`profile.apiKey.${p.name}`) ? "synced — blank to keep" : "per-profile key"}>
 											{secretInput(`profile.apiKey.${p.name}`)}
 										</Field>
+										<div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 4 }}>
+											<button className="sbx-btn" disabled={!p.baseUrl || connTest[p.name]?.busy} onClick={() => void testConnection(p)}>
+												{connTest[p.name]?.busy ? "Testing…" : "Test connection"}
+											</button>
+											{connTest[p.name] && !connTest[p.name].busy && (
+												<span className="muted" style={{ fontSize: 11, color: connTest[p.name].ok === false ? "var(--err, #f48771)" : undefined }}>
+													{connTest[p.name].msg}
+												</span>
+											)}
+										</div>
 									</div>
 								)}
 								{cardTab === "usage" && (
@@ -906,7 +947,7 @@ export default function SettingsPage() {
 				<Modal title={editing.index === null ? "Add provider" : `Edit ${profiles[editing.index]?.name ?? "provider"}`} onClose={() => setEditing(null)}>
 					<Field label="Name"><input className="input" autoFocus value={editing.draft.name} onChange={(e) => setEditing({ ...editing, draft: { ...editing.draft, name: e.target.value } })} placeholder="openai" /></Field>
 					<div className="profile-grid">
-						<Field label="Provider ID"><input className="input" value={editing.draft.providerId} onChange={(e) => setEditing({ ...editing, draft: { ...editing.draft, providerId: e.target.value } })} placeholder="vercel" /></Field>
+						<Field label="Provider ID"><input className="input" list="kronyx-provider-ids" value={editing.draft.providerId} onChange={(e) => setEditing({ ...editing, draft: { ...editing.draft, providerId: e.target.value } })} placeholder="openrouter" /></Field>
 						<Field label="Default model"><input className="input mono" value={editing.draft.modelId} onChange={(e) => setEditing({ ...editing, draft: { ...editing.draft, modelId: e.target.value } })} placeholder="anthropic/claude-sonnet-4.6" /></Field>
 					</div>
 					<Field label="Base URL"><input className="input mono" value={editing.draft.baseUrl} onChange={(e) => setEditing({ ...editing, draft: { ...editing.draft, baseUrl: e.target.value } })} placeholder="https://ai-gateway.vercel.sh/v1" /></Field>

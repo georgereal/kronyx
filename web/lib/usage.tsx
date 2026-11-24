@@ -26,6 +26,7 @@ export interface UsageCall {
 	durationMs: number;
 	runId?: string;
 	session?: string;
+	task?: string;
 	uid?: string;
 }
 

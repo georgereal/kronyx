@@ -2,7 +2,9 @@ import { exec } from "node:child_process";
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { AgentRunner, type ProviderSettings } from "./agent/runner";
+import { AgentRunner, type ProviderSettings, type RunnerHost } from "./agent/runner";
+import type { AgentEngine, EngineKind } from "./agent/engine";
+import { OpenAIEngine } from "./agent/openaiEngine";
 
 export interface EvalCase {
 	name: string;
@@ -21,6 +23,11 @@ export interface EvalResult {
 	details: string;
 	iterations: number;
 	durationMs: number;
+	engine?: EngineKind;
+	inputTokens?: number;
+	cachedTokens?: number;
+	outputTokens?: number;
+	toolCalls?: number;
 }
 
 interface EvalSuiteFile {
@@ -38,45 +45,62 @@ export async function loadSuite(root: string): Promise<EvalCase[]> {
 	return Array.isArray(parsed) ? parsed : (parsed.cases ?? []);
 }
 
-/** Runs each eval case through a fresh AgentRunner (bypass mode, no approvals). */
+/**
+ * Runs each eval case through a fresh engine per engine kind (bypass mode, no
+ * approvals). Passing both kinds gives a like-for-like comparison on the same tasks.
+ */
 export async function runSuite(
 	root: string,
 	settings: ProviderSettings,
 	log: (line: string) => void,
+	engines: EngineKind[] = ["cline"],
 ): Promise<EvalResult[]> {
 	const cases = await loadSuite(root);
 	const results: EvalResult[] = [];
-	for (const evalCase of cases) {
-		log(`Eval "${evalCase.name}" started`);
-		const started = Date.now();
-		let status = "failed";
-		let iterations = 0;
-		const runner = new AgentRunner({
-			workspaceRoot: root,
-			relativePath: (abs) => path.relative(root, abs).split(path.sep).join("/"),
-			isDirty: () => false,
-			approvals: { confirm: async () => true },
-			currentMode: () => "bypass",
-			planDir: `${root}/.kronyx/plans`,
-			emit: (event) => {
-				if (event.type === "run-finished") {
-					status = event.status;
-					iterations = event.iterations;
-				}
-			},
-		});
-		await runner.run(evalCase.task, settings);
-		const details = await verify(root, evalCase);
-		results.push({
-			name: evalCase.name,
-			model: settings.modelId,
-			status,
-			passed: status === "completed" && details.length === 0,
-			details: details.join("; "),
-			iterations,
-			durationMs: Date.now() - started,
-		});
-		log(`Eval "${evalCase.name}" ${results[results.length - 1].passed ? "passed" : "failed"}`);
+	for (const engine of engines) {
+		for (const evalCase of cases) {
+			log(`Eval "${evalCase.name}" [${engine}] started`);
+			const started = Date.now();
+			const m = { status: "failed", iterations: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, toolCalls: 0 };
+			const host: RunnerHost = {
+				ideTools: true,
+				workspaceRoot: root,
+				relativePath: (abs) => path.relative(root, abs).split(path.sep).join("/"),
+				isDirty: () => false,
+				approvals: { confirm: async () => true },
+				currentMode: () => "bypass",
+				planDir: `${root}/.kronyx/plans`,
+				emit: (event) => {
+					if (event.type === "run-finished") {
+						m.status = event.status;
+						m.iterations = event.iterations;
+					} else if (event.type === "usage") {
+						m.inputTokens = event.inputTokens;
+						m.cachedTokens = event.cacheReadTokens;
+						m.outputTokens = event.outputTokens;
+					} else if (event.type === "tool-started") m.toolCalls++;
+				},
+			};
+			const agent: AgentEngine = engine === "openai" ? new OpenAIEngine(host) : new AgentRunner(host);
+			await agent.run(evalCase.task, settings);
+			const details = await verify(root, evalCase);
+			const passed = m.status === "completed" && details.length === 0;
+			results.push({
+				name: evalCase.name,
+				model: settings.modelId,
+				engine,
+				status: m.status,
+				passed,
+				details: details.join("; "),
+				iterations: m.iterations,
+				durationMs: Date.now() - started,
+				inputTokens: m.inputTokens,
+				cachedTokens: m.cachedTokens,
+				outputTokens: m.outputTokens,
+				toolCalls: m.toolCalls,
+			});
+			log(`Eval "${evalCase.name}" [${engine}] ${passed ? "passed" : "failed"}`);
+		}
 	}
 	return results;
 }

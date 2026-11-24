@@ -12,6 +12,12 @@ VS Code extension (root `src/`) + Next.js web dashboard (`web/`) + standalone ba
 
 Tool-call policy runs through `src/agent/pipeline.ts`: ordered `pre` waterfalls (allow/ask/deny; returning without `next()` short-circuits), `around` wrappers (execute-decorator), `post` result rewriting. Production order: `repeatGuard → savePlanGuard → permissionGuard → writeModeGuard → approvalGuard` (`src/agent/guards/`). New policy = a new registered guard, not a `beforeTool` edit. Hosts supply capability providers via `RunnerHost` seam fields instead of callback bags.
 
+Tool classification: MCP tools are writes unless the server sets `readOnlyHint` (`isReadOnlyMcpTool`); ask/plan hide them. `READ_ONLY_DENY` (`guards/modeGuard.ts`) holds side-effecting non-file tools refused in ask/plan. Every model-facing tool result passes `redactForModel` (`src/tools/redact.ts`) in `toolSet.ts`, using `RunnerHost.secretValues` plus credential shapes. Secret-looking and gitignored files (not vendored dirs or `.kronyx/`) return a metadata stub from read/search (`isSensitivePath` in `tools/workspace.ts`). Host-side web access (`fetch_url`, local browser) goes through `src/tools/network.ts`: private/loopback/link-local destinations are refused at connect time unless listed in `kronyx.network.allowHosts`.
+
+## Execution engines (IDE)
+
+Two engines implement `AgentEngine` (`src/agent/engine.ts`) over one `RunnerHost` and emit the same `RunViewEvent` stream: `AgentRunner` (Cline SDK, default) and `OpenAIEngine` (`src/agent/openaiEngine.ts`). The composer's engine chip picks per run; the choice persists per session (`tabState.engines`). Shared assembly (pipeline, mode-filtered tools, parallel policy, concurrency gate, system prompt, `update_progress`) lives in `src/agent/toolSet.ts` — change tool policy there, not in an engine. `OpenAIEngine` speaks Responses for `providerId: openai` (chained with `previous_response_id`, `store: true`, server compaction via `context_management`; a chain never carries a local projection) and stateless chat completions for every other OpenAI-compatible provider (local `prepareTurn` compaction). Wire conversion/SSE live in `src/agent/openaiWire.ts`. Its transcript mirror is the canonical history; a cold instance restores from the session's durable log. `kronyx.eval.engines` runs the eval suite on one or both engines. The cloud worker still uses `AgentRunner` only.
+
 ## Dev commands
 
 ```bash

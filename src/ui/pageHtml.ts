@@ -31,7 +31,7 @@ export function renderPage(webview: vscode.Webview, extensionUri: vscode.Uri): s
     <button type="button" id="attach" class="icon-btn" title="Add context"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg></button>
     <button type="button" id="mention" class="icon-btn context-btn" title="Attach a file"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-4 8"/></svg></button>
     <button type="button" id="mode" class="chip" title="Agent mode"><span class="chip-icon" id="mode-icon"></span><span class="chip-text" id="mode-label">Code</span><span class="caret">&#9662;</span></button>
-    <button type="button" id="workspace" class="chip workspace-chip" title="Workspace" hidden><span class="folder-glyph" aria-hidden="true"></span><span class="chip-text" id="workspace-label"></span></button>
+    <button type="button" id="engine" class="chip" title="Execution engine"><span class="chip-text" id="engine-label">Cline</span><span class="caret">&#9662;</span></button>
     <span class="spacer"></span>
     <span id="tokchip" class="tok" title="Tokens in / out" hidden></span>
     <button type="button" id="model" class="chip model-chip" title="Model"><span class="chip-text" id="model-label">Model</span><span class="caret">&#9662;</span></button>

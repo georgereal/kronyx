@@ -92,11 +92,10 @@ export function openCloudSessionPanel(context: vscode.ExtensionContext, deps: Se
 	surface.attach(panel.webview);
 	surface.setState({
 		mode: deps.modeRef.current,
-		modelId: deps.viewState.modelId,
+		modelId: currentSelection()?.modelId ?? "",
 		models: deps.viewState.models,
 		groups: deps.viewState.groups,
 		modelProfile: currentSelection()?.profile ?? "",
-		workspaceName: vscode.workspace.workspaceFolders?.[0]?.name ?? "",
 	});
 	deps.surfaces.add(surface);
 	if (task) void controller.start(task);
@@ -143,11 +142,10 @@ function wire(
 	surface.attach(panel.webview);
 	surface.setState({
 		mode: deps.modeRef.current,
-		modelId: deps.viewState.modelId,
+		modelId: currentSelection()?.modelId ?? "",
 		models: deps.viewState.models,
 		groups: deps.viewState.groups,
 		modelProfile: currentSelection()?.profile ?? "",
-		workspaceName: vscode.workspace.workspaceFolders?.[0]?.name ?? "",
 	});
 	deps.surfaces.add(surface);
 	panel.onDidDispose(() => {

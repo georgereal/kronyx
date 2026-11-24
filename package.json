@@ -67,6 +67,11 @@
 				"category": "Kronyx"
 			},
 			{
+				"command": "kronyx.manageMcp",
+				"title": "Manage MCP servers",
+				"category": "Kronyx"
+			},
+			{
 				"command": "kronyx.compactContext",
 				"title": "Compact context",
 				"category": "Kronyx"
@@ -177,6 +182,12 @@
 				"icon": "$(pulse)"
 			},
 			{
+				"command": "kronyx.harnessReport",
+				"title": "Show harness report",
+				"category": "Kronyx",
+				"icon": "$(checklist)"
+			},
+			{
 				"command": "kronyx.signIn",
 				"title": "Sign in (GitHub)",
 				"category": "Kronyx",
@@ -284,6 +295,11 @@
 					"group": "navigation@4"
 				},
 				{
+					"command": "kronyx.harnessReport",
+					"when": "view == kronyx.runViewRight",
+					"group": "navigation@5"
+				},
+				{
 					"command": "kronyx.signIn",
 					"when": "(view == kronyx.runViewRight) && !kronyx.signedIn",
 					"group": "navigation@5"
@@ -371,7 +387,7 @@
 				},
 				"kronyx.agent.maxIterations": {
 					"type": "number",
-					"default": 40,
+					"default": 300,
 					"minimum": 1,
 					"description": "Maximum agent steps per run."
 				},
@@ -470,6 +486,20 @@
 					"default": ".kronyx/evals.json",
 					"description": "Path to the eval suite file (JSON array or {cases: [...]}) relative to the workspace root."
 				},
+				"kronyx.eval.engines": {
+					"type": "array",
+					"items": {
+						"type": "string",
+						"enum": [
+							"cline",
+							"openai"
+						]
+					},
+					"default": [
+						"cline"
+					],
+					"description": "Execution engines to run the eval suite on. Include both to compare them on the same cases."
+				},
 				"kronyx.memory.embeddingModel": {
 					"type": "string",
 					"default": "",
@@ -527,6 +557,17 @@
 						]
 					},
 					"description": "Named provider+model presets selectable in the settings page."
+				},
+				"kronyx.harness.debug": {
+					"type": "boolean",
+					"default": false,
+					"description": "Show harness decision details in the chat — steering rule ids, per-turn token counts, recaps. For harness development; turn off for normal use."
+				},
+				"kronyx.network.allowHosts": {
+					"type": "array",
+					"items": { "type": "string" },
+					"default": [],
+					"description": "Hosts the fetch_url and browser tools may reach even though they are private or local — e.g. \"localhost:3000\" to verify a dev server, or \"*.corp.internal\". Private, loopback and link-local addresses are refused otherwise."
 				},
 				"kronyx.git.autoBranch": {
 					"type": "boolean",
@@ -604,6 +645,7 @@
 		"e2b": "^2.62.0",
 		"gpt-tokenizer": "4.1.0",
 		"highlight.js": "11.12.0",
+		"playwright-core": "^1.65.1",
 		"sql.js": "^1.15.2"
 	},
 	"keywords": [

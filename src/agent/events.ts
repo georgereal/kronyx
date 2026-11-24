@@ -23,8 +23,9 @@ export type KronyxEvent =
 	| { type: "compaction"; stats?: unknown }
 	/** Sandbox was recreated mid-run; uncommitted work was lost. */
 	| { type: "sandbox-recreated"; reason?: string }
-	/** Resume marker: the agent was seeded from a prior run's event log. */
-	| { type: "resumed-from-log"; messages: number };
+	/** Resume marker: the agent was seeded from a prior run's event log.
+	 *  `repaired` counts tool-call/result pairs fixed by sanitizeMessages. */
+	| { type: "resumed-from-log"; messages: number; repaired?: number };
 
 /**
  * Project the model-visible message history out of the durable record.

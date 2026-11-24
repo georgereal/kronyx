@@ -92,6 +92,10 @@ export default function SessionView() {
 	}, [session?.sessionId, session?.repo, session?.installationId, session?.startRef, session?.base, session?.branch]);
 	// Bottom-pin: window scrollbar follows new events unless the user scrolls up.
 	const pinnedRef = useRef(true);
+	// True while scrolled up with an active/live feed — drives the "↓ Latest" pill.
+	const [unpinned, setUnpinned] = useState(false);
+	// Live transport for the status chip: SSE, or the 3s poll fallback after a drop.
+	const [liveTransport, setLiveTransport] = useState<"sse" | "polling" | null>(null);
 
 	// Slice sub-runs share the parent's runId and finish independently — a "done"
 	// slice sorted last would mask a live multi run and hide the Stop button.
@@ -239,7 +243,9 @@ export default function SessionView() {
 
 	useEffect(() => {
 		const onScroll = () => {
-			pinnedRef.current = window.scrollY + window.innerHeight >= pageHeight() - 40;
+			const pinned = window.scrollY + window.innerHeight >= pageHeight() - 40;
+			pinnedRef.current = pinned;
+			setUnpinned(!pinned);
 		};
 		window.addEventListener("scroll", onScroll, { passive: true });
 		return () => window.removeEventListener("scroll", onScroll);
@@ -322,6 +328,7 @@ export default function SessionView() {
 			if (closed) return;
 			const es = new EventSource(`/api/sessions/${id}/events?run=${runId}&stream=1&token=${encodeURIComponent(token)}`);
 			sseRef.current = es;
+			setLiveTransport("sse");
 			es.onmessage = (m) => {
 				const data = JSON.parse(m.data) as { type: string; seq?: number; event?: RunEvent["event"]; run?: RunDoc };
 				if (data.type === "event" && data.seq !== undefined && data.event) {
@@ -330,6 +337,7 @@ export default function SessionView() {
 			};
 			es.onerror = () => {
 				es.close();
+				setLiveTransport("polling");
 				// Fallback to polling.
 				let after = 0;
 				pollTimer = setInterval(() => {
@@ -347,6 +355,7 @@ export default function SessionView() {
 			closed = true;
 			sseRef.current?.close();
 			if (pollTimer) clearInterval(pollTimer);
+			setLiveTransport(null);
 		};
 	}, [user, id, latestRun?.runId, active, pushEvents]);
 
@@ -417,6 +426,9 @@ export default function SessionView() {
 					</span>
 				)}
 				<span className="cloud-badge">☁ Cloud Run</span>
+				{liveTransport === "polling" && (
+					<span className="sess-chip muted" title="The live event stream dropped — falling back to polling every 3s">⟳ Reconnecting…</span>
+				)}
 				{active && latestRun && (
 					<button className="btn sm" style={{ padding: "2px 8px" }} title="Compact context on the next model turn" onClick={() => void compactNow()}>⌗ Compact</button>
 				)}
@@ -516,10 +528,11 @@ export default function SessionView() {
 			{(lifecycle.length > 0 || halted) && (
 				<details style={{ flex: "1 1 auto", minWidth: 0 }}>
 					<summary className="muted" style={{ cursor: "pointer", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-						<span style={{ color: latestRun?.status === "failed" ? "var(--err)" : active ? "var(--amber, #facc15)" : "var(--ok, #4ade80)" }}>●</span>{" "}
+						<span style={{ color: latestRun?.status === "failed" ? "var(--err)" : active || latestRun?.status === "paused" ? "var(--amber, #facc15)" : "var(--ok, #4ade80)" }}>●</span>{" "}
 						Status log ({lifecycle.length}) —{" "}
 						{halted
 							? latestRun?.status === "failed" ? "✗ Failed" : latestRun?.status === "stopped" ? "■ Stopped" : "✓ Completed"
+							: latestRun?.status === "paused" ? "❚❚ Paused at step limit"
 							: String(lifecycle[lifecycle.length - 1].event.text ?? "")}
 					</summary>
 					<div style={{ display: "flex", flexDirection: "column", gap: 2, marginTop: 4 }}>
@@ -586,6 +599,30 @@ export default function SessionView() {
 			<Timeline user={user} sessionId={id} events={ordered} runs={runs} active={active} lateAfter={lateAfter}
 				focus={agentFocus} onFocusChange={setAgentFocus}
 				githubUrl={session?.prUrl ?? (session?.repo && session?.branch ? `https://github.com/${session.repo}/tree/${session.branch}` : undefined)} />
+			{/* Queued placeholder: a live run with only its run-started event
+			    shows a blank gap otherwise — say what we're waiting on. */}
+			{active && latestRun && !ordered.some((e) => e.runId === latestRun.runId && e.event.type !== "run-started") && (
+				<div className="ev status muted" style={{ margin: "8px 0" }}>
+					<span className="stream-cursor" style={{ verticalAlign: "middle", marginRight: 8 }} />
+					{latestRun.status === "queued" || latestRun.status === "claimed"
+						? "Waiting for a worker to pick up the run…"
+						: "Starting the sandbox…"}
+				</div>
+			)}
+			{/* Jump-to-latest: the tail keeps moving while scrolled up. */}
+			{unpinned && active && (
+				<button
+					className="btn sm"
+					style={{ position: "fixed", bottom: 96, right: 24, zIndex: 20, boxShadow: "0 2px 10px rgba(0,0,0,.4)" }}
+					onClick={() => {
+						pinnedRef.current = true;
+						setUnpinned(false);
+						window.scrollTo({ top: pageHeight(), behavior: "smooth" });
+					}}
+				>
+					↓ Latest
+				</button>
+			)}
 			{userMsgs.length > 1 && (
 				<div className="msg-nav" role="navigation" aria-label="Jump to message">
 					{userMsgs.map((e) => (

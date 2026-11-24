@@ -24954,7 +24954,13 @@ ${runBlocks.join("\n\n")}`;
                 ] }),
                 g.models.map((m) => /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("button", { className: "pop-item", onClick: () => pickModel(m, g.profile), children: [
                   /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("span", { style: { flex: 1, minWidth: 0 }, children: [
-                    /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "mono", style: { display: "block", fontSize: 12 }, children: m.label ?? m.id }),
+                    /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("span", { className: "mono", style: { display: "block", fontSize: 12 }, children: [
+                      /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("span", { className: "muted", children: [
+                        g.profile,
+                        " / "
+                      ] }),
+                      m.label ?? m.id
+                    ] }),
                     modelDesc(m) && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "muted", style: { display: "block", fontSize: 10.5 }, children: modelDesc(m) })
                   ] }),
                   modelId === m.id && modelProfile === g.profile && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "right", children: "\u2713" })
@@ -27022,7 +27028,24 @@ Please report this to https://github.com/markedjs/marked.`, e) {
         }
       }
     }
-    return seen.filter((i) => !i.hidden && i.kind !== "preflight");
+    const visible = seen.filter((i) => !i.hidden && i.kind !== "preflight");
+    const isCompaction = (i) => i.kind === "event" && i.e.event.meta?.kind === "context_compaction";
+    const firstByRun = /* @__PURE__ */ new Map();
+    const out = [];
+    for (const i of visible) {
+      if (i.kind === "event" && isCompaction(i)) {
+        const rid = i.e.runId ?? "";
+        const first = firstByRun.get(rid);
+        if (first) {
+          first.e = i.e;
+          first.count = (first.count ?? 1) + 1;
+          continue;
+        }
+        firstByRun.set(rid, i);
+      }
+      out.push(i);
+    }
+    return out;
   }
   function turnMergeable(t) {
     if (!t.done) return false;
@@ -27233,7 +27256,8 @@ Please report this to https://github.com/markedjs/marked.`, e) {
     "run-stopping": "Stopping",
     "run-finished": "Summary",
     "run-completed": "Completed",
-    "run-failed": "Failed"
+    "run-failed": "Failed",
+    "run-paused": "Paused"
   };
   var WRITE_TOOLS = /* @__PURE__ */ new Set(["file_editor", "write_file", "edit_file", "append_file", "insert_lines"]);
   function Md({ text }) {
@@ -27732,7 +27756,7 @@ Please report this to https://github.com/markedjs/marked.`, e) {
       }
     );
   }
-  function Event({ user, sessionId, e, events, runs, githubUrl, onShowFailures }) {
+  function Event({ user, sessionId, e, events, runs, githubUrl, onShowFailures, count }) {
     const ev = e.event;
     const kind = KIND[ev.type] ?? ev.type;
     const cls = ev.type === "run-failed" ? "failed" : ev.type === "cloud-status" || ev.type === "info" || ev.type === "setup" ? "status" : "";
@@ -27779,27 +27803,75 @@ Please report this to https://github.com/markedjs/marked.`, e) {
         /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "avatar", children: (user.email ?? "U")[0].toUpperCase() })
       ] });
     }
+    if (ev.type === "run-paused") {
+      const live = runs.some((r) => r.runId === e.runId && r.status === "paused") && events.reduce((m, x2) => x2.runId === e.runId ? Math.max(m, x2.seq) : m, 0) === e.seq;
+      const refresh = () => window.dispatchEvent(new CustomEvent("kronyx:refresh-session"));
+      return /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("div", { className: "ev", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("div", { className: "ev-kind", children: "Paused at step limit" }),
+        /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("span", { children: [
+          "Paused after ",
+          String(ev.iterations ?? ""),
+          " steps \u2014 the agent's context is kept."
+        ] }),
+        live && /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("div", { style: { display: "flex", gap: 8, marginTop: 8 }, children: [
+          /* @__PURE__ */ (0, import_jsx_runtime7.jsx)(
+            "button",
+            {
+              className: "btn sm",
+              onClick: async () => {
+                const res = await apiFetch(`/api/runs/${e.runId}/resume`, user, { method: "POST" });
+                if (res.ok) refresh();
+              },
+              children: "Continue"
+            }
+          ),
+          /* @__PURE__ */ (0, import_jsx_runtime7.jsx)(
+            "button",
+            {
+              className: "btn sm",
+              onClick: async () => {
+                await apiFetch(`/api/runs/${e.runId}/stop`, user, { method: "POST" });
+                refresh();
+              },
+              children: "Stop"
+            }
+          )
+        ] })
+      ] });
+    }
     if (ev.type === "run-failed") {
       const err = String(ev.error ?? ev.text ?? "");
-      const iterLimit = /maxIterations|exceeded.*iterations/i.test(err);
+      const FAIL_META = {
+        missing_tool_results: { title: "The run was interrupted", hint: "A tool call lost its result before the run could continue \u2014 the transcript is repaired on retry." },
+        sandbox_death: { title: "The sandbox VM died", hint: "The environment running the tools was lost mid-run." },
+        rate_limit: { title: "Provider rate limit", hint: "The model provider throttled the request." },
+        context_overflow: { title: "Context overflow", hint: "The conversation grew past the model's context window." },
+        auth: { title: "Authentication failed", hint: "Check the provider credentials in Settings." },
+        no_such_tool: { title: "Tool unavailable", hint: "The model tried to call a tool this mode doesn't provide." },
+        stopped: { title: "Stopped", hint: "" },
+        unknown: { title: "Run failed", hint: "" }
+      };
+      const meta = FAIL_META[String(ev.errorKind ?? "unknown")] ?? FAIL_META.unknown;
+      const live = ev.retryable === true && runs.some((r) => r.runId === e.runId && r.status === "failed") && events.reduce((m, x2) => x2.runId === e.runId ? Math.max(m, x2.seq) : m, 0) === e.seq;
+      const refresh = () => window.dispatchEvent(new CustomEvent("kronyx:refresh-session"));
       return /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("div", { className: "ev failed", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("div", { className: "ev-kind", children: "Failed" }),
-        /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { children: err || "Run failed" }),
-        iterLimit && /* @__PURE__ */ (0, import_jsx_runtime7.jsx)(
+        /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("div", { className: "ev-kind", children: meta.title }),
+        meta.hint ? /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { children: meta.hint }) : null,
+        err ? /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("details", { style: { marginTop: 4 }, children: [
+          /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("summary", { className: "muted", style: { cursor: "pointer", fontSize: 12 }, children: "Details" }),
+          /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("pre", { className: "act-out", style: { marginTop: 4 }, children: err })
+        ] }) : null,
+        live && /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("div", { style: { display: "flex", gap: 8, marginTop: 8 }, children: /* @__PURE__ */ (0, import_jsx_runtime7.jsx)(
           "button",
           {
             className: "btn sm",
-            style: { marginTop: 8 },
             onClick: async () => {
-              const res = await apiFetch(`/api/sessions/${sessionId}/messages`, user, {
-                method: "POST",
-                body: JSON.stringify({ task: "Continue where you left off and finish the task.", mode: "agent" })
-              });
-              if (res.ok) window.dispatchEvent(new CustomEvent("kronyx:refresh-session"));
+              const res = await apiFetch(`/api/runs/${e.runId}/resume`, user, { method: "POST" });
+              if (res.ok) refresh();
             },
-            children: "Continue run"
+            children: "Retry"
           }
-        )
+        ) })
       ] });
     }
     if (ev.type === "ui-screenshot") {
@@ -27944,7 +28016,8 @@ Please report this to https://github.com/markedjs/marked.`, e) {
         /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "dot", style: { background: "var(--amber, #facc15)" } }),
         /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("span", { style: { overflow: "hidden", textOverflow: "ellipsis" }, children: [
           "\u25C8 ",
-          text
+          text,
+          (count ?? 1) > 1 ? ` \xD7${count}` : ""
         ] })
       ] });
     }
@@ -28311,7 +28384,7 @@ Please report this to https://github.com/markedjs/marked.`, e) {
           ] })
         ] }, item.key);
       }
-      return /* @__PURE__ */ (0, import_jsx_runtime7.jsx)(Event, { user, sessionId, e: item.e, events, runs, githubUrl, onShowFailures: jumpToFailures }, item.key);
+      return /* @__PURE__ */ (0, import_jsx_runtime7.jsx)(Event, { user, sessionId, e: item.e, events, runs, githubUrl, onShowFailures: jumpToFailures, count: item.count }, item.key);
     };
     const stOf = (i, runId) => sliceStatus(events, runs, i, runId);
     const vitalsOf = (ai, runId) => agentVitals(events, ai, runId);
@@ -28747,6 +28820,8 @@ Please report this to https://github.com/markedjs/marked.`, e) {
       syncedEnv.current = { repo: sRepo, ref: sessionRef };
     }, [session?.sessionId, session?.repo, session?.installationId, session?.startRef, session?.base, session?.branch]);
     const pinnedRef = (0, import_react13.useRef)(true);
+    const [unpinned, setUnpinned] = (0, import_react13.useState)(false);
+    const [liveTransport, setLiveTransport] = (0, import_react13.useState)(null);
     const mainRuns = runs.filter((r) => r.mode !== "multi-slice" && !r.parentRunId);
     const latestRun = mainRuns[mainRuns.length - 1];
     const runOrder = new Map(runs.map((r, i) => [r.runId, i]));
@@ -28852,7 +28927,9 @@ Please report this to https://github.com/markedjs/marked.`, e) {
     const toBottom = () => window.scrollTo({ top: pageHeight(), behavior: "auto" });
     (0, import_react13.useEffect)(() => {
       const onScroll = () => {
-        pinnedRef.current = window.scrollY + window.innerHeight >= pageHeight() - 40;
+        const pinned = window.scrollY + window.innerHeight >= pageHeight() - 40;
+        pinnedRef.current = pinned;
+        setUnpinned(!pinned);
       };
       window.addEventListener("scroll", onScroll, { passive: true });
       return () => window.removeEventListener("scroll", onScroll);
@@ -28921,6 +28998,7 @@ Please report this to https://github.com/markedjs/marked.`, e) {
         if (closed) return;
         const es = new EventSource(`/api/sessions/${id}/events?run=${runId}&stream=1&token=${encodeURIComponent(token)}`);
         sseRef.current = es;
+        setLiveTransport("sse");
         es.onmessage = (m) => {
           const data = JSON.parse(m.data);
           if (data.type === "event" && data.seq !== void 0 && data.event) {
@@ -28929,6 +29007,7 @@ Please report this to https://github.com/markedjs/marked.`, e) {
         };
         es.onerror = () => {
           es.close();
+          setLiveTransport("polling");
           let after = 0;
           pollTimer = setInterval(() => {
             void (async () => {
@@ -28945,6 +29024,7 @@ Please report this to https://github.com/markedjs/marked.`, e) {
         closed = true;
         sseRef.current?.close();
         if (pollTimer) clearInterval(pollTimer);
+        setLiveTransport(null);
       };
     }, [user, id, latestRun?.runId, active, pushEvents]);
     const submit = async (task, attachmentIds, refs) => {
@@ -28997,6 +29077,7 @@ Please report this to https://github.com/markedjs/marked.`, e) {
           /* @__PURE__ */ (0, import_jsx_runtime10.jsx)("h1", { style: { flex: 1, fontSize: 16, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, children: session?.title ?? "Session" }),
           latestRun && /* @__PURE__ */ (0, import_jsx_runtime10.jsx)("span", { className: "status-pill completed", style: { textTransform: "capitalize" }, children: latestRun.status === "completed" ? "\u2713 Completed" : latestRun.status }),
           /* @__PURE__ */ (0, import_jsx_runtime10.jsx)("span", { className: "cloud-badge", children: "\u2601 Cloud Run" }),
+          liveTransport === "polling" && /* @__PURE__ */ (0, import_jsx_runtime10.jsx)("span", { className: "sess-chip muted", title: "The live event stream dropped \u2014 falling back to polling every 3s", children: "\u27F3 Reconnecting\u2026" }),
           active && latestRun && /* @__PURE__ */ (0, import_jsx_runtime10.jsx)("button", { className: "btn sm", style: { padding: "2px 8px" }, title: "Compact context on the next model turn", onClick: () => void compactNow(), children: "\u2317 Compact" }),
           /* @__PURE__ */ (0, import_jsx_runtime10.jsx)("button", { className: "btn sm", style: { padding: "2px 8px" }, title: "Clear context \u2014 next message starts fresh", onClick: () => void clearContext(), children: "\u232B Clear" }),
           /* @__PURE__ */ (0, import_jsx_runtime10.jsx)("button", { className: "btn sm", style: { padding: "2px 8px" }, children: "\xB7\xB7\xB7" }),
@@ -29099,13 +29180,13 @@ Please report this to https://github.com/markedjs/marked.`, e) {
           ] }),
           (lifecycle.length > 0 || halted) && /* @__PURE__ */ (0, import_jsx_runtime10.jsxs)("details", { style: { flex: "1 1 auto", minWidth: 0 }, children: [
             /* @__PURE__ */ (0, import_jsx_runtime10.jsxs)("summary", { className: "muted", style: { cursor: "pointer", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, children: [
-              /* @__PURE__ */ (0, import_jsx_runtime10.jsx)("span", { style: { color: latestRun?.status === "failed" ? "var(--err)" : active ? "var(--amber, #facc15)" : "var(--ok, #4ade80)" }, children: "\u25CF" }),
+              /* @__PURE__ */ (0, import_jsx_runtime10.jsx)("span", { style: { color: latestRun?.status === "failed" ? "var(--err)" : active || latestRun?.status === "paused" ? "var(--amber, #facc15)" : "var(--ok, #4ade80)" }, children: "\u25CF" }),
               " ",
               "Status log (",
               lifecycle.length,
               ") \u2014",
               " ",
-              halted ? latestRun?.status === "failed" ? "\u2717 Failed" : latestRun?.status === "stopped" ? "\u25A0 Stopped" : "\u2713 Completed" : String(lifecycle[lifecycle.length - 1].event.text ?? "")
+              halted ? latestRun?.status === "failed" ? "\u2717 Failed" : latestRun?.status === "stopped" ? "\u25A0 Stopped" : "\u2713 Completed" : latestRun?.status === "paused" ? "\u275A\u275A Paused at step limit" : String(lifecycle[lifecycle.length - 1].event.text ?? "")
             ] }),
             /* @__PURE__ */ (0, import_jsx_runtime10.jsxs)("div", { style: { display: "flex", flexDirection: "column", gap: 2, marginTop: 4 }, children: [
               lifecycle.map((e, i) => /* @__PURE__ */ (0, import_jsx_runtime10.jsxs)("div", { className: "muted", style: { display: "flex", gap: 6, alignItems: "center" }, children: [
@@ -29158,6 +29239,23 @@ Please report this to https://github.com/markedjs/marked.`, e) {
               focus: agentFocus,
               onFocusChange: setAgentFocus,
               githubUrl: session?.prUrl ?? (session?.repo && session?.branch ? `https://github.com/${session.repo}/tree/${session.branch}` : void 0)
+            }
+          ),
+          active && latestRun && !ordered.some((e) => e.runId === latestRun.runId && e.event.type !== "run-started") && /* @__PURE__ */ (0, import_jsx_runtime10.jsxs)("div", { className: "ev status muted", style: { margin: "8px 0" }, children: [
+            /* @__PURE__ */ (0, import_jsx_runtime10.jsx)("span", { className: "stream-cursor", style: { verticalAlign: "middle", marginRight: 8 } }),
+            latestRun.status === "queued" || latestRun.status === "claimed" ? "Waiting for a worker to pick up the run\u2026" : "Starting the sandbox\u2026"
+          ] }),
+          unpinned && active && /* @__PURE__ */ (0, import_jsx_runtime10.jsx)(
+            "button",
+            {
+              className: "btn sm",
+              style: { position: "fixed", bottom: 96, right: 24, zIndex: 20, boxShadow: "0 2px 10px rgba(0,0,0,.4)" },
+              onClick: () => {
+                pinnedRef.current = true;
+                setUnpinned(false);
+                window.scrollTo({ top: pageHeight(), behavior: "smooth" });
+              },
+              children: "\u2193 Latest"
             }
           ),
           userMsgs.length > 1 && /* @__PURE__ */ (0, import_jsx_runtime10.jsx)("div", { className: "msg-nav", role: "navigation", "aria-label": "Jump to message", children: userMsgs.map((e) => /* @__PURE__ */ (0, import_jsx_runtime10.jsx)(

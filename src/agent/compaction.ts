@@ -16,25 +16,25 @@ const HEAD_CHARS = 6_000;
 const TAIL_CHARS = 2_000;
 const CALL_INPUT_CAP = 600;
 const DEFAULT_CONTEXT_WINDOW = 128_000;
+/** Budget cycle: start at cap/this and grow ×this on each hard pass. */
+const BUDGET_CYCLE_DIVISOR = 4;
+const BUDGET_CYCLE_GROWTH = 1.5;
 
 /** Economical context ceiling — decode cost grows with context regardless of
  *  the model's max window, so trigger compaction against a budget, not the
  *  catalogued 200K/1M. */
 export const DEFAULT_CONTEXT_BUDGET = 200_000;
 const CONTEXT_BUDGET_FLOOR = 64_000;
+const BUDGET_WINDOW_FRACTION = 0.5;
 
 /**
- * Task-aware context budget: read-heavy work (audits, exploration, plans)
- * piles up large tool results and benefits from earlier compaction; coding
- * work gets the full default. Classification is heuristic — a miss only
- * shifts the trigger point; recall_context recovers anything elided.
+ * Context budget derived from the model's own window: half of it, capped at
+ * the economical default and floored. Unknown windows get the default. The
+ * budget only sets the trigger point; the tier algorithm is unchanged.
  */
-export function taskContextBudget(task: string, mode?: string): number {
-	const readHeavy =
-		mode === "plan" ||
-		/\b(audit\w*|review\w*|explor\w*|investigat\w*|analy[sz]\w*|research\w*|inspect\w*|check (the|for|that)\b|how does|why does|walk me|explain)\b/i.test(task);
-	const budget = readHeavy ? 100_000 : DEFAULT_CONTEXT_BUDGET;
-	return Math.max(CONTEXT_BUDGET_FLOOR, budget);
+export function contextBudget(contextWindow?: number): number {
+	if (!contextWindow || contextWindow <= 0) return DEFAULT_CONTEXT_BUDGET;
+	return Math.max(CONTEXT_BUDGET_FLOOR, Math.min(Math.floor(contextWindow * BUDGET_WINDOW_FRACTION), DEFAULT_CONTEXT_BUDGET));
 }
 const PATH_KEYS = ["path", "file", "filePath", "rel"];
 const ATTACH_RE = /^--- attached file: (.+?) ---\n[\s\S]*?--- end \1 ---$/;
@@ -198,12 +198,18 @@ export interface CompactStats {
 	deduped: number;
 	summarized: boolean;
 	summaryBlocks: number;
+	/** Chunks the summarizer dropped — they stayed verbatim in the prefix. */
+	summaryFailedChunks: number;
+	/** Dangling/orphan tool-call pairs repaired by the final sanitize pass. */
+	repaired: number;
 	estTokensBefore: number;
 	estTokensAfter: number;
 	forced: boolean;
 	soft: boolean;
-	/** Effective budget after any ratchet this pass. */
+	/** Effective budget after any ratchet or cycle transition this pass. */
 	effectiveBudget: number;
+	/** True when the big reset ran and the budget wrapped back to the start. */
+	budgetReset?: boolean;
 	/** Provider ceiling learned from an overflow rejection, when known. */
 	learnedCeiling?: number;
 	/** Headroom reserve (maxTokens + turn-growth EWA) used at the ceiling. */
@@ -234,6 +240,68 @@ export interface PrepareTurnOptions {
 	/** Live flag: set externally (manual "compact now") to force a hard-tier
 	 *  compaction on the next turn. Consumed and cleared on use. */
 	forceCompactRef?: { current: boolean };
+	/** Minimum prepareTurn calls between non-forced deep passes (reasoning
+	 *  prune, ordered stubbing, summarization). Read-heavy runs otherwise
+	 *  compact every turn, shedding the results the model just fetched and
+	 *  driving a compact→refetch loop. Always-on trims (clamp, supersede,
+	 *  dedupe, sanitize) still run every call. 0 disables the throttle. */
+	minDeepPassCalls?: number;
+}
+
+/** Synthetic result for a tool call whose result never landed — the run
+ *  died mid-tool, or a compaction summary spliced the pair apart. The
+ *  model-facing history must satisfy the SDK's pair invariant or
+ *  convertToModelMessages throws AI_MissingToolResultsError. */
+const INTERRUPTED_RESULT =
+	"[interrupted — the run was restarted or the context was compacted before this tool returned]";
+
+/**
+ * Pair-invariant repair, idempotent: every tool-call part must have a
+ * tool-result part. Dangling calls get a synthetic error result injected
+ * immediately after the call's message (where providers expect the tool
+ * message); orphan results — possible when a summary splice removed the
+ * call's message but not the result's — are dropped. Returns the same
+ * array (cast) when nothing needed fixing.
+ */
+export function sanitizeMessages(messages: readonly AgentMessage[]): { messages: AgentMessage[]; repaired: number } {
+	const callIds = new Set<string>();
+	const resultIds = new Set<string>();
+	for (const m of messages)
+		for (const p of m.content) {
+			if (p.type === "tool-call") callIds.add((p as { toolCallId: string }).toolCallId);
+			else if (p.type === "tool-result") resultIds.add((p as AgentToolResultPart).toolCallId);
+		}
+	const missing = new Set([...callIds].filter((id) => !resultIds.has(id)));
+	const orphans = new Set([...resultIds].filter((id) => !callIds.has(id)));
+	if (!missing.size && !orphans.size) return { messages: messages as AgentMessage[], repaired: 0 };
+	let repaired = 0;
+	const out: AgentMessage[] = [];
+	for (const m of messages) {
+		const content = orphans.size
+			? m.content.filter((p) => !(p.type === "tool-result" && orphans.has((p as AgentToolResultPart).toolCallId)))
+			: m.content;
+		if (content !== m.content) repaired += m.content.length - content.length;
+		const dangling = m.content.filter(
+			(p) => p.type === "tool-call" && missing.has((p as { toolCallId: string }).toolCallId),
+		);
+		if (content.length) out.push(content === m.content ? m : { ...m, content });
+		if (dangling.length) {
+			repaired += dangling.length;
+			out.push({
+				id: `repair-${m.id}`,
+				role: "tool",
+				createdAt: (m.createdAt ?? 0) + 1,
+				content: dangling.map((p) => ({
+					type: "tool-result",
+					toolCallId: (p as { toolCallId: string }).toolCallId,
+					toolName: (p as { toolName?: string }).toolName ?? "tool",
+					output: INTERRUPTED_RESULT,
+					isError: true,
+				})),
+			} as AgentMessage);
+		}
+	}
+	return { messages: out, repaired };
 }
 
 /** Outputs shorter than this are cheaper kept than stubbed — and the stub
@@ -261,7 +329,7 @@ function estimateTokens(messages: readonly AgentMessage[], systemPrompt?: string
 }
 
 /** Head+tail clamp for a single oversized tool-result part. Returns the new part or undefined. */
-function clampResult(part: AgentToolResultPart): AgentToolResultPart | undefined {
+export function clampResult(part: AgentToolResultPart): AgentToolResultPart | undefined {
 	const clamp = CLAMPS[part.toolName] ?? DEFAULT_CLAMP;
 	const text = resultText(part);
 	if (text.length <= clamp.max) return undefined;
@@ -313,29 +381,41 @@ function pathKeyOf(input: unknown): string | undefined {
  * The canonical transcript is untouched; stubs point the model at recall_context.
  */
 export function createPrepareTurn(opts: PrepareTurnOptions = {}) {
-	// Stateful budget (per Agent instance): starts at the task's economical
-	// budget, ratchets up toward the model's real window when mechanical trims
-	// can't reach the target (fill-anchored: B = est/0.55), and clamps down to
-	// a ceiling learned from provider overflow rejections.
-	let budget = Math.max(
-		CONTEXT_BUDGET_FLOOR,
-		opts.budgetRef?.current || opts.contextBudget || DEFAULT_CONTEXT_BUDGET,
-	);
+	// Stateful budget cycle (per Agent instance): `cap` is the window-derived
+	// maximum. The live budget starts small (cap/4, floored at 64K) and grows
+	// ×1.5 on each hard pass — cheap mechanical trims while it grows. At the
+	// cap a full summarizing reset fires (oldest turns replaced by briefs),
+	// then the budget drops back to the start and the cycle repeats. Escape
+	// hatches: fill-anchored ratchet (B = est/0.55) when mechanical trims
+	// can't reach the target, and a ceiling learned from provider overflows.
+	const capFrom = (v: number | undefined) =>
+		Math.max(CONTEXT_BUDGET_FLOOR, v || DEFAULT_CONTEXT_BUDGET);
+	const startOf = (c: number) => Math.max(CONTEXT_BUDGET_FLOOR, Math.floor(c / BUDGET_CYCLE_DIVISOR));
+	let cap = capFrom(opts.budgetRef?.current || opts.contextBudget);
+	let startBudget = startOf(cap);
+	let budget = startBudget;
 	let learnedCeiling: number | undefined;
 	// Per-turn context growth EWA — part of the discard reserve at the ceiling.
 	let growth = 8_000;
 	let prevEst = -1;
+	// Deep-pass throttle state: counts prepareTurn calls, last pass index.
+	let passTick = 0;
+	let lastDeepPass = -1e9;
 	const setBudget = (b: number) => {
 		budget = b;
 		if (opts.budgetRef) opts.budgetRef.current = b;
 	};
 	setBudget(budget);
 	return async (ctx: AgentRuntimePrepareTurnContext): Promise<AgentRuntimePrepareTurnResult | undefined> => {
-		// The Agent (and this closure) can be reused across run() calls — honor
-		// an external reseed (new task writes budgetRef.current) while internal
-		// setBudget writes keep the two in lockstep otherwise.
-		if (opts.budgetRef && opts.budgetRef.current > 0 && opts.budgetRef.current !== budget)
-			setBudget(opts.budgetRef.current);
+		// The Agent (and this closure) can be reused across run() calls — an
+		// external reseed (new task writes a different budgetRef.current) moves
+		// the cap and restarts the cycle; internal setBudget writes keep the
+		// two in lockstep otherwise.
+		if (opts.budgetRef && opts.budgetRef.current > 0 && opts.budgetRef.current !== budget) {
+			cap = capFrom(opts.budgetRef.current);
+			startBudget = startOf(cap);
+			setBudget(startBudget);
+		}
 		const ceiling = Math.min(
 			ctx.model.info?.contextWindow ?? opts.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
 			learnedCeiling ?? Number.MAX_SAFE_INTEGER,
@@ -491,9 +571,20 @@ export function createPrepareTurn(opts: PrepareTurnOptions = {}) {
 		const reserve = (opts.maxTokens ?? 8_192) + growth;
 		const triggerAt = window < ceiling ? window * TRIGGER_FRACTION : ceiling - reserve;
 		const soft = !forced && estNow >= window * SOFT_TRIGGER_FRACTION && estNow < triggerAt;
+		passTick++;
 		if (!forced && estNow < window * SOFT_TRIGGER_FRACTION) {
-			return clamped || superseded || callsElided ? { messages: mutable } : undefined;
+			const clean = sanitizeMessages(mutable);
+			return clamped || superseded || callsElided || clean.repaired ? { messages: clean.messages } : undefined;
 		}
+		// Throttle deep passes: at most one per `minDeepPassCalls` calls
+		// unless forced (provider overflow / manual). Below-soft already
+		// returned, so reaching here means we're in the soft or hard band.
+		const minGap = opts.minDeepPassCalls ?? 2;
+		if (!forced && passTick - lastDeepPass < minGap) {
+			const clean = sanitizeMessages(mutable);
+			return clamped || superseded || callsElided || clean.repaired ? { messages: clean.messages } : undefined;
+		}
+		lastDeepPass = passTick;
 
 		// Prune reasoning + inlined attachments outside the recent window.
 		// Anthropic requires the thinking block that preceded a tool call to
@@ -540,29 +631,65 @@ export function createPrepareTurn(opts: PrepareTurnOptions = {}) {
 			stubbed++;
 		}
 
-		// Still over target after mechanical trims. Summary-first at the hard
-		// tier: old turns carry decisions/state, not serialized history — chunked
-		// LLM briefs replace them (task message pinned, recent window verbatim,
-		// recall_context is the escape hatch). When no summarizer is available,
-		// the budget ratchets instead of discarding context. ceilingNow folds in
-		// a ceiling learned THIS pass — `ceiling`/`window` above are stale then.
+		// Still over target after mechanical trims. The budget cycle decides
+		// what happens next: below the cap a hard pass just grows the budget a
+		// step (mechanical trims already ran); AT the cap the big reset fires —
+		// the whole old transcript is summarized into briefs (task pinned,
+		// recent window verbatim, recall_context is the escape hatch) and the
+		// budget restarts. Forced compactions summarize immediately like
+		// before. With no summarizer the fill-anchored ratchet grows toward the
+		// real window instead of discarding context. ceilingNow folds in a
+		// ceiling learned THIS pass — `ceiling`/`window` above are stale then.
 		let summarized = false;
 		let ratcheted = false;
 		let summaryBlocks = 0;
+		let summaryFailedChunks = 0;
 		let summary: string | undefined;
 		const ceilingNow = Math.min(ceiling, learnedCeiling ?? Number.MAX_SAFE_INTEGER);
+		const capNow = Math.min(cap, ceilingNow);
+		// The big reset needs a summarizer — without one the cycle can't shed
+		// history, so growth is left to the fill-anchored ratchet below.
+		const bigReset = !soft && !forced && !!opts.summarize && budget >= capNow;
 		const SUMMARY_CHUNK = 20;
 		const SUMMARY_MAX_CHUNKS = 3;
-		if (!soft && opts.summarize && mutable.length - KEEP_RECENT_MESSAGES > 4) {
+		if (!soft && opts.summarize && (forced || bigReset) && mutable.length - KEEP_RECENT_MESSAGES > 4) {
 			const prefix = mutable.slice(0, mutable.length - KEEP_RECENT_MESSAGES);
 			// The task message (first user turn) survives verbatim — a good
 			// compaction is a brief for future work, not a summary of the task.
 			const pinTask = prefix[0]?.role === "user" ? 1 : 0;
+			// Forced passes keep the old 3-chunk bound; the big reset covers the
+			// entire prefix so nothing unsummarized is left behind.
+			const maxChunks = bigReset ? Math.ceil(prefix.length / SUMMARY_CHUNK) : SUMMARY_MAX_CHUNKS;
+			// A chunk boundary may not split a tool-call from its result —
+			// extend while the next message resolves a call inside the chunk.
+			const pairSafeEnd = (start: number, end: number): number => {
+				while (end < prefix.length) {
+					const open = new Set<string>();
+					const closed = new Set<string>();
+					for (let i = start; i < end; i++)
+						for (const p of prefix[i].content) {
+							if (p.type === "tool-call") open.add((p as { toolCallId: string }).toolCallId);
+							else if (p.type === "tool-result") closed.add((p as AgentToolResultPart).toolCallId);
+						}
+					const dangling = [...open].filter((id) => !closed.has(id));
+					if (!dangling.length) return end;
+					const nextIds = new Set(
+						prefix[end].content
+							.filter((p) => p.type === "tool-result")
+							.map((p) => (p as AgentToolResultPart).toolCallId),
+					);
+					if (!dangling.some((id) => nextIds.has(id))) return end;
+					end++;
+				}
+				return end;
+			};
 			const blocks: { start: number; end: number; text: string }[] = [];
-			for (let s = pinTask; s < prefix.length && blocks.length < SUMMARY_MAX_CHUNKS; s += SUMMARY_CHUNK) {
-				const end = Math.min(prefix.length, s + SUMMARY_CHUNK);
+			for (let s = pinTask; s < prefix.length && blocks.length < maxChunks; ) {
+				const end = pairSafeEnd(s, Math.min(prefix.length, s + SUMMARY_CHUNK));
 				const text = await opts.summarize(prefix.slice(s, end)).catch(() => undefined);
 				if (text) blocks.push({ start: s, end, text });
+				else summaryFailedChunks++;
+				s = end;
 			}
 			if (blocks.length) {
 				// Splice newest-first so earlier indexes stay valid.
@@ -587,11 +714,32 @@ export function createPrepareTurn(opts: PrepareTurnOptions = {}) {
 			}
 		}
 		if (!summarized && !soft && est > target && window < ceilingNow) {
-			setBudget(Math.min(ceilingNow, Math.max(budget, Math.ceil(est / TARGET_FRACTION))));
+			// Ratchet room: below the cap growth stays inside the cycle (a
+			// summarizer exists to do the reset later); at the cap — or whenever
+			// no summarizer exists — escape toward the model's real window.
+			const growCeiling = opts.summarize && !bigReset ? capNow : ceilingNow;
+			setBudget(Math.min(growCeiling, Math.max(budget, Math.ceil(est / TARGET_FRACTION))));
 			ratcheted = true;
 		}
 
-		if (!stubbed && !clamped && !reasoningPruned && !attachmentsStubbed && !callsElided && !superseded && !deduped && !summarized && !ratcheted)
+		// Cycle transitions for ordinary hard passes: grow a step below the
+		// cap, or wrap back to the start once the big reset fired.
+		let budgetReset = false;
+		if (!soft && !forced && opts.summarize) {
+			if (bigReset && summarized) {
+				setBudget(startBudget);
+				budgetReset = true;
+			} else if (!bigReset) {
+				setBudget(Math.min(capNow, Math.max(budget, Math.ceil(budget * BUDGET_CYCLE_GROWTH))));
+			}
+		}
+
+		// Final invariant: whatever ran above, the projected history must be
+		// pair-complete — a failed summary chunk next to a successful one can
+		// leave a dangling tool-call, and a poisoned seeded transcript carries
+		// its own. Repair here so the request never trips the SDK.
+		const clean = sanitizeMessages(mutable);
+		if (!stubbed && !clamped && !reasoningPruned && !attachmentsStubbed && !callsElided && !superseded && !deduped && !summarized && !ratcheted && !budgetReset && !clean.repaired)
 			return undefined;
 		const stats: CompactStats = {
 			stubbed,
@@ -603,11 +751,14 @@ export function createPrepareTurn(opts: PrepareTurnOptions = {}) {
 			deduped,
 			summarized,
 			summaryBlocks,
+			summaryFailedChunks,
+			repaired: clean.repaired,
 			estTokensBefore: estBefore,
 			estTokensAfter: est,
 			forced,
 			soft,
 			effectiveBudget: budget,
+			budgetReset,
 			learnedCeiling,
 			reserve,
 		};
@@ -621,7 +772,8 @@ export function createPrepareTurn(opts: PrepareTurnOptions = {}) {
 				`${reasoningPruned ? `pruned ${reasoningPruned} reasoning part(s), ` : ""}` +
 				`${attachmentsStubbed ? `stubbed ${attachmentsStubbed} attachment(s), ` : ""}` +
 				`${summarized ? `summarized oldest turns into ${summaryBlocks} brief(s), ` : ""}` +
-				`(~${Math.round(estBefore / 1000)}k → ~${Math.round(est / 1000)}k est. tokens)`,
+				`(~${Math.round(estBefore / 1000)}k → ~${Math.round(est / 1000)}k est. tokens)` +
+				`${budgetReset ? ` — context budget reset to ~${Math.round(budget / 1000)}k` : ""}`,
 			{
 				kind: "context_compaction",
 				stubbed,
@@ -633,8 +785,11 @@ export function createPrepareTurn(opts: PrepareTurnOptions = {}) {
 				deduped,
 				summarized,
 				summaryBlocks,
+				summaryFailedChunks,
+				repaired: clean.repaired,
 				forced,
 				soft,
+				budgetReset,
 				contextBudget: window,
 				effectiveBudget: budget,
 				learnedCeiling,
@@ -645,11 +800,11 @@ export function createPrepareTurn(opts: PrepareTurnOptions = {}) {
 				actualInputTokens: ctx.previousRequestInputTokens,
 				recap: summary,
 				contextPreview: { before: previewMessages(ctx.messages), after: previewMessages(mutable) },
-				contextDump: { before: dumpMessages(ctx.messages), after: dumpMessages(mutable) },
+				contextDump: { before: dumpMessages(ctx.messages), after: dumpMessages(clean.messages) },
 				estTokensBefore: estBefore,
 				estTokensAfter: est,
 			},
 		);
-		return { messages: mutable };
+		return { messages: clean.messages };
 	};
 }

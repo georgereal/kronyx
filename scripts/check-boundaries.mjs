@@ -7,7 +7,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-const FREE_DIRS = ["src/agent", "src/tools", "src/sandbox", "src/diff"];
+const FREE_DIRS = ["src/agent", "src/tools", "src/sandbox", "src/diff", "src/harness"];
 const PATTERN = /(?:from\s+["']vscode["']|import\s*\(\s*["']vscode["']|require\s*\(\s*["']vscode["'])/;
 
 const violations = [];

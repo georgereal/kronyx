@@ -78,7 +78,11 @@ export class CloudController {
 		if (!servers?.length) return [];
 		const key = JSON.stringify(servers);
 		if (this.mcp?.key !== key) {
-			this.mcp = { key, tools: (await createMcpTools({ servers, log: (m) => log("mcp", m) })).tools };
+			const secrets = this.deps.context.secrets;
+			this.mcp = {
+				key,
+				tools: (await createMcpTools({ servers, resolveSecret: async (n) => secrets.get(n), log: (m) => log("mcp", m) })).tools,
+			};
 		}
 		return this.mcp.tools;
 	}
@@ -531,7 +535,7 @@ export class CloudController {
 					},
 					setTimeout: (ms) => sbx.inner?.setTimeout?.(ms) ?? Promise.resolve(),
 				};
-				return [...createRemoteFileTools(live, REPO_DIR, { planDir: PLAN_DIR }), ...createFetchTools(), ...(await this.mcpTools())];
+				return [...createRemoteFileTools(live, REPO_DIR, { planDir: PLAN_DIR }), ...createFetchTools(userConfig().webSearch), ...(await this.mcpTools())];
 			},
 			emit: (event) => {
 				this.surface.post(event);

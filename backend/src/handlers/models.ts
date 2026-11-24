@@ -32,3 +32,37 @@ export async function modelPricing(req: Request): Promise<Response> {
 	}
 	return json({ pricing });
 }
+
+/**
+ * POST /api/models/test — live connectivity check for a provider profile.
+ * Body: { name?, baseUrl, apiKey? }. A typed (unsaved) apiKey wins; otherwise
+ * the stored secret for the profile name is used. Reports HTTP status + model
+ * count so the settings page can show a real pass/fail, not just "no models".
+ */
+export async function testProvider(req: Request): Promise<Response> {
+	const uid = await authenticate(req);
+	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
+	const body = (await req.json().catch(() => ({}))) as { name?: string; baseUrl?: string; apiKey?: string };
+	const baseUrl = typeof body.baseUrl === "string" ? body.baseUrl.trim() : "";
+	if (!baseUrl) return json({ error: "baseUrl required" }, { status: 400 });
+	let key = typeof body.apiKey === "string" && body.apiKey ? body.apiKey : undefined;
+	if (key === undefined && body.name) {
+		const db = await getDb();
+		const doc = await db.collection("users").findOne({ _id: uid as never }, { projection: { "settings.secrets": 1 } });
+		const secrets = (doc?.settings?.secrets ?? {}) as Record<string, string>;
+		key = secrets[`profile.apiKey.${body.name}`] ?? secrets[body.name] ?? "";
+	}
+	const t0 = Date.now();
+	try {
+		const res = await fetch(`${baseUrl.replace(/\/+$/, "")}/models`, {
+			headers: key ? { Authorization: `Bearer ${key}` } : {},
+			signal: AbortSignal.timeout(10_000),
+		});
+		const ms = Date.now() - t0;
+		if (!res.ok) return json({ ok: false, status: res.status, error: `HTTP ${res.status}`, ms });
+		const b = (await res.json()) as { data?: unknown[]; models?: unknown[] };
+		return json({ ok: true, status: res.status, models: (b.data ?? b.models ?? []).length, keySet: !!key, ms });
+	} catch (e) {
+		return json({ ok: false, error: e instanceof Error ? e.message : String(e), ms: Date.now() - t0 });
+	}
+}

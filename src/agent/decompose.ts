@@ -43,18 +43,49 @@ export function isSharedManifest(rel: string): boolean {
 	return SHARED_MANIFESTS.some((p) => globToRe(p, true).test(norm));
 }
 
+/** Expand `{a,b}` alternatives into separate globs (globToRe has no brace support). */
+export function expandBraces(glob: string): string[] {
+	const open = glob.indexOf("{");
+	if (open < 0) return [glob];
+	let depth = 0;
+	for (let i = open; i < glob.length; i++) {
+		if (glob[i] === "{") depth++;
+		else if (glob[i] === "}") {
+			depth--;
+			if (depth === 0) {
+				// Split the group on top-level commas only — nested braces recurse.
+				const alts: string[] = [];
+				let last = open + 1;
+				let d = 0;
+				for (let j = open + 1; j < i; j++) {
+					if (glob[j] === "{") d++;
+					else if (glob[j] === "}") d--;
+					else if (glob[j] === "," && d === 0) {
+						alts.push(glob.slice(last, j));
+						last = j + 1;
+					}
+				}
+				alts.push(glob.slice(last, i));
+				return alts.flatMap((alt) => expandBraces(glob.slice(0, open) + alt + glob.slice(i + 1)));
+			}
+		}
+	}
+	return [glob]; // unbalanced — treat literally
+}
+
 /** True when `relPath` (repo-relative) matches any of the `owns` globs. */
 export function ownsMatch(owns: string[], relPath: string): boolean {
 	const norm = relPath.replace(/^\.\//, "").replace(/^\//, "");
 	// Never let a boundary check bless a traversal — `**` must not match
 	// paths that escape the worktree (`../repo/...`, `a/../../b`).
 	if (norm.split("/").includes("..")) return false;
-	return owns.some((g) => {
-		const pat = g.replace(/^\.\//, "").replace(/^\//, "");
-		// A bare directory prefix ("src/api") means "everything under it".
-		const glob = pat.endsWith("**") || pat.includes("*") || pat.includes("?") ? pat : `${pat}/**`;
-		return globToRe(glob, true).test(norm) || globToRe(pat, true).test(norm);
-	});
+	return owns.some((g) =>
+		expandBraces(g.replace(/^\.\//, "").replace(/^\//, "")).some((pat) => {
+			// A bare directory prefix ("src/api") means "everything under it".
+			const glob = pat.endsWith("**") || pat.includes("*") || pat.includes("?") ? pat : `${pat}/**`;
+			return globToRe(glob, true).test(norm) || globToRe(pat, true).test(norm);
+		}),
+	);
 }
 
 export const DECOMPOSE_PROMPT = (task: string, treeSummary: string, maxSlices: number): string => `You are decomposing a coding task for parallel execution by ${maxSlices > 1 ? `up to ${maxSlices}` : "one"} independent agents working simultaneously in separate git worktrees of the same repository.

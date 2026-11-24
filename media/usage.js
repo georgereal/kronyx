@@ -12,8 +12,13 @@
 	const callsTable = document.querySelector("table");
 	const ideTable = document.getElementById("ideTable");
 	const ideRowsEl = document.getElementById("ideRows");
+	const storeView = document.getElementById("storeView");
+	const storeRowsEl = document.getElementById("storeRows");
+	const syncStatusEl = document.getElementById("syncStatus");
+	const flushBtn = document.getElementById("flush");
 	let calls = [];
 	let ideEvents = [];
+	let sync = { status: undefined, tables: [] };
 
 	const fmtTok = (n) => (n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n));
 	const fmtCost = (c) => (c === null || c === undefined ? "—" : c === 0 ? "$0" : `$${c < 0.01 ? c.toFixed(4) : c.toFixed(2)}`);
@@ -42,6 +47,7 @@
 					<td class="num">${fmtTok(Number(c.tokens_in))} input · ${fmtTok(Number(c.tokens_out))} output</td>
 					<td class="num">${fmtCost(c.cost_usd)}</td>
 					<td class="num">${fmtDur(Number(c.duration_ms))}</td>
+					<td>${Number(c.synced) ? `<span class="pill ok" title="Uploaded to the dashboard">synced</span>` : `<span class="pill warn" title="Queued locally — uploads on the next flush">pending</span>`}</td>
 					<td class="key">${esc(c.key_label)}</td>
 				</tr>`;
 			})
@@ -111,14 +117,69 @@
 	}
 
 	function applyView() {
-		const ide = viewEl.value === "ide";
-		callsTable.hidden = ide;
-		ideTable.hidden = !ide;
-		chart.hidden = ide;
-		modelEl.hidden = ide;
-		statusEl.hidden = ide;
-		render();
+		const view = viewEl.value;
+		const store = view === "store";
+		callsTable.hidden = view !== "calls";
+		ideTable.hidden = view !== "ide";
+		storeView.hidden = !store;
+		chart.hidden = view !== "calls";
+		modelEl.hidden = view !== "calls";
+		statusEl.hidden = view !== "calls";
+		rangeEl.hidden = store;
+		emptyEl.hidden = store || emptyEl.hidden;
+		if (store) {
+			renderStore();
+			totalsEl.textContent = "";
+		} else {
+			render();
+		}
 	}
+
+	const TABLE_LABELS = {
+		api_calls: "API calls",
+		runs: "Runs",
+		session_events: "Run events",
+		prs: "Pull requests",
+		sandboxes: "Sandbox events",
+		memory_events: "Memory events",
+	};
+
+	function renderStore() {
+		const s = sync.status;
+		if (!s) {
+			syncStatusEl.textContent = "Sync worker not running.";
+		} else {
+			const parts = [];
+			parts.push(`<span class="pill ${s.enabled ? "ok" : "err"}">${s.enabled ? "sync on" : "sync off"}</span>`);
+			parts.push(`<span class="pill ${s.signedIn ? "ok" : "err"}">${s.signedIn ? "signed in" : "signed out"}</span>`);
+			parts.push(s.endpoint ? `endpoint ${esc(new URL(s.endpoint).hostname)}` : "no web endpoint configured");
+			if (s.lastOkAt) parts.push(`last upload ${new Date(s.lastOkAt).toLocaleTimeString()} (${esc(s.lastUploaded)})`);
+			else parts.push("no upload yet this session");
+			if (s.lastError) parts.push(`<span class="pill err">${esc(s.lastError)}</span>`);
+			if (s.pausedUntil && s.pausedUntil > Date.now() && s.pausedUntil < Number.MAX_SAFE_INTEGER)
+				parts.push(`next attempt ${new Date(s.pausedUntil).toLocaleTimeString()}`);
+			if (s.pausedUntil === Number.MAX_SAFE_INTEGER) parts.push("paused — sign in to resume");
+			if (s.flushing) parts.push("flushing…");
+			syncStatusEl.innerHTML = parts.join(" &nbsp;·&nbsp; ");
+		}
+		storeRowsEl.innerHTML = sync.tables
+			.map((t) => {
+				const when = t.lastAt ? new Date(t.lastAt).toLocaleString() : "—";
+				return `<tr>
+					<td>${esc(TABLE_LABELS[t.table] || t.table)}</td>
+					<td class="num">${t.total}</td>
+					<td class="num">${t.pending ? `<b>${t.pending}</b>` : "0"}</td>
+					<td class="num">${t.stuck ? `<span class="pill err">${t.stuck}</span>` : "0"}</td>
+					<td class="time">${esc(when)}</td>
+				</tr>`;
+			})
+			.join("");
+	}
+
+	flushBtn.addEventListener("click", () => {
+		flushBtn.disabled = true;
+		vscode.postMessage({ type: "flushNow" });
+	});
 
 	function drawChart() {
 		const ctx = chart.getContext("2d");
@@ -162,6 +223,12 @@
 		const msg = e.data;
 		if (msg.type === "noDashboard") {
 			document.getElementById("dashboard").hidden = true;
+			return;
+		}
+		if (msg.type === "sync") {
+			sync = { status: msg.status, tables: msg.tables || [] };
+			flushBtn.disabled = false;
+			if (viewEl.value === "store") renderStore();
 			return;
 		}
 		if (msg.type !== "calls") return;

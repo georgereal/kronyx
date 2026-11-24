@@ -285,7 +285,6 @@ async function onMessage(
 			const profile = String(m.profile ?? "");
 			if (!id || !profile) return;
 			await pickModel(id, profile);
-			deps.viewState.modelId = id;
 			return pushState(webview, context, deps);
 		}
 	}

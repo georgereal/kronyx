@@ -15,4 +15,9 @@ server.registerTool(
 server.registerTool("explode", { description: "Always fails", inputSchema: {} }, async () => {
 	throw new Error("boom");
 });
+server.registerTool(
+	"status",
+	{ description: "Read-only status", inputSchema: {}, annotations: { readOnlyHint: true } },
+	async () => ({ content: [{ type: "text", text: "ok" }] }),
+);
 await server.connect(new StdioServerTransport());

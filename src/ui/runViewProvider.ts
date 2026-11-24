@@ -1,19 +1,21 @@
 import * as vscode from "vscode";
 import type { AgentMode, RunViewEvent } from "../agent/runner";
+import type { EngineKind } from "../agent/engine";
 import type { ModelOption, ProfileCatalog } from "../config";
 import { renderPage } from "./pageHtml";
 
 export type { AgentMode, ModelOption };
 
 export type WebviewMessage =
-	| { type: "run"; task: string; mode: AgentMode }
-	| { type: "continue" }
+	| { type: "run"; task: string; mode: AgentMode; pick?: { modelId: string; profile: string }; engine?: EngineKind }
+	| { type: "resumeRun" }
 	| { type: "stop" }
 	| { type: "compact" }
 	| { type: "clearContext" }
 	| { type: "new" }
 	| { type: "setApiKey" }
 	| { type: "requestState" }
+	| { type: "setEngine"; engine: EngineKind }
 	| { type: "setMode"; mode: AgentMode }
 	| { type: "setModel"; modelId: string; profile?: string }
 	| { type: "attach"; kind: "file" | "directory" | "upload" }
@@ -44,6 +46,8 @@ export interface ViewState {
 	groups?: ProfileCatalog[];
 	/** Provider profile the last composer pick belongs to; empty = the Settings default. */
 	modelProfile?: string;
+	/** Execution engine for the session's next run. */
+	engine?: EngineKind;
 	signedIn?: boolean;
 	userEmail?: string;
 	cloudRepo?: string;
@@ -54,7 +58,6 @@ export interface ViewState {
 	/** Stored sessions without an open tab — listed in the dropdown for reopening. */
 	moreSessions?: { name: string; title: string }[];
 	activeSession?: string;
-	workspaceName?: string;
 }
 
 export interface AttachmentPreview {

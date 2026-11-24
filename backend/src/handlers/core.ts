@@ -527,6 +527,7 @@ export async function ingest(req: Request): Promise<Response> {
 		prs?: Record<string, unknown>[];
 		sandboxes?: Record<string, unknown>[];
 		memory?: Record<string, unknown>[];
+		harnessReports?: { runId?: unknown; session?: unknown; report?: unknown; at?: unknown; workspace?: unknown }[];
 	};
 	const calls = Array.isArray(body.calls) ? body.calls.slice(0, 500) : [];
 	const runs = Array.isArray(body.runs) ? body.runs : [];
@@ -534,7 +535,8 @@ export async function ingest(req: Request): Promise<Response> {
 	const prs = Array.isArray(body.prs) ? body.prs : [];
 	const sandboxes = Array.isArray(body.sandboxes) ? body.sandboxes : [];
 	const memory = Array.isArray(body.memory) ? body.memory.slice(0, 500) : [];
-	if (calls.length + runs.length + events.length + prs.length + sandboxes.length + memory.length === 0) return json({ inserted: 0 });
+	const harnessReports = (Array.isArray(body.harnessReports) ? body.harnessReports : []).slice(0, 100);
+	if (calls.length + runs.length + events.length + prs.length + sandboxes.length + memory.length + harnessReports.length === 0) return json({ inserted: 0 });
 	const db = await getDb();
 	const docs = calls
 		.filter((c) => typeof c.at === "number" && c.at > 0)
@@ -619,6 +621,31 @@ export async function ingest(req: Request): Promise<Response> {
 		await db.collection("sandboxes").insertMany(docs, { ordered: false }).catch(swallow("core", "op"));
 		await db.collection("sandbox_events").insertMany(docs, { ordered: false }).catch(swallow("core", "op"));
 	}
+	if (harnessReports.length) {
+		const docs = harnessReports
+			.filter((h) => typeof h.runId === "string" && h.runId && typeof h.report === "object" && h.report !== null)
+			.map((h) => ({
+				uid,
+				runId: String(h.runId).slice(0, 80),
+				session: typeof h.session === "string" ? h.session.slice(0, 200) : "",
+				report: h.report,
+				at: new Date(Number(h.at) || Date.now()),
+				workspace: typeof h.workspace === "string" ? h.workspace : "",
+				updatedAt: now,
+			}));
+		if (docs.length) {
+			await db.collection("harness_reports").bulkWrite(
+				docs.map((h) => ({
+					updateOne: {
+						filter: { uid, runId: h.runId },
+						update: { $set: h },
+						upsert: true,
+					},
+				})),
+				{ ordered: false },
+			);
+		}
+	}
 	if (memory.length) {
 		const docs = memory.map((m) => ({
 			uid,
@@ -635,7 +662,7 @@ export async function ingest(req: Request): Promise<Response> {
 		}));
 		await db.collection("memory_events").insertMany(docs, { ordered: false }).catch(swallow("core", "op"));
 	}
-	return json({ inserted, runs: runs.length, events: events.length, prs: prs.length, sandboxes: sandboxes.length, memory: memory.length });
+	return json({ inserted, runs: runs.length, events: events.length, prs: prs.length, sandboxes: sandboxes.length, memory: memory.length, harnessReports: harnessReports.length });
 }
 
 export { resolveApiKey };

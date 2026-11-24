@@ -1,12 +1,26 @@
 import * as vscode from "vscode";
-import { listApiCalls, listMemoryEvents, openStore, type ApiCallFilter } from "../store";
+import { listApiCalls, listMemoryEvents, openStore, storeStats, type ApiCallFilter } from "../store";
+import type { SyncStatus } from "../sync";
 
 let panel: vscode.WebviewPanel | undefined;
 
-type UsageMessage = { type: "query"; filter?: ApiCallFilter } | { type: "ready" } | { type: "openDashboard" };
+/** Live view of the local store + uploader, supplied by the extension host. */
+export interface UsageSyncHandle {
+	status(): Promise<SyncStatus | undefined>;
+	flush(): Promise<void>;
+}
+
+type UsageMessage =
+	| { type: "query"; filter?: ApiCallFilter }
+	| { type: "ready" }
+	| { type: "openDashboard" }
+	| { type: "flushNow" };
+
+let syncHandle: UsageSyncHandle | undefined;
 
 /** Vercel/OpenRouter-style per-request usage log, served from the local api_calls ledger. */
-export function openUsagePage(context: vscode.ExtensionContext): void {
+export function openUsagePage(context: vscode.ExtensionContext, sync?: UsageSyncHandle): void {
+	syncHandle = sync;
 	if (panel) {
 		panel.reveal();
 		return;
@@ -35,6 +49,7 @@ export function openUsagePage(context: vscode.ExtensionContext): void {
       <select id="view">
         <option value="calls">API calls</option>
         <option value="ide">IDE tools</option>
+        <option value="store">Local store & sync</option>
       </select>
       <select id="range">
         <option value="3600000">Last hour</option>
@@ -60,7 +75,7 @@ export function openUsagePage(context: vscode.ExtensionContext): void {
     <tr>
       <th>Time</th><th>Status</th><th>Model</th><th>Provider</th>
       <th class="num">Usage</th><th class="num">Cost <span class="est">est.</span></th>
-      <th class="num">Duration</th><th>Key</th>
+      <th class="num">Duration</th><th>Sync</th><th>Key</th>
     </tr>
   </thead>
   <tbody id="rows"></tbody>
@@ -73,6 +88,25 @@ export function openUsagePage(context: vscode.ExtensionContext): void {
   </thead>
   <tbody id="ideRows"></tbody>
 </table>
+<div id="storeView" hidden>
+  <div class="sync-card">
+    <div class="sync-head">
+      <h2>Upload to dashboard</h2>
+      <button id="flush">Flush now</button>
+    </div>
+    <div id="syncStatus" class="sync-status">…</div>
+  </div>
+  <table id="storeTable">
+    <thead>
+      <tr>
+        <th>Table</th><th class="num">Rows</th><th class="num">Pending upload</th>
+        <th class="num">Stuck</th><th>Latest row</th>
+      </tr>
+    </thead>
+    <tbody id="storeRows"></tbody>
+  </table>
+  <div class="sync-note" id="storePath"></div>
+</div>
 <div id="empty" hidden>No API calls recorded yet. Run a task to see per-request usage.</div>
 <script src="${js}"></script>
 </body>
@@ -86,14 +120,25 @@ export function openUsagePage(context: vscode.ExtensionContext): void {
 	});
 }
 
+async function postSync(d: Awaited<ReturnType<typeof openStore>>): Promise<void> {
+	if (!panel) return;
+	const status = syncHandle ? await syncHandle.status() : undefined;
+	void panel.webview.postMessage({ type: "sync", status, tables: storeStats(d) });
+}
+
 async function handle(message: UsageMessage): Promise<void> {
 	const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-	const d = root ? await openStore(root) : undefined;
+	const d = await openStore(root ?? "");
 	switch (message.type) {
 		case "openDashboard": {
 			const { webAppUrl } = await import("../auth");
 			const url = webAppUrl();
 			if (url) await vscode.env.openExternal(vscode.Uri.parse(url));
+			break;
+		}
+		case "flushNow": {
+			if (syncHandle) await syncHandle.flush();
+			await postSync(d);
 			break;
 		}
 		case "ready":
@@ -108,6 +153,7 @@ async function handle(message: UsageMessage): Promise<void> {
 				limit: 2000,
 			});
 			void panel?.webview.postMessage({ type: "calls", calls, models, ideEvents });
+			await postSync(d);
 			break;
 		}
 	}

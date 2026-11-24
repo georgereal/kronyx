@@ -43,6 +43,7 @@ const KIND: Record<string, string> = {
 	"run-finished": "Summary",
 	"run-completed": "Completed",
 	"run-failed": "Failed",
+	"run-paused": "Paused",
 };
 
 const WRITE_TOOLS = new Set(["file_editor", "write_file", "edit_file", "append_file", "insert_lines"]);
@@ -624,7 +625,7 @@ function CheckRow({ e }: { e: RunEvent }) {
 	);
 }
 
-function Event({ user, sessionId, e, events, runs, githubUrl, onShowFailures }: { user: User; sessionId: string; e: RunEvent; events: RunEvent[]; runs: RunDoc[]; githubUrl?: string; onShowFailures?: (runId: string) => void }) {
+function Event({ user, sessionId, e, events, runs, githubUrl, onShowFailures, count }: { user: User; sessionId: string; e: RunEvent; events: RunEvent[]; runs: RunDoc[]; githubUrl?: string; onShowFailures?: (runId: string) => void; count?: number }) {
 	const ev = e.event;
 	const kind = KIND[ev.type] ?? ev.type;
 	const cls =
@@ -666,27 +667,84 @@ function Event({ user, sessionId, e, events, runs, githubUrl, onShowFailures }: 
 			</div>
 		);
 	}
+	if (ev.type === "run-paused") {
+		// Only the run's latest event while the run is still paused is actionable —
+		// an older pause (resumed or stopped since) is history.
+		const live =
+			runs.some((r) => r.runId === e.runId && r.status === "paused") &&
+			events.reduce((m, x) => (x.runId === e.runId ? Math.max(m, x.seq) : m), 0) === e.seq;
+		const refresh = () => window.dispatchEvent(new CustomEvent("kronyx:refresh-session"));
+		return (
+			<div className="ev">
+				<div className="ev-kind">Paused at step limit</div>
+				<span>Paused after {String(ev.iterations ?? "")} steps — the agent&apos;s context is kept.</span>
+				{live && (
+					<div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+						<button
+							className="btn sm"
+							onClick={async () => {
+								const res = await apiFetch(`/api/runs/${e.runId}/resume`, user, { method: "POST" });
+								if (res.ok) refresh();
+							}}
+						>
+							Continue
+						</button>
+						<button
+							className="btn sm"
+							onClick={async () => {
+								await apiFetch(`/api/runs/${e.runId}/stop`, user, { method: "POST" });
+								refresh();
+							}}
+						>
+							Stop
+						</button>
+					</div>
+				)}
+			</div>
+		);
+	}
 	if (ev.type === "run-failed") {
 		const err = String(ev.error ?? ev.text ?? "");
-		const iterLimit = /maxIterations|exceeded.*iterations/i.test(err);
+		const FAIL_META: Record<string, { title: string; hint: string }> = {
+			missing_tool_results: { title: "The run was interrupted", hint: "A tool call lost its result before the run could continue — the transcript is repaired on retry." },
+			sandbox_death: { title: "The sandbox VM died", hint: "The environment running the tools was lost mid-run." },
+			rate_limit: { title: "Provider rate limit", hint: "The model provider throttled the request." },
+			context_overflow: { title: "Context overflow", hint: "The conversation grew past the model's context window." },
+			auth: { title: "Authentication failed", hint: "Check the provider credentials in Settings." },
+			no_such_tool: { title: "Tool unavailable", hint: "The model tried to call a tool this mode doesn't provide." },
+			stopped: { title: "Stopped", hint: "" },
+			unknown: { title: "Run failed", hint: "" },
+		};
+		const meta = FAIL_META[String(ev.errorKind ?? "unknown")] ?? FAIL_META.unknown;
+		// Retry is only meaningful on the run's terminal failed state and its
+		// latest event — an older failure (continued or superseded) is history.
+		const live =
+			ev.retryable === true &&
+			runs.some((r) => r.runId === e.runId && r.status === "failed") &&
+			events.reduce((m, x) => (x.runId === e.runId ? Math.max(m, x.seq) : m), 0) === e.seq;
+		const refresh = () => window.dispatchEvent(new CustomEvent("kronyx:refresh-session"));
 		return (
 			<div className="ev failed">
-				<div className="ev-kind">Failed</div>
-				<span>{err || "Run failed"}</span>
-				{iterLimit && (
-					<button
-						className="btn sm"
-						style={{ marginTop: 8 }}
-						onClick={async () => {
-							const res = await apiFetch(`/api/sessions/${sessionId}/messages`, user, {
-								method: "POST",
-								body: JSON.stringify({ task: "Continue where you left off and finish the task.", mode: "agent" }),
-							});
-							if (res.ok) window.dispatchEvent(new CustomEvent("kronyx:refresh-session"));
-						}}
-					>
-						Continue run
-					</button>
+				<div className="ev-kind">{meta.title}</div>
+				{meta.hint ? <span>{meta.hint}</span> : null}
+				{err ? (
+					<details style={{ marginTop: 4 }}>
+						<summary className="muted" style={{ cursor: "pointer", fontSize: 12 }}>Details</summary>
+						<pre className="act-out" style={{ marginTop: 4 }}>{err}</pre>
+					</details>
+				) : null}
+				{live && (
+					<div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+						<button
+							className="btn sm"
+							onClick={async () => {
+								const res = await apiFetch(`/api/runs/${e.runId}/resume`, user, { method: "POST" });
+								if (res.ok) refresh();
+							}}
+						>
+							Retry
+						</button>
+					</div>
 				)}
 			</div>
 		);
@@ -820,12 +878,15 @@ function Event({ user, sessionId, e, events, runs, githubUrl, onShowFailures }: 
 		);
 	}
 	if (!text && !ev.type.startsWith("run-")) return null;
-	// Context compaction — distinct marker, not a generic info line.
+	// Context compaction — distinct marker, not a generic info line. Repeated
+	// compactions fold into one row via EventItem.count ("compacted ×N").
 	if (ev.type === "info" && (ev.meta as { kind?: string } | undefined)?.kind === "context_compaction") {
 		return (
 			<div className="ev-line muted">
 				<span className="dot" style={{ background: "var(--amber, #facc15)" }} />
-				<span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>◈ {text}</span>
+				<span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>
+					◈ {text}{(count ?? 1) > 1 ? ` ×${count}` : ""}
+				</span>
 			</div>
 		);
 	}
@@ -1186,7 +1247,7 @@ export function Timeline({
 				</div>
 			);
 		}
-		return <Event key={item.key} user={user} sessionId={sessionId} e={item.e} events={events} runs={runs} githubUrl={githubUrl} onShowFailures={jumpToFailures} />;
+		return <Event key={item.key} user={user} sessionId={sessionId} e={item.e} events={events} runs={runs} githubUrl={githubUrl} onShowFailures={jumpToFailures} count={item.count} />;
 	};
 
 	// Multi-agent helpers (shared with MultiAgentPanel): titles from the

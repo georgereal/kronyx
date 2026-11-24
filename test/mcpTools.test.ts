@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { fileURLToPath } from "node:url";
 import * as path from "node:path";
-import { createMcpTools, expandEnv } from "../src/tools/mcpTools";
+import { createMcpTools, expandEnv, isReadOnlyMcpTool } from "../src/tools/mcpTools";
 
 const fixture = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", "fakeMcpServer.mjs");
 
@@ -23,9 +23,12 @@ describe("createMcpTools", () => {
 		});
 		try {
 			const names = set.tools.map((t) => t.name).sort();
-			expect(names).toEqual(["mcp_fake_echo", "mcp_fake_explode"]);
+			expect(names).toEqual(["mcp_fake_echo", "mcp_fake_explode", "mcp_fake_status"]);
 			const echo = set.tools.find((t) => t.name === "mcp_fake_echo")!;
 			expect(await echo.execute({ text: "hi" }, {} as never)).toBe("echo:hi");
+			// Only server-annotated readOnlyHint tools are reads; unannotated tools stay writes.
+			expect(isReadOnlyMcpTool(set.tools.find((t) => t.name === "mcp_fake_status")!)).toBe(true);
+			expect(isReadOnlyMcpTool(echo)).toBe(false);
 		} finally {
 			await set.close();
 		}

@@ -65,6 +65,11 @@ export async function openStore(root: string): Promise<Store | undefined> {
 		db.exec(`CREATE TABLE IF NOT EXISTS eval_results(
 			id INTEGER PRIMARY KEY, root TEXT, name TEXT, model TEXT, status TEXT,
 			passed INTEGER, details TEXT, iterations INTEGER, duration_ms INTEGER, at INTEGER)`);
+		for (const col of ["engine TEXT", "input_tokens INTEGER", "cached_tokens INTEGER", "output_tokens INTEGER", "tool_calls INTEGER"]) {
+			try {
+				db.exec(`ALTER TABLE eval_results ADD COLUMN ${col}`);
+			} catch { /* column exists */ }
+		}
 		db.exec(`CREATE TABLE IF NOT EXISTS transcripts(
 			id INTEGER PRIMARY KEY, root TEXT, session TEXT, at INTEGER, messages TEXT)`);
 		db.exec(`CREATE TABLE IF NOT EXISTS episodes(
@@ -97,6 +102,7 @@ export async function openStore(root: string): Promise<Store | undefined> {
 			"context_msgs INTEGER",
 			"kind TEXT",
 			"op TEXT",
+			"engine TEXT",
 		]) {
 			try {
 				db.exec(`ALTER TABLE api_calls ADD COLUMN ${col}`);
@@ -109,6 +115,10 @@ export async function openStore(root: string): Promise<Store | undefined> {
 		db.exec(`CREATE TABLE IF NOT EXISTS memory_events(
 			id INTEGER PRIMARY KEY, root TEXT, session TEXT, run_id TEXT, at INTEGER,
 			op TEXT, detail TEXT, device_id TEXT, synced INTEGER DEFAULT 0)`);
+		db.exec(`CREATE TABLE IF NOT EXISTS harness_reports(
+			id INTEGER PRIMARY KEY, root TEXT, run_id TEXT, session TEXT, report TEXT,
+			at INTEGER, synced INTEGER DEFAULT 0)`);
+		db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS harness_reports_run ON harness_reports(root, run_id)`);
 		db.exec(`CREATE TABLE IF NOT EXISTS chunks(
 			root TEXT, path TEXT, idx INTEGER, text TEXT, embedding BLOB,
 			PRIMARY KEY(root, path, idx))`);
@@ -217,7 +227,7 @@ export function migrateLegacyStore(legacyPath: string): void {
 		if (all(db, "SELECT value FROM kv WHERE key = ?", [`migrated:${legacyPath}`]).length) return;
 		if (!existsSync(legacyPath)) return;
 		db.exec(`ATTACH DATABASE '${legacyPath.replace(/'/g, "''")}' AS legacy`);
-			for (const t of ["runs", "session_events", "api_calls", "usage_history", "prs", "transcripts", "episodes", "kv", "sandboxes", "eval_results", "chunks", "memory_events"]) {
+			for (const t of ["runs", "session_events", "api_calls", "usage_history", "prs", "transcripts", "episodes", "kv", "sandboxes", "eval_results", "chunks", "memory_events", "harness_reports"]) {
 			try {
 				const cols = (db.prepare(`SELECT name FROM pragma_table_info(?)`).all(t) as { name: string }[])
 					.map((c) => c.name).filter((n) => n !== "id");
@@ -304,6 +314,37 @@ export function markRunEventsSynced(d: Store | undefined, ids: number[]): void {
 	if (!d || ids.length === 0) return;
 	try {
 		run(d, `UPDATE session_events SET synced = 1 WHERE id IN (${ids.map(() => "?").join(",")})`, ids);
+	} catch { /* store unavailable */ }
+}
+
+// ---------- harness reports ----------
+
+/** Queue (or refresh) a run's harness report for the next sync flush. One row
+ *  per (root, run_id); re-queueing resets synced so the latest report uploads. */
+export function upsertHarnessReport(d: Store | undefined, entry: { runId: string; session: string; report: unknown }, root = ""): void {
+	try {
+		run(d, "INSERT OR REPLACE INTO harness_reports(root, run_id, session, report, at, synced) VALUES (?, ?, ?, ?, ?, 0)", [
+			root,
+			entry.runId,
+			entry.session,
+			JSON.stringify(entry.report),
+			Date.now(),
+		]);
+	} catch { /* store unavailable */ }
+}
+
+export function listUnsyncedHarnessReports(d: Store | undefined, limit = 50): Record<string, unknown>[] {
+	try {
+		return all(d, "SELECT * FROM harness_reports WHERE synced = 0 AND run_id != '' ORDER BY id LIMIT ?", [limit]);
+	} catch {
+		return [];
+	}
+}
+
+export function markHarnessReportsSynced(d: Store | undefined, ids: number[]): void {
+	if (!d || ids.length === 0) return;
+	try {
+		run(d, `UPDATE harness_reports SET synced = 1 WHERE id IN (${ids.map(() => "?").join(",")})`, ids);
 	} catch { /* store unavailable */ }
 }
 
@@ -460,6 +501,48 @@ export function markMemoryEventsSynced(d: Store | undefined, ids: number[]): voi
 	} catch { /* store unavailable */ }
 }
 
+// ---------- store stats (usage page sync card) ----------
+
+export interface StoreTableStat {
+	table: string;
+	total: number;
+	/** Rows the uploader will pick up on the next flush. */
+	pending: number;
+	/** synced=0 rows excluded from upload (e.g. missing run_id). */
+	stuck: number;
+	lastAt?: number;
+}
+
+export function storeStats(d: Store | undefined): StoreTableStat[] {
+	// pendingSql mirrors each listUnsynced* predicate so the page shows exactly
+	// what the next flush will upload — and what's stuck.
+	const defs: { table: string; pendingSql: string }[] = [
+		{ table: "api_calls", pendingSql: "synced = 0" },
+		{ table: "runs", pendingSql: "synced = 0 AND run_id != ''" },
+		{ table: "session_events", pendingSql: "synced = 0 AND run_id != ''" },
+		{ table: "prs", pendingSql: "synced = 0" },
+		{ table: "sandboxes", pendingSql: "synced = 0" },
+		{ table: "memory_events", pendingSql: "synced = 0" },
+		{ table: "harness_reports", pendingSql: "synced = 0 AND run_id != ''" },
+	];
+	return defs.map(({ table, pendingSql }) => {
+		try {
+			const t = all(d, `SELECT COUNT(*) c, MAX(at) last FROM ${table}`, [])[0] ?? {};
+			const p = all(d, `SELECT COUNT(*) c FROM ${table} WHERE ${pendingSql}`, [])[0] ?? {};
+			const u = all(d, `SELECT COUNT(*) c FROM ${table} WHERE synced = 0`, [])[0] ?? {};
+			return {
+				table,
+				total: Number(t.c) || 0,
+				pending: Number(p.c) || 0,
+				stuck: (Number(u.c) || 0) - (Number(p.c) || 0),
+				lastAt: t.last ? Number(t.last) : undefined,
+			};
+		} catch {
+			return { table, total: 0, pending: 0, stuck: 0 };
+		}
+	});
+}
+
 // ---------- usage history ----------
 
 export function insertUsage(
@@ -513,6 +596,7 @@ export interface ApiCallRow {
 	iteration?: number;
 	contextMsgs?: number;
 	kind?: string;
+	engine?: string;
 	op?: string;
 	costUsd?: number;
 	durationMs?: number;
@@ -526,8 +610,8 @@ export function insertApiCall(d: Store | undefined, call: ApiCallRow, root = "")
 			d,
 			`INSERT INTO api_calls(root, session, task, at, status, provider, base_url, model, profile, key_label,
 				device, device_id, run_id, tokens_in, tokens_out, cache_read, cache_write,
-				reasoning_tokens, billed_cost_usd, iteration, context_msgs, kind, op, cost_usd, duration_ms)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				reasoning_tokens, billed_cost_usd, iteration, context_msgs, kind, op, cost_usd, duration_ms, engine)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			[
 				root, call.session, call.task, call.at, call.status, call.provider ?? "", call.baseUrl ?? "",
 				call.model ?? "", call.profile ?? "", call.keyLabel ?? "", call.device ?? "", call.deviceId ?? "",
@@ -535,7 +619,7 @@ export function insertApiCall(d: Store | undefined, call: ApiCallRow, root = "")
 				call.tokensIn, call.tokensOut, call.cacheRead ?? 0, call.cacheWrite ?? 0,
 				call.reasoningTokens ?? 0, call.billedCostUsd ?? null, call.iteration ?? null, call.contextMsgs ?? null,
 				call.kind ?? "chat", call.op ?? "",
-				call.costUsd ?? null, call.durationMs ?? 0,
+				call.costUsd ?? null, call.durationMs ?? 0, call.engine ?? "cline",
 			],
 		);
 		const rows = all(d, "SELECT last_insert_rowid() AS id", []);
@@ -615,12 +699,18 @@ export interface EvalResultRow {
 	iterations: number;
 	durationMs: number;
 	at: number;
+	engine?: string;
+	inputTokens?: number;
+	cachedTokens?: number;
+	outputTokens?: number;
+	toolCalls?: number;
 }
 
 export function insertEvalResult(d: Store | undefined, r: EvalResultRow, root = ""): void {
 	try {
-		run(d, "INSERT INTO eval_results(root, name, model, status, passed, details, iterations, duration_ms, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+		run(d, "INSERT INTO eval_results(root, name, model, status, passed, details, iterations, duration_ms, at, engine, input_tokens, cached_tokens, output_tokens, tool_calls) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
 			root, r.name, r.model ?? "", r.status, r.passed ? 1 : 0, r.details, r.iterations, r.durationMs, r.at,
+			r.engine ?? "cline", r.inputTokens ?? 0, r.cachedTokens ?? 0, r.outputTokens ?? 0, r.toolCalls ?? 0,
 		]);
 	} catch { /* store unavailable */ }
 }

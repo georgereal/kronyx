@@ -33,7 +33,7 @@ export async function getRun(req: Request, p: Record<string, string>): Promise<R
 	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
 	const after = Number(new URL(req.url).searchParams.get("after")) || 0;
 	const db = await getDb();
-	const [run, pr, events] = await Promise.all([
+	const [run, pr, events, harness] = await Promise.all([
 		db.collection("runs").findOne({ uid, runId: p.id }),
 		db.collection("prs").findOne({ uid, runId: p.id }),
 		db.collection("run_events")
@@ -41,12 +41,14 @@ export async function getRun(req: Request, p: Record<string, string>): Promise<R
 			.sort({ seq: 1 })
 			.limit(500)
 			.toArray(),
+		db.collection("harness_reports").findOne({ uid, runId: p.id }, { projection: { _id: 0, report: 1 } }),
 	]);
 	if (!run && events.length === 0) return json({ error: "not_found" }, { status: 404 });
 	return json({
 		run: run ? { ...run, _id: undefined } : null,
 		pr: pr ? { ...pr, _id: undefined } : null,
 		events: events.map((e) => ({ seq: e.seq, event: e.event })),
+		harnessReport: harness?.report ?? null,
 	});
 }
 
@@ -92,6 +94,11 @@ export async function stopRun(req: Request, p: Record<string, string>): Promise<
 		await db
 			.collection("sessions")
 			.updateOne({ uid, sessionId: run.sessionId, activeRunId: p.id }, { $set: { activeRunId: null, updatedAt: new Date() } });
+	} else if (run.status === "paused") {
+		// No job is running to read `control` — the paused agent is finalized here.
+		await db
+			.collection("runs")
+			.updateMany({ uid, runId: p.id }, { $set: { status: "stopped", finishedAt: new Date(), updatedAt: new Date() } });
 	} else {
 		// Claimed/running: worker's stopCheck reads `control` — show progress meanwhile.
 		await db
@@ -99,6 +106,42 @@ export async function stopRun(req: Request, p: Record<string, string>): Promise<
 			.updateMany({ uid, runId: p.id, status: { $in: ["running", "claimed"] } }, { $set: { status: "stopping", updatedAt: new Date() } });
 	}
 	return json({ ok: true });
+}
+
+/** POST /api/runs/:id/resume — continue a run parked at its step cap or a
+ *  retryable failure on its own agent (rebuilt from the durable log either
+ *  way; sanitizeMessages repairs interrupted tool calls on reseed). */
+export async function resumeRun(req: Request, p: Record<string, string>): Promise<Response> {
+	const uid = await authenticate(req);
+	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
+	const db = await getDb();
+	const run = await db.collection("runs").findOne({ uid, runId: p.id });
+	if (!run) return json({ error: "not_found" }, { status: 404 });
+	if (run.status !== "paused" && run.status !== "failed") return json({ error: "not_resumable" }, { status: 409 });
+	const session = await db.collection("sessions").findOne({ uid, sessionId: run.sessionId }, { projection: { activeRunId: 1 } });
+	if (session?.activeRunId) return json({ error: "run_active" }, { status: 409 });
+	const now = new Date();
+	// Same runId: the timeline, event seq, and transcript continue under one run.
+	await db
+		.collection("runs")
+		.updateMany({ uid, runId: p.id }, { $set: { status: "queued", updatedAt: now }, $unset: { control: "" } });
+	await db.collection("cloud_jobs").insertOne({
+		jobId: `${p.id}-resume-${now.getTime()}`,
+		uid,
+		sessionId: run.sessionId,
+		runId: p.id,
+		resumeRunId: p.id,
+		task: run.task,
+		mode: run.mode,
+		modelId: run.modelId,
+		profile: run.profile,
+		attachmentIds: [],
+		planSlug: null,
+		kind: "run",
+		status: "queued",
+		createdAt: now,
+	});
+	return json({ ok: true, runId: p.id });
 }
 
 /** POST /api/runs/:id/compact — request a manual context compaction; the

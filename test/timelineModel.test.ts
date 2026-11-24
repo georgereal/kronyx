@@ -233,3 +233,48 @@ describe("tool labels", () => {
 		expect(toolDetail(cmd)).toBe("");
 	});
 });
+
+describe("compaction rollup", () => {
+	it("rolls up consecutive context-compaction info lines into one row", () => {
+		const evs: RunEvent[] = [
+			ev("run-started", { task: "t" }),
+			ev("info", { text: "context compacted (~146k → ~70k)", meta: { kind: "context_compaction" } }),
+			ev("info", { text: "context compacted (~150k → ~71k)", meta: { kind: "context_compaction" } }),
+			ev("info", { text: "context compacted (~155k → ~72k)", meta: { kind: "context_compaction" } }),
+			ev("run-finished", { status: "completed", text: "done", iterations: 3 }),
+		];
+		const items = buildTimeline(evs);
+		const compacted = events(items).filter((i) => i.e.event.type === "info");
+		expect(compacted).toHaveLength(1);
+		expect(compacted[0].count).toBe(3);
+		expect(String(compacted[0].e.event.text)).toContain("155k");
+	});
+
+	it("folds compaction lines separated by tool rows and stat events into the first row", () => {
+		const compact = (text: string) => ev("info", { text, meta: { kind: "context_compaction" } });
+		const evs: RunEvent[] = [
+			compact("context compacted (~109k → ~67k)"),
+			ev("compaction", { stats: {} }),
+			ev("tool-started", { name: "read_file", id: "t1", input: { path: "a.ts" } }),
+			ev("tool-finished", { id: "t1", name: "read_file", output: "ok", ok: true }),
+			compact("context compacted (~111k → ~68k)"),
+			ev("compaction", { stats: {} }),
+			ev("tool-started", { name: "read_file", id: "t2", input: { path: "b.ts" } }),
+			ev("tool-finished", { id: "t2", name: "read_file", output: "ok", ok: true }),
+			compact("context compacted (~120k → ~70k)"),
+		];
+		const rows = events(buildTimeline(evs)).filter((i) => (i.e.event.meta as { kind?: string } | undefined)?.kind === "context_compaction");
+		expect(rows).toHaveLength(1);
+		expect(rows[0].count).toBe(3);
+		expect(String(rows[0].e.event.text)).toContain("120k");
+	});
+
+	it("does not roll up compaction lines across runs", () => {
+		const evs: RunEvent[] = [
+			ev("info", { text: "a", meta: { kind: "context_compaction" } }, "r1"),
+			ev("info", { text: "b", meta: { kind: "context_compaction" } }, "r2"),
+		];
+		const compacted = events(buildTimeline(evs)).filter((i) => i.e.event.type === "info");
+		expect(compacted).toHaveLength(2);
+	});
+});

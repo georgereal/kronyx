@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AgentMessage, AgentRuntimePrepareTurnContext } from "@cline/shared";
-import { createPrepareTurn, taskContextBudget } from "../src/agent/compaction";
+import { contextBudget, createPrepareTurn, sanitizeMessages } from "../src/agent/compaction";
 
 let seq = 0;
 const msg = (role: AgentMessage["role"], content: AgentMessage["content"]): AgentMessage => ({
@@ -24,6 +24,43 @@ const ctx = (messages: AgentMessage[], contextWindow: number, extra: Partial<Age
 		model: { info: { contextWindow } },
 		...extra,
 	}) as AgentRuntimePrepareTurnContext;
+
+describe("sanitizeMessages", () => {
+	it("returns the input untouched when every call is paired", () => {
+		const msgs = [call("c1", "read_file", { path: "a" }), result("c1", "read_file", "ok")];
+		const { messages, repaired } = sanitizeMessages(msgs);
+		expect(repaired).toBe(0);
+		expect(messages).toBe(msgs);
+	});
+
+	it("injects a synthetic error result right after a dangling call", () => {
+		const msgs = [
+			msg("user", [{ type: "text", text: "t" }]),
+			call("c1", "read_file", { path: "a" }),
+			result("c1", "read_file", "ok"),
+			call("c2", "search_files", { pattern: "x" }),
+		];
+		const { messages, repaired } = sanitizeMessages(msgs);
+		expect(repaired).toBe(1);
+		expect(messages).toHaveLength(5);
+		expect(messages[4].role).toBe("tool");
+		const p = messages[4].content[0] as { toolCallId: string; isError: boolean; output: string };
+		expect(p.toolCallId).toBe("c2");
+		expect(p.isError).toBe(true);
+		expect(p.output).toContain("interrupted");
+	});
+
+	it("drops orphan results (and now-empty messages)", () => {
+		const msgs = [
+			call("c1", "read_file", { path: "a" }),
+			result("c1", "read_file", "ok"),
+			result("zz", "read_file", "no call for this"),
+		];
+		const { messages, repaired } = sanitizeMessages(msgs);
+		expect(repaired).toBe(1);
+		expect(messages).toHaveLength(2);
+	});
+});
 
 describe("createPrepareTurn", () => {
 	it("returns undefined below the threshold", async () => {
@@ -283,12 +320,12 @@ describe("createPrepareTurn", () => {
 		expect(texts[2]).toContain("output elided by context compaction"); // superseded read stubbed under budget
 	});
 
-	it("taskContextBudget classifies read-heavy vs implementation tasks", () => {
-		expect(taskContextBudget("audit the executor for bugs we missed")).toBe(100_000);
-		expect(taskContextBudget("explore how compaction works")).toBe(100_000);
-		expect(taskContextBudget("some task", "plan")).toBe(100_000);
-		expect(taskContextBudget("fix the login redirect bug")).toBe(200_000);
-		expect(taskContextBudget("add a dark mode toggle")).toBe(200_000);
+	it("contextBudget derives from the model window: half, capped at 200K, floored at 64K", () => {
+		expect(contextBudget(1_048_576)).toBe(200_000);
+		expect(contextBudget(256_000)).toBe(128_000);
+		expect(contextBudget(128_000)).toBe(64_000);
+		expect(contextBudget(32_000)).toBe(64_000);
+		expect(contextBudget(undefined)).toBe(200_000);
 	});
 
 	it("summarize tier replaces the oldest turns when stubbing can't reach target", async () => {
@@ -333,6 +370,175 @@ describe("createPrepareTurn", () => {
 		// next pass uses the raised budget — same context now sits below trigger
 		const stats2 = await turn(ctx(msgs, 300_000));
 		void stats2;
+	});
+
+	it("grows the budget stepwise, then resets after the big summary at the cap", async () => {
+		// Pseudo-random alnum via LCG — aperiodic, so BPE can't compress it.
+		// `off` seeds each result differently so dedupe/supersession can't fire.
+		const dense = (n: number, off: number) => {
+			let x = off + 1;
+			return Array.from({ length: n }, () => {
+				x = (x * 1103515245 + 12345) % 2 ** 31;
+				return "abcdefghijklmnopqrstuvwxyz0123456789"[x % 36];
+			}).join("");
+		};
+		const transcript = (resultChars: number, results: number) => {
+			const msgs: AgentMessage[] = [msg("user", [{ type: "text", text: "task" }])];
+			for (let i = 0; i < results; i++) {
+				msgs.push(call(`c${i}`, "read_file", { path: `f${i}.ts` }), result(`c${i}`, "read_file", dense(resultChars, i * 13)));
+			}
+			return msgs;
+		};
+		const budgetRef = { current: 0 };
+		let stats: import("../src/agent/compaction").CompactStats | undefined;
+		let summaries = 0;
+		const turn = createPrepareTurn({
+			contextBudget: 200_000,
+			budgetRef,
+			minDeepPassCalls: 0, // each call in this test is a distinct turn
+			onCompact: (s) => { stats = s; },
+			summarize: async () => {
+				summaries++;
+				return "Recap: read files.";
+			},
+		});
+		// Cycle starts at cap/4 = 64K, trigger 44.8K. ~50K est → hard pass.
+		const mid = transcript(17_000, 12);
+		await turn(ctx(mid, 1_000_000));
+		expect(budgetRef.current).toBe(96_000); // 64K × 1.5
+		expect(summaries).toBe(0); // no summary below the cap
+		// Same context now sits in the soft band — pass runs, budget unchanged.
+		await turn(ctx(mid, 1_000_000));
+		expect(budgetRef.current).toBe(96_000);
+		// ~105K est → hard at 96K, then at 144K, then reaches the 200K cap.
+		const big = transcript(17_000, 22);
+		await turn(ctx(big, 1_000_000));
+		expect(budgetRef.current).toBe(144_000);
+		await turn(ctx(big, 1_000_000));
+		expect(budgetRef.current).toBe(200_000);
+		// ~150K est ≥ 140K trigger at the cap → big reset: whole prefix
+		// summarized and the budget wraps back to the start.
+		const out = (await turn(ctx(transcript(17_000, 30), 1_000_000)))!;
+		expect(summaries).toBeGreaterThan(0); // chunked briefs — one reset
+		expect(stats?.budgetReset).toBe(true);
+		expect(budgetRef.current).toBe(64_000);
+		expect(JSON.stringify(out.messages!.map((m) => m.content))).toContain("summarized by context compaction");
+	});
+
+	it("repairs a dangling tool-call in the projected history (interrupted run)", async () => {
+		// Canonical transcript ends in a call whose result never landed —
+		// exactly what a resume log replay produces after a mid-tool death.
+		const msgs: AgentMessage[] = [
+			msg("user", [{ type: "text", text: "task" }]),
+			call("c0", "read_file", { path: "a.ts" }),
+		];
+		const turn = createPrepareTurn({ contextWindow: 1_000_000 });
+		const out = (await turn(ctx(msgs, 1_000_000)))!;
+		expect(out).toBeDefined(); // repair alone forces a projection
+		const last = out!.messages!.at(-1)!;
+		expect(last.role).toBe("tool");
+		const part = last.content[0] as { type: string; toolCallId: string; isError: boolean; output: string };
+		expect(part.type).toBe("tool-result");
+		expect(part.toolCallId).toBe("c0");
+		expect(part.isError).toBe(true);
+		expect(part.output).toContain("interrupted");
+	});
+
+	it("a failed summary chunk adjacent to a kept call still yields complete pairs", async () => {
+		// Summarizer fails on the chunk holding call c0's result; the chunk
+		// holding later calls succeeds. The final sanitize pass must repair
+		// whatever dangles.
+		const window = 2_000;
+		const msgs: AgentMessage[] = [msg("user", [{ type: "text", text: "task " + "t".repeat(8000) }])];
+		for (let i = 0; i < 12; i++) {
+			msgs.push(call(`c${i}`, "read_file", { path: `f${i}.ts` }), result(`c${i}`, "read_file", "y".repeat(600)));
+		}
+		let calls = 0;
+		const turn = createPrepareTurn({
+			contextWindow: window,
+			minDeepPassCalls: 0,
+			summarize: async () => (++calls === 1 ? Promise.reject(new Error("summarizer down")) : "Recap."),
+		});
+		const out = (await turn(ctx(msgs, window, { overflowRecovery: true })))!;
+		const callIds = new Set<string>();
+		const resultIds = new Set<string>();
+		for (const m of out.messages!)
+			for (const p of m.content) {
+				if (p.type === "tool-call") callIds.add((p as { toolCallId: string }).toolCallId);
+				if (p.type === "tool-result") resultIds.add((p as { toolCallId: string }).toolCallId);
+			}
+		for (const id of callIds) expect(resultIds.has(id)).toBe(true);
+		for (const id of resultIds) expect(callIds.has(id)).toBe(true);
+	});
+
+	it("summary chunk boundaries never split a tool-call from its result", async () => {
+		// 21 call/result pairs: a naive 20-message chunk would cut between
+		// call c9 and its result; pairSafeEnd must extend the chunk.
+		const window = 2_000;
+		const msgs: AgentMessage[] = [msg("user", [{ type: "text", text: "task" }])];
+		for (let i = 0; i < 21; i++) {
+			msgs.push(call(`c${i}`, "read_file", { path: `f${i}.ts` }), result(`c${i}`, "read_file", "y".repeat(400)));
+		}
+		const slices: number[][] = [];
+		const turn = createPrepareTurn({
+			contextWindow: window,
+			minDeepPassCalls: 0,
+			summarize: async (chunk) => {
+				// record which message indexes this chunk covers via id
+				const start = msgs.findIndex((m) => m.id === chunk[0].id);
+				slices.push([start, start + chunk.length]);
+				return "Recap.";
+			},
+		});
+		await turn(ctx(msgs, window, { overflowRecovery: true }));
+		expect(slices.length).toBeGreaterThan(0);
+		for (const [s, e] of slices) {
+			const ids = new Set<string>();
+			const res = new Set<string>();
+			for (const m of msgs.slice(s, e))
+				for (const p of m.content) {
+					if (p.type === "tool-call") ids.add((p as { toolCallId: string }).toolCallId);
+					if (p.type === "tool-result") res.add((p as { toolCallId: string }).toolCallId);
+				}
+			// no call inside the chunk whose result sits immediately outside
+			const dangling = [...ids].filter((id) => !res.has(id));
+			if (e < msgs.length) {
+				const nextIds = new Set(
+					msgs[e].content.filter((p) => p.type === "tool-result").map((p) => (p as { toolCallId: string }).toolCallId),
+				);
+				expect(dangling.some((id) => nextIds.has(id))).toBe(false);
+			}
+		}
+	});
+
+	it("throttles non-forced deep passes to every minDeepPassCalls calls", async () => {
+		const window = 1_500;
+		const msgs: AgentMessage[] = [msg("user", [{ type: "text", text: "task" }])];
+		for (let i = 0; i < 10; i++) {
+			msgs.push(call(`c${i}`, "read_file", { path: `f${i}.ts` }), result(`c${i}`, "read_file", "y".repeat(400)));
+		}
+		const stats: import("../src/agent/compaction").CompactStats[] = [];
+		const turn = createPrepareTurn({ contextWindow: window, onCompact: (s) => stats.push(s) });
+		await turn(ctx(msgs, window)); // deep pass — first call always allowed
+		const afterFirst = stats.length;
+		expect(afterFirst).toBe(1);
+		await turn(ctx(msgs, window)); // throttled (gap 1 < 2)
+		expect(stats.length).toBe(1);
+		await turn(ctx(msgs, window)); // gap 2 → runs
+		expect(stats.length).toBe(2);
+	});
+
+	it("forced passes bypass the deep-pass throttle", async () => {
+		const window = 1_500;
+		const msgs: AgentMessage[] = [msg("user", [{ type: "text", text: "task" }])];
+		for (let i = 0; i < 10; i++) {
+			msgs.push(call(`c${i}`, "read_file", { path: `f${i}.ts` }), result(`c${i}`, "read_file", "y".repeat(400)));
+		}
+		const stats: import("../src/agent/compaction").CompactStats[] = [];
+		const turn = createPrepareTurn({ contextWindow: window, onCompact: (s) => stats.push(s) });
+		await turn(ctx(msgs, window));
+		await turn(ctx(msgs, window, { overflowRecovery: true })); // forced — not throttled
+		expect(stats.length).toBe(2);
 	});
 
 	it("learns the provider ceiling on overflow and clamps the budget", async () => {
