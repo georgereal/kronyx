@@ -59,7 +59,7 @@ export class AgentsView implements vscode.WebviewViewProvider {
 		if (!this.view) return;
 		const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? this.deps.context.globalStorageUri.fsPath;
 		const d = await openStore(root);
-		const runs = listSessions(d, 30).map((r) => ({
+		const runs = listSessions(d, 30, root).map((r) => ({
 			session: r.session,
 			task: r.title,
 			status: r.status,

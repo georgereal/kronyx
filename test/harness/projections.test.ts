@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import type { SessionEvent } from "../../src/harness/contracts";
-import { MemoryEventLog } from "../../src/harness/eventLog";
-import { initialState, project, reduce } from "../../src/harness/projections";
-import { LedgerError } from "../../src/harness/taskLedger";
+import type { SessionEvent } from "../../src/harness/core/contracts";
+import { MemoryEventLog } from "../../src/harness/core/eventLog";
+import { initialState, project, reduce } from "../../src/harness/core/projections";
+import { LedgerError } from "../../src/harness/core/taskLedger";
 
 const run = "r";
 const base = { at: 1, runId: run };

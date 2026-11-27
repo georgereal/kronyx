@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
-import type { ModelPort, ModelRequest, ToolPort } from "../../src/harness/contracts";
-import { MemoryEventLog } from "../../src/harness/eventLog";
-import { HarnessLoop } from "../../src/harness/loop";
-import { buildContext, COMPACT_CHUNK, KEEP_RECENT_MESSAGES } from "../../src/harness/context";
-import { makeRecap } from "../../src/harness/recap";
-import { initialState } from "../../src/harness/projections";
+import type { ModelPort, ModelRequest, ToolPort } from "../../src/harness/core/contracts";
+import { MemoryEventLog } from "../../src/harness/core/eventLog";
+import { HarnessLoop } from "../../src/harness/core/loop";
+import { buildContext, COMPACT_CHUNK, KEEP_RECENT_MESSAGES } from "../../src/harness/defaults/context";
+import { makeRecap } from "../../src/harness/defaults/recap";
+import { initialState } from "../../src/harness/core/projections";
 
 const tools: ToolPort = { specs: () => [], execute: async () => ({ ok: true, output: "" }) };
 

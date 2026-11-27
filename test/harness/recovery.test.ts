@@ -2,9 +2,9 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import type { ModelPort, SessionEvent, ToolPort } from "../../src/harness/contracts";
-import { FileEventLog, MemoryEventLog } from "../../src/harness/eventLog";
-import { HarnessLoop } from "../../src/harness/loop";
+import type { ModelPort, SessionEvent, ToolPort } from "../../src/harness/core/contracts";
+import { FileEventLog, MemoryEventLog } from "../../src/harness/core/eventLog";
+import { HarnessLoop } from "../../src/harness/core/loop";
 
 const spec = { name: "noop", description: "", inputSchema: {} };
 

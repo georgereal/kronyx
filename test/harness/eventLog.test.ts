@@ -2,7 +2,7 @@ import { appendFile, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { FileEventLog, MemoryEventLog } from "../../src/harness/eventLog";
+import { FileEventLog, MemoryEventLog } from "../../src/harness/core/eventLog";
 
 const clock = () => 1_700_000_000_000;
 

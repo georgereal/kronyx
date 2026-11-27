@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { ToolPort, ToolResult, ToolSpec } from "../../src/harness/contracts";
-import { READ_FILES, withBatchReads } from "../../src/harness/batchReads";
+import type { ToolPort, ToolResult, ToolSpec } from "../../src/harness/core/contracts";
+import { READ_FILES, withBatchReads } from "../../src/harness/tools/batchReads";
 
 const readSpec: ToolSpec = { name: "read_file", description: "read one", inputSchema: {}, parallel: true };
 

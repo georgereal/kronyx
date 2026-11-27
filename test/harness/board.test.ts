@@ -4,10 +4,10 @@
  * never calls task tools.
  */
 import { describe, expect, it } from "vitest";
-import type { ModelPort, ModelRequest, ModelResponse, ToolCall, ToolPort, ToolSpec, VerifierPort } from "../../src/harness/contracts";
-import { MemoryEventLog } from "../../src/harness/eventLog";
-import { HarnessLoop } from "../../src/harness/loop";
-import { fallbackPlan, makePlan, parsePlan } from "../../src/harness/planner";
+import type { ModelPort, ModelRequest, ModelResponse, ToolCall, ToolPort, ToolSpec, VerifierPort } from "../../src/harness/core/contracts";
+import { MemoryEventLog } from "../../src/harness/core/eventLog";
+import { HarnessLoop } from "../../src/harness/core/loop";
+import { fallbackPlan, makePlan, parsePlan } from "../../src/harness/defaults/planning";
 
 const readSpec: ToolSpec = { name: "read_file", description: "", inputSchema: {}, parallel: true };
 const noopSpec: ToolSpec = { name: "noop", description: "", inputSchema: {} };
@@ -165,7 +165,7 @@ describe("harness-owned board", () => {
 		expect(ids).toEqual(["t1", "t2"]);
 	});
 
-	it("a continuation run adopts a prior run's open plan instead of minting new tasks", async () => {
+	it("a continuation ask never adopts a prior run's plan — new runs own only their own tasks", async () => {
 		const log = new MemoryEventLog(() => 1);
 		await log.append({
 			type: "task.created",
@@ -192,15 +192,16 @@ describe("harness-owned board", () => {
 		// The planner saw the earlier run's plan grouped under its run id.
 		expect(m.requests[0]?.messages[0]?.kind === "user" && m.requests[0].messages[0].text).toContain("Run r1");
 		const events = await log.read();
-		const adopted = events.find((e) => e.type === "task.adopted");
-		expect(adopted?.type === "task.adopted" && adopted.id).toBe("t1");
-		expect(adopted?.type === "task.adopted" && adopted.runId).toBe("r2");
+		// The prior board is context for the planner, never executable scope:
+		// continue ids are ignored, t1 stays owned by r1, and the run completes
+		// with an empty board of its own.
+		expect(events.some((e) => e.type === "task.adopted")).toBe(false);
 		expect(events.filter((e) => e.type === "task.created")).toHaveLength(1);
-		expect(loop.projection.ledger.tasks.t1?.runId).toBe("r2");
-		expect(loop.projection.ledger.tasks.t1?.status).toBe("done");
+		expect(events.some((e) => e.type === "steer.note" && e.rule === "plan.reuse")).toBe(true);
+		expect(loop.projection.ledger.tasks.t1?.runId).toBe("r1");
 	});
 
-	it("an empty planner answer adopts the most recent run's open tasks", async () => {
+	it("an empty planner answer never adopts earlier tasks", async () => {
 		const log = new MemoryEventLog(() => 1);
 		const stale = { id: "t1", title: "old run", acceptance: { kind: "none" as const }, dependsOn: [], status: "pending" as const, steps: [], evidence: [] };
 		const recent = { id: "t2", title: "recent run", acceptance: { kind: "none" as const }, dependsOn: [], status: "pending" as const, steps: [], evidence: [] };
@@ -212,10 +213,210 @@ describe("harness-owned board", () => {
 		await loop.recover();
 		await loop.run("continue", undefined, undefined, { plan: true });
 		const events = await log.read();
-		const adopted = events.filter((e) => e.type === "task.adopted").map((e) => (e.type === "task.adopted" ? e.id : ""));
-		expect(adopted).toEqual(["t2"]);
-		// t1 stays owned by r1 — it never enters r3's board.
+		expect(events.some((e) => e.type === "task.adopted")).toBe(false);
+		expect(events.some((e) => e.type === "steer.note" && e.rule === "plan.reuse")).toBe(true);
+		// Both stay owned by their own runs — neither enters r3's board.
 		expect(loop.projection.ledger.tasks.t1?.runId).toBe("r1");
+		expect(loop.projection.ledger.tasks.t2?.runId).toBe("r2");
+	});
+
+	it("a seeded step closes when the model cites the call that proves it", async () => {
+		const m = scripted([
+			acting(call("r1", "read_file", { path: "a" })),
+			acting(call("d1", "task_step_update", { taskId: "t1", stepId: "s1", status: "done", callIds: ["r1"] })),
+			finish("done"),
+		]);
+		const { tools } = fakeTools([readSpec]);
+		const log = new MemoryEventLog(() => 1);
+		const loop = new HarnessLoop({ runId: "r", log, model: m.model, tools, verifier: pass });
+		await loop.run("read a", undefined, undefined, { seed: [{ title: "Read a", steps: ["read a.ts"] }] });
+		const step = loop.projection.ledger.tasks.t1?.steps[0];
+		expect(step?.status).toBe("done");
+		expect(step?.callIds).toEqual(["r1"]);
+	});
+
+	it("a done step the model finds wrong is failed with a reason and replaced — the replacement carries the work", async () => {
+		const m = scripted([
+			acting(call("r1", "read_file", { path: "a" })),
+			acting(call("d1", "task_step_update", { taskId: "t1", stepId: "s1", status: "done", callIds: ["r1"] })),
+			acting(call("f1", "task_step_update", { taskId: "t1", stepId: "s1", status: "failed", reason: "a was the wrong file", replacement: { id: "s3", text: "read c" } })),
+			acting(call("r2", "read_file", { path: "b" })),
+			acting(call("d2", "task_step_update", { taskId: "t1", stepId: "s2", status: "done", callIds: ["r2"] })),
+			acting(call("r3", "read_file", { path: "c" })),
+			acting(call("d3", "task_step_update", { taskId: "t1", stepId: "s3", status: "done", callIds: ["r3"] })),
+			finish("done"),
+		]);
+		const { tools } = fakeTools([readSpec]);
+		const log = new MemoryEventLog(() => 1);
+		const loop = new HarnessLoop({ runId: "r", log, model: m.model, tools, verifier: pass });
+		await loop.run("read files", undefined, undefined, { seed: [{ title: "Read", steps: ["read a", "read b"] }] });
+		const task = loop.projection.ledger.tasks.t1;
+		expect(task?.steps.map((s) => [s.id, s.status])).toEqual([
+			["s1", "failed"],
+			["s2", "done"],
+			["s3", "done"],
+		]);
+		expect(task?.steps[0]?.reason).toBe("a was the wrong file");
+		expect(task?.status).toBe("done");
+	});
+
+	it("a done step gets the successful calls since it started attached — the model never copies ids", async () => {
+		const m = scripted([acting(call("r1", "read_file", { path: "a" })), acting(call("d1", "task_step_update", { taskId: "t1", stepId: "s1", status: "done" })), finish("done")]);
+		const { tools } = fakeTools([readSpec]);
+		const log = new MemoryEventLog(() => 1);
+		const loop = new HarnessLoop({ runId: "r", log, model: m.model, tools, verifier: pass });
+		await loop.run("read a", undefined, undefined, { seed: [{ title: "Read a", steps: ["read a.ts"] }] });
+		expect(loop.projection.ledger.tasks.t1?.steps[0]).toMatchObject({ status: "done", callIds: ["r1"] });
+	});
+
+	it("a done step with no successful call since it started is refused until the work is done", async () => {
+		const m = scripted([
+			acting(call("d0", "task_step_update", { taskId: "t1", stepId: "s1", status: "done" })),
+			acting(call("r1", "read_file", { path: "a" })),
+			acting(call("d1", "task_step_update", { taskId: "t1", stepId: "s1", status: "done" })),
+			finish("done"),
+		]);
+		const { tools } = fakeTools([readSpec]);
+		const log = new MemoryEventLog(() => 1);
+		const loop = new HarnessLoop({ runId: "r", log, model: m.model, tools, verifier: pass });
+		await loop.run("read a", undefined, undefined, { seed: [{ title: "Read a", steps: ["read a.ts"] }] });
+		const refusal = (await log.read()).find((e) => e.type === "tool.finished" && e.callId === "d0");
+		expect(refusal?.type === "tool.finished" && refusal.ok).toBe(false);
+		expect(loop.projection.ledger.tasks.t1?.steps[0]).toMatchObject({ status: "done", callIds: ["r1"] });
+	});
+
+	it("work done while an earlier step is open proves the next step too — the window is the task's", async () => {
+		const m = scripted([
+			acting(call("r1", "read_file", { path: "a" }), call("r2", "read_file", { path: "b" })),
+			acting(call("d1", "task_step_update", { taskId: "t1", stepId: "s1", status: "done" })),
+			acting(call("d2", "task_step_update", { taskId: "t1", stepId: "s2", status: "done" })),
+			finish("done"),
+		]);
+		const { tools } = fakeTools([readSpec]);
+		const log = new MemoryEventLog(() => 1);
+		const loop = new HarnessLoop({ runId: "r", log, model: m.model, tools, verifier: pass });
+		await loop.run("read a and b", undefined, undefined, { seed: [{ title: "Read", steps: ["read a", "read b"] }] });
+		const steps = loop.projection.ledger.tasks.t1?.steps ?? [];
+		expect(steps.map((s) => [s.status, s.callIds])).toEqual([
+			["done", ["r1", "r2"]],
+			["done", ["r1", "r2"]],
+		]);
+	});
+
+	it("a signaled step that activates after its proof ran closes on that earlier call", async () => {
+		const PLAN = JSON.stringify({
+			tasks: [
+				{
+					id: "t1",
+					title: "Two reads",
+					acceptance: { kind: "none" },
+					steps: [
+						{ id: "s1", text: "read a", signal: { tool: "read_file", path: "a" } },
+						{ id: "s2", text: "read b", signal: { tool: "read_file", path: "b" } },
+					],
+				},
+			],
+		});
+		const m = scripted([
+			{ text: PLAN, toolCalls: [] },
+			acting(call("r1", "read_file", { path: "b" })),
+			acting(call("r2", "read_file", { path: "a" })),
+			finish("done"),
+		]);
+		const { tools } = fakeTools([readSpec]);
+		const log = new MemoryEventLog(() => 1);
+		const loop = new HarnessLoop({ runId: "r", log, model: m.model, tools, verifier: pass });
+		await loop.run("read a and b", undefined, undefined, { plan: true });
+		const steps = loop.projection.ledger.tasks.t1?.steps ?? [];
+		expect(steps.map((s) => [s.status, s.callIds])).toEqual([
+			["done", ["r2"]],
+			["done", ["r1"]],
+		]);
+	});
+
+	it("the model's own check run never counts — the harness runs its check once for the task", async () => {
+		let checks = 0;
+		const verifier: VerifierPort = { check: async () => (checks++, { ok: true, detail: "passed" }) };
+		const m = scripted([
+			acting(call("c1", "run_command", { command: "npm run typecheck" })),
+			acting(call("d1", "task_step_update", { taskId: "t1", stepId: "s1", status: "done" })),
+			acting(call("u1", "task_update", { id: "t1", status: "done" })),
+			finish("done"),
+		]);
+		const { tools } = fakeTools([{ name: "run_command", description: "", inputSchema: {} }]);
+		const log = new MemoryEventLog(() => 1);
+		const loop = new HarnessLoop({ runId: "r", log, model: m.model, tools, verifier });
+		await loop.run("check it", undefined, undefined, { seed: [{ title: "Check", steps: ["run the check"], acceptance: { kind: "command", command: "npm run typecheck" } }] });
+		expect(checks).toBe(1);
+		expect(loop.projection.ledger.tasks.t1?.status).toBe("done");
+	});
+
+	it("a check that passed earlier in the run proves a later task's acceptance, whenever it ran", async () => {
+		let checks = 0;
+		const verifier: VerifierPort = { check: async () => (checks++, { ok: true, detail: "passed" }) };
+		const PLAN = JSON.stringify({
+			tasks: [
+				{ id: "A", title: "First", acceptance: { kind: "none" }, dependsOn: [], steps: [{ id: "s1", text: "check it" }] },
+				{ id: "B", title: "Second", acceptance: { kind: "command", command: "npm run typecheck" }, dependsOn: ["A"], steps: [{ id: "s1", text: "read it" }] },
+			],
+		});
+		const m = scripted([
+			{ text: PLAN, toolCalls: [] },
+			acting(call("c1", "run_command", { command: "npm run typecheck" })),
+			acting(call("d1", "task_step_update", { taskId: "t1", stepId: "s1", status: "done" })),
+			acting(call("r2", "read_file", { path: "a" })),
+			acting(call("d2", "task_step_update", { taskId: "t2", stepId: "s1", status: "done" })),
+			finish("done"),
+		]);
+		const { tools } = fakeTools([readSpec, { name: "run_command", description: "", inputSchema: {} }]);
+		const log = new MemoryEventLog(() => 1);
+		const loop = new HarnessLoop({ runId: "r", log, model: m.model, tools, verifier });
+		await loop.run("two tasks", undefined, undefined, { plan: true });
+		expect(loop.projection.ledger.tasks.t2?.status).toBe("done");
+		expect(checks).toBe(1);
+	});
+
+	it("a harness check that ran after the last write proves a later task's acceptance too", async () => {
+		let checks = 0;
+		const verifier: VerifierPort = { check: async () => (checks++, { ok: true, detail: "passed" }) };
+		const PLAN = JSON.stringify({
+			tasks: [
+				{ id: "A", title: "Write", acceptance: { kind: "command", command: "npm run typecheck" }, dependsOn: [], steps: [{ id: "s1", text: "write it" }] },
+				{ id: "B", title: "Write again", acceptance: { kind: "command", command: "npm run typecheck" }, dependsOn: ["A"], steps: [{ id: "s1", text: "write again" }] },
+			],
+		});
+		const m = scripted([
+			{ text: PLAN, toolCalls: [] },
+			acting(call("w1", "write_file", { path: "a.txt", content: "x" })),
+			acting(call("d1", "task_step_update", { taskId: "t1", stepId: "s1", status: "done" })),
+			acting(call("w2", "write_file", { path: "a.txt", content: "y" })),
+			acting(call("d2", "task_step_update", { taskId: "t2", stepId: "s1", status: "done" })),
+			finish("done"),
+		]);
+		const { tools } = fakeTools([{ name: "write_file", description: "", inputSchema: {} }]);
+		const log = new MemoryEventLog(() => 1);
+		const loop = new HarnessLoop({ runId: "r", log, model: m.model, tools, verifier });
+		await loop.run("write twice", undefined, undefined, { plan: true });
+		expect(checks).toBe(1);
+		expect(loop.projection.ledger.tasks.t2?.status).toBe("done");
+	});
+
+	it("plan seeds carry plain step text — completion is the model's to prove, not inferred from prose", async () => {
+		const { parsePlanSeed } = await import("../../src/harness/planning/planSeed");
+		const seed = parsePlanSeed("# Plan: X\n\n## Steps\n1. Review `src/harness/loop.ts` for regressions\n2. Run `npx vitest run test/harness`\n");
+		expect(seed?.steps).toEqual(["Review `src/harness/loop.ts` for regressions", "Run `npx vitest run test/harness`"]);
+	});
+
+	it("an implement plan seeds its steps and verify gate, or refuses — never a planner fallback", async () => {
+		const { planSeedTasks } = await import("../../src/harness/planning/planSeed");
+		const ok = planSeedTasks("plans/x.md", "# Plan: X\n\n## Steps\n1. Edit `src/a.ts` to add the flag\n\n## Verification\n- `npm run check`\n");
+		expect("seed" in ok && ok.seed[0]).toEqual({
+			title: "Implement plan: X",
+			steps: ["Edit `src/a.ts` to add the flag"],
+			acceptance: { kind: "command", command: "npm run check" },
+		});
+		const bad = planSeedTasks("plans/y.md", "# Plan: Y\n\nJust some prose, no steps.\n");
+		expect("error" in bad && bad.error).toContain("plans/y.md has no numbered steps");
 	});
 
 	it("a search_files pattern hits a filename-glob signal — brace globs included", async () => {
@@ -244,27 +445,23 @@ describe("harness-owned board", () => {
 	});
 
 	it("signals on tools the run cannot call don't block close-out", async () => {
-		// A task adopted/created elsewhere carries an explore_codebase signal this
-		// run doesn't offer — the step resolves via acceptance instead of stalling.
-		const log = new MemoryEventLog(() => 1);
-		await log.append({
-			type: "task.created",
-			runId: "r1",
-			task: {
-				id: "t1",
-				title: "Survey",
-				acceptance: { kind: "none" },
-				dependsOn: [],
-				status: "pending",
-				steps: [{ id: "s1", text: "explore src", status: "pending", callIds: [], signal: { tool: "explore_codebase", path: "src/**" } }],
-				evidence: [],
-			},
+		// A planner task carries an explore_codebase signal this run doesn't
+		// offer — the signal is stripped and the step resolves via acceptance.
+		const PLAN = JSON.stringify({
+			tasks: [
+				{
+					id: "t1",
+					title: "Survey",
+					acceptance: { kind: "none" },
+					steps: [{ id: "s1", text: "explore src", signal: { tool: "explore_codebase", path: "src/**" } }],
+				},
+			],
 		});
-		const m = scripted([{ text: '{"continue":["t1"],"tasks":[]}', toolCalls: [] }, acting(call("x", "read_file", { path: "src/a.ts" })), finish("done")]);
+		const m = scripted([{ text: PLAN, toolCalls: [] }, acting(call("x", "read_file", { path: "src/a.ts" })), finish("done")]);
 		const { tools } = fakeTools([readSpec]); // no explore_codebase offered
+		const log = new MemoryEventLog(() => 1);
 		const loop = new HarnessLoop({ runId: "r2", log, model: m.model, tools, verifier: pass });
-		await loop.recover();
-		const outcome = await loop.run("continue the survey", undefined, undefined, { plan: true });
+		const outcome = await loop.run("survey the code", undefined, undefined, { plan: true });
 		expect(outcome.status).toBe("completed");
 		expect(loop.projection.ledger.tasks.t1?.status).toBe("done");
 	});
@@ -289,11 +486,11 @@ describe("harness-owned board", () => {
 	});
 
 	it("boardOf surfaces the adopting task's origin run", async () => {
-		const { boardOf } = await import("../../src/harness/runner");
+		const { boardOf } = await import("../../src/harness/core/runner");
 		const log = new MemoryEventLog(() => 1);
 		await log.append({ type: "task.created", runId: "r1", task: { id: "t1", title: "x", acceptance: { kind: "none" }, dependsOn: [], status: "pending", steps: [], evidence: [] } });
 		await log.append({ type: "task.adopted", id: "t1", runId: "r2" });
-		const { project } = await import("../../src/harness/projections");
+		const { project } = await import("../../src/harness/core/projections");
 		const board = boardOf(project(await log.read()), "r2");
 		expect(board[0]?.from).toBe("r1");
 	});
@@ -342,7 +539,7 @@ describe("harness-owned board", () => {
 		]);
 		const log = new MemoryEventLog(() => 1);
 		const base = fakeTools([{ name: "read_file", description: "", inputSchema: {}, parallel: true }]);
-		const { withBatchReads } = await import("../../src/harness/batchReads");
+		const { withBatchReads } = await import("../../src/harness/tools/batchReads");
 		const loop = new HarnessLoop({ runId: "r", log, model: m.model, tools: withBatchReads(base.tools), verifier: pass });
 		const outcome = await loop.run("read both", undefined, undefined, { plan: true });
 		expect(outcome.status).toBe("completed");
@@ -381,8 +578,8 @@ describe("usage accounting", () => {
 
 describe("boardOf attribution", () => {
 	it("emits step callIds so the UI can nest calls under steps", async () => {
-		const { boardOf } = await import("../../src/harness/runner");
-		const { project } = await import("../../src/harness/projections");
+		const { boardOf } = await import("../../src/harness/core/runner");
+		const { project } = await import("../../src/harness/core/projections");
 		const log = new MemoryEventLog(() => 1);
 		await log.append({
 			type: "task.created",

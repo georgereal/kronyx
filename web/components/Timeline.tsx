@@ -11,6 +11,7 @@ import {
 	buildTimeline,
 	group,
 	groupWorked,
+	quietItem,
 	toolDetail,
 	toolMeta,
 	toolPath,
@@ -909,6 +910,7 @@ export function Timeline({
 	lateAfter,
 	focus: focusProp,
 	onFocusChange,
+	quiet,
 }: {
 	user: User;
 	sessionId: string;
@@ -921,8 +923,10 @@ export function Timeline({
 	/** Controlled focus: when onFocusChange is set, `focus` is owned by the parent (session page also drives it from the multi-agent panel). */
 	focus?: AgentFocus | null;
 	onFocusChange?: (f: AgentFocus | null) => void;
+	/** Quiet view: chat replies, permissions and failures only — no tool/plan/check cards. */
+	quiet?: boolean;
 }) {
-	const items = buildTimeline(events);
+	const items = quiet ? buildTimeline(events).filter(quietItem) : buildTimeline(events);
 	const seqOf = (item: Item | WorkedItem): number =>
 		item.kind === "event" ? item.e.seq : item.kind === "worked" ? (item.turns[0]?.seq ?? 0) : (item.seq ?? 0);
 	const runIdOf = (item: Item | WorkedItem): string | undefined =>

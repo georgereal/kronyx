@@ -24265,17 +24265,36 @@
   __iconData9.node;
   var Settings2 = createLucideIcon(__iconData9);
 
-  // web/node_modules/lucide-react/dist/esm/icons/square.mjs
+  // web/node_modules/lucide-react/dist/esm/icons/sliders-horizontal.mjs
   var __iconData10 = {
+    name: "sliders-horizontal",
+    size: 24,
+    node: [
+      ["path", { d: "M10 5H3", key: "1qgfaw" }],
+      ["path", { d: "M12 19H3", key: "yhmn1j" }],
+      ["path", { d: "M14 3v4", key: "1sua03" }],
+      ["path", { d: "M16 17v4", key: "1q0r14" }],
+      ["path", { d: "M21 12h-9", key: "1o4lsq" }],
+      ["path", { d: "M21 19h-5", key: "1rlt1p" }],
+      ["path", { d: "M21 5h-7", key: "1oszz2" }],
+      ["path", { d: "M8 10v4", key: "tgpxqk" }],
+      ["path", { d: "M8 12H3", key: "a7s4jb" }]
+    ]
+  };
+  __iconData10.node;
+  var SlidersHorizontal = createLucideIcon(__iconData10);
+
+  // web/node_modules/lucide-react/dist/esm/icons/square.mjs
+  var __iconData11 = {
     name: "square",
     size: 24,
     node: [["rect", { width: "18", height: "18", x: "3", y: "3", rx: "2", key: "afitv7" }]]
   };
-  __iconData10.node;
-  var Square = createLucideIcon(__iconData10);
+  __iconData11.node;
+  var Square = createLucideIcon(__iconData11);
 
   // web/node_modules/lucide-react/dist/esm/icons/x.mjs
-  var __iconData11 = {
+  var __iconData12 = {
     name: "x",
     size: 24,
     node: [
@@ -24283,8 +24302,8 @@
       ["path", { d: "m6 6 12 12", key: "d8bk6v" }]
     ]
   };
-  __iconData11.node;
-  var X = createLucideIcon(__iconData11);
+  __iconData12.node;
+  var X = createLucideIcon(__iconData12);
 
   // web/components/Composer.tsx
   var import_react6 = __toESM(require_react());
@@ -24349,7 +24368,8 @@
     lockRepo,
     currentBranch,
     plans,
-    runRefs
+    runRefs,
+    prefs
   }) {
     const [text, setText] = (0, import_react6.useState)("");
     const [atts, setAtts] = (0, import_react6.useState)([]);
@@ -24690,6 +24710,16 @@ ${runBlocks.join("\n\n")}`;
             /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pop-item disabled", children: [
               /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { style: { flex: 1 }, children: "Environment / model" }),
               /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "right", children: "\u2699 and model buttons" })
+            ] })
+          ] })
+        ] }),
+        prefs && /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "anchor", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("button", { className: "icon-btn", title: "Preferences", onClick: () => toggleMenu("prefs"), children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(SlidersHorizontal, { size: 15 }) }),
+          menu === "prefs" && /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(Modal, { title: "Preferences", onClose: closeMenus, children: [
+            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pop-title", children: "Timeline" }),
+            /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("label", { className: "pop-item", style: { cursor: "pointer", gap: 8 }, children: [
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("input", { type: "checkbox", checked: prefs.quiet, onChange: (e) => prefs.onQuiet(e.target.checked) }),
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { style: { flex: 1, fontSize: 12 }, children: "Quiet view \u2014 hide tool calls, plans, thoughts and checks" })
             ] })
           ] })
         ] }),
@@ -26755,6 +26785,7 @@ Please report this to https://github.com/markedjs/marked.`, e) {
   }
 
   // web/lib/timelineModel.ts
+  var quietItem = (i) => i.kind === "stream" && i.streamKind === "assistant" || i.kind === "perm" || i.kind === "event" && (i.e.event.ok === false || i.e.event.type === "run-failed");
   var TRANSPARENT = /* @__PURE__ */ new Set(["usage", "info", "memory", "cloud-status", "setup", "check", "agent-message", "agent-message-chunk"]);
   function fold(events) {
     const items = [];
@@ -28035,9 +28066,10 @@ Please report this to https://github.com/markedjs/marked.`, e) {
     active,
     lateAfter,
     focus: focusProp,
-    onFocusChange
+    onFocusChange,
+    quiet
   }) {
-    const items = buildTimeline(events);
+    const items = quiet ? buildTimeline(events).filter(quietItem) : buildTimeline(events);
     const seqOf = (item) => item.kind === "event" ? item.e.seq : item.kind === "worked" ? item.turns[0]?.seq ?? 0 : item.seq ?? 0;
     const runIdOf = (item) => item.kind === "event" ? item.e.runId : item.kind === "worked" ? item.turns[0]?.runId : item.runId;
     const isLate = (item) => !!lateAfter && runIdOf(item) === lateAfter.runId && seqOf(item) > lateAfter.seq;
@@ -28773,6 +28805,14 @@ Please report this to https://github.com/markedjs/marked.`, e) {
     const [plans, setPlans] = (0, import_react13.useState)([]);
     const [openPlan, setOpenPlan] = (0, import_react13.useState)(null);
     const [plansOpen, setPlansOpen] = (0, import_react13.useState)(false);
+    const [quiet, setQuiet] = (0, import_react13.useState)(() => typeof window !== "undefined" && window.localStorage.getItem("kronyx.timeline.quiet") === "1");
+    const setQuietPersist = (v) => {
+      setQuiet(v);
+      try {
+        window.localStorage.setItem("kronyx.timeline.quiet", v ? "1" : "0");
+      } catch {
+      }
+    };
     const [events, setEvents] = (0, import_react13.useState)([]);
     const [mode, setMode] = (0, import_react13.useState)("agent");
     const modeInit = (0, import_react13.useRef)(false);
@@ -29236,6 +29276,7 @@ Please report this to https://github.com/markedjs/marked.`, e) {
               runs,
               active,
               lateAfter,
+              quiet,
               focus: agentFocus,
               onFocusChange: setAgentFocus,
               githubUrl: session?.prUrl ?? (session?.repo && session?.branch ? `https://github.com/${session.repo}/tree/${session.branch}` : void 0)
@@ -29299,7 +29340,8 @@ Please report this to https://github.com/markedjs/marked.`, e) {
                 },
                 env: env ?? void 0,
                 onEnv: setEnv,
-                currentBranch: session?.branch ?? void 0
+                currentBranch: session?.branch ?? void 0,
+                prefs: { quiet, onQuiet: setQuietPersist }
               }
             )
           ] })
@@ -29873,6 +29915,7 @@ lucide-react/dist/esm/icons/paperclip.mjs:
 lucide-react/dist/esm/icons/plus.mjs:
 lucide-react/dist/esm/icons/send-horizontal.mjs:
 lucide-react/dist/esm/icons/settings-2.mjs:
+lucide-react/dist/esm/icons/sliders-horizontal.mjs:
 lucide-react/dist/esm/icons/square.mjs:
 lucide-react/dist/esm/icons/x.mjs:
 lucide-react/dist/esm/lucide-react.mjs:

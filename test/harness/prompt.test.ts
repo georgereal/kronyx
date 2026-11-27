@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import type { ModelRequest } from "../../src/harness/contracts";
-import { SYSTEM_INSTRUCTIONS } from "../../src/harness/context";
-import { MemoryEventLog } from "../../src/harness/eventLog";
-import { HarnessLoop } from "../../src/harness/loop";
+import type { ModelRequest } from "../../src/harness/core/contracts";
+import { SYSTEM_INSTRUCTIONS } from "../../src/harness/defaults/context";
+import { MemoryEventLog } from "../../src/harness/core/eventLog";
+import { HarnessLoop } from "../../src/harness/core/loop";
 
 const tools = { specs: () => [], execute: async () => ({ ok: true, output: "" }) };
 

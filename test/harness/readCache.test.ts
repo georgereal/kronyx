@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { ToolPort, ToolResult } from "../../src/harness/contracts";
-import { withReadCache } from "../../src/harness/readCache";
+import type { ToolPort, ToolResult } from "../../src/harness/core/contracts";
+import { withReadCache } from "../../src/harness/tools/readCache";
 
 function countingPort(handler: (name: string, input: unknown, n: number) => ToolResult) {
 	let n = 0;

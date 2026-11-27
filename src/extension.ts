@@ -220,12 +220,11 @@ export function activate(context: vscode.ExtensionContext): void {
 			if (!root) return [];
 			await refreshStore().catch(() => {});
 			const d = await openStore(root);
-			// Root-scoped first; fall back to session-only if nothing matched
-			// (rows written under a different root column or empty root).
+			// Strictly root-scoped — session names collide across workspaces
+			// (Kronyx-Local-Session-N), so an unscoped fallback would replay
+			// another workspace's history into this one.
 			const scoped = listEvents(d, session, root) as Parameters<RunViewProvider["post"]>[0][];
-			const all = listEvents(d, session) as Parameters<RunViewProvider["post"]>[0][];
-			output.appendLine(`[store] loadEvents "${session}" — scoped(root=${root})=${scoped.length}, session-only=${all.length}`);
-			return scoped.length ? scoped : all;
+			return scoped;
 		},
 		clearEvents: (session) => {
 			void storeRoot.then((root) => {
@@ -236,13 +235,11 @@ export function activate(context: vscode.ExtensionContext): void {
 			const root = await storeRoot;
 			if (!root) return [];
 			const d = await openStore(root);
-			// Workspace sessions first; fall back to all local sessions so history
-			// survives root changes (dev windows open different folders). Dedupe by
-			// session name — the same name can exist under multiple roots.
-			const local = (rows: { session: string; title: string; cloud: boolean }[]) =>
-				rows.filter((r) => !r.cloud).map((r) => ({ name: r.session, title: r.title }));
-			const merged = [...local(listSessions(d, 30, root)), ...local(listSessions(d, 30))];
-			return merged.filter((s, i) => merged.findIndex((e) => e.name === s.name) === i);
+			// Sessions are workspace-scoped — other workspaces' histories (which
+			// share the same store and reuse session names) must not leak in.
+			return listSessions(d, 30, root)
+				.filter((r) => !r.cloud)
+				.map((r) => ({ name: r.session, title: r.title }));
 		},
 		tabState: {
 			get: () => context.workspaceState.get<{ last?: string; tabs?: string[] }>("kronyx.sessionTabs", {}),
@@ -617,9 +614,13 @@ export function activate(context: vscode.ExtensionContext): void {
 				void vscode.window.showInformationMessage("Kronyx: no runs yet.");
 				return;
 			}
+			// Icon per outcome — "not completed" isn't a failure: stopped/interrupted
+			// runs (VS Code closed, user stop) read differently from hard failures.
+			const statusIcon = (s: string) =>
+				s === "completed" ? "$(check)" : s === "failed" || s === "error" ? "$(error)" : "$(debug-stop)";
 			const picked = await vscode.window.showQuickPick(
 				history.map((run) => ({
-					label: `${run.status === "completed" ? "$(check)" : "$(error)"} ${run.task.slice(0, 80)}`,
+					label: `${statusIcon(run.status)} ${run.task.slice(0, 80)}`,
 					description: `${run.session} · ${(run.durationMs / 1000).toFixed(1)}s · ${new Date(run.at).toLocaleTimeString()}${
 						"tokens_in" in run && (run as { tokens_in?: number }).tokens_in
 							? ` · in ${(run as { tokens_in: number }).tokens_in.toLocaleString()} tok` +
@@ -632,7 +633,8 @@ export function activate(context: vscode.ExtensionContext): void {
 				})),
 				{ title: "Run history" },
 			);
-			if (picked) void vscode.window.showInformationMessage(`"${picked.run.task}" — ${picked.run.status}`);
+			// Open the run's session — the replayed chat IS the history view.
+			if (picked) void vscode.commands.executeCommand("kronyx.openSession", picked.run.session);
 		}),
 		vscode.commands.registerCommand("kronyx.runTask", async () => {
 			const task = await vscode.window.showInputBox({ title: "Kronyx: run task", prompt: "Describe the change" });

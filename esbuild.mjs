@@ -61,6 +61,9 @@ const ctx = await esbuild.context({
 	target: "node22",
 	outfile: "dist/extension.js",
 	external: ["vscode", "better-sqlite3", "playwright-core", "@huggingface/transformers", "onnxruntime-node"],
+	// A build stamp the webview compares against — a panel kept open across a
+	// dev rebuild self-reloads instead of painting with a stale webview.js.
+	define: { __BUILD_ID__: JSON.stringify(String(Date.now())) },
 	...shared,
 });
 

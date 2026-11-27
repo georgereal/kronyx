@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import type { HookRule } from "../../src/harness/contracts";
-import { emptyLedger } from "../../src/harness/taskLedger";
-import { builtinRules, SteeringError, SteeringRegistry, type SteerContext } from "../../src/harness/steering";
-import { isReadOnlyCommand } from "../../src/harness/shellReadOnly";
+import type { HookRule } from "../../src/harness/core/contracts";
+import { emptyLedger } from "../../src/harness/core/taskLedger";
+import { builtinRules, SteeringError, SteeringRegistry, type SteerContext } from "../../src/harness/defaults/steering";
+import { isReadOnlyCommand } from "../../src/harness/tools/shellReadOnly";
 
 const beforeTool = (call = { callId: "c", name: "read", input: {} }): SteerContext["beforeTool"] => ({ call, ledger: emptyLedger(), outcomes: {} });
 const rule = (id: string, order: number, decide: () => unknown): HookRule<unknown> => ({ id, point: "beforeTool", order, decide: decide as HookRule<unknown>["decide"] });
@@ -341,7 +341,7 @@ describe("plan.drift rule", () => {
 		await drain(r, 1); // baseline signature
 		expect(await drain(r, 5)).toEqual({ kind: "allow" });
 		const note = await r.decide(ctx(ledger())); // 6th unproductive turn
-		expect(note).toMatchObject({ kind: "note", text: expect.stringContaining("Explain the discrepancy") });
+		expect(note).toMatchObject({ kind: "note", text: expect.stringContaining("task_replace") });
 	});
 
 	it("escalates to ask only after several ignored nudges", async () => {

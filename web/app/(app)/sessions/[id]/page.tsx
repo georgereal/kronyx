@@ -34,6 +34,14 @@ export default function SessionView() {
 	const [plans, setPlans] = useState<{ slug: string; runId?: string }[]>([]);
 	const [openPlan, setOpenPlan] = useState<string | null>(null);
 	const [plansOpen, setPlansOpen] = useState(false);
+	// Quiet view hides harness chatter (tools, plans, checks, thoughts) — chat replies + failures only. Persisted per client.
+	const [quiet, setQuiet] = useState(() => (typeof window !== "undefined" && window.localStorage.getItem("kronyx.timeline.quiet") === "1"));
+	const setQuietPersist = (v: boolean) => {
+		setQuiet(v);
+		try {
+			window.localStorage.setItem("kronyx.timeline.quiet", v ? "1" : "0");
+		} catch {}
+	};
 	const [events, setEvents] = useState<RunEvent[]>([]);
 	const [mode, setMode] = useState<Mode>("agent");
 	const modeInit = useRef(false);
@@ -596,7 +604,7 @@ export default function SessionView() {
 					<PlanCard user={user} sessionId={id} slug={openPlan} />
 				</Modal>
 			)}
-			<Timeline user={user} sessionId={id} events={ordered} runs={runs} active={active} lateAfter={lateAfter}
+			<Timeline user={user} sessionId={id} events={ordered} runs={runs} active={active} lateAfter={lateAfter} quiet={quiet}
 				focus={agentFocus} onFocusChange={setAgentFocus}
 				githubUrl={session?.prUrl ?? (session?.repo && session?.branch ? `https://github.com/${session.repo}/tree/${session.branch}` : undefined)} />
 			{/* Queued placeholder: a live run with only its run-started event
@@ -663,6 +671,7 @@ export default function SessionView() {
 					env={env ?? undefined}
 					onEnv={setEnv}
 					currentBranch={session?.branch ?? undefined}
+					prefs={{ quiet, onQuiet: setQuietPersist }}
 				/>
 			</div>
 			</div>

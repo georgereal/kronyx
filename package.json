@@ -563,6 +563,16 @@
 					},
 					"description": "Named provider+model presets selectable in the settings page."
 				},
+				"kronyx.openai.store": {
+					"type": "boolean",
+					"default": true,
+					"description": "OpenAI transport: store responses on the provider (Responses API store flag). Conversations require this on. Off keeps nothing server-side; reasoning is replayed from the encrypted items instead."
+				},
+				"kronyx.openai.conversations": {
+					"type": "boolean",
+					"default": true,
+					"description": "OpenAI transport on direct api.openai.com: keep the run's history in a server-side Conversation and send only new items each turn, with server-side compaction. Other providers always send the full history."
+				},
 				"kronyx.harness.debug": {
 					"type": "boolean",
 					"default": false,

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isReadOnlyCommand } from "../src/harness/shellReadOnly";
+import { isReadOnlyCommand } from "../src/harness/tools/shellReadOnly";
 
 describe("isReadOnlyCommand", () => {
 	it("accepts plain read commands and read pipelines", () => {

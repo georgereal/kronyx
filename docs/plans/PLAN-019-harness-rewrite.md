@@ -1,6 +1,6 @@
 # PLAN-019: Agent harness rewrite — host-owned state, task ledger, steering
 
-- Status: In progress (M0–M9 implemented; selected per run from the composer's Harness engine; M10 scripted suite done, real-model comparison and eval wiring not done)
+- Status: In progress (M0–M9 implemented; selected per run from the composer's Harness engine; M10 scripted suite done, real-model comparison and eval wiring not done). The IDE runs the harness for every run; the OpenAI transport adds server-side Conversations (direct OpenAI) with delta sends and reasoning replay. `OpenAIEngine` and `AgentRunner` are off the IDE run path, kept for evals and the cloud worker until parity is complete.
 - Owner: Jacob
 - Created: 2026-11-23
 - Decided: 2026-11-23
@@ -91,6 +91,7 @@ Build sequence M0–M10, each milestone gated by an acceptance test. The harness
 - M7: idempotency is the callId check only. Recovery is tested by truncating a file, not by killing a real process.
 - M8: the subagent module exists, but no spawn tool is exposed to the model, so it can't be reached from a run.
 - M9: not run against a live provider. No Anthropic cache markers. Cache-write tokens aren't recorded. The webview has no task board. Memory context and run digests are not injected on the harness path.
+- Stop granularity: `stop()` aborts the model request and gates un-dispatched calls, but in-flight tool calls run to completion — the abort signal never reaches `toolPort.execute`. Thread it through so cancellable tools kill their work: `run_command`/shell exec kills the child process, `browser_use` aborts the driver, MCP calls cancel their request. File writes stay atomic (no meaningful cancellation).
 - M10: no harness engine in the eval harness, so no side-by-side comparison has been run. Eval metrics are not populated for harness runs.
 
 ## Decision and reason

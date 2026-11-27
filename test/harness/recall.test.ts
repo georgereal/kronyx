@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import type { ToolPort } from "../../src/harness/contracts";
-import { MemoryEventLog } from "../../src/harness/eventLog";
-import { RECALL_TOOL, withRecall } from "../../src/harness/recall";
+import type { ToolPort } from "../../src/harness/core/contracts";
+import { MemoryEventLog } from "../../src/harness/core/eventLog";
+import { RECALL_TOOL, withRecall } from "../../src/harness/tools/recall";
 
 const base: ToolPort = { specs: () => [], execute: async () => ({ ok: true, output: "base" }) };
 

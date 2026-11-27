@@ -283,7 +283,7 @@ export class OpenAIEngine implements AgentEngine {
 				}),
 			];
 			this.record({ id: `asst-${randomUUID()}`, role: "assistant", content, createdAt: Date.now() });
-			this.chain = turn.responseId && protocolFor(settings.providerId) === "responses" ? { responseId: turn.responseId, from: this.mirror.length } : undefined;
+			this.chain = turn.responseId && protocolFor(settings.providerId, settings.modelId) === "responses" ? { responseId: turn.responseId, from: this.mirror.length } : undefined;
 			this.emitTurn(turn);
 			if (turn.text) this.lastText = turn.text;
 			if (!turn.calls.length) {
@@ -352,7 +352,7 @@ export class OpenAIEngine implements AgentEngine {
 	}
 
 	private async requestTurn(settings: ProviderSettings, ts: ToolSet, iteration: number): Promise<TurnOutcome> {
-		const protocol = protocolFor(settings.providerId);
+		const protocol = protocolFor(settings.providerId, settings.modelId);
 		const url = endpointFor(protocol, settings.baseUrl);
 		if (this.forceCompactRef.current) this.chain = undefined;
 		const send = async (chain: Chain | undefined): Promise<TurnOutcome> => {
@@ -453,12 +453,12 @@ export class OpenAIEngine implements AgentEngine {
 		if (!parsed.ok) return done(`Tool call rejected: invalid JSON arguments (${parsed.error}). Resend the call with valid JSON.`, false);
 		const tool = ts.tools.find((t) => t.name === call.name);
 		if (!tool?.execute) return done(`Tool "${call.name}" is not available in this run.`, false);
-		const verdict = await ts.pipeline.runPre({ name: tool.name, input });
+		const verdict = await ts.pipeline.runPre({ name: tool.name, input, callId: call.callId });
 		if (verdict.kind === "deny") return done(verdict.reason, false);
 		if (verdict.kind === "ask") return done("This action needs approval but no approval channel answered.", false);
 		try {
 			const raw = await tool.execute(input, { agentId: "openai-engine", iteration: this.runIterations, toolCallId: call.callId, signal: this.abort?.signal });
-			const out = await ts.pipeline.runPost({ name: tool.name, input }, raw);
+			const out = await ts.pipeline.runPost({ name: tool.name, input, callId: call.callId }, raw);
 			const text = typeof out === "string" ? out : JSON.stringify(out ?? "");
 			const clamped = clampResult({ type: "tool-result", toolCallId: call.callId, toolName: call.name, output: text });
 			return done(clamped ? String(clamped.output) : text, true);

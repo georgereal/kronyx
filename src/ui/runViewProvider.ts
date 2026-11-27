@@ -4,6 +4,8 @@ import type { EngineKind } from "../agent/engine";
 import type { ModelOption, ProfileCatalog } from "../config";
 import { renderPage } from "./pageHtml";
 
+declare const __BUILD_ID__: string;
+
 export type { AgentMode, ModelOption };
 
 export type WebviewMessage =
@@ -71,6 +73,10 @@ export interface AttachmentPreview {
 export type ViewEvent =
 	| RunViewEvent
 	| { type: "reset" }
+	// Bracket a stored-event replay burst so the view mounts work cards
+	// synchronously — the deferred live-mount would scramble ordering.
+	| { type: "replay-start" }
+	| { type: "replay-end" }
 	| { type: "cloud-status"; text: string; key?: string }
 	| { type: "setup"; step: number; label: string; state: "run" | "ok" | "fail"; detail?: string }
 	| { type: "setupStatus"; items: { key: string; label: string; ok: boolean; detail?: string; fixLabel?: string }[] }
@@ -118,7 +124,9 @@ export class RunViewProvider implements vscode.WebviewViewProvider {
 			this.backlog.push(event);
 			if (this.backlog.length > 500) this.backlog.shift();
 		}
-		for (const webview of this.views) void webview.postMessage(event);
+		// Build stamp lets a long-lived webview detect it was loaded from an
+		// older bundle (retainContextWhenHidden) and reload before it mispaints.
+		for (const webview of this.views) void webview.postMessage({ ...event, build: __BUILD_ID__ });
 	}
 
 	setState(state: Partial<ViewState>): void {

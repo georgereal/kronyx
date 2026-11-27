@@ -222,6 +222,18 @@ describe("list_files and search_files", () => {
 		expect(await run("list_files", { path: "" })).toContain("src/");
 	});
 
+	it("reports a failing command as a failed call with its output", async () => {
+		await expect(run("run_command", { command: "echo broke; exit 3" })).rejects.toThrow(/exit 3[\s\S]*broke/);
+	});
+
+	it("fails a pipeline when an early stage fails, not just the last one", async () => {
+		await expect(run("run_command", { command: "false | tail -1" })).rejects.toThrow(/exit 1/);
+	});
+
+	it("reports a passing command as exit 0 with its output", async () => {
+		expect(await run("run_command", { command: "echo hi" })).toBe("exit 0\nhi");
+	});
+
 	it("converts globs", () => {
 		expect(globToRegExp("**/*.ts").test("a/b/c.ts")).toBe(true);
 		expect(globToRegExp("**/*.ts").test("c.ts")).toBe(true);

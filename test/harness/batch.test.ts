@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import type { ModelPort, ToolPort } from "../../src/harness/contracts";
-import { MemoryEventLog } from "../../src/harness/eventLog";
-import { HarnessLoop } from "../../src/harness/loop";
+import type { ModelPort, ToolPort } from "../../src/harness/core/contracts";
+import { MemoryEventLog } from "../../src/harness/core/eventLog";
+import { HarnessLoop } from "../../src/harness/core/loop";
 
 describe("batch execution on the harness (step 4)", () => {
 	it("runs adjacent parallel read tools concurrently", async () => {

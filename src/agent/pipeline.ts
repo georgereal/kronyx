@@ -19,6 +19,8 @@
 export interface ToolCall {
 	readonly name: string;
 	readonly input: unknown;
+	/** The model call this guards — present when the caller threads it through. */
+	readonly callId?: string;
 }
 
 export type PreVerdict = { kind: "allow" } | { kind: "ask" } | { kind: "deny"; reason: string };

@@ -98,6 +98,16 @@ export interface EventItem {
 
 export type Item = StreamItem | ActionItem | TurnItem | PermItem | PreflightItem | EventItem;
 
+/**
+ * Quiet view: the chat keeps only what needs the user's eyes — assistant
+ * replies, permission requests (interactive), and failures. Tool cards,
+ * reasoning, plan/check/lifecycle events drop out.
+ */
+export const quietItem = (i: Item): boolean =>
+	(i.kind === "stream" && i.streamKind === "assistant") ||
+	i.kind === "perm" ||
+	(i.kind === "event" && (i.e.event.ok === false || i.e.event.type === "run-failed"));
+
 /** Bookkeeping events that don't end a streamed reasoning/assistant block. */
 const TRANSPARENT = new Set(["usage", "info", "memory", "cloud-status", "setup", "check", "agent-message", "agent-message-chunk"]);
 

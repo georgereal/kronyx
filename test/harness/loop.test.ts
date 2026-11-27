@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import type { LoopDetectorConfig, ModelPort, ModelRequest, ModelResponse, ToolCall, ToolPort, ToolResult, ToolSpec, VerifierPort } from "../../src/harness/contracts";
-import { MemoryEventLog } from "../../src/harness/eventLog";
-import { HarnessLoop, type HarnessLimits } from "../../src/harness/loop";
-import { project } from "../../src/harness/projections";
+import type { LoopDetectorConfig, ModelPort, ModelRequest, ModelResponse, ToolCall, ToolPort, ToolResult, ToolSpec, VerifierPort } from "../../src/harness/core/contracts";
+import { MemoryEventLog } from "../../src/harness/core/eventLog";
+import { HarnessLoop, type HarnessLimits } from "../../src/harness/core/loop";
+import { project } from "../../src/harness/core/projections";
 
 /** A model that replays a fixed script of responses, one per call. Any extra call fails the test. */
 function scriptedModel(script: Array<Partial<ModelResponse> & { calls?: ToolCall[] }>) {
@@ -33,10 +33,10 @@ function fakeTools(specs: ToolSpec[] = [], handler: (name: string, input: unknow
 const passingVerifier: VerifierPort = { check: async () => ({ ok: true, detail: "suite passed" }) };
 const failingVerifier: VerifierPort = { check: async () => ({ ok: false, detail: "suite failed" }) };
 
-function harness(opts: { script: Array<Partial<ModelResponse> & { calls?: ToolCall[] }>; verifier?: VerifierPort; tools?: ToolPort; limits?: Partial<HarnessLimits>; loop?: Partial<LoopDetectorConfig> }) {
+function harness(opts: { script: Array<Partial<ModelResponse> & { calls?: ToolCall[] }>; verifier?: VerifierPort; tools?: ToolPort; limits?: Partial<HarnessLimits>; loop?: Partial<LoopDetectorConfig>; onTurnLimit?: (used: number, limit: number) => Promise<boolean> }) {
 	const scripted = scriptedModel(opts.script);
 	const log = new MemoryEventLog(() => 1);
-	const loop = new HarnessLoop({ runId: "run-1", log, model: scripted.model, tools: opts.tools ?? fakeTools(), verifier: opts.verifier, limits: opts.limits, loop: opts.loop });
+	const loop = new HarnessLoop({ runId: "run-1", log, model: scripted.model, tools: opts.tools ?? fakeTools(), verifier: opts.verifier, limits: opts.limits, loop: opts.loop, onTurnLimit: opts.onTurnLimit });
 	return { loop, log, scripted };
 }
 
@@ -186,7 +186,7 @@ describe("HarnessLoop: budgets and terminal states", () => {
 		expect(scripted.remaining()).toBe(0);
 	});
 
-	it("auto-extends the input allowance (recap + note) instead of pausing, and warns once at 80%", async () => {
+	it("at its input allowance a run extends silently — no ask, no compaction; warns once at 80%", async () => {
 		const { loop, log } = harness({
 			limits: { maxInputTokens: 1000 },
 			script: [
@@ -199,8 +199,60 @@ describe("HarnessLoop: budgets and terminal states", () => {
 		expect(await loop.run("x")).toMatchObject({ status: "completed" });
 		const events = await log.read();
 		expect(events.filter((e) => e.type === "budget.warning")).toHaveLength(1);
-		// Too few messages to recap (boundary is 0) — the allowance still extends with a note.
 		expect(events.some((e) => e.type === "steer.note" && e.rule === "context.budget")).toBe(true);
+		expect(events.some((e) => e.type === "context.recap")).toBe(false);
+	});
+
+	it("each run gets its own input allowance — a prior run's spend does not carry over", async () => {
+		const { loop, log } = harness({
+			limits: { maxInputTokens: 1000 },
+			script: [
+				{ text: "first", calls: [], usage: { inputTokens: 1200, outputTokens: 1, cachedTokens: 0 } },
+				{ text: "second", calls: [], usage: { inputTokens: 0, outputTokens: 1, cachedTokens: 0 } },
+			],
+		});
+		expect(await loop.run("a")).toMatchObject({ status: "completed" });
+		expect(await loop.run("b")).toMatchObject({ status: "completed" });
+		expect((await log.read()).some((e) => e.type === "steer.note" && e.rule === "context.budget")).toBe(false);
+	});
+
+	it("a tool call written as text is not treated as the answer — the model is asked again and the real call runs", async () => {
+		const { loop, log } = harness({
+			script: [
+				{ text: '{"name":"noop","args":{}}', calls: [] },
+				{ text: "", calls: [call("c1", "noop", {})] },
+				finish("done"),
+			],
+			tools: fakeTools([{ name: "noop", description: "", inputSchema: {} }]),
+		});
+		expect(await loop.run("x")).toMatchObject({ status: "completed" });
+		const events = await log.read();
+		expect(events.some((e) => e.type === "tool.finished" && e.name === "noop" && e.ok)).toBe(true);
+		expect(events.some((e) => e.type === "steer.note" && e.rule === "tool.text" && e.text.includes('"noop"'))).toBe(true);
+	});
+
+	it("a tool call written in markup is retried the same way as JSON text", async () => {
+		const { loop, log } = harness({
+			script: [
+				{ text: "<tool_call> <function=noop> </function> </tool_call>", calls: [] },
+				{ text: "", calls: [call("c1", "noop", {})] },
+				finish("done"),
+			],
+			tools: fakeTools([{ name: "noop", description: "", inputSchema: {} }]),
+		});
+		expect(await loop.run("x")).toMatchObject({ status: "completed" });
+		const events = await log.read();
+		expect(events.some((e) => e.type === "tool.finished" && e.name === "noop" && e.ok)).toBe(true);
+		expect(events.some((e) => e.type === "steer.note" && e.rule === "tool.text")).toBe(true);
+	});
+
+	it("quoted JSON for a tool this run doesn't offer is ordinary text, not a retry", async () => {
+		const { loop, log } = harness({
+			script: [{ text: 'Example payload: {"name":"other_tool","args":{}}', calls: [] }],
+			tools: fakeTools([{ name: "noop", description: "", inputSchema: {} }]),
+		});
+		expect(await loop.run("x")).toMatchObject({ status: "completed" });
+		expect((await log.read()).some((e) => e.type === "steer.note" && e.rule === "tool.text")).toBe(false);
 	});
 
 	it("treats a failing external tool as a result the model can react to", async () => {
@@ -263,14 +315,14 @@ describe("HarnessLoop: steering integration (M4)", () => {
 
 	it("pauses when a beforeModel rule denies, without calling the model", async () => {
 		const { scripted } = harness({ script: [finish()] });
-		const registry = new (await import("../../src/harness/steering")).SteeringRegistry();
+		const registry = new (await import("../../src/harness/defaults/steering")).SteeringRegistry();
 		registry.add("beforeModel", { id: "stop-here", point: "beforeModel", order: 0, decide: () => ({ kind: "deny", reason: "budget frozen" }) });
 		const paused = new HarnessLoop({ runId: "r", log: new MemoryEventLog(() => 1), model: scripted.model, tools: fakeTools(), steering: registry });
 		expect(await paused.run("x")).toMatchObject({ status: "paused", reason: "budget frozen" });
 	});
 
 	it("fails the run with the rule id when an onStop rule throws", async () => {
-		const registry = new (await import("../../src/harness/steering")).SteeringRegistry();
+		const registry = new (await import("../../src/harness/defaults/steering")).SteeringRegistry();
 		registry.add("onStop", { id: "explodes", point: "onStop", order: 0, decide: () => { throw new Error("bad rule"); } });
 		const { loop } = harness({ script: [finish()] });
 		const broken = new HarnessLoop({ runId: "r", log: new MemoryEventLog(() => 1), model: (loop as unknown as { deps: { model: ModelPort } }).deps.model, tools: fakeTools(), steering: registry });
@@ -355,7 +407,7 @@ describe("HarnessLoop: loop controller (M5)", () => {
 
 describe("HarnessLoop: steering ask verdicts", () => {
 	const askRegistry = async () => {
-		const registry = new (await import("../../src/harness/steering")).SteeringRegistry();
+		const registry = new (await import("../../src/harness/defaults/steering")).SteeringRegistry();
 		registry.add("beforeModel", { id: "always-ask", point: "beforeModel", order: 0, decide: () => ({ kind: "ask", question: "drift — continue?" }) });
 		return registry;
 	};

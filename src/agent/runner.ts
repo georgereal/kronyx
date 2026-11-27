@@ -57,8 +57,11 @@ export type RunViewEvent =
 	| { type: "check"; command: string; ok: boolean; durationMs: number; output: string }
 	| { type: "plan-ready"; path: string }
 	| { type: "task-board"; tasks: Array<{ id: string; title: string; status: string; steps: Array<{ id: string; text: string; status: string }> }> }
+	// Lightweight ledger names (always emitted, debug-independent) so the view can
+	// resolve t1/s3 refs in narration to task titles without the full board.
+	| { type: "task-named"; id: string; title?: string; steps?: { id: string; text: string }[] }
 	| { type: "task-progress"; objective: string; completed: string[]; inProgress: string[]; next: string[]; blockers: string[] }
-	| { type: "permission-request"; id: string; tool: string; path: string; command?: string; input?: unknown; diff?: string }
+	| { type: "permission-request"; id: string; tool: string; path: string; command?: string; input?: unknown; diff?: string; callId?: string }
 	| { type: "permission-response"; id: string; decision: "allow" | "always" | "deny" | "alwaysTool" | "alwaysRule" | "stopped" | "timeout" }
 	| { type: "loop-detected"; tool: string; count: number }
 	| { type: "mode-blocked"; mode: AgentMode }
@@ -471,8 +474,8 @@ export class AgentRunner implements AgentEngine {
 			}),
 			...(initialMessages?.length ? { initialMessages } : {}),
 			hooks: {
-				beforeTool: async ({ tool, input }) => {
-					const verdict = await pipeline.runPre({ name: tool.name, input });
+				beforeTool: async ({ tool, toolCall, input }) => {
+					const verdict = await pipeline.runPre({ name: tool.name, input, callId: toolCall?.toolCallId });
 					if (verdict.kind === "deny") return { skip: true, reason: verdict.reason };
 					if (verdict.kind === "ask") {
 						// Chain tail with no approval resolution — same as a denial.

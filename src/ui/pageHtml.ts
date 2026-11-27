@@ -1,8 +1,11 @@
 import * as vscode from "vscode";
 
+declare const __BUILD_ID__: string;
+
 export function renderPage(webview: vscode.Webview, extensionUri: vscode.Uri): string {
 	const media = vscode.Uri.joinPath(extensionUri, "media");
 	const script = webview.asWebviewUri(vscode.Uri.joinPath(media, "webview.js"));
+	const queueJs = webview.asWebviewUri(vscode.Uri.joinPath(media, "eventQueue.js"));
 	const markedJs = webview.asWebviewUri(vscode.Uri.joinPath(media, "marked.js"));
 	const highlightJs = webview.asWebviewUri(vscode.Uri.joinPath(media, "highlight.js"));
 	const style = webview.asWebviewUri(vscode.Uri.joinPath(media, "webview.css"));
@@ -24,6 +27,7 @@ export function renderPage(webview: vscode.Webview, extensionUri: vscode.Uri): s
 </div>
 <div id="tabs" class="tabs"><button type="button" id="tab-prev" class="tab-new" title="Previous sessions">▾</button><span id="tab-list" class="tab-list"></span><button type="button" id="tab-right" class="tab-new" title="Scroll to latest tabs" hidden>»</button><button type="button" id="tab-new" class="tab-new" title="New session">+</button></div>
 <div id="timeline" class="timeline"><p class="empty">No runs yet. Describe a change below.</p></div>
+<div id="phase" class="phase" hidden><span class="phase-dot"></span><span id="phase-text"></span></div>
 <div id="composer" class="composer">
   <textarea id="task" rows="1" placeholder="Ask, plan, or describe a change..."></textarea>
   <div id="attachment-previews" class="attachment-previews" hidden></div>
@@ -32,6 +36,7 @@ export function renderPage(webview: vscode.Webview, extensionUri: vscode.Uri): s
     <button type="button" id="mention" class="icon-btn context-btn" title="Attach a file"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-4 8"/></svg></button>
     <button type="button" id="mode" class="chip" title="Agent mode"><span class="chip-icon" id="mode-icon"></span><span class="chip-text" id="mode-label">Code</span><span class="caret">&#9662;</span></button>
     <button type="button" id="engine" class="chip" title="Execution engine"><span class="chip-text" id="engine-label">Cline</span><span class="caret">&#9662;</span></button>
+    <button type="button" id="harness-toggle" class="icon-btn" title="Show harness comments (kronyx plan lines)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg></button>
     <span class="spacer"></span>
     <span id="tokchip" class="tok" title="Tokens in / out" hidden></span>
     <button type="button" id="model" class="chip model-chip" title="Model"><span class="chip-text" id="model-label">Model</span><span class="caret">&#9662;</span></button>
@@ -44,8 +49,10 @@ export function renderPage(webview: vscode.Webview, extensionUri: vscode.Uri): s
 <div id="status" class="status" role="status" aria-live="polite">Idle</div>
 <div id="menu" class="menu" hidden></div>
 <div id="context-popover" class="context-popover" hidden></div>
+<script nonce="${nonce}">globalThis.KRONYX_BUILD=${JSON.stringify(__BUILD_ID__)};</script>
 <script nonce="${nonce}" src="${markedJs}"></script>
 <script nonce="${nonce}" src="${highlightJs}"></script>
+<script nonce="${nonce}" src="${queueJs}"></script>
 <script nonce="${nonce}" src="${script}"></script>
 </body>
 </html>`;

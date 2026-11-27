@@ -11,8 +11,11 @@ import type { AgentImagePart, AgentMessage, AgentToolCallPart, AgentToolDefiniti
 
 export type WireProtocol = "responses" | "chat";
 
-/** The OpenAI provider speaks Responses (chaining + server compaction); other compatible endpoints use chat completions. */
-export const protocolFor = (providerId: string): WireProtocol => (providerId === "openai" ? "responses" : "chat");
+/** Providers that serve the OpenAI Responses API: direct OpenAI, and the Vercel AI Gateway which proxies it. */
+const RESPONSES_PROVIDERS = new Set(["openai", "vercel-ai-gateway"]);
+
+/** Whether the provider serves the Responses API (direct OpenAI / Vercel AI Gateway) or only chat completions. */
+export const protocolFor = (providerId: string, _modelId = ""): WireProtocol => (RESPONSES_PROVIDERS.has(providerId) ? "responses" : "chat");
 
 export const endpointFor = (protocol: WireProtocol, baseUrl: string): string =>
 	`${baseUrl.replace(/\/+$/, "")}/${protocol === "responses" ? "responses" : "chat/completions"}`;
@@ -38,6 +41,8 @@ export interface TurnOutcome {
 	usage: TurnUsage;
 	/** Set when the provider stopped early (length limit, incomplete response). */
 	incomplete?: string;
+	/** The response's full ordered output items (Responses only), for verbatim replay. */
+	providerItems?: unknown[];
 }
 
 export const zeroUsage = (): TurnUsage => ({ inputTokens: 0, outputTokens: 0, cachedTokens: 0, reasoningTokens: 0 });
@@ -122,18 +127,24 @@ export function responsesBody(args: {
 	input: Record<string, unknown>[];
 	tools: readonly AgentToolDefinition[];
 	previousResponseId?: string;
+	conversationId?: string;
+	store?: boolean;
 	maxOutputTokens?: number;
 	compactThreshold?: number;
 }): Record<string, unknown> {
+	const store = args.store ?? true;
 	return {
 		model: args.model,
 		instructions: args.instructions,
 		input: args.input,
 		tools: args.tools.map((t) => ({ type: "function", name: t.name, description: t.description, parameters: t.inputSchema, strict: false })),
 		parallel_tool_calls: true,
-		store: true,
+		store,
 		stream: true,
+		// Without server storage, encrypted reasoning must come back in the response so it can be replayed.
+		...(store ? {} : { include: ["reasoning.encrypted_content"] }),
 		...(args.previousResponseId ? { previous_response_id: args.previousResponseId } : {}),
+		...(args.conversationId ? { conversation: args.conversationId } : {}),
 		...(args.maxOutputTokens ? { max_output_tokens: args.maxOutputTokens } : {}),
 		...(args.compactThreshold ? { context_management: [{ type: "compaction", compact_threshold: args.compactThreshold }] } : {}),
 	};
@@ -164,6 +175,9 @@ const sleep = (ms: number, signal?: AbortSignal) =>
 		signal?.addEventListener("abort", () => (clearTimeout(t), reject(new Error("Stopped by user"))), { once: true });
 	});
 
+/** HTTP failure with the status attached, so callers can tell a missing conversation (404) from other errors. */
+const httpError = (status: number, detail: string): Error => Object.assign(new Error(`HTTP ${status}: ${detail}`), { status });
+
 /** POST a streaming request; retries rate limits and transient 5xx before the stream starts. */
 export async function postStream(url: string, apiKey: string, body: unknown, signal?: AbortSignal): Promise<ReadableStream<Uint8Array>> {
 	for (let attempt = 0; ; attempt++) {
@@ -176,9 +190,22 @@ export async function postStream(url: string, apiKey: string, body: unknown, sig
 		if (res.ok && res.body) return res.body;
 		const detail = (await res.text().catch(() => "")).slice(0, 500);
 		const delay = RETRY_DELAYS_MS[attempt];
-		if (!RETRY_STATUS.has(res.status) || delay === undefined) throw new Error(`HTTP ${res.status}: ${detail || res.statusText}`);
+		if (!RETRY_STATUS.has(res.status) || delay === undefined) throw httpError(res.status, detail || res.statusText);
 		await sleep(delay, signal);
 	}
+}
+
+/** Creates a server-side conversation (Conversations API); returns its id. */
+export async function createConversation(baseUrl: string, apiKey: string): Promise<string> {
+	const res = await fetch(`${baseUrl.replace(/\/+$/, "")}/conversations`, {
+		method: "POST",
+		headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+		body: "{}",
+	});
+	if (!res.ok) throw httpError(res.status, (await res.text().catch(() => "")).slice(0, 500) || res.statusText);
+	const id = (await res.json()).id;
+	if (typeof id !== "string") throw new Error("conversation create returned no id");
+	return id;
 }
 
 export interface SseEvent {
@@ -234,6 +261,7 @@ const chatUsage = (u: Record<string, any> | undefined): TurnUsage => ({
 /** Fold Responses API stream events into one turn. Throws on failed/truncated streams. */
 export async function reduceResponses(events: AsyncIterable<SseEvent>, hooks: StreamHooks): Promise<TurnOutcome> {
 	const out: TurnOutcome = { text: "", reasoning: "", calls: [], usage: zeroUsage() };
+	const items: unknown[] = [];
 	let finished = false;
 	for await (const ev of events) {
 		if (ev.data === "[DONE]") continue;
@@ -253,6 +281,7 @@ export async function reduceResponses(events: AsyncIterable<SseEvent>, hooks: St
 				break;
 			case "response.output_item.done": {
 				const item = j.item;
+				items.push(item);
 				if (item?.type === "function_call") out.calls.push({ callId: item.call_id, name: item.name, args: item.arguments ?? "" });
 				else if (item?.type === "message" && !out.text) {
 					const t = (item.content ?? []).flatMap((c: any) => (c.type === "output_text" ? [c.text] : [])).join("");
@@ -268,6 +297,7 @@ export async function reduceResponses(events: AsyncIterable<SseEvent>, hooks: St
 				const r = j.response ?? {};
 				out.responseId = r.id ?? out.responseId;
 				out.usage = responsesUsage(r.usage);
+				out.providerItems = Array.isArray(r.output) && r.output.length ? r.output : items.slice();
 				if (j.type === "response.incomplete") out.incomplete = r.incomplete_details?.reason ?? "incomplete";
 				finished = true;
 				break;

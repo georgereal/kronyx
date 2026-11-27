@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
-import type { ModelPort, Task, ToolPort } from "../../src/harness/contracts";
-import { CommandVerifier } from "../../src/harness/verifier";
-import { SubagentRunner, restrictTools, SUBAGENT_SUMMARY_CAP } from "../../src/harness/subagent";
+import type { ModelPort, Task, ToolPort } from "../../src/harness/core/contracts";
+import { CommandVerifier } from "../../src/harness/defaults/verifier";
+import { shellExec } from "../../src/harness/tools/exec";
+import { SubagentRunner, restrictTools, SUBAGENT_SUMMARY_CAP } from "../../src/harness/tools/subagent";
 
 const task = (acceptance: Task["acceptance"]): Task => ({ id: "t", title: "t", acceptance, dependsOn: [], status: "pending", steps: [], evidence: [] });
 
@@ -89,6 +90,12 @@ describe("subagent contract (M8)", () => {
 		await expect(runner.run(contract)).rejects.toThrow(/one subagent/);
 		release();
 		await first;
+	});
+
+	it("a pipeline fails the acceptance check when an early stage fails", async () => {
+		const exec = shellExec(process.cwd());
+		expect((await exec("false | tail -1")).ok).toBe(false);
+		expect((await exec("true | tail -1")).ok).toBe(true);
 	});
 
 	it("refuses a subagent with no allowed tools, and refuses nesting", async () => {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { ModelPort, ToolPort } from "../../src/harness/contracts";
-import { EXPLORE_TOOL, withExplore } from "../../src/harness/explore";
+import type { ModelPort, ToolPort } from "../../src/harness/core/contracts";
+import { EXPLORE_TOOL, withExplore } from "../../src/harness/tools/explore";
 
 const base: ToolPort = {
 	specs: () => [

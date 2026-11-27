@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_LOOP_DETECTOR, parseLoopDetectorConfig, parseSessionEvent, parseTask, SchemaError, type SessionEvent } from "../../src/harness/contracts";
+import { DEFAULT_LOOP_DETECTOR, parseLoopDetectorConfig, parseSessionEvent, parseTask, SchemaError, type SessionEvent } from "../../src/harness/core/contracts";
 
 const meta = { seq: 1, at: 1_700_000_000_000, runId: "run-1" };
 const task = { id: "t1", title: "Add parser", acceptance: { kind: "command", command: "npm test" }, dependsOn: [], status: "pending", steps: [{ id: "s1", text: "write it", status: "pending", callIds: [] }], evidence: [] };

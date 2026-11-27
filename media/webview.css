@@ -49,8 +49,15 @@ body {
 	opacity: 0.75;
 	max-width: 160px;
 	overflow: hidden;
-	text-overflow: ellipsis;
 	flex-shrink: 0;
+	display: inline-flex;
+	align-items: center;
+}
+.tab-label {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	min-width: 0;
 }
 .tab:hover {
 	background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2));
@@ -59,13 +66,14 @@ body {
 	margin-left: 6px;
 	padding: 0 2px;
 	border-radius: 3px;
-	opacity: 0;
+	opacity: 0.5;
 	font-size: 1.05em;
 	line-height: 1;
+	flex-shrink: 0;
 }
 .tab:hover .tab-close,
 .tab-close:hover {
-	opacity: 0.8;
+	opacity: 0.9;
 }
 .tab-close:hover {
 	background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.35));
@@ -136,9 +144,19 @@ body {
 	margin: 2px 0;
 }
 .step.info.harness {
-	opacity: 0.85;
+	font-size: 0.84em;
+	font-style: italic;
+	opacity: 0.7;
 	border-left: 2px solid var(--vscode-charts-blue, #3794ff);
 	padding-left: 6px;
+}
+body.hide-harness .step.info.harness,
+body.hide-harness .step.taskboard {
+	display: none;
+}
+.icon-btn.active {
+	color: var(--vscode-charts-blue, #3794ff);
+	opacity: 1;
 }
 .step.file {
 	display: flex;
@@ -514,6 +532,11 @@ input.perm-path-input {
 	background: rgba(200, 160, 60, 0.15);
 	color: var(--vscode-editorWarning-foreground, #c8a03c);
 }
+.board-step.failed {
+	color: var(--vscode-errorForeground, #f14c4c);
+	text-decoration: line-through;
+	opacity: 0.75;
+}
 .board-adopt {
 	font-size: 0.75em;
 	font-weight: 400;
@@ -525,6 +548,14 @@ input.perm-path-input {
 	padding: 0;
 	font-size: 0.92em;
 }
+.board-task.stale {
+	opacity: 0.5;
+}
+
+.board-pill.stale {
+	background: var(--vscode-badge-background, #4d4d4d);
+}
+
 .board-task.done .board-title {
 	opacity: 0.6;
 }
@@ -602,25 +633,6 @@ input.perm-path-input {
 .result-issues.blocked {
 	color: var(--vscode-editorWarning-foreground, #c8a03c);
 }
-.tool-batch {
-	margin: 2px 0;
-}
-/* One call in a batch: the card speaks for itself — no duplicated header or indent. */
-.tool-batch.single > summary { display: none; }
-.tool-batch.single > .batch-body { padding-left: 0; border-left: none; }
-.tool-batch > summary {
-	font-size: 0.9em;
-	opacity: 0.8;
-	cursor: pointer;
-	list-style: none;
-}
-.tool-batch > .batch-body {
-	padding-left: 12px;
-	display: flex;
-	flex-direction: column;
-	gap: 4px;
-	border-left: 1px solid var(--vscode-panel-border);
-}
 .step.done .label,
 .step.failed .label {
 	font-size: 0.85em;
@@ -689,7 +701,9 @@ input.perm-path-input {
 	flex-shrink: 0;
 }
 .step.tool[open] .twisty,
-.board-task[open] > summary .twisty {
+.board-task[open] > summary .twisty,
+.run-group[open] > summary .twisty,
+.thoughts-group[open] > summary .twisty {
 	transform: rotate(90deg);
 }
 .tool-name {
@@ -747,21 +761,29 @@ pre.io {
 }
 
 /* ---------- markdown ---------- */
-.md { line-height: 1.65; }
+.md {
+	font-family: -apple-system-body, ui-sans-serif, -apple-system, system-ui, "Segoe UI", Helvetica, "Apple Color Emoji", Arial, sans-serif, "Segoe UI Emoji", "Segoe UI Symbol";
+	font-size: 12px;
+	font-weight: 400;
+	line-height: 20px;
+	letter-spacing: normal;
+	overflow-wrap: break-word;
+	-webkit-font-smoothing: antialiased;
+}
 .md > :first-child { margin-top: 0; }
 .md > :last-child { margin-bottom: 0; }
-.md p { margin: 7px 0; }
+.md p { margin: 12px 0 0; }
 .md li { margin: 4px 0; padding-left: 4px; }
 .md li::marker { color: var(--vscode-textLink-foreground, #4682c8); }
 .md ul ul, .md ol ol, .md ul ol, .md ol ul { margin: 2px 0; }
-.md li > p { margin: 3px 0; }
+.md li > p { margin: 4px 0; }
 .md strong { font-weight: 600; }
 .md em { color: var(--vscode-descriptionForeground); }
 .md .ref-chip { font-weight: 600; color: var(--vscode-textLink-foreground, #4682c8); }
 .narration-note {
 	font-size: 0.9em;
 	color: var(--vscode-descriptionForeground);
-	margin: 4px 0;
+	margin: 8px 0;
 }
 .narration-note .narration-head {
 	font-weight: 400;
@@ -772,12 +794,12 @@ pre.io {
 	font: inherit;
 	color: inherit;
 }
-.md h1, .md h2, .md h3, .md h4 { margin: 12px 0 5px; font-weight: 600; }
-.md h1 { font-size: 1.25em; }
-.md h2 { font-size: 1.15em; padding-bottom: 3px; border-bottom: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.25)); }
-.md h3 { font-size: 1.05em; color: var(--vscode-textLink-foreground, #4682c8); }
+.md h1, .md h2, .md h3, .md h4 { margin: 16px 0 6px; font-weight: 600; }
+.md h1 { font-size: 1.3em; }
+.md h2 { font-size: 1.2em; padding-bottom: 4px; border-bottom: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.25)); }
+.md h3 { font-size: 1.08em; color: var(--vscode-textLink-foreground, #4682c8); }
 .md h4 { font-size: 1em; }
-.md ul, .md ol { margin: 5px 0; padding-left: 20px; }
+.md ul, .md ol { margin: 6px 0; padding-left: 22px; }
 .md ul { list-style: disc; }
 .md ol { list-style: decimal; }
 .md code {
@@ -788,7 +810,7 @@ pre.io {
 	padding: 1px 5px;
 }
 .md blockquote {
-	margin: 4px 0;
+	margin: 10px 0;
 	padding-left: 10px;
 	border-left: 3px solid var(--vscode-panel-border);
 	opacity: 0.85;
@@ -796,13 +818,13 @@ pre.io {
 .md table {
 	display: block;
 	border-collapse: collapse;
-	margin: 6px 0;
-	font-size: 0.88em;
+	margin: 10px 0;
+	font-size: 0.92em;
 	max-width: 100%;
 	overflow-x: auto;
 }
 .md td, .md th { word-break: break-word; }
-.md th, .md td { border: 1px solid var(--vscode-panel-border); padding: 3px 8px; }
+.md th, .md td { border: 1px solid var(--vscode-panel-border); padding: 5px 10px; }
 .code-wrap {
 	margin: 6px 0;
 	border: 1px solid var(--vscode-panel-border);
@@ -853,17 +875,18 @@ pre.io {
 	opacity: 0.55;
 	margin-bottom: 2px;
 }
-.bubble-text { white-space: pre-wrap; word-break: break-word; }
+.bubble-text {
+	white-space: pre-wrap;
+	word-break: break-word;
+	font-family: -apple-system-body, ui-sans-serif, -apple-system, system-ui, "Segoe UI", Helvetica, "Apple Color Emoji", Arial, sans-serif, "Segoe UI Emoji", "Segoe UI Symbol";
+	font-size: 12px;
+	line-height: 20px;
+	font-weight: 400;
+	-webkit-font-smoothing: antialiased;
+}
 
 /* ---------- tool verbs / input / output ---------- */
 .tool-icon { width: 16px; text-align: center; flex-shrink: 0; opacity: 0.8; }
-.tool-input { margin-left: 16px; }
-.tool-input > summary {
-	cursor: pointer;
-	font-size: 0.78em;
-	opacity: 0.55;
-	list-style: none;
-}
 pre.io-err { color: var(--vscode-errorForeground); }
 
 /* ---------- empty state / jump ---------- */
@@ -1078,13 +1101,14 @@ textarea {
 	border: none;
 	outline: none;
 	padding: 2px 4px;
-	font-family: var(--vscode-font-family);
-	font-size: var(--vscode-font-size);
+	font-family: -apple-system-body, ui-sans-serif, -apple-system, system-ui, "Segoe UI", Helvetica, "Apple Color Emoji", Arial, sans-serif, "Segoe UI Emoji", "Segoe UI Symbol";
+	font-size: 12px;
 	font-weight: 400;
-	line-height: 1.45;
+	line-height: 20px;
+	-webkit-font-smoothing: antialiased;
 	width: 100%;
 	box-sizing: border-box;
-	min-height: calc(var(--vscode-font-size) * 1.45 + 6px);
+	min-height: 30px;
 	max-height: 180px;
 	opacity: 0.95;
 }
@@ -1172,6 +1196,29 @@ textarea::placeholder {
 .spacer {
 	flex: 1;
 	min-width: 10px;
+}
+/* Phase line above the composer — what's happening right now. */
+.phase {
+	display: flex;
+	align-items: center;
+	gap: 7px;
+	font-size: 0.85em;
+	font-style: italic;
+	opacity: 0.75;
+	padding: 0 4px 6px;
+	min-height: 18px;
+}
+.phase-dot {
+	width: 6px;
+	height: 6px;
+	border-radius: 50%;
+	background: var(--vscode-charts-blue, #3794ff);
+	animation: phase-pulse 1.4s ease-in-out infinite;
+	flex-shrink: 0;
+}
+@keyframes phase-pulse {
+	0%, 100% { opacity: 0.35; transform: scale(0.8); }
+	50% { opacity: 1; transform: scale(1.05); }
 }
 .icon-btn,
 .chip {

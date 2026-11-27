@@ -28,8 +28,8 @@ export interface ToolsProvider {
 export interface ApprovalsProvider {
 	/** Prompt-free policy check (rule-file evaluation). Runs before mode defaults. */
 	check?(toolName: string, input: unknown): Promise<PermissionDecision>;
-	/** Interactive confirmation for writes that reached the ask stage. */
-	confirm(toolName: string, input: unknown): Promise<boolean>;
+	/** Interactive confirmation for writes that reached the ask stage. `callId` links the ask to the tool call it gates. */
+	confirm(toolName: string, input: unknown, callId?: string): Promise<boolean>;
 }
 
 export interface MemoryProvider {

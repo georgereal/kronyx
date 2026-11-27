@@ -14,6 +14,7 @@
 	const modeLabel = /** @type {HTMLElement} */ (document.getElementById("mode-label"));
 	const engineBtn = /** @type {HTMLButtonElement} */ (document.getElementById("engine"));
 	const engineLabel = /** @type {HTMLElement} */ (document.getElementById("engine-label"));
+	const harnessBtn = /** @type {HTMLButtonElement} */ (document.getElementById("harness-toggle"));
 	const modelLabel = /** @type {HTMLElement} */ (document.getElementById("model-label"));
 	const status = /** @type {HTMLElement} */ (document.getElementById("status"));
 	const tokchip = /** @type {HTMLElement} */ (document.getElementById("tokchip"));
@@ -28,11 +29,13 @@
 	const attachmentPreviews = /** @type {HTMLElement} */ (document.getElementById("attachment-previews"));
 	const activity = /** @type {HTMLButtonElement} */ (document.getElementById("activity"));
 	const contextPopover = /** @type {HTMLElement} */ (document.getElementById("context-popover"));
+	const phaseEl = /** @type {HTMLElement} */ (document.getElementById("phase"));
+	const phaseText = /** @type {HTMLElement} */ (document.getElementById("phase-text"));
 	/** @type {Map<string, HTMLElement>} */
 	const tools = new Map();
 	/** @type {Map<string, HTMLElement>} */
 	const attachments = new Map();
-	let openToolCard = null;
+	/** @type {any} */ let openToolCard = null;
 	let usage = {
 		inputTokens: 0,
 		outputTokens: 0,
@@ -49,7 +52,7 @@
 	const persisted = vscode.getState() || {};
 	/** @type {string} */
 	let mode = persisted.mode || "code";
-	const ENGINES = ["cline", "openai"];
+	const ENGINES = ["cline", "responses", "conversations"];
 	let engine = ENGINES.includes(persisted.engine) ? persisted.engine : "cline";
 	/** @type {string} */
 	// The composer pick (modelId + modelProfile) is host state only — never restored
@@ -61,7 +64,7 @@
 	let groups = [];
 	let modelProfile = "";
 	let providerFilter = "";
-	/** @type {string[]} */
+	/** @type {any[]} */
 	let recentModels = persisted.recentModels || [];
 	/** @type {{name: string, title: string}[]} */
 	let sessionTabs = [];
@@ -82,14 +85,29 @@
 
 	const persist = () => {
 		drafts[activeSession] = task.value;
-		vscode.setState({ mode, engine, models, recentModels, drafts, authDismissed, cloudEnv });
+		vscode.setState({ mode, engine, models, recentModels, drafts, authDismissed, cloudEnv, showHarness });
 	};
+
+	// Harness comments (the "kronyx plan —" lines and the debug board) are noise
+	// for a clean read — the toggle shows/hides them live in the timeline.
+	let showHarness = persisted.showHarness === true;
+	const applyHarness = () => {
+		document.body.classList.toggle("hide-harness", !showHarness);
+		harnessBtn.classList.toggle("active", showHarness);
+		harnessBtn.title = showHarness ? "Hide harness comments" : "Show harness comments (kronyx plan lines)";
+	};
+	harnessBtn.addEventListener("click", () => {
+		showHarness = !showHarness;
+		applyHarness();
+		persist();
+	});
+	applyHarness();
 
 	let cloudEnv = persisted.cloudEnv === true;
 
 	const persistedAuth = persisted.authDismissed === true;
 	let authDismissed = persistedAuth;
-	let signedIn = undefined;
+	/** @type {any} */ let signedIn = undefined;
 	const refreshAuthBanner = () => {
 		authBanner.hidden = signedIn !== false || authDismissed;
 	};
@@ -101,7 +119,7 @@
 	});
 	refreshAuthBanner();
 
-	const el = (tag, cls, text) => {
+	const el = (/** @type {any} */ tag = undefined, /** @type {any} */ cls = undefined, /** @type {any} */ text = undefined) => {
 		const node = document.createElement(tag);
 		if (cls) node.className = cls;
 		if (text !== undefined) node.textContent = text;
@@ -111,18 +129,21 @@
 	const renderTabs = () => {
 		tabList.innerHTML = "";
 		const labels = sessionTabs.map((s) => s.title || s.name);
-		const makeChip = (s, active) => {
+		const makeChip = (/** @type {any} */ s = undefined, /** @type {any} */ active = undefined) => {
 			const label = s.title || s.name;
 			// Disambiguate same-title sessions with the stored session name.
 			const text = labels.indexOf(label) !== labels.lastIndexOf(label) && s.title !== s.name ? `${label} · ${s.name}` : label;
-			const chip = el("button", "tab" + (active ? " active" : ""), text);
+			const chip = el("button", "tab" + (active ? " active" : ""));
+			// Label truncates in its own span — text-overflow on the chip itself
+			// clipped the close × right out of truncated chips.
+			chip.appendChild(el("span", "tab-label", text));
 			chip.title = s.name;
 			chip.addEventListener("click", () => {
 				if (s.name !== activeSession) vscode.postMessage({ type: "switchSession", name: s.name });
 			});
 			const close = el("span", "tab-close", "×");
 			close.title = "Close session tab";
-			close.addEventListener("click", (e) => {
+			close.addEventListener("click", (/** @type {any} */ e = undefined) => {
 				e.stopPropagation();
 				vscode.postMessage({ type: "closeSession", name: s.name });
 			});
@@ -147,7 +168,7 @@
 	tabNew.addEventListener("click", () => vscode.postMessage({ type: "newSession" }));
 	window.addEventListener("resize", renderTabs);
 	tabPrev.addEventListener("click", () => {
-		const item = (s) => ({
+		const item = (/** @type {any} */ s = undefined) => ({
 			label: s.title || s.name,
 			desc: s.title && s.title !== s.name ? s.name : undefined,
 			checked: s.name === activeSession,
@@ -164,14 +185,14 @@
 	});
 
 	// ---------- markdown ----------
-	const sanitizeMd = (html) => html.replace(/<(script|style|iframe|object|embed|form)[\s\S]*?<\/\1>/gi, "");
-	const renderMd = (text) => {
+	const sanitizeMd = (/** @type {any} */ html = undefined) => html.replace(/<(script|style|iframe|object|embed|form)[\s\S]*?<\/\1>/gi, "");
+	const renderMd = (/** @type {any} */ text = undefined) => {
 		const d = el("div", "md");
-		if (typeof marked === "undefined") {
+		if (typeof /** @type {any} */ (globalThis).marked === "undefined") {
 			d.textContent = text;
 			return d;
 		}
-		d.innerHTML = sanitizeMd(marked.parse(text));
+		d.innerHTML = sanitizeMd(/** @type {any} */ (globalThis).marked.parse(text));
 		for (const pre of d.querySelectorAll("pre")) {
 			const wrap = el("div", "code-wrap");
 			const bar = el("div", "code-bar");
@@ -201,7 +222,7 @@
 	});
 	document.body.appendChild(jumpBtn);
 
-	const scrollMaybe = (force) => {
+	const scrollMaybe = (/** @type {any} */ force = undefined) => {
 		if (force || atBottom()) {
 			timeline.scrollTop = timeline.scrollHeight;
 			jumpBtn.hidden = true;
@@ -210,12 +231,11 @@
 		}
 	};
 
-	let runGroup = null;
+	/** @type {any} */ let runGroup = null;
 	/** The current run's top-level section — bubble, worked group and result
 	 *  card all live inside it so nothing escapes into a sibling run's area. */
-	let runEl = null;
+	/** @type {any} */ let runEl = null;
 	/** @type {any} */
-	let batchEl = null;
 	/** @type {any} */
 	let boardEl = null;
 	let boardSig = "";
@@ -223,6 +243,9 @@
 	 *  plan-reuse run doesn't inherit the previous run's blocked counts. */
 	let boardActive = false;
 	const boardTasks = new Map();
+	/** Control-plane / harness-owned calls — they render as "kronyx plan —"
+	 * comment lines (toggleable), never as operation cards. */
+	const HARNESS_TOOLS = new Set(["task_create", "task_replace", "task_update", "task_remove", "task_step_add", "task_step_update", "update_progress", "log_slice", "recall_context", "use_tool", "read_plan", "finish"]);
 	/** callId → {name, ok} for every tool card in the session — feeds the board
 	 *  tree's compact call rows and the off-plan feed badges. */
 	const callInfo = new Map();
@@ -233,7 +256,7 @@
 	 *  jump-to-card, but off-plan/attribution is per-run like the board. */
 	const runCalls = new Set();
 	/** "tN/sM" of the in-progress step calls tentatively serve. */
-	let liveAnchor = null;
+	/** @type {any} */ let liveAnchor = null;
 	/** callId → "t1/s2" locked attribution, rebuilt from step.callIds each board. */
 	const attributed = new Map();
 	/** Rebuild the locked call→step map from the latest board snapshot. */
@@ -246,12 +269,12 @@
 		// The in-progress step is what new calls tentatively serve.
 		liveAnchor = null;
 		for (const t of boardTasks.values()) {
-			const s = (t.steps || []).find((x) => x.status === "in_progress");
+			const s = (t.steps || []).find((/** @type {any} */ x = undefined) => x.status === "in_progress");
 			if (t.status === "in_progress" && s) liveAnchor = `${t.id}/${s.id}`;
 		}
 	};
 	/** A compact call row inside a board step; click jumps to the feed card. */
-	const callRow = (cid, tentative) => {
+	const callRow = (/** @type {any} */ cid = undefined, /** @type {any} */ tentative = undefined) => {
 		const info = callInfo.get(cid) || {};
 		const row = el("li", `call-row${tentative ? " tentative" : ""}${info.ok === false ? " failed" : ""}`);
 		const [icon, verb] = toolVerb(info.name || "?");
@@ -259,7 +282,7 @@
 		row.appendChild(el("span", "call-verb", verb));
 		row.appendChild(el("span", `call-ok${info.ok === undefined ? "" : info.ok ? " ok" : " err"}`, info.ok === undefined ? "…" : info.ok ? "✓" : "✗"));
 		row.title = `${info.name || cid} — click to jump to the call`;
-		row.addEventListener("click", (e) => {
+		row.addEventListener("click", (/** @type {any} */ e = undefined) => {
 			e.stopPropagation();
 			tools.get(cid)?.scrollIntoView({ block: "center", behavior: "smooth" });
 		});
@@ -290,28 +313,36 @@
 	let progressEl = null;
 	/** Newest plan doc this session produced — the result card links back to it. */
 	let lastPlanPath = "";
-	let lastCompactEl = null;
+	/** @type {any} */ let lastCompactEl = null;
 	let groupStats = { added: 0, removed: 0, files: new Set() };
-	let streamMsg = null;
+	/** @type {any} */ let streamMsg = null;
 	let streamText = "";
-	let streamReasoning = null;
+	/** @type {any} */ let streamReasoning = null;
 	let reasoningText = "";
 	let lastReasoningNorm = "";
-	let thoughts = null;
-	let mdTimer = 0;
+	/** @type {any} */ let thoughts = null;
 	let lastVerb = "";
 
-	const setEmptyMode = (empty) => timeline.classList.toggle("is-empty", empty);
+	const setEmptyMode = (/** @type {any} */ empty = undefined) => timeline.classList.toggle("is-empty", empty);
 
-	const add = (node) => {
+	/** The resolved edit card currently expanded — the next element that lands
+	 * folds it to its one-line summary (one expanded thing at a time). */
+	/** @type {any} */ let openEditorCard = null;
+	const add = (/** @type {any} */ node = undefined, /** @type {boolean} */ transient = false) => {
 		setEmptyMode(false);
 		timeline.querySelector(".empty")?.remove();
 		if (runGroup && !runGroup.isConnected) runGroup = null;
 		if (runEl && !runEl.isConnected) runEl = null;
 		// Work goes into the run's open group; run-level cards go into the run's
 		// section; only content outside any run reaches the bare timeline.
-		const target = runGroup?.querySelector(".group-body") ?? runEl ?? timeline;
+		/** @type {any} */ const target = runGroup?.querySelector(".group-body") ?? runEl ?? timeline;
 		target.appendChild(node);
+		// Transient nodes (the streaming text bubble) don't exist on replay —
+		// letting them fold the open card would make live paint differ from it.
+		if (!transient) {
+			if (openEditorCard && node !== openEditorCard && openEditorCard.open) openEditorCard.open = false;
+			if (node !== openEditorCard) openEditorCard = null;
+		}
 		scrollMaybe(true);
 		persist();
 	};
@@ -328,7 +359,6 @@
 		groupStats = { added: 0, removed: 0, files: new Set() };
 		lastReasoningNorm = "";
 		runGroup = group;
-		batchEl = null;
 		streamMsg = null;
 		streamText = "";
 		streamReasoning = null;
@@ -338,13 +368,13 @@
 		(runEl ?? timeline).appendChild(group);
 	};
 
-	const fmtDur = (secs) => {
+	const fmtDur = (/** @type {any} */ secs = undefined) => {
 		if (secs < 60) return `${secs}s`;
 		const m = Math.floor(secs / 60), s = secs % 60;
 		return s ? `${m}m ${s}s` : `${m}m`;
 	};
 
-	const updateGroupTitle = (prefix) => {
+	const updateGroupTitle = (/** @type {any} */ prefix = undefined) => {
 		if (!runGroup) return;
 		const secs = startedAt ? Math.round((Date.now() - startedAt) / 1000) : 0;
 		const diff = groupStats.added || groupStats.removed ? ` +${groupStats.added} −${groupStats.removed}` : "";
@@ -359,10 +389,10 @@
 
 	// Ledger refs (t1, s3, s3–s4) render as small chips — the id stays terse and
 	// the task/step it points at shows as a hover tooltip.
-	const clip = (s, n) => (s.length > n ? `${s.slice(0, n)}…` : s);
-	const stepText = (id) => {
+	const clip = (/** @type {any} */ s = undefined, /** @type {any} */ n = undefined) => (s.length > n ? `${s.slice(0, n)}…` : s);
+	const stepText = (/** @type {any} */ id = undefined) => {
 		for (const t of boardTasks.values()) {
-			const s = (t.steps || []).find((x) => x.id === id);
+			const s = (t.steps || []).find((/** @type {any} */ x = undefined) => x.id === id);
 			if (s) return s.text;
 		}
 		return "";
@@ -372,11 +402,11 @@
 	// stray "t2" in code talk is left alone.
 	const REF_RE = /\{[ts]\d+(?:\s*[–-]\s*s?\d+)?\}|\bt\d+\b|\bs\d+(?:\s*[–-]\s*s?\d+)?/g;
 	const REF_TEST = /\{[ts]\d|\bt\d+\b|\bs\d+/;
-	const refTip = (ref) =>
+	const refTip = (/** @type {any} */ ref = undefined) =>
 		ref[0] === "t"
 			? boardTasks.get(ref)?.title
 			: (ref.match(/s\d+/g) || []).map(stepText).filter(Boolean).join(" / ");
-	const refChip = (ref, braced) => {
+	const refChip = (/** @type {any} */ ref = undefined, /** @type {any} */ braced = undefined) => {
 		// Step ids repeat across tasks — a bare "s3" is just prose (AWS S3 says hi);
 		// steps resolve only through explicit {s3} braces. Task ids are board-unique.
 		if (!braced && ref[0] === "s") return document.createTextNode(ref);
@@ -390,7 +420,7 @@
 		return chip;
 	};
 	/** Split text into text nodes and ref chips. */
-	const refNodes = (text) => {
+	const refNodes = (/** @type {any} */ text = undefined) => {
 		const nodes = [];
 		let last = 0;
 		for (const m of text.matchAll(REF_RE)) {
@@ -404,23 +434,23 @@
 		return nodes;
 	};
 	/** Wrap refs inside a rendered markdown tree; skips code and links. */
-	const chipify = (root) => {
+	const chipify = (/** @type {any} */ root = undefined) => {
 		const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-			acceptNode: (n) => (REF_TEST.test(n.nodeValue) ? (n.parentElement?.closest("code, pre, a") ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT) : NodeFilter.FILTER_SKIP),
+			acceptNode: (n) => (REF_TEST.test(n.nodeValue || "") ? (n.parentElement?.closest("code, pre, a") ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT) : NodeFilter.FILTER_SKIP),
 		});
 		const targets = [];
 		while (walker.nextNode()) targets.push(walker.currentNode);
 		for (const n of targets) {
 			const frag = document.createDocumentFragment();
 			for (const part of refNodes(n.nodeValue)) frag.appendChild(part);
-			n.parentNode.replaceChild(frag, n);
+			n.parentNode?.replaceChild(frag, n);
 		}
 	};
 
 	// Inline `code` spans that spell a workspace file path open the file on click —
 	// so "approve the plan at `.kronyx/plans/x.md`" is a link, not dead text.
 	const PATH_EXT = /\.(md|ts|tsx|js|jsx|mjs|cjs|json|css|html|py|go|rs|toml|yaml|yml|txt|sh|sql|java|c|cc|cpp|h|hpp|rb|swift|kt|env|ini|cfg|xml|lock)$/i;
-	const linkifyPaths = (root) => {
+	const linkifyPaths = (/** @type {any} */ root = undefined) => {
 		for (const code of root.querySelectorAll("code")) {
 			if (code.closest("pre")) continue;
 			const t = code.textContent.trim();
@@ -433,7 +463,7 @@
 	};
 
 	// First line of assistant text becomes a header line; the rest renders as markdown.
-	const narrationNodes = (rawText) => {
+	const narrationNodes = (/** @type {any} */ rawText = undefined) => {
 		const idx = rawText.indexOf("\n");
 		const rawHead = (idx === -1 ? rawText : rawText.slice(0, idx)).trim();
 		const head = rawHead.length > 140 ? rawHead.slice(0, 140) + "…" : rawHead || "…";
@@ -453,9 +483,9 @@
 	};
 
 	// Each reasoning segment gets its own inline collapsed section at the position it occurs.
-	const newThoughtSegment = (previewText) => {
+	const newThoughtSegment = (/** @type {any} */ previewText = undefined) => {
 		// Only the newest thoughts segment stays expanded; earlier ones collapse.
-		runGroup?.querySelectorAll(".thoughts-group[open]").forEach((t) => (t.open = false));
+		runGroup?.querySelectorAll(".thoughts-group[open]").forEach((/** @type {any} */ t = undefined) => (t.open = false));
 		thoughts = el("details", "thoughts-group dim");
 		thoughts.open = true;
 		const s = el("summary");
@@ -467,27 +497,27 @@
 		return thoughts;
 	};
 
-	const firstLine = (text) => {
+	const firstLine = (/** @type {any} */ text = undefined) => {
 		const line = String(text).split("\n").find((l) => l.trim()) || "";
 		return line.trim().length > 90 ? `${line.trim().slice(0, 90)}…` : line.trim();
 	};
 
-	const setThoughtPreview = (text) => {
-		const p = thoughts?.querySelector(".thought-preview");
+	const setThoughtPreview = (/** @type {any} */ text = undefined) => {
+		/** @type {any} */ const p = thoughts?.querySelector(".thought-preview");
 		if (p) p.textContent = firstLine(text);
 	};
 
 	const collapseEditCards = () => {
-		runGroup?.querySelectorAll("details.diff-editor[data-state='done']").forEach((d) => (d.open = false));
+		runGroup?.querySelectorAll("details.diff-editor[data-state='done']").forEach((/** @type {any} */ d = undefined) => (d.open = false));
 	};
 
 	const collapseAux = () => {
 		// Fold every inner details — batches, tool cards, thoughts — so the
 		// collapsed group expands to one line per batch, not the open wall.
-		runGroup?.querySelectorAll(".thoughts-group, details.tool-batch, details.step.tool").forEach((t) => (t.open = false));
+		runGroup?.querySelectorAll(".thoughts-group, details.step.tool").forEach((/** @type {any} */ t = undefined) => (t.open = false));
 	};
 
-	const closeGroup = (label) => {
+	const closeGroup = (/** @type {any} */ label = undefined) => {
 		if (!runGroup) return;
 		collapseAux();
 		collapseEditCards();
@@ -495,7 +525,6 @@
 		// The section stays open — every card inside is already a collapsed line,
 		// so the run reads as a clean list of steps, not a folded blob.
 		runGroup = null;
-		batchEl = null;
 	};
 
 	// Work events lazily open a segment; assistant text closes it — yielding
@@ -508,50 +537,37 @@
 		if (!runGroup) startGroup();
 	};
 
-	// Tool calls from one model turn share a batch card: a count and duration on the
-	// header, one row per call underneath. Calls without a turn number render alone.
-	/** @param {any} batch */
-	const updateBatch = (batch) => {
-		const total = batch.querySelectorAll(":scope > .batch-body > .step.tool").length;
-		const running = batch.querySelectorAll(":scope > .batch-body > .step.tool.running").length;
-		// A one-call batch is its own card — hide the redundant header row.
-		batch.classList.toggle("single", total === 1);
-		const label = `${total} operation${total === 1 ? "" : "s"}`;
-		const secs = Math.round((Date.now() - Number(batch.dataset.startedAt)) / 1000);
-		batch.querySelector(".batch-title").textContent = running ? `Running ${label}…` : secs > 0 ? `${label} · ${fmtDur(secs)}` : label;
+
+	let runningNow = false;
+	/** True from submit until the first event after run-started — the gap where
+	 * the prompt sits with nothing rendered (model call in flight). */
+	let awaitingFirst = false;
+	const setPhase = (/** @type {any} */ label = undefined) => {
+		phaseEl.hidden = !label;
+		phaseText.textContent = label || "";
+	};
+	const refreshPhase = () => {
+		if (permPending.size) return setPhase("Waiting for your approval…");
+		if (!runningNow) return setPhase("");
+		if (awaitingFirst) return setPhase("Analyzing your request…");
+		const busy = [...tools.values()].some((/** @type {any} */ c = undefined) => c.isConnected && c.classList?.contains("running"));
+		if (busy) return setPhase(lastVerb || "Working…");
+		return setPhase("Thinking…");
 	};
 
-	/** @param {any} card @param {any} iteration */
-	const addToolCard = (card, iteration) => {
-		if (iteration === undefined || iteration === null) return add(card);
-		if (!batchEl || !batchEl.isConnected || batchEl.dataset.iteration !== String(iteration)) {
-			batchEl = el("details", "tool-batch");
-			batchEl.open = true;
-			batchEl.dataset.iteration = String(iteration);
-			batchEl.dataset.startedAt = String(Date.now());
-			const head = el("summary");
-			head.appendChild(el("span", "twisty", "›"));
-			head.appendChild(el("span", "batch-title", ""));
-			batchEl.appendChild(head);
-			batchEl.appendChild(el("div", "batch-body"));
-			add(batchEl);
-		}
-		batchEl.querySelector(".batch-body").appendChild(card);
-		updateBatch(batchEl);
-		scrollMaybe(true);
-	};
-
-	const setRunning = (running) => {
+	const setRunning = (/** @type {any} */ running = undefined) => {
+		runningNow = running;
 		sendBtn.hidden = running;
 		stopBtn.hidden = !running;
 		task.disabled = running;
 		activity.classList.toggle("running", running);
+		refreshPhase();
 	};
 
-	const fmt = (n) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
+	const fmt = (/** @type {any} */ n = undefined) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
 	// Events are stamped at persist time; replayed ones keep their real clock
 	// time instead of all showing the replay moment.
-	const evTime = (msg) =>
+	const evTime = (/** @type {any} */ msg = undefined) =>
 		new Date(typeof msg?.ts === "number" ? msg.ts : Date.now()).toLocaleTimeString([], {
 			hour: "numeric",
 			minute: "2-digit",
@@ -560,7 +576,7 @@
 	let statusText = "Idle";
 	let elapsedTimer = 0;
 
-	const activityFill = document.getElementById("activity-fill");
+	/** @type {any} */ const activityFill = document.getElementById("activity-fill");
 	const RING_C = 2 * Math.PI * 6; // r=6 in the 16x16 activity svg
 	const contextWindow = () =>
 		groups.find((g) => g.profile === modelProfile)?.models?.find((m) => m.id === modelId)?.contextWindow ||
@@ -588,7 +604,7 @@
 	let contextPinned = false;
 	let contextHideTimer = 0;
 
-	const usageRow = (label, value) => {
+	const usageRow = (/** @type {any} */ label = undefined, /** @type {any} */ value = undefined) => {
 		const row = el("div", "context-row");
 		row.appendChild(el("span", "context-key", label));
 		row.appendChild(el("span", "context-val", String(value)));
@@ -625,7 +641,7 @@
 		contextPopover.appendChild(el("div", "context-note", "Values are provider-reported usage for this run."));
 	};
 
-	const showContextPopover = (pinned) => {
+	const showContextPopover = (/** @type {any} */ pinned = undefined) => {
 		clearTimeout(contextHideTimer);
 		contextPinned = pinned;
 		renderContextPopover();
@@ -670,7 +686,7 @@
 		if (e.key === "Escape") hideContextPopover();
 	});
 
-	const setStatus = (text) => {
+	const setStatus = (/** @type {any} */ text = undefined) => {
 		statusText = text;
 		const total = usage.inputTokens + usage.outputTokens;
 		const elapsed = startedAt ? ` · ${((Date.now() - startedAt) / 1000).toFixed(0)}s` : "";
@@ -702,7 +718,7 @@
 		startedAt = 0;
 	};
 
-	const describeInput = (name, input) => {
+	const describeInput = (/** @type {any} */ name = undefined, /** @type {any} */ input = undefined) => {
 		if (typeof input === "string") {
 			try { input = JSON.parse(input); } catch { return input.length > 90 ? input.slice(0, 87) + "…" : input; }
 		}
@@ -713,7 +729,7 @@
 		if (name === "read_file" && input.start_line) return `${p} (${input.start_line}-${input.end_line ?? "end"})`;
 		if (name === "edit_file" && Array.isArray(input.edits)) return `${p} (${input.edits.length} edit(s))`;
 		if (name === "read_files" && Array.isArray(input.files)) {
-			const names = input.files.map((f) => String(f?.path ?? "")).filter(Boolean);
+			const names = input.files.map((/** @type {any} */ f = undefined) => String(f?.path ?? "")).filter(Boolean);
 			const list = names.join(", ");
 			return list.length > 90 ? `${names[0]} +${names.length - 1} more` : list;
 		}
@@ -721,9 +737,9 @@
 	};
 
 	/** Result rollup for the collapsed tool row, e.g. "1,204 lines", "3 matches". */
-	const resultDetail = (name, output) => {
+	const resultDetail = (/** @type {any} */ name = undefined, /** @type {any} */ output = undefined) => {
 		const lines = String(output || "").split("\n").filter((l) => l.trim());
-		const plural = (n, one, many) => `${n.toLocaleString()} ${n === 1 ? one : many}`;
+		const plural = (/** @type {any} */ n = undefined, /** @type {any} */ one = undefined, /** @type {any} */ many = undefined) => `${n.toLocaleString()} ${n === 1 ? one : many}`;
 		if (!lines.length) return "";
 		if (name === "read_file") {
 			const n = lines.filter((l) => /^\s*\d+\|/.test(l)).length;
@@ -734,20 +750,20 @@
 		return "";
 	};
 
-	const fmtMs = (ms) => {
+	const fmtMs = (/** @type {any} */ ms = undefined) => {
 		ms = Number(ms) || 0;
 		if (ms < 1000) return "";
 		const s = ms / 1000;
 		return s < 10 ? `${s.toFixed(1)}s` : `${Math.round(s)}s`;
 	};
 
-	const copyIconButton = (text, title) => {
+	const copyIconButton = (/** @type {any} */ text = undefined, /** @type {any} */ title = undefined) => {
 		const copy = el("button", "perm-copy");
 		copy.type = "button";
 		copy.title = title;
 		copy.setAttribute("aria-label", title);
 		copy.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>';
-		copy.addEventListener("click", async (e) => {
+		copy.addEventListener("click", async (/** @type {any} */ e = undefined) => {
 			e.stopPropagation();
 			try {
 				await navigator.clipboard.writeText(text);
@@ -764,7 +780,7 @@
 		return copy;
 	};
 
-	const commandResult = (raw, ok) => {
+	const commandResult = (/** @type {any} */ raw = undefined, /** @type {any} */ ok = undefined) => {
 		const clean = prettyOut(String(raw || "")).replace(/\x1b\[[0-9;]*m/g, "").trim();
 		const match = /^exit\s+(-?\d+)\s*(?:\n|$)/i.exec(clean);
 		return {
@@ -773,8 +789,45 @@
 		};
 	};
 
+	/**
+	 * One permission model for every tool: while an ask is open the work card is
+	 * held hidden — allow removes the ask and unhides it, deny drops the card.
+	 * Keys: run_command → `c:<cmd>`, file/write tools → `p:<normPath>`.
+	 */
+	const permPending = new Set();
+	/** The card an ask covers — by callId when the ask carries it, else the
+	 * path/command permKey fallback (older persisted events, callId-less asks). */
+	const heldCard = (/** @type {any} */ key = undefined) => tools.get(key) ?? [...tools.values()].find((/** @type {any} */ c = undefined) => c.dataset?.permKey === key);
+	/** A decision lands: allow unhides the work card and removes the ask row;
+	 * deny keeps the rejected ask and drops the held card. */
+	const settlePerm = (/** @type {any} */ row = undefined, /** @type {any} */ allowed = undefined) => {
+		const key = String(row?.dataset?.permKey || "");
+		permPending.delete(key);
+		const held = heldCard(key);
+		if (allowed) {
+			if (held) {
+				held.hidden = false;
+				delete held.dataset.permHeld;
+			}
+			row.remove();
+			return;
+		}
+		if (held) {
+			if (held.dataset.toolId) tools.delete(held.dataset.toolId);
+			const i = pendingEdits.findIndex((/** @type {any} */ pe = undefined) => pe.card === held);
+			if (i >= 0) pendingEdits.splice(i, 1);
+			held.remove();
+		}
+		refreshPhase();
+	};
+	/** Work cards mount a beat late — the ask lands right after tool.requested and
+	 * claims the card before it paints, so there is no show-then-hide repaint.
+	 * Any approvable tool can be claimed by callId or by its permKey. */
+	/** Work cards queue for batch-end mount (see pendingMounts/attachWorkCard at
+	 * file end) — an ask in the same batch claims the card before it paints. */
+
 	/** Unwrap {"error": "…"} JSON envelopes so failures read as text. */
-	const prettyOut = (raw) => {
+	const prettyOut = (/** @type {any} */ raw = undefined) => {
 		const t = String(raw || "").trim();
 		if (t.startsWith("{")) {
 			try {
@@ -787,22 +840,22 @@
 	};
 
 	/** Numbered unified-diff rows: new-file numbers for +/ctx, old for −. */
-	const LANG_BY_EXT = {
+	/** @type {Record<string, any[]>} */ const LANG_BY_EXT = {
 		ts: ["typescript", "TS"], tsx: ["typescript", "TSX"], js: ["javascript", "JS"], jsx: ["javascript", "JSX"],
 		mjs: ["javascript", "JS"], cjs: ["javascript", "JS"], json: ["json", "JSON"], py: ["python", "PY"],
 		css: ["css", "CSS"], html: ["xml", "HTML"], htm: ["xml", "HTML"], xml: ["xml", "XML"], svg: ["xml", "SVG"],
 		sh: ["bash", "SH"], bash: ["bash", "SH"], zsh: ["bash", "SH"], md: ["markdown", "MD"], go: ["go", "GO"], rs: ["rust", "RS"],
 	};
 	/** Highlight.js language id + short badge + split name/dir for a file path. */
-	const fileLang = (path) => {
+	const fileLang = (/** @type {any} */ path = undefined) => {
 		const full = String(path || "");
 		const name = full.split("/").pop() || "";
-		const ext = name.includes(".") ? name.split(".").pop().toLowerCase() : "";
+		const ext = name.includes(".") ? (name.split(".").pop() || "").toLowerCase() : "";
 		const [lang, badge] = LANG_BY_EXT[ext] || [null, ext.slice(0, 4).toUpperCase() || "TXT"];
 		return { lang, badge, name, dir: full.slice(0, full.length - name.length).replace(/\/$/, "") };
 	};
-	const normPath = (p) => String(p ?? "").replace(/^\.\//, "").replace(/^\/+/, "");
-	const parseInput = (input) => {
+	const normPath = (/** @type {any} */ p = undefined) => String(p ?? "").replace(/^\.\//, "").replace(/^\/+/, "");
+	const parseInput = (/** @type {any} */ input = undefined) => {
 		if (typeof input === "string") {
 			try { return JSON.parse(input) ?? {}; } catch { return {}; }
 		}
@@ -810,14 +863,14 @@
 	};
 
 	/** One diff code line, highlighted when the language is bundled (media/highlight.js). */
-	const codeCell = (text, lang) => {
+	const codeCell = (/** @type {any} */ text = undefined, /** @type {any} */ lang = undefined) => {
 		const span = el("span", "fd-code");
 		const hl = /** @type {any} */ (globalThis).hljs;
 		if (lang && text && hl?.getLanguage?.(lang)) span.innerHTML = hl.highlight(text, { language: lang, ignoreIllegals: true }).value;
 		else span.textContent = text || " ";
 		return span;
 	};
-	const renderDiffRows = (rows, lang, truncated) => {
+	const renderDiffRows = (/** @type {any} */ rows = undefined, /** @type {any} */ lang = undefined, /** @type {any} */ truncated = undefined) => {
 		const pre = el("div", "diff-body");
 		for (const r of rows) {
 			if (r.cls === "fd-fold") {
@@ -833,10 +886,10 @@
 		return pre;
 	};
 	// Parses formatUnifiedWithContext / formatHunks text. Numbers appear only when the text has @@ headers.
-	const parseDiffRows = (diff, cap = 400) => {
+	const parseDiffRows = (/** @type {any} */ diff = undefined, cap = 400) => {
 		const rows = [];
 		let oldN = 0, newN = 0, truncated = false, numbered = false;
-		const num = (n) => (numbered ? n : 0);
+		const num = (/** @type {any} */ n = undefined) => (numbered ? n : 0);
 		for (const l of String(diff || "").split("\n")) {
 			const h = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(l);
 			if (h) {
@@ -856,7 +909,7 @@
 		return { rows, truncated };
 	};
 	/** Finished write: numbered lines with context, highlighted for the file's language. */
-	const renderEditorDiff = (diff, path) => {
+	const renderEditorDiff = (/** @type {any} */ diff = undefined, /** @type {any} */ path = undefined) => {
 		const { rows, truncated } = parseDiffRows(diff);
 		return renderDiffRows(rows, fileLang(path).lang, truncated);
 	};
@@ -864,7 +917,7 @@
 	const READ_TOOLS = new Set(["read_file", "read_files"]);
 	/** Read results as an editor view: one highlighted, numbered block per file
 	 *  (### path sections from read_files; bare "path (lines a-b of n)" for read_file). */
-	const renderReadOutput = (text, cap = 400) => {
+	const renderReadOutput = (/** @type {any} */ text = undefined, cap = 400) => {
 		const wrap = el("div", "readout");
 		const rawChunks = [];
 		// Split into sections; text before the first ### belongs to the first (unnamed) section.
@@ -916,16 +969,16 @@
 
 	const EDIT_TOOLS = new Set(["edit_file", "write_file", "append_file", "insert_lines"]);
 	/** Proposed lines for an edit call — available as soon as the call starts, before the write runs. */
-	const previewRows = (name, input, cap = 200) => {
-		const rows = [];
+	const previewRows = (/** @type {any} */ name = undefined, /** @type {any} */ input = undefined, cap = 200) => {
+		/** @type {any} */ const rows = [];
 		let truncated = false;
-		const lines = (s) => (s ? String(s).replace(/\n$/, "").split("\n") : []);
-		const push = (cls, text) => {
+		const lines = (/** @type {any} */ s = undefined) => (s ? String(s).replace(/\n$/, "").split("\n") : []);
+		const push = (/** @type {any} */ cls = undefined, /** @type {any} */ text = undefined) => {
 			if (rows.length >= cap) truncated = true;
 			else rows.push({ num: 0, cls, text });
 		};
 		if (name === "edit_file" && Array.isArray(input?.edits)) {
-			input.edits.forEach((e, i) => {
+			input.edits.forEach((/** @type {any} */ e = undefined, /** @type {any} */ i = undefined) => {
 				if (i > 0) rows.push({ cls: "fd-fold" });
 				for (const l of lines(e?.old_text)) push("fd-l-del", l);
 				for (const l of lines(e?.new_text)) push("fd-l-add", l);
@@ -937,7 +990,7 @@
 	};
 
 	/** Head of an editor card: language badge, file name, dir, +/- totals, and status. */
-	const editorHead = (path, { added = 0, removed = 0, status = "", cls = "" } = {}) => {
+	const editorHead = (/** @type {any} */ path = undefined, { added = 0, removed = 0, status = "", cls = "" } = {}) => {
 		const { badge, name, dir } = fileLang(path);
 		const head = el("summary", "diff-editor-head");
 		head.appendChild(el("span", "diff-lang", badge));
@@ -952,19 +1005,19 @@
 		head.appendChild(el("span", `diff-status ${cls}`.trim(), status));
 		return head;
 	};
-	const setEditStatus = (card, text, cls = "") => {
+	const setEditStatus = (/** @type {any} */ card = undefined, /** @type {any} */ text = undefined, cls = "") => {
 		const s = card.querySelector(".diff-status");
 		if (!s) return;
 		s.textContent = text;
 		s.className = `diff-status ${cls}`.trim();
 	};
 	/** Icon actions shared by edit cards and standalone file rows. */
-	const fileActions = (path, target) => {
+	const fileActions = (/** @type {any} */ path = undefined, /** @type {any} */ target = undefined) => {
 		const actions = el("span", "file-actions");
 		for (const [label, type, title] of [["↗", "review", "Open diff"], ["✓", "acceptChange", "Accept changes"], ["✗", "rejectChange", "Revert file"]]) {
 			const btn = el("button", "file-btn", label);
 			btn.title = title;
-			btn.addEventListener("click", (e) => {
+			btn.addEventListener("click", (/** @type {any} */ e = undefined) => {
 				e.stopPropagation();
 				vscode.postMessage({ type, path });
 				if (type !== "review") target.remove();
@@ -973,8 +1026,8 @@
 		}
 		return actions;
 	};
-	const pendingEdits = [];
-	const pendingEditCard = (name, input, path) => {
+	/** @type {any} */ const pendingEdits = [];
+	const pendingEditCard = (/** @type {any} */ name = undefined, /** @type {any} */ input = undefined, /** @type {any} */ path = undefined) => {
 		const card = el("details", "diff-editor pending");
 		card.dataset.state = "pending";
 		card.open = true;
@@ -983,20 +1036,21 @@
 		card.appendChild(renderDiffRows(rows, fileLang(path).lang, truncated));
 		return card;
 	};
-	const takePending = (path) => {
+	const takePending = (/** @type {any} */ path = undefined) => {
 		const key = normPath(path);
-		const i = pendingEdits.findIndex((e) => e.path === key);
+		/** @type {any} */ const i = pendingEdits.findIndex((/** @type {any} */ e) => e.path === key);
 		return i < 0 ? null : pendingEdits.splice(i, 1)[0].card;
 	};
-	const dropPending = (card) => {
-		const i = pendingEdits.findIndex((e) => e.card === card);
+	const dropPending = (/** @type {any} */ card = undefined) => {
+		/** @type {any} */ const i = pendingEdits.findIndex((/** @type {any} */ e) => e.card === card);
 		if (i >= 0) pendingEdits.splice(i, 1);
 	};
 	/** Fills an edit card in place: header with totals/actions, then the real diff when present. */
-	const fillEditorCard = (card, { path, diff = "", added = 0, removed = 0, status = "", cls = "" }) => {
+	const fillEditorCard = (/** @type {any} */ card = undefined, /** @type {any} */ { path, diff = "", added = 0, removed = 0, status = "", cls = "" } = {}) => {
 		card.classList.remove("pending");
 		card.dataset.state = "done";
 		card.open = startedAt > 0;
+		if (card.open) openEditorCard = card;
 		const head = editorHead(path, { added, removed, status, cls });
 		head.appendChild(fileActions(path, card));
 		card.replaceChildren(head);
@@ -1008,7 +1062,7 @@
 	const retirePaused = () => {
 		for (const n of timeline.querySelectorAll(".paused-actions")) n.remove();
 	};
-	const settlePending = (label) => {
+	const settlePending = (/** @type {any} */ label = undefined) => {
 		for (const { card } of pendingEdits) {
 			if (card.dataset.state !== "pending") continue;
 			card.classList.remove("pending");
@@ -1016,13 +1070,55 @@
 			setEditStatus(card, label, "muted");
 		}
 		pendingEdits.length = 0;
+		// Non-edit tool cards still in flight (their tool-finished never came —
+		// the run was stopped or died) flip to interrupted instead of spinning
+		// "Running" forever.
+		for (const card of new Set(tools.values())) {
+			if (!card.isConnected || !card.classList?.contains("running")) continue;
+			card.classList.remove("running");
+			card.classList.add("error");
+			const stat = card.querySelector(".tool-status");
+			if (stat) {
+				stat.textContent = "";
+				stat.appendChild(el("span", "act-pill err", label));
+			}
+			card.open = false;
+			if (openToolCard === card) openToolCard = null;
+		}
+		// Unanswered asks can't resolve anymore — the loop is gone. Keep the row
+		// as the record of what was requested, drop the dead buttons, and reveal
+		// the held work card as interrupted (it never ran, but stays visible).
+		for (const row of timeline.querySelectorAll(".step.permission")) {
+			if (row.querySelector(".perm-decision")) continue;
+			row.querySelector(".perm-btns")?.remove();
+			(row.querySelector(".perm-card") || row).appendChild(el("span", "perm-decision", `✗ ${String(label).toLowerCase()}`));
+			// The held card never ran, but reveal it as interrupted — while
+			// building we want to see exactly what the agent was asking for.
+			const held = heldCard(String(row.dataset.permKey || ""));
+			if (held?.dataset.permHeld) {
+				held.hidden = false;
+				delete held.dataset.permHeld;
+				if (held.classList.contains("running")) {
+					held.classList.remove("running");
+					held.classList.add("error");
+					const stat = held.querySelector(".tool-status");
+					if (stat) {
+						stat.textContent = "";
+						stat.appendChild(el("span", "act-pill err", label));
+					}
+					if (openToolCard === held) openToolCard = null;
+				}
+			}
+		}
+		permPending.clear();
+		refreshPhase();
 	};
 
 	/** Per-run counters for the summary card — reset on run-started. */
 	let runStats = { toolsFailed: 0, checksPassed: 0, checksFailed: 0, files: new Map() };
 	const resetRunStats = () => { runStats = { toolsFailed: 0, checksPassed: 0, checksFailed: 0, files: new Map() }; };
 
-	const TOOL_STYLE = {
+	/** @type {Record<string, string[]>} */ const TOOL_STYLE = {
 		read_file: ["📄", "Read", "Reading"],
 		read_files: ["📄", "Read", "Reading"],
 		list_files: ["🔍", "Listed", "Listing"],
@@ -1034,7 +1130,7 @@
 		run_command: ["›_", "Ran", "Running"],
 		memory_write: ["✦", "Saved", "Saving"],
 	};
-	const toolVerb = (name) => TOOL_STYLE[name] || ["⛭", name, name];
+	const toolVerb = (/** @type {any} */ name = undefined) => TOOL_STYLE[name] || ["⛭", name, name];
 
 	const showEmpty = () => {
 		setEmptyMode(true);
@@ -1120,7 +1216,7 @@
 	 * @param {{search?: boolean, wide?: boolean, below?: boolean, items: any[]}} config
 	 * items: {header} | {icon, label, desc, checked, disabled, onPick}
 	 */
-	const openMenu = (anchor, config) => {
+	const openMenu = (/** @type {any} */ anchor = undefined, /** @type {any} */ config = undefined) => {
 		if (!menu.hidden && menu.dataset.anchor === anchor.id) {
 			closeMenu();
 			return;
@@ -1153,7 +1249,7 @@
 			const row = el("div", "menu-chips");
 			for (const c of config.chips) {
 				const b = el("button", c.active ? "menu-chip on" : "menu-chip", c.label);
-				b.addEventListener("click", (e) => {
+				b.addEventListener("click", (/** @type {any} */ e = undefined) => {
 					e.stopPropagation();
 					c.onPick();
 				});
@@ -1176,7 +1272,7 @@
 			if (item.onInfo) {
 				const info = el("button", "menu-info", "ⓘ");
 				info.title = "Model details";
-				info.addEventListener("click", (e) => {
+				info.addEventListener("click", (/** @type {any} */ e = undefined) => {
 					e.stopPropagation();
 					item.onInfo();
 				});
@@ -1211,19 +1307,21 @@
 
 	// ---------- chips ----------
 
-	const modeLabelFor = (id) => MODES.find((m) => m.id === id)?.label ?? id;
+	const modeLabelFor = (/** @type {any} */ id = undefined) => MODES.find((m) => m.id === id)?.label ?? id;
 
 	/** @type {Record<string, string>} */
-	const ENGINE_LABELS = { cline: "Cline SDK", openai: "OpenAI" };
+	/** @type {Record<string, string>} */ const ENGINE_LABELS = { cline: "Cline SDK", openai: "OpenAI", responses: "OpenAI Responses", conversations: "OpenAI Conversations" };
 	/** @type {Record<string, string>} */
 	const ENGINE_DESCS = {
 		cline: "Cline SDK transport: any provider, including Anthropic",
 		openai: "OpenAI transport: Responses for OpenAI, chat completions elsewhere",
+		responses: "OpenAI-compatible wire, stateless: Responses API for OpenAI, chat completions elsewhere",
+		conversations: "OpenAI Conversations API (direct api.openai.com): server-side history, delta sends, server compaction",
 	};
 
-	const MODE_ICONS = { code: "</>", smart: "✦", ask: "◯", plan: "≡", bypass: "⛨" };
-	const svg = (paths) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${paths}</svg>`;
-	const MODE_SVGS = {
+	/** @type {Record<string, string>} */ const MODE_ICONS = { code: "</>", smart: "✦", ask: "◯", plan: "≡", bypass: "⛨" };
+	const svg = (/** @type {any} */ paths = undefined) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${paths}</svg>`;
+	/** @type {Record<string, string>} */ const MODE_SVGS = {
 		code: svg('<polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>'),
 		smart: svg('<path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8L19 15z"/>'),
 		ask: svg('<circle cx="12" cy="12" r="9"/><path d="M9.2 9a3 3 0 0 1 5.8 1c0 2-3 2.6-3 4.5"/><line x1="12" y1="17.5" x2="12" y2="17.6"/>'),
@@ -1231,7 +1329,7 @@
 		bypass: svg('<path d="M12 22s8-3.5 8-10V5l-8-3-8 3v7c0 6.5 8 10 8 10z"/><path d="M4 4l16 16"/>'),
 	};
 
-	const MODE_PLACEHOLDERS = {
+	/** @type {Record<string, string>} */ const MODE_PLACEHOLDERS = {
 		ask: "Ask a question about the codebase…",
 		plan: "Describe what to plan…",
 	};
@@ -1239,7 +1337,7 @@
 	const refreshChips = () => {
 		modeLabel.textContent = modeLabelFor(mode);
 		engineLabel.textContent = ENGINE_LABELS[engine];
-		document.getElementById("mode-icon").innerHTML = MODE_SVGS[mode] || MODE_SVGS.code;
+		/** @type {HTMLElement} */ (document.getElementById("mode-icon")).innerHTML = MODE_SVGS[mode] || MODE_SVGS.code;
 		// Selection identity is the pair profile|modelId — look up the label in
 		// the picked profile's catalog first so a same-id model elsewhere can't win.
 		const found = groups.find((g) => g.profile === modelProfile)?.models?.find((m) => m.id === modelId) ||
@@ -1293,7 +1391,7 @@
 		const pool = groups.length > 0 ? groups : [{ profile: "", active: true, models }];
 		const scoped = pool.filter((g) => !providerFilter || g.profile === providerFilter);
 		const all = scoped.flatMap((g) => g.models.map((m) => ({ m, profile: g.profile })));
-		const recent = recentModels
+		/** @type {any[]} */ const recent = recentModels
 			// Entries are {id, profile}; legacy persisted entries are bare ids — resolve those against the current profile.
 			.map((r) => all.find((e) => e.m.id === (typeof r === "string" ? r : r.id) && e.profile === (typeof r === "string" ? modelProfile : r.profile)))
 			.filter(Boolean);
@@ -1322,13 +1420,13 @@
 	};
 	modelBtn.addEventListener("click", showModelMenu);
 
-	const fmtToks = (n) => (n == null ? "" : n >= 1e6 ? `${n / 1e6}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n));
-	const fmtPrice = (v) => {
+	const fmtToks = (/** @type {any} */ n = undefined) => (n == null ? "" : n >= 1e6 ? `${n / 1e6}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n));
+	const fmtPrice = (/** @type {any} */ v = undefined) => {
 		if (v == null) return "";
 		const perM = v * 1e6;
 		return `$${perM >= 100 ? perM.toFixed(0) : perM >= 1 ? perM.toFixed(2) : perM.toFixed(3)}`;
 	};
-	const modelDesc = (m) => {
+	const modelDesc = (/** @type {any} */ m = undefined) => {
 		const parts = [];
 		if (m.label && m.label !== m.id) parts.push(m.id);
 		if (m.contextWindow) parts.push(`${fmtToks(m.contextWindow)} ctx`);
@@ -1342,7 +1440,7 @@
 	};
 
 	/** Record a pick and tell the host which provider profile it belongs to (pins the run's provider). */
-	const chooseModel = (m, profile) => {
+	const chooseModel = (/** @type {any} */ m = undefined, /** @type {any} */ profile = undefined) => {
 		modelId = m.id;
 		modelProfile = profile || "";
 		recentModels = [{ id: m.id, profile: modelProfile }, ...recentModels.filter((r) => (typeof r === "string" ? r : r.id) !== m.id || (typeof r === "string" ? modelProfile : r.profile) !== modelProfile)].slice(0, 3);
@@ -1352,7 +1450,7 @@
 		vscode.postMessage({ type: "setModel", modelId, profile: modelProfile || undefined });
 	};
 
-	const modelItem = (m, profile) => ({
+	const modelItem = (/** @type {any} */ m = undefined, /** @type {any} */ profile = undefined) => ({
 		label: profile ? `${profile} / ${m.label || m.id}` : m.label || m.id,
 		desc: modelDesc(m) || m.description?.slice(0, 120),
 		checked: m.id === modelId && (modelProfile ? profile === modelProfile : !profile),
@@ -1360,7 +1458,7 @@
 		onPick: () => chooseModel(m, profile),
 	});
 
-	const showModelDetail = (m, profile) => {
+	const showModelDetail = (/** @type {any} */ m = undefined, /** @type {any} */ profile = undefined) => {
 		const overlay = el("div", "detail-overlay");
 		const card = el("div", "detail-card");
 		const head = el("div", "detail-head");
@@ -1389,8 +1487,8 @@
 		actions.appendChild(close);
 		head.appendChild(actions);
 		card.appendChild(head);
-		const fmtDate = (ts) => (ts ? new Date(ts * 1000).toISOString().slice(0, 10) : "");
-		const perTok = (v) => (v == null ? "" : `$${v} / tok`);
+		const fmtDate = (/** @type {any} */ ts = undefined) => (ts ? new Date(ts * 1000).toISOString().slice(0, 10) : "");
+		const perTok = (/** @type {any} */ v = undefined) => (v == null ? "" : `$${v} / tok`);
 		const rows = [
 			["ID", m.id],
 			["Owner", m.owner],
@@ -1416,7 +1514,7 @@
 		card.appendChild(grid);
 		if (m.description) card.appendChild(el("p", "detail-desc", m.description));
 		overlay.appendChild(card);
-		overlay.addEventListener("mousedown", (e) => {
+		overlay.addEventListener("mousedown", (/** @type {any} */ e = undefined) => {
 			e.stopPropagation();
 			if (e.target === overlay) overlay.remove();
 		});
@@ -1424,7 +1522,7 @@
 	};
 
 	attachBtn.addEventListener("click", () => {
-		const pick = (kind) => () => vscode.postMessage({ type: "attach", kind });
+		const pick = (/** @type {any} */ kind = undefined) => () => vscode.postMessage({ type: "attach", kind });
 		openMenu(attachBtn, {
 			items: [
 				{ icon: "⇪", label: "Upload file", onPick: pick("upload") },
@@ -1465,8 +1563,14 @@
 	let iterMin = 0;
 	let iterMax = 0;
 
-	window.addEventListener("message", (event) => {
-		const msg = event.data;
+	/** Applies one queued event to the DOM. Batching/coalescing is the queue's
+	 * job — this is a pure per-event reducer. */
+	const handleEvent = (/** @type {any} */ msg = undefined) => {
+		// First post-run-started event ends the "Analyzing" gap — the model answered.
+		if (awaitingFirst && msg.type !== "run-started") {
+			awaitingFirst = false;
+			refreshPhase();
+		}
 		if (typeof msg.iteration === "number" && msg.iteration > 0) {
 			iterMax = Math.max(iterMax, msg.iteration);
 			iterMin = iterMin ? Math.min(iterMin, msg.iteration) : msg.iteration;
@@ -1549,8 +1653,7 @@
 				// Clear them or new events append into dead DOM.
 				runGroup = null;
 				runEl = null;
-				batchEl = null;
-				boardEl = null;
+					boardEl = null;
 				boardSig = "";
 				progressEl = null;
 				streamMsg = null;
@@ -1563,6 +1666,10 @@
 				callInfo.clear();
 				callGuess.clear();
 				runCalls.clear();
+				permPending.clear();
+				runningNow = false;
+				awaitingFirst = false;
+				refreshPhase();
 				liveAnchor = null;
 				tools.clear();
 				pendingEdits.length = 0;
@@ -1587,6 +1694,9 @@
 				break;
 			case "run-started": {
 				retirePaused();
+				// A new run invalidates any ask left open by the previous one —
+				// the tool call that owned it is gone.
+				permPending.clear();
 				// A previous group left open (missing terminal event, mid-run
 				// reload) would swallow this run's bubble and cards inside its
 				// collapsed body — close it before the new bubble lands.
@@ -1608,8 +1718,8 @@
 				);
 				add(card);
 				resetRunStats();
-				// Each run owns one plan board and one progress card; refs persist
-				// so narration can still resolve ids to titles between boards.
+				// Each run owns one plan board (debug mode) and one progress
+				// card; refs persist so narration can resolve ids between boards.
 				boardEl = null;
 				boardSig = "";
 				boardActive = false;
@@ -1627,7 +1737,7 @@
 				lastReasoningNorm = "";
 				thoughts = null;
 				lastCompactEl = null;
-				batchEl = null;
+				awaitingFirst = true;
 				setRunning(true);
 				setStatus("Running...");
 				break;
@@ -1639,6 +1749,9 @@
 				if (streamReasoning) {
 					// Final event for the segment we already streamed — update it
 					// in place instead of opening a duplicate Thoughts pill.
+					// The segment mounted at first-delta position; replay mounts
+					// it here — re-attach so live and replay agree.
+					if (thoughts?.isConnected) add(thoughts);
 					streamReasoning.classList.remove("streaming");
 					if (norm) {
 						reasoningText = text;
@@ -1672,12 +1785,28 @@
 				break;
 			}
 			case "assistant-text": {
+				// The streaming bubble already rendered these deltas — finalize it
+				// in place instead of appending the same text as a second card.
+				if (streamMsg?.isConnected) {
+					// Re-attach at this event's sequence position: the bubble was
+					// mounted where the first delta arrived, but replay mounts the
+					// final text here — keep live and replay identical.
+					add(streamMsg);
+					streamMsg.classList.remove("streaming");
+					streamMsg.querySelector(".k-body")?.replaceChildren(...narrationNodes(String(msg.text || streamText)));
+					if (!streamMsg.querySelector(".msg-time")) streamMsg.appendChild(el("span", "msg-time", evTime(msg)));
+					streamMsg = null;
+					streamText = "";
+					break;
+				}
 				streamMsg = null;
 				streamText = "";
-				// Interim narration is a working note — it folds into the current
-				// worked group; only a tool-free reply gets its own top-level card.
-				const hasWork = !!runGroup?.querySelector(".step.tool, .tool-batch, .thoughts-group");
-				const card = el("div", `step assistant${hasWork ? " narration-note" : ""}`);
+				// Narration is always a segment boundary: close the work group so
+				// it collapses to its one-liner and the text lands top-level. Never
+				// tie this to whether work has mounted yet — mount timing made it
+				// flaky, and differed between live and replay.
+				closeGroup("Worked for");
+				const card = el("div", "step assistant");
 				const body = el("div", "k-body");
 				for (const n of narrationNodes(msg.text)) body.appendChild(n);
 				card.appendChild(body);
@@ -1688,46 +1817,50 @@
 						evTime(msg),
 					),
 				);
-				if (hasWork) add(card);
-				else {
-					closeGroup("Worked for");
-					add(card);
-				}
+				add(card);
 				break;
 			}
 			case "assistant-delta": {
 				if (!streamMsg) {
-					const hasWork = !!runGroup?.querySelector(".step.tool, .tool-batch, .thoughts-group");
-					if (!hasWork) closeGroup("Worked for");
-					streamMsg = el("div", `step assistant${hasWork ? " narration-note" : ""}`);
+					// Same boundary as assistant-text: close the work group first,
+					// stream the bubble top-level.
+					closeGroup("Worked for");
+					streamMsg = el("div", "step assistant");
 					streamMsg.appendChild(el("div", "k-body"));
-					add(streamMsg);
+					add(streamMsg, true);
 				}
 				streamText += msg.text;
-				clearTimeout(mdTimer);
-				mdTimer = setTimeout(() => {
-					if (!streamMsg) return;
-					streamMsg.querySelector(".k-body")?.replaceChildren(...narrationNodes(streamText + "▍"));
-				}, 60);
+				// The queue already folded consecutive deltas — render once per batch.
+				streamMsg.querySelector(".k-body")?.replaceChildren(...narrationNodes(streamText + "▍"));
 				scrollMaybe();
 				break;
 			}
 			case "tool-started": {
 				ensureSegment();
-				callInfo.set(msg.id, { name: msg.name, ok: undefined });
+				callInfo.set(msg.id, { name: msg.name, ok: undefined, input: msg.input });
 				runCalls.add(msg.id);
 				if (liveAnchor) callGuess.set(msg.id, liveAnchor);
+				if (HARNESS_TOOLS.has(msg.name)) break;
+				const permKey =
+					msg.name === "run_command" && msg.input?.command
+						? `c:${String(msg.input.command).trim()}`
+						: EDIT_TOOLS.has(msg.name)
+							? `p:${normPath(parseInput(msg.input).path)}`
+							: "";
+				if (permPending.has(msg.id) || (permKey && permPending.has(permKey))) break;
 				const [icon, verb] = toolVerb(msg.name);
 				lastVerb = `${verb} ${describeInput(msg.name, msg.input)}…`;
 				setStatus("Running...");
+				refreshPhase();
 				if (EDIT_TOOLS.has(msg.name)) {
 					const input = parseInput(msg.input);
 					const path = normPath(input.path);
 					const card = pendingEditCard(msg.name, input, path);
 					card.dataset.toolId = msg.id;
+					card.dataset.permKey = permKey;
 					tools.set(msg.id, card);
 					pendingEdits.push({ path, card });
-					add(card);
+					attachWorkCard(card, msg.id, permKey);
 					break;
 				}
 				const card = el("details", "step tool running");
@@ -1743,26 +1876,32 @@
 				stat.appendChild(el("span", "act-pill run", "Running"));
 				summary.appendChild(stat);
 				card.appendChild(summary);
-				const input = el("details", "tool-input");
-				input.appendChild(el("summary", "", "Input"));
-				input.appendChild(el("pre", "io", JSON.stringify(msg.input, null, 2)));
-				card.appendChild(input);
 				card.dataset.toolId = msg.id;
 				if (msg.name === "run_command" && msg.input?.command) card.dataset.cmd = msg.input.command;
+				card.dataset.permKey = permKey;
 				tools.set(msg.id, card);
 				// Open while running; collapse the previous card so only one stays expanded.
 				if (openToolCard && openToolCard !== card) openToolCard.open = false;
 				card.open = true;
-				input.open = true;
 				openToolCard = card;
-				addToolCard(card, msg.iteration);
+				attachWorkCard(card, msg.id, permKey);
 				break;
 			}
 			case "tool-finished": {
 				const info = callInfo.get(msg.id);
 				if (info) info.ok = msg.ok;
 				markCards();
-				const card = tools.get(msg.id);
+				if (HARNESS_TOOLS.has(msg.name)) {
+					const i = info?.input && typeof info.input === "object" ? info.input : {};
+					const ref = [i.taskId ?? i.id, i.stepId].filter(Boolean).join("/");
+					const arg = `${ref}${i.status ? ` → ${i.status}` : ""}`;
+					const tail = msg.ok ? "" : ` ✗ ${clip(String(msg.output || "").replace(/\s+/g, " ").trim(), 80)}`;
+					const line = el("div", "step info harness");
+					line.append(...refNodes(`kronyx plan — ${msg.name}${arg ? ` ${arg}` : ""}${tail}`));
+					add(line);
+					break;
+				}
+				/** @type {any} */ const card = tools.get(msg.id);
 				if (!card) break;
 				if (card.classList.contains("diff-editor")) {
 					dropPending(card);
@@ -1780,6 +1919,7 @@
 						setEditStatus(card, "No changes", "muted");
 					}
 					lastVerb = "";
+					refreshPhase();
 					break;
 				}
 				card.classList.remove("running");
@@ -1835,21 +1975,30 @@
 					}
 					card.open = false;
 				}
-				const batch = card.closest(".tool-batch");
-				if (batch) {
-					updateBatch(batch);
-					// Every call in the batch is done — fold it to one line.
-					if (!batch.querySelector(".step.tool.running")) batch.open = false;
-				}
 				lastVerb = "";
+				refreshPhase();
+				break;
+			}
+			case "task-named": {
+				// Ledger names feed ref resolution ({t1}/**t1** → title chips)
+				// whether or not the debug board is emitted. Merge — statuses and
+				// callIds stay owned by task-board/step updates.
+				const t = boardTasks.get(msg.id) ?? { id: msg.id, title: "", steps: [] };
+				if (msg.title) t.title = msg.title;
+				for (const s of msg.steps || []) {
+					const ex = (t.steps || []).find((/** @type {any} */ x = undefined) => x.id === s.id);
+					if (ex) ex.text = s.text;
+					else (t.steps = t.steps || []).push({ id: s.id, text: s.text, status: "pending", callIds: [] });
+				}
+				boardTasks.set(msg.id, t);
 				break;
 			}
 			case "task-board": {
 				boardActive = true;
 				const tasks = msg.tasks || [];
-				// Same plan → update the existing card in place. A different task
-				// set means the model wrote a new plan — only then append a card.
-				const sig = tasks.map((t) => t.id).join(",");
+				// task-board events only arrive when kronyx.harness.debug is on —
+				// the card and its badges are harness development surfaces.
+				const sig = tasks.map((/** @type {any} */ t = undefined) => t.id).join(",");
 				if (sig !== boardSig || !boardEl || !boardEl.isConnected) {
 					boardEl = el("div", "step taskboard");
 					add(boardEl);
@@ -1857,7 +2006,7 @@
 				} else {
 					// Move the live card to the current position so progress isn't
 					// buried in a collapsed earlier segment.
-					const target = runGroup?.querySelector(".group-body") ?? runEl ?? timeline;
+					/** @type {any} */ const target = runGroup?.querySelector(".group-body") ?? runEl ?? timeline;
 					if (boardEl.parentNode !== target) add(boardEl);
 				}
 				boardTasks.clear();
@@ -1865,7 +2014,7 @@
 				rebuildAttribution();
 				const head = el("div", "board-head");
 				head.appendChild(el("span", "board-label", "Plan"));
-				const counts = tasks.reduce((acc, t) => ((acc[t.status] = (acc[t.status] || 0) + 1), acc), {});
+				const counts = tasks.reduce((/** @type {any} */ acc = undefined, /** @type {any} */ t = undefined) => ((acc[t.status] = (acc[t.status] || 0) + 1), acc), {});
 				head.appendChild(
 					el(
 						"span",
@@ -1875,12 +2024,14 @@
 							.join(" · "),
 					),
 				);
-				const rows = tasks.map((t) => {
+				const rows = tasks.map((/** @type {any} */ t = undefined) => {
 					const row = el("details", `board-task ${t.status}`);
-					row.open = true;
+					// Superseded plans stay as collapsed history — one active plan at a time.
+					row.open = t.status !== "stale";
 					const title = el("summary", "board-title");
 					title.appendChild(el("span", "twisty", "›"));
 					title.appendChild(el("span", "board-name", t.title));
+					if (t.planId) title.appendChild(el("span", "board-adopt", t.planId));
 					if (t.from) title.appendChild(el("span", "board-adopt", `↩ run ${String(t.from).slice(0, 8)}`));
 					title.appendChild(el("span", `board-pill ${t.status}`, t.status.replace("_", " ")));
 					row.appendChild(title);
@@ -1946,7 +2097,7 @@
 					add(card);
 				} else {
 					// Keep the card at the current position across segments.
-					const target = runGroup?.querySelector(".group-body") ?? runEl ?? timeline;
+					/** @type {any} */ const target = runGroup?.querySelector(".group-body") ?? runEl ?? timeline;
 					if (card.parentNode !== target) add(card);
 					else {
 						scrollMaybe(true);
@@ -1983,14 +2134,16 @@
 				// Collapse consecutive compaction notices into the last one — a
 				// long run can fire one per turn and bury the real timeline.
 				const compact = msg.meta?.kind === "context_compaction";
-				const target = runGroup?.querySelector(".group-body") ?? runEl ?? timeline;
+				const harnessLine = msg.meta?.kind === "harness";
+				/** @type {any} */ const target = runGroup?.querySelector(".group-body") ?? runEl ?? timeline;
 				if (compact && lastCompactEl && target.lastElementChild === lastCompactEl) {
 					lastCompactEl.textContent = `ⓘ ${msg.text}`;
 					scrollMaybe(true);
 					persist();
 					break;
 				}
-				const n = el("div", msg.meta?.kind === "harness" ? "step info harness" : "step info", `ⓘ ${msg.text}`);
+				const n = el("div", harnessLine ? "step info harness" : "step info");
+				n.append(...refNodes(`${harnessLine ? "kronyx plan — " : "ⓘ "}${msg.text}`));
 				if (compact) lastCompactEl = n;
 				add(n);
 				break;
@@ -2044,7 +2197,21 @@
 				ensureSegment();
 				const row = el("div", "step permission");
 				row.dataset.permId = msg.id;
-				const titles = { run_command: "Run a command?", memory_write: "Save a fact?" };
+				// The ask owns the work card by callId when it carries one; the
+				// path/command key stays as fallback for callId-less events.
+				const permKey = msg.callId ?? (msg.tool === "run_command" ? `c:${String(msg.path || "").trim()}` : `p:${normPath(String(msg.path || ""))}`);
+				row.dataset.permKey = permKey;
+				permPending.add(permKey);
+				refreshPhase();
+				// tool-started may have raced ahead of the ask — hold its card
+				// (hide, never remove) so allow is a reveal, not a repaint.
+				const held0 = heldCard(permKey);
+				if (held0) {
+					held0.hidden = true;
+					held0.dataset.permHeld = "1";
+					if (openToolCard === held0) openToolCard = null;
+				}
+				/** @type {Record<string, string>} */ const titles = { run_command: "Run a command?", memory_write: "Save a fact?" };
 				row.appendChild(el("div", "perm-title", titles[msg.tool] || "Apply changes?"));
 				const card = el("div", "perm-card");
 				const commandHead = el("div", "perm-command-head");
@@ -2055,7 +2222,7 @@
 					copy.title = "Copy command";
 					copy.setAttribute("aria-label", "Copy command");
 					copy.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>';
-					copy.addEventListener("click", async (e) => {
+					copy.addEventListener("click", async (/** @type {any} */ e = undefined) => {
 						e.stopPropagation();
 						try {
 							await navigator.clipboard.writeText(String(msg.path || ""));
@@ -2072,7 +2239,7 @@
 					commandHead.appendChild(copy);
 				}
 				card.appendChild(commandHead);
-				let editedPath;
+				/** @type {any} */ let editedPath;
 				if (msg.tool === "save_plan") {
 					// Editable target — the detected plan dir is prefilled; the user may
 					// point the save anywhere inside the workspace.
@@ -2087,10 +2254,11 @@
 				}
 				if (msg.diff) card.appendChild(renderEditorDiff(msg.diff, msg.path));
 				const btns = el("div", "perm-btns");
-				const resolve = (decision, label) => {
+				const resolve = (/** @type {any} */ decision = undefined, /** @type {any} */ label = undefined) => {
 					vscode.postMessage({ type: "permissionResponse", id: msg.id, decision, ...(editedPath ? { path: editedPath() } : {}) });
 					btns.remove();
 					card.appendChild(el("span", "perm-decision", label));
+					settlePerm(row, decision !== "deny");
 				};
 				const wrap = el("div", "perm-allow-wrap");
 				const allowBtn = el("button", "perm-btn allow", "Allow");
@@ -2111,7 +2279,7 @@
 					});
 					menu.appendChild(item);
 				}
-				dropBtn.addEventListener("click", (e) => {
+				dropBtn.addEventListener("click", (/** @type {any} */ e = undefined) => {
 					e.stopPropagation();
 					menu.hidden = !menu.hidden;
 				});
@@ -2139,6 +2307,7 @@
 					row.querySelector(".perm-btns")?.remove();
 					const card = row.querySelector(".perm-card") || row;
 					card.appendChild(el("span", "perm-decision", msg.decision === "deny" ? "✗ denied" : `✓ ${msg.decision}`));
+					settlePerm(row, msg.decision !== "deny");
 				}
 				break;
 			}
@@ -2211,7 +2380,7 @@
 					card.appendChild(rs);
 				}
 				const stats = el("div", "result-stats");
-				const stat = (val, cls, label) => {
+				const stat = (/** @type {any} */ val = undefined, /** @type {any} */ cls = undefined, /** @type {any} */ label = undefined) => {
 					const d = el("div", "result-stat");
 					d.appendChild(el("b", cls, String(val)));
 					d.appendChild(el("span", "muted", label));
@@ -2289,5 +2458,88 @@
 				break;
 			}
 		}
+	};
+
+	/* ---------- event queue ---------- */
+	// Work cards mount at batch end — an ask in the same batch claims its card
+	// before it paints. Approvable cards (permKey-bearing) defer one batch: the
+	// ask follows tool.requested by one message, so the next batch resolves
+	// them held-or-visible. The timer is only a starvation fallback.
+	/** @type {any[]} */ const pendingMounts = [];
+	const attachWorkCard = (/** @type {any} */ card = undefined, /** @type {any} */ callId = undefined, /** @type {any} */ permKey = undefined) => {
+		const m = { card, callId, permKey, deferred: false };
+		pendingMounts.push(m);
+		// Mount in event order, right here — hidden when approvable. Deferring
+		// the mount to batch end inverted the timeline (work cards landed after
+		// the run's result card, worst on replay where history is one batch);
+		// hidden cards don't paint, so the ask can still claim them pre-reveal.
+		mountCard(m);
+	};
+	let mountTimer = 0;
+	const mountCard = (/** @type {any} */ m = undefined) => {
+		if (m.card.isConnected) return;
+		// Approvable cards always enter hidden — an ask arriving any number of
+		// batches later claims them in place; unclaimed ones reveal next flush.
+		if (m.permKey || permPending.has(m.callId)) {
+			m.card.hidden = true;
+			m.card.dataset.permHeld = "1";
+		}
+		add(m.card);
+	};
+	const flushMounts = (/** @type {any} */ all = undefined) => {
+		for (let i = pendingMounts.length - 1; i >= 0; i--) {
+			const m = pendingMounts[i];
+			const claimed = permPending.has(m.callId) || (m.permKey && permPending.has(m.permKey));
+			if (m.card.isConnected) {
+				// Already mounted (all cards now mount at event time) — the
+				// flush only owns the reveal. Claimed holds belong to settlePerm.
+				if (!claimed) {
+					// Approvable cards stay hidden one extra batch — the ask
+					// trails tool.requested by a message and must claim first.
+					if (!all && m.permKey && !m.deferred) {
+						m.deferred = true;
+						continue;
+					}
+					m.card.hidden = false;
+					delete m.card.dataset.permHeld;
+				}
+				pendingMounts.splice(i, 1);
+				continue;
+			}
+			mountCard(m);
+			pendingMounts.splice(i, 1);
+		}
+		clearTimeout(mountTimer);
+		if (pendingMounts.length) mountTimer = setTimeout(() => flushMounts(true), 300);
+	};
+
+	// Fold consecutive streaming frames into one apply — the queue is the
+	// render throttle, so no per-delta repaint (and no mdTimer).
+	const foldEvent = (/** @type {any} */ prev = undefined, /** @type {any} */ next = undefined) => {
+		if (prev.type === next.type && (prev.type === "assistant-delta" || prev.type === "reasoning-delta" || prev.type === "tool-output-delta")) {
+			return { ...prev, text: String(prev.text || "") + String(next.text || "") };
+		}
+		return null;
+	};
+
+	const applyBatch = (/** @type {any} */ batch = undefined) => {
+		for (const m of batch) handleEvent(m);
+		flushMounts(false);
+	};
+
+	const queue = new (/** @type {any} */ (globalThis)).KronyxRunQueue({ applyBatch, fold: foldEvent });
+	window.addEventListener("message", (event) => {
+		const msg = event.data;
+		// Stale-bundle guard: the host stamps each event with its build id; a
+		// panel kept open across a dev rebuild reloads instead of mispainting.
+		const build = (/** @type {any} */ (globalThis)).KRONYX_BUILD;
+		if (build && msg.build && msg.build !== build) {
+			location.reload();
+			return;
+		}
+		// Replay brackets fold the whole stored history into one ordered batch.
+		if (msg.type === "replay-start") return queue.setBurst(true);
+		if (msg.type === "replay-end") return queue.setBurst(false);
+		queue.push(msg);
 	});
 })();

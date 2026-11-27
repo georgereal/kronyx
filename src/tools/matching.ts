@@ -14,6 +14,15 @@ export interface SimilarRegion {
 
 type LineNormalizer = (line: string) => string;
 
+/** Removes `123| ` / `123|` read_file-style prefixes — only when most lines
+ *  carry them, so genuine content starting with digits is left alone. */
+function stripLineNumberPrefixes(needle: string): string {
+	const lines = needle.split("\n");
+	const numbered = lines.filter((l) => /^\s*\d+\|\s?/.test(l));
+	if (numbered.length < Math.max(2, Math.ceil(lines.length * 0.6))) return needle;
+	return lines.map((l) => l.replace(/^\s*\d+\|\s?/, "")).join("\n");
+}
+
 const LINE_STRATEGIES: [MatchStrategy, LineNormalizer][] = [
 	["trimmed-lines", (l) => l.trim()],
 	["collapsed-whitespace", (l) => l.replace(/\s+/g, " ").trim()],
@@ -27,6 +36,15 @@ export function findMatches(content: string, needle: string): TextMatch[] {
 	if (needle.length === 0) return [];
 	const exact = findExact(content, needle);
 	if (exact.length > 0) return exact;
+
+	// Models copy numbered read_file/view output verbatim — strip `123| ` line
+	// prefixes and retry the whole pipeline once. Without this every line fails
+	// even the whitespace-tolerant strategies, and the edit loop never converges.
+	const stripped = stripLineNumberPrefixes(needle);
+	if (stripped !== needle) {
+		const reprefixed = findMatches(content, stripped);
+		if (reprefixed.length > 0) return reprefixed;
+	}
 
 	const needleLines = trimBlankEdges(needle.split("\n"));
 	if (needleLines.length === 0) return [];

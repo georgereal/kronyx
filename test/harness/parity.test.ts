@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
-import type { ModelPort, ToolPort } from "../../src/harness/contracts";
-import { MemoryEventLog } from "../../src/harness/eventLog";
-import { runHarness } from "../../src/harness/runner";
+import type { ModelPort, ToolPort } from "../../src/harness/core/contracts";
+import { MemoryEventLog } from "../../src/harness/core/eventLog";
+import { runHarness } from "../../src/harness/core/runner";
 import type { RunViewEvent } from "../../src/agent/runner";
 
 /** One scripted task through the IDE path (runHarness → view events) with a fake transport. */
-async function runScripted(steps: Array<{ text?: string; calls?: Array<{ callId: string; name: string; input: unknown }> }>, toolPort: ToolPort) {
+async function runScripted(steps: Array<{ text?: string; calls?: Array<{ callId: string; name: string; input: unknown }> }>, toolPort: ToolPort, debug = false) {
 	const queue = [...steps];
 	const model: ModelPort = {
 		complete: async () => {
@@ -14,7 +14,7 @@ async function runScripted(steps: Array<{ text?: string; calls?: Array<{ callId:
 		},
 	};
 	const events: RunViewEvent[] = [];
-	const outcome = await runHarness({ runId: "parity", log: new MemoryEventLog(() => 1), model, tools: toolPort, emit: (e) => events.push(e), nudgeWrites: false }, "task");
+	const outcome = await runHarness({ runId: "parity", log: new MemoryEventLog(() => 1), model, tools: toolPort, emit: (e) => events.push(e), nudgeWrites: false, debug }, "task");
 	return { outcome, events, left: queue.length };
 }
 
@@ -38,7 +38,7 @@ describe("parity: IDE view events from a harness run (step 9)", () => {
 		expect(r.events.at(-1)).toMatchObject({ type: "run-finished", status: "completed" });
 	});
 
-	it("a task with steps emits task-board snapshots that end with the step done", async () => {
+	it("a task with steps emits task-board snapshots that end with the step done (debug mode)", async () => {
 		const tools: ToolPort = {
 			specs: () => [{ name: "noop", description: "", inputSchema: {} }],
 			execute: async () => ({ ok: true, output: "ok" }),
@@ -52,11 +52,27 @@ describe("parity: IDE view events from a harness run (step 9)", () => {
 				{ text: "finished the parser" },
 			],
 			tools,
+			true,
 		);
 		const boards = r.events.filter((e) => e.type === "task-board");
 		expect(boards.length).toBeGreaterThan(0);
 		const last = boards.at(-1);
 		expect(last).toMatchObject({ type: "task-board", tasks: [{ id: "a", steps: [{ id: "s1", status: "done" }] }] });
+	});
+
+	it("emits no task-board events without debug", async () => {
+		const tools: ToolPort = {
+			specs: () => [],
+			execute: async () => ({ ok: true, output: "ok" }),
+		};
+		const r = await runScripted(
+			[
+				{ calls: [{ callId: "t", name: "task_create", input: { id: "a", title: "P", steps: [] } }] },
+				{ text: "done" },
+			],
+			tools,
+		);
+		expect(r.events.filter((e) => e.type === "task-board")).toEqual([]);
 	});
 
 	it("a refused write shows as a failed tool-finished, and the run still finishes", async () => {

@@ -1,7 +1,7 @@
 "use client";
 
 import type { User } from "firebase/auth";
-import { Cpu, GitBranch, Info, Paperclip, Plus, SendHorizontal, Settings2, Square, X } from "lucide-react";
+import { Cpu, GitBranch, Info, Paperclip, Plus, SendHorizontal, Settings2, SlidersHorizontal, Square, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { apiFetch } from "@/lib/api";
 import { Modal } from "@/components/Modal";
@@ -74,6 +74,7 @@ export function Composer({
 	currentBranch,
 	plans,
 	runRefs,
+	prefs,
 }: {
 	user: User;
 	mode: Mode;
@@ -95,10 +96,12 @@ export function Composer({
 	plans?: string[];
 	/** Past runs (newest first) — enables the @run picker. */
 	runRefs?: { runId: string; title: string; summary?: string }[];
+	/** View/session preferences — enables the tuning gear in the composer bar. */
+	prefs?: { quiet: boolean; onQuiet: (v: boolean) => void };
 }) {
 	const [text, setText] = useState("");
 	const [atts, setAtts] = useState<Attachment[]>([]);
-	const [menu, setMenu] = useState<"none" | "attach" | "env" | "model" | "slash" | "mode" | "mention" | "help">("none");
+	const [menu, setMenu] = useState<"none" | "attach" | "env" | "model" | "slash" | "mode" | "mention" | "help" | "prefs">("none");
 	const [repos, setRepos] = useState<Repo[]>([]);
 	const [groups, setGroups] = useState<ModelGroup[]>([]);
 	const [modelId, setModelId] = useState("");
@@ -490,6 +493,22 @@ export function Composer({
 							</Modal>
 						)}
 					</div>
+					{prefs && (
+						<div className="anchor">
+							<button className="icon-btn" title="Preferences" onClick={() => toggleMenu("prefs")}>
+								<SlidersHorizontal size={15} />
+							</button>
+							{menu === "prefs" && (
+								<Modal title="Preferences" onClose={closeMenus}>
+									<div className="pop-title">Timeline</div>
+									<label className="pop-item" style={{ cursor: "pointer", gap: 8 }}>
+										<input type="checkbox" checked={prefs.quiet} onChange={(e) => prefs.onQuiet(e.target.checked)} />
+										<span style={{ flex: 1, fontSize: 12 }}>Quiet view — hide tool calls, plans, thoughts and checks</span>
+									</label>
+								</Modal>
+							)}
+						</div>
+					)}
 					{env && onEnv && (
 						<div className="anchor">
 							<button

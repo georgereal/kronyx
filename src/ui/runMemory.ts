@@ -1,5 +1,5 @@
 import { cosine, topK } from "../agent/vector";
-import type { SessionEvent } from "../harness/contracts";
+import type { SessionEvent } from "../harness/core/contracts";
 import { embedTexts, memoryEnabled } from "./memory";
 import { localEmbedError } from "./localEmbed";
 

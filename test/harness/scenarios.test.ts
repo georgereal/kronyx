@@ -4,10 +4,10 @@
  * No network, no real provider: this runs in CI.
  */
 import { describe, expect, it } from "vitest";
-import type { ModelPort, ModelRequest, ModelResponse, ToolCall, ToolPort, ToolSpec, VerifierPort } from "../../src/harness/contracts";
-import { MemoryEventLog } from "../../src/harness/eventLog";
-import { HarnessLoop, type HarnessLimits } from "../../src/harness/loop";
-import { project } from "../../src/harness/projections";
+import type { ModelPort, ModelRequest, ModelResponse, ToolCall, ToolPort, ToolSpec, VerifierPort } from "../../src/harness/core/contracts";
+import { MemoryEventLog } from "../../src/harness/core/eventLog";
+import { HarnessLoop, type HarnessLimits } from "../../src/harness/core/loop";
+import { project } from "../../src/harness/core/projections";
 
 const noop: ToolSpec = { name: "noop", description: "", inputSchema: {} };
 const tools = (fail = false): ToolPort => ({

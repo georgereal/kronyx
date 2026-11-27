@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { RunViewEvent } from "../../src/agent/runner";
-import type { SessionEvent } from "../../src/harness/contracts";
-import { toViewEvents } from "../../src/harness/runner";
+import type { SessionEvent } from "../../src/harness/core/contracts";
+import { toViewEvents } from "../../src/harness/core/runner";
 
 const meta = { at: 1, runId: "r" };
 const tracker = () => ({ turn: 0, runStart: 0, lastText: "", starts: new Map<string, number>(), usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 } });

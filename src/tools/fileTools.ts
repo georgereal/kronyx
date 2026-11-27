@@ -209,9 +209,15 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 
 			input.edits.forEach((edit, index) => {
 				const label = `Edit ${index + 1}`;
-				const oldText = normalizeEol(edit.old_text ?? "");
-				const newText = normalizeEol(edit.new_text ?? "");
-				if (oldText.trim() === "") throw new Error(`${label}: old_text is empty. Use insert_lines or append_file to add text.`);
+				// file_editor uses old_str/new_str — models mix the two edit schemas,
+				// so accept the aliases rather than failing a call over a key name.
+				const e = edit as { old_text?: string; new_text?: string; old_str?: string; new_str?: string };
+				const oldText = normalizeEol(e.old_text ?? e.old_str ?? "");
+				const newText = normalizeEol(e.new_text ?? e.new_str ?? "");
+				if (oldText.trim() === "")
+					throw new Error(
+						`${label}: old_text is empty or missing (received keys: ${Object.keys(edit).join(", ") || "none"}) — pass the exact text to replace as old_text and its replacement as new_text. To add text without replacing, use insert_lines or append_file.`,
+					);
 				const matches = findMatches(text, oldText);
 				if (matches.length === 0) throw new Error(noMatchMessage(label, guard.relative(abs), text, oldText));
 				if (matches.length > 1 && !edit.replace_all) {
@@ -442,10 +448,15 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 			}
 			const timeout = Math.min(Math.max(input.timeout_seconds ?? 300, 1), 1800) * 1000;
 			const { exec } = await import("node:child_process");
-			return new Promise((resolve) => {
-				exec(input.command, { cwd: options.root, timeout }, (error, stdout, stderr) => {
-					const out = `${stdout}${stderr}`.trim();
-					resolve(`exit ${error ? 1 : 0}\n${clampCmdOut(out)}`);
+			// A pipeline fails when any stage fails, not just its last one (pipefail);
+			// a failed command throws so callers see it as a failed call, with its output.
+			const shell = process.platform === "win32" ? undefined : "/bin/bash";
+			const script = shell ? `set -o pipefail; ${input.command}` : input.command;
+			return new Promise((resolve, reject) => {
+				exec(script, { cwd: options.root, timeout, shell }, (error, stdout, stderr) => {
+					const out = clampCmdOut(`${stdout}${stderr}`.trim());
+					if (error) reject(new Error(`exit ${error.code ?? 1}\n${out}`));
+					else resolve(`exit 0\n${out}`);
 				});
 			});
 		},
@@ -459,6 +470,9 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 		file_text?: string;
 		old_str?: string;
 		new_str?: string;
+		/** Aliases tolerated because edit_file uses these names — models mix the two schemas. */
+		old_text?: string;
+		new_text?: string;
 		name?: string;
 		insert_line?: number;
 		view_range?: [number, number];
@@ -563,8 +577,11 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 				}
 				case "str_replace": {
 					const text = normalizeEol(await readText(abs));
-					const oldText = normalizeEol(input.old_str ?? "");
-					if (!oldText) throw new Error("old_str is empty.");
+					const oldText = normalizeEol(input.old_str ?? input.old_text ?? "");
+					if (!oldText) {
+						const keys = Object.keys(input as object).filter((k) => (input as unknown as Record<string, unknown>)[k] != null).join(", ");
+						throw new Error(`old_str is empty or missing (received keys: ${keys || "none"}) — pass the exact text to replace as old_str, and its replacement as new_str.`);
+					}
 					const matches = findMatches(text, oldText);
 					if (matches.length === 0)
 						throw new Error(
@@ -576,7 +593,7 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 							`old_str matched ${matches.length} locations — add more surrounding context, or split into separate str_replace calls.`,
 						);
 					const match = matches[0];
-					const newText = normalizeEol(input.new_str ?? "");
+					const newText = normalizeEol(input.new_str ?? input.new_text ?? "");
 					const replacement = match.strategy === "exact" ? newText : adaptIndentation(text.slice(match.start, match.end), oldText, newText);
 					assertWritable(abs);
 					await snapshot();
@@ -626,7 +643,7 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 					return `Undid last edit in ${guard.relative(abs)}`;
 				}
 				default:
-					throw new Error(`Unknown command "${cmd}"`);
+					throw new Error(`Unknown command "${cmd}" — valid commands: view, create, str_replace, insert, undo_edit, symbols, replace_function.`);
 			}
 		},
 	};

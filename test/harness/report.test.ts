@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { EventBody, SessionEvent, Task } from "../../src/harness/contracts";
-import { buildHarnessReport, REPORT_INTERVENTION_CAP } from "../../src/harness/report";
+import type { EventBody, SessionEvent, Task } from "../../src/harness/core/contracts";
+import { buildHarnessReport, REPORT_INTERVENTION_CAP } from "../../src/harness/report/report";
 
 /** Stamps bodies into a contiguous session log. */
 function log(bodies: EventBody[], runId = "run-1"): SessionEvent[] {

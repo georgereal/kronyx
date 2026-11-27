@@ -5,13 +5,13 @@ import * as vscode from "vscode";
 import { AgentRunner, type AgentMode, type ProviderSettings, type RunnerAttachment, type RunDigest, type RunnerHost } from "../agent/runner";
 import type { AgentEngine, EngineKind } from "../agent/engine";
 import { OpenAIEngine } from "../agent/openaiEngine";
-import { chooseTransport, type TransportKind } from "../harness/transport";
+import { chooseTransport, type TransportKind } from "../harness/adapters";
 import { buildSystemPrompt } from "../agent/systemPrompt";
 import { assembleToolSet } from "../agent/toolSet";
-import { withExplore } from "../harness/explore";
-import { withBatchReads } from "../harness/batchReads";
-import { withReadCache } from "../harness/readCache";
-import { withRecall } from "../harness/recall";
+import { withExplore } from "../harness/tools/explore";
+import { withBatchReads } from "../harness/tools/batchReads";
+import { withReadCache } from "../harness/tools/readCache";
+import { withRecall } from "../harness/tools/recall";
 import { WRITE_MODES } from "../agent/runner";
 import { isConversationalTask } from "../agent/taskGuard";
 import { deriveMessages, type KronyxEvent } from "../agent/events";
@@ -25,15 +25,16 @@ import { E2bSandbox, sandboxBackend, sandboxEnabled } from "./e2b";
 import { appendFact, createIdeRecallScorer, indexFile, loadMemoryContext, logEpisode } from "./memory";
 import { buildRunIndex, indexRunDigests, searchRunDigests } from "./runMemory";
 import { createFileTools } from "../tools/fileTools";
-import { FileEventLog } from "../harness/eventLog";
-import { OpenAIModelPort } from "../harness/adapters/openai";
-import { ClineModelPort } from "../harness/adapters/cline";
-import { createHarnessToolPort } from "../harness/toolPort";
-import { CommandVerifier } from "../harness/verifier";
-import { shellExec } from "../harness/exec";
-import { runHarness } from "../harness/runner";
-import { buildHarnessReport } from "../harness/report";
-import type { HarnessLoop } from "../harness/loop";
+import { FileEventLog } from "../harness/core/eventLog";
+import { createModelAdapter } from "../harness/adapters";
+import { resolveBehaviorProfile } from "../harness/behaviors";
+import { createHarnessToolPort } from "../harness/tools/toolPort";
+import { CommandVerifier } from "../harness/defaults/verifier";
+import { shellExec } from "../harness/tools/exec";
+import { runHarness } from "../harness/core/runner";
+import { buildHarnessReport } from "../harness/report/report";
+import type { HarnessLoop, SeedTask } from "../harness/core/loop";
+import { planSeedTasks } from "../harness/planning/planSeed";
 import { PLAN_VISIBLE, READ_ONLY_HIDDEN } from "../agent/toolSet";
 import { createFetchTools } from "../tools/fetchTools";
 import { createMcpTools, type McpServerConfig } from "../tools/mcpTools";
@@ -51,6 +52,10 @@ import type { DiffReview } from "./diffReview";
 import type { AttachmentPreview, ModelOption, RunViewProvider, WebviewMessage } from "./runViewProvider";
 
 const MENTION_TOTAL_CAP = 50 * 1024;
+
+/** Appended to an implement task when its plan seeded the board — the model's scope is the seed, not the session's history. */
+const IMPLEMENT_SCOPE_NOTE =
+	" The plan's steps are already on your task board — work them in order and stay inside the plan's scope. This is an implementation run: if the plan's text hedges (\"review-first\", \"no code changes\", \"pending review\"), that described the planning phase — your job now is to carry the plan out, including writing code where its steps call for deliverables. Close each step with the tool-call ids that prove it; when a check fails, fix the cause or find a working alternative, don't skip ahead.";
 
 export interface GitSettings {
 	autoBranch: boolean;
@@ -194,9 +199,11 @@ export class SessionController {
 	/** Engine of the run in flight (or last run); stamped on api_calls rows for comparison. */
 	private runEngine: EngineKind = "cline";
 	private runTransport: TransportKind = "cline";
-	/** Usage-row tag: harness runs are split by transport so the comparison can tell them apart. */
+	/** Resolved wire of the adapter actually in flight — the chip can ask for conversations while the provider only supports chat. */
+	private runWire: string | undefined;
+	/** Usage-row tag: harness runs are tagged by the resolved wire so fallback transports don't misreport. */
 	private engineTag(): string {
-		return this.runEngine === "harness" ? `harness:${this.runTransport}` : this.runEngine;
+		return this.runEngine === "harness" ? `harness:${this.runWire ?? this.runTransport}` : this.runEngine;
 	}
 	/** Aborts the harness run in flight (Stop). Set only while a harness run is active. */
 	private harnessAbort: AbortController | undefined;
@@ -329,6 +336,9 @@ export class SessionController {
 	/** Replay history without leaving a run visually active after an IDE restart. */
 	private async replayStoredEvents(): Promise<number> {
 		const evs = await this.deps.loadEvents(this.name);
+		// Mark the replay burst — work cards mount synchronously inside it, or
+		// the deferred live-mount would dump them all after the text.
+		this.surface.post({ type: "replay-start" });
 		let active = false;
 		let task = "";
 		for (const event of evs) {
@@ -354,6 +364,7 @@ export class SessionController {
 			this.surface.post(recovery);
 			this.deps.persistEvent(this.name, recovery, this.runId);
 		}
+		this.surface.post({ type: "replay-end" });
 		this.deps.setStatus("idle");
 		return evs.length;
 	}
@@ -568,7 +579,7 @@ export class SessionController {
 				isDirty: (abs) =>
 					vscode.workspace.textDocuments.some((doc) => doc.isDirty && doc.uri.fsPath === abs),
 				approvals: {
-					confirm: (toolName, input) => this.confirmWrite(root, toolName, input),
+					confirm: (toolName, input, callId) => this.confirmWrite(root, toolName, input, callId),
 					check: async (toolName, input) => evaluate(this.permLayers, toolName, input, this.deps.modeRef.current),
 				},
 				currentMode: () => this.deps.modeRef.current,
@@ -827,14 +838,35 @@ export class SessionController {
 
 	/** `pick` is the composer chip's pair; the run uses exactly that pair, or none of them. */
 	/** "Implement this plan" — from the plan-ready card or the editor CodeLens:
-	 *  flips to code mode and runs the implement prompt on this session. */
+	 *  flips to code mode and runs a scope-bounded implement: the plan file's
+	 *  steps are seeded onto this run's task board (no planner call, no prior
+	 *  board adoption), the plan's verify command becomes the close-out gate,
+	 *  and step failures surface on the board for the model to fix or reroute. */
 	public async implementPlan(planPath: string): Promise<void> {
 		this.deps.modeRef.current = "code";
 		this.surface.setState({ mode: "code" });
-		await this.startRun(implementPrompt(planPath), "code");
+		const rel = path.isAbsolute(planPath) ? path.relative(this.runnerRoot ?? "", planPath) : planPath;
+		const planned = await this.planSeed(rel);
+		if ("error" in planned) return this.surface.post({ type: "run-failed", error: planned.error });
+		await this.startRun(implementPrompt(planPath) + IMPLEMENT_SCOPE_NOTE, "code", undefined, this.engineKind, planned.seed);
 	}
 
-	private async startRun(task: string, mode?: AgentMode, pick?: { modelId: string; profile: string }, engine: EngineKind = this.engineKind): Promise<void> {
+	/** Board for an implement run on a plan file: the file's steps, or an error. Never the planner. */
+	private async planSeed(rel: string): Promise<{ seed: SeedTask[] } | { error: string }> {
+		let markdown: string;
+		try {
+			markdown = await fs.readFile(this.planAbs(rel), "utf8");
+		} catch (err) {
+			return { error: `Can't read ${rel}: ${err instanceof Error ? err.message : String(err)}` };
+		}
+		return planSeedTasks(rel, markdown);
+	}
+
+	private planAbs(rel: string): string {
+		return path.isAbsolute(rel) ? rel : path.join(this.runnerRoot ?? "", rel);
+	}
+
+	private async startRun(task: string, mode?: AgentMode, pick?: { modelId: string; profile: string }, engine: EngineKind = this.engineKind, seed?: SeedTask[]): Promise<void> {
 		const freshRunner = false;
 		const active = await this.getRunner(engine);
 		if (!active) return;
@@ -856,7 +888,8 @@ export class SessionController {
 				this.surface.post({ type: "run-failed", error: providerErrorMessage(error!) });
 				return;
 			}
-			const choice = chooseTransport(settings.providerId, engine === "openai" ? "openai" : "cline");
+			const transport: TransportKind = engine === "openai" || engine === "conversations" || engine === "responses" ? engine : "cline";
+			const choice = chooseTransport(settings.providerId, transport);
 			if (!choice.ok) {
 				this.surface.post({ type: "run-failed", error: choice.message });
 				return;
@@ -893,7 +926,21 @@ export class SessionController {
 				return;
 			}
 			this.lastTransport = choice.transport;
-			await this.runOnHarness(expanded, settings, task, choice.transport, false, attachments);
+			// "implement <plan>.md" typed in chat: the named plan file is the board —
+			// seeded like the Implement button, or refused. Never handed to the planner.
+			let runSeed = seed;
+			let runTask = expanded;
+			const named = !runSeed && /\bimplement\b/i.test(task) ? /@?\s*([\w./\-[\]{}()]+\.md)\b/i.exec(task)?.[1] : undefined;
+			if (named) {
+				if (!(await fs.access(this.planAbs(named)).then(() => true, () => false))) {
+					return this.surface.post({ type: "run-failed", error: `${named} doesn't exist — save the plan there or fix the path, then run again.` });
+				}
+				const planned = await this.planSeed(named);
+				if ("error" in planned) return this.surface.post({ type: "run-failed", error: planned.error });
+				runSeed = planned.seed;
+				runTask += IMPLEMENT_SCOPE_NOTE;
+			}
+			await this.runOnHarness(runTask, settings, task, choice.transport, false, attachments, runSeed);
 		} finally {
 			this.deps.runLock.release(this.name);
 		}
@@ -1082,7 +1129,7 @@ export class SessionController {
 	}
 
 	/** One task on the harness loop (the composer's Harness engine). Local only. Acceptance commands need approval before they run. */
-	private async runOnHarness(task: string, settings: ProviderSettings, displayTask: string, transport: TransportKind, resume = false, attachments: RunnerAttachment[] = []): Promise<void> {
+	private async runOnHarness(task: string, settings: ProviderSettings, displayTask: string, transport: TransportKind, resume = false, attachments: RunnerAttachment[] = [], seed?: SeedTask[]): Promise<void> {
 		const root = this.runnerRoot ?? "";
 		const mode = this.deps.modeRef.current;
 		// Plan mode keeps the plan-visible exceptions offered (write_file scoped,
@@ -1107,7 +1154,30 @@ export class SessionController {
 		}
 		const provider = { providerId: settings.providerId, baseUrl: settings.baseUrl, apiKey: settings.apiKey, modelId: settings.modelId, maxOutputTokens: settings.maxTokens };
 		// The transport is the model side only; the loop is always the harness.
-		const model = transport === "openai" ? new OpenAIModelPort(provider) : new ClineModelPort(provider);
+		// Provider/model behavior resolves independently from the wire adapter.
+		const openaiConfig = vscode.workspace.getConfiguration("kronyx");
+		const model = (() => {
+			try {
+				return createModelAdapter(transport, {
+					...provider,
+					store: openaiConfig.get<boolean>("openai.store", true),
+					conversations: openaiConfig.get<boolean>("openai.conversations", true),
+					contextWindow: settings.contextWindow,
+				});
+			} catch (err) {
+				this.surface.post({ type: "run-failed", error: err instanceof Error ? err.message : String(err) });
+				return undefined;
+			}
+		})();
+		if (!model) return;
+		this.runWire = model.capabilities?.wire;
+		const behavior = resolveBehaviorProfile({
+			providerId: settings.providerId,
+			modelId: settings.modelId,
+			profile: settings.profile,
+			contextWindow: settings.contextWindow,
+			capabilities: model.capabilities,
+		});
 		const run = shellExec(root);
 		const verifier = new CommandVerifier(async (command) =>
 			(await this.confirmWrite(root, "run_command", { command })) ? run(command) : { ok: false, output: "Acceptance command was not approved." },
@@ -1116,12 +1186,12 @@ export class SessionController {
 		const basePort = createHarnessToolPort({
 			tools,
 			hidden,
-			check: async (name, input) => {
+			check: async (name, input, callId) => {
 				if (!pipeline) return evaluate(this.permLayers, name, input, mode) ?? "ask";
-				const verdict = await pipeline.runPre({ name, input });
+				const verdict = await pipeline.runPre({ name, input, callId });
 				return verdict.kind === "allow" ? "allow" : verdict.kind === "deny" ? "deny" : "ask";
 			},
-			confirm: (name, input) => this.confirmWrite(root, name, input),
+			confirm: (name, input, callId) => this.confirmWrite(root, name, input, callId),
 		});
 		const toolPort = withRecall(
 			withExplore(withReadCache(withBatchReads(basePort)), model),
@@ -1166,6 +1236,7 @@ export class SessionController {
 					runId: this.runId,
 					log,
 					model,
+					behavior,
 					tools: toolPort,
 					verifier,
 					emit: (e) => this.onEvent(e),
@@ -1176,12 +1247,9 @@ export class SessionController {
 					limits: { maxTurns: settings.maxIterations },
 					// Hit the turn cap → ask in chat instead of silently pausing.
 					// "Always" answers auto-continue future windows for this run.
-					onTurnLimit: (used, limit, kind = "turns", contextTokens) =>
+					onTurnLimit: (used, limit) =>
 						this.confirmWrite(root, "continue_run", {
-							command:
-								kind === "input_tokens"
-									? `Total spend ${Math.round(used / 1000)}k of the ${Math.round(limit / 1000)}k input budget${contextTokens ? ` — context compacted to ~${Math.round(contextTokens / 1000)}k` : ""}. Continue with a fresh allowance?`
-									: `Run reached ${used} turns (limit ${limit}). Continue for another ${limit}?`,
+							command: `Run reached ${used} turns (limit ${limit}). Continue for another ${limit}?`,
 						}),
 					// Steering "ask" verdicts (plan.drift) go through the same in-chat card.
 					onSteerAsk: (question) => this.confirmWrite(root, "steer_ask", { command: question }),
@@ -1190,7 +1258,7 @@ export class SessionController {
 				},
 				task,
 				displayTask,
-				{ resume, context, images, plan },
+				{ resume, context, images, plan, seed },
 			);
 			this.harnessPaused = outcome.status === "paused";
 			void this.queueHarnessReport();
@@ -1223,7 +1291,7 @@ export class SessionController {
 	}
 
 	private harnessCompact(): void {
-		if (!this.activeHarnessLoop?.requestCompact()) this.deps.output.appendLine("[ctx] no running harness run to compact");
+		if (!this.activeHarnessLoop?.requestCompact()) this.deps.output.appendLine("[ctx] nothing to compact: no running run, or Conversations compact on the server");
 	}
 
 	/** Clear context between runs: appends to the log, so the next run's replay starts empty. Ledger and log are kept. */
@@ -1254,7 +1322,7 @@ export class SessionController {
 		return configured || "plans";
 	}
 
-	private async confirmWrite(root: string, toolName: string, input: unknown): Promise<boolean> {
+	private async confirmWrite(root: string, toolName: string, input: unknown, callId?: string): Promise<boolean> {
 		if (autoApproveWrites() || this.approveAll || this.permittedTools.has(toolName)) return true;
 		let file =
 			(input as { path?: string })?.path ??
@@ -1270,7 +1338,7 @@ export class SessionController {
 		}
 		const id = `perm-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 		const diff = await this.pendingDiff(root, file, toolName, input);
-		const event = { type: "permission-request" as const, id, tool: toolName, path: file, diff };
+		const event = { type: "permission-request" as const, id, tool: toolName, path: file, diff, ...(callId ? { callId } : {}) };
 		this.surface.post(event);
 		this.deps.persistEvent(this.name, event, this.runId);
 		void root;

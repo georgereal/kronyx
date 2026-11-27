@@ -1,8 +1,8 @@
 import * as vscode from "vscode";
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
-import { FileEventLog } from "../harness/eventLog";
-import { buildHarnessReport, type HarnessReport } from "../harness/report";
+import { FileEventLog } from "../harness/core/eventLog";
+import { buildHarnessReport, type HarnessReport } from "../harness/report/report";
 import { openStore, upsertHarnessReport } from "../store";
 
 let panel: vscode.WebviewPanel | undefined;

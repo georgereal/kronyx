@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
-import type { ToolSpec } from "../../src/harness/contracts";
-import { MemoryEventLog } from "../../src/harness/eventLog";
-import { buildContext, compactHistory, COMPACT_CHUNK, COMPACT_HEAD_CHARS, COMPACT_OVER_CHARS, DIGEST_OVER_CHARS, KEEP_RECENT_MESSAGES, KEEP_RECENT_RESULTS, LOG_SLICE_SPEC, prefixHash, SYSTEM_INSTRUCTIONS, taskBoard } from "../../src/harness/context";
-import { initialState, reduce, type HarnessState } from "../../src/harness/projections";
-import type { SessionEvent } from "../../src/harness/contracts";
+import type { ToolSpec } from "../../src/harness/core/contracts";
+import { MemoryEventLog } from "../../src/harness/core/eventLog";
+import { buildContext, compactHistory, COMPACT_CHUNK, COMPACT_HEAD_CHARS, COMPACT_OVER_CHARS, DIGEST_OVER_CHARS, KEEP_RECENT_MESSAGES, KEEP_RECENT_RESULTS, LOG_SLICE_SPEC, prefixHash, SYSTEM_INSTRUCTIONS, taskBoard } from "../../src/harness/defaults/context";
+import { initialState, reduce, type HarnessState } from "../../src/harness/core/projections";
+import type { SessionEvent } from "../../src/harness/core/contracts";
 
 const tools: ToolSpec[] = [{ name: "read_file", description: "read", inputSchema: { type: "object" } }];
 

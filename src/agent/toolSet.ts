@@ -79,7 +79,8 @@ const progressTool = (emit: RunnerHost["emit"]): AgentTool<ProgressInput, string
 		executionMode: "sequential",
 		description:
 			"Publish a short progress update for the user: the objective, what is done, what is in progress, what is next, and any blockers. " +
-			"Call at phase boundaries on multi-step tasks, not after every tool call.",
+			"Call at phase boundaries on multi-step tasks, not after every tool call. " +
+			"This only informs the UI — it does not change the task board. To change the plan call task_replace; to close a step call task_step_update.",
 		inputSchema: {
 			type: "object",
 			properties: {

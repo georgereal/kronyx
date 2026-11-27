@@ -1,22 +1,23 @@
 // @ts-check
 (() => {
+	// @ts-ignore acquireVsCodeApi is injected by VS Code
 	const vscode = acquireVsCodeApi();
-	const sessionEl = document.getElementById("session");
-	const runEl = document.getElementById("run");
-	const reportEl = document.getElementById("report");
-	const hintEl = document.getElementById("hint");
-	const refreshBtn = document.getElementById("refresh");
-	const uploadBtn = document.getElementById("upload");
-	const liveEl = document.getElementById("live");
+	const sessionEl = /** @type {HTMLSelectElement} */ (document.getElementById("session"));
+	const runEl = /** @type {HTMLSelectElement} */ (document.getElementById("run"));
+	const reportEl = /** @type {HTMLElement} */ (document.getElementById("report"));
+	const hintEl = /** @type {HTMLElement} */ (document.getElementById("hint"));
+	const refreshBtn = /** @type {HTMLButtonElement} */ (document.getElementById("refresh"));
+	const uploadBtn = /** @type {HTMLButtonElement} */ (document.getElementById("upload"));
+	const liveEl = /** @type {HTMLElement} */ (document.getElementById("live"));
 
 	let sessions = [];
-	let report = null;
+	/** @type {any} */ let report = null;
 	let runId = "";
-	let pollTimer = null;
+	/** @type {ReturnType<typeof setInterval> | null} */ let pollTimer = null;
 
-	const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
-	const fmtTok = (n) => (n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n));
-	const fmtWhen = (at) => new Date(Number(at)).toLocaleString(undefined, { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+	const esc = (/** @type {any} */ s = undefined) => String(s ?? "").replace(/[&<>"]/g, (c) => (/** @type {Record<string, string>} */ ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }))[c]);
+	const fmtTok = (/** @type {any} */ n = undefined) => (n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n));
+	const fmtWhen = (/** @type {any} */ at = undefined) => new Date(Number(at)).toLocaleString(undefined, { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit" });
 
 	function load() {
 		stopPolling();
@@ -52,21 +53,21 @@
 		hintEl.textContent = "";
 		runEl.innerHTML =
 			'<option value="">All runs</option>' +
-			(r.runs || []).map((run) => `<option value="${esc(run.runId)}"${run.runId === runId ? " selected" : ""}>${esc(fmtWhen(run.startedAt))} · ${esc(run.status ?? "running")} · ${run.tasksCreated ?? 0} tasks · ${fmtTok(run.tokensIn)} tok</option>`).join("");
+			(r.runs || []).map((/** @type {any} */ run = undefined) => `<option value="${esc(run.runId)}"${run.runId === runId ? " selected" : ""}>${esc(fmtWhen(run.startedAt))} · ${esc(run.status ?? "running")} · ${run.tasksCreated ?? 0} tasks · ${fmtTok(run.tokensIn)} tok</option>`).join("");
 		renderBoard(r);
 		renderInterventions(r);
 		renderContext(r);
 		renderExecution(r);
 	}
 
-	function renderBoard(r) {
+	function renderBoard(/** @type {any} */ r = undefined) {
 		const tasks = r.board?.tasks || [];
 		const html = tasks.length
 			? tasks
-					.map((t) => {
+					.map((/** @type {any} */ t = undefined) => {
 						const steps = (t.steps || [])
-							.map((s) => {
-								const mark = { done: "✓", in_progress: "◐", pending: "○", blocked: "✕" }[s.status] || "○";
+							.map((/** @type {any} */ s = undefined) => {
+								const mark = /** @type {Record<string, string>} */ ({ done: "✓", in_progress: "◐", pending: "○", blocked: "✕" })[s.status] || "○";
 								const ev = s.evidence?.length ? `<span class="step-ev">${s.evidence.length} call${s.evidence.length === 1 ? "" : "s"}</span>` : "";
 								const sig = s.signal ? `<span class="step-signal">on ${esc(s.signal.tool)}${s.signal.path ? ` ${esc(s.signal.path)}` : ""}</span>` : "";
 								return `<li><span class="step-mark ${esc(s.status)}">${mark}</span><span class="step-text">${esc(s.text)}${sig}${ev}</span></li>`;
@@ -81,24 +82,24 @@
 		section("Plan & board", html);
 	}
 
-	function renderInterventions(r) {
-		const items = (r.interventions || []).filter((i) => !runId || i.runId === runId);
+	function renderInterventions(/** @type {any} */ r = undefined) {
+		const items = (r.interventions || []).filter((/** @type {any} */ i = undefined) => !runId || i.runId === runId);
 		const html = items.length
 			? `<div class="tl">${items
 					.map(
-						(i, idx) => `<div class="tl-item kind-${esc(i.kind)}${idx === items.length - 1 ? " latest" : ""}"><span class="tl-kind">${esc(i.kind)}</span><span class="tl-label">${esc(i.label)}</span><span class="tl-when">${esc(fmtWhen(i.at))}</span>${i.detail ? `<div class="tl-detail">${esc(i.detail)}</div>` : ""}</div>`,
+						(/** @type {any} */ i = undefined, /** @type {any} */ idx = undefined) => `<div class="tl-item kind-${esc(i.kind)}${idx === items.length - 1 ? " latest" : ""}"><span class="tl-kind">${esc(i.kind)}</span><span class="tl-label">${esc(i.label)}</span><span class="tl-when">${esc(fmtWhen(i.at))}</span>${i.detail ? `<div class="tl-detail">${esc(i.detail)}</div>` : ""}</div>`,
 					)
 					.join("")}</div>${r.interventionsOmitted ? `<div class="omitted">…and ${r.interventionsOmitted} earlier interventions omitted.</div>` : ""}`
 			: '<div class="card muted">The harness never had to intervene — no steering notes, loop verdicts, or compactions.</div>';
 		section("Harness interventions", html);
 	}
 
-	function renderContext(r) {
+	function renderContext(/** @type {any} */ r = undefined) {
 		const c = r.context || {};
 		const t = c.tokens || { input: 0, output: 0, cached: 0 };
 		const src = c.bySource || { model: 0, planner: 0, tools: 0, recap: 0 };
 		const total = src.model + src.planner + src.tools + src.recap || 1;
-		const pct = (n) => `${Math.round((n / total) * 100)}%`;
+		const pct = (/** @type {any} */ n = undefined) => `${Math.round((n / total) * 100)}%`;
 		const tiles = `<div class="tiles">
 			<div class="tile"><div class="num">${c.turns ?? 0}</div><div class="lbl">model turns</div></div>
 			<div class="tile"><div class="num">${c.toolCalls ?? 0}</div><div class="lbl">tool calls</div></div>
@@ -128,10 +129,10 @@
 		section("Context & budget", tiles + split);
 	}
 
-	function renderExecution(r) {
+	function renderExecution(/** @type {any} */ r = undefined) {
 		const e = r.execution || {};
 		const tools = (e.tools || [])
-			.map((t) => `<tr><td class="mono">${esc(t.name)}</td><td class="num">${t.calls}</td><td class="num">${t.failures || ""}</td></tr>`)
+			.map((/** @type {any} */ t = undefined) => `<tr><td class="mono">${esc(t.name)}</td><td class="num">${t.calls}</td><td class="num">${t.failures || ""}</td></tr>`)
 			.join("");
 		const stats = `<div class="stat-row" style="margin-bottom:8px">
 			<span>steps proven by tool calls <b>${e.stepsSignalDone ?? 0}</b></span>
@@ -146,7 +147,7 @@
 		section("Execution stats", stats + table);
 	}
 
-	function section(title, html) {
+	function section(/** @type {any} */ title = undefined, /** @type {any} */ html = undefined) {
 		const el = document.createElement("section");
 		el.innerHTML = `<h2>${esc(title)}</h2>${html}`;
 		reportEl.appendChild(el);
@@ -188,7 +189,7 @@
 		switch (msg.type) {
 			case "sessions": {
 				sessions = msg.sessions || [];
-				sessionEl.innerHTML = '<option value="">Select a session…</option>' + sessions.map((s) => `<option value="${esc(s.name)}">${esc(s.name)} · ${esc(fmtWhen(s.at))}</option>`).join("");
+				sessionEl.innerHTML = '<option value="">Select a session…</option>' + sessions.map((/** @type {any} */ s = undefined) => `<option value="${esc(s.name)}">${esc(s.name)} · ${esc(fmtWhen(s.at))}</option>`).join("");
 				hintEl.textContent = sessions.length ? `${sessions.length} session log${sessions.length === 1 ? "" : "s"} under .kronyx/harness/ — tracking the newest.` : "No harness logs yet — run a task on the Harness engine first.";
 				// Auto-select the newest session so the panel is live on open.
 				if (sessions.length) {
@@ -201,7 +202,7 @@
 			case "report": {
 				report = msg.report;
 				runId = msg.runId || "";
-				liveEl.hidden = !(report?.runs || []).some((run) => run.status === "running");
+				liveEl.hidden = !(report?.runs || []).some((/** @type {any} */ run = undefined) => run.status === "running");
 				render();
 				break;
 			}

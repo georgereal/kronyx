@@ -95,6 +95,7 @@ async function collectValues(context: vscode.ExtensionContext): Promise<Record<s
 			"git.commitOnFinish": config.get("git.commitOnFinish", false),
 			"checks.commands": JSON.stringify(config.get("checks.commands", []), null, 2),
 			"checks.runOnFinish": config.get("checks.runOnFinish", false),
+			"harness.debug": config.get("harness.debug", false),
 			"memory.enabled": config.get("memory.enabled", true),
 			"memory.embeddingModel": config.get("memory.embeddingModel", ""),
 			"memory.topK": config.get("memory.topK", 5),
@@ -391,6 +392,7 @@ const SECTIONS = `
   <label>Plan directory <input data-key="agent.planDir" data-kind="text" placeholder=".kronyx/plans"></label>
   <label>Implement prompt <input data-key="agent.implementPrompt" data-kind="text" placeholder="Implement the plan in {path}..."></label>
   <label class="check"><input data-key="approval.autoApproveWrites" data-kind="bool" type="checkbox"> Auto-approve file writes</label>
+  <label class="check"><input data-key="harness.debug" data-kind="bool" type="checkbox"> Harness debug — show plan board, steer rule ids and per-turn token lines in the chat</label>
 </section>
 
 <section id="sec-checks" class="page">

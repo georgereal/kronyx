@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { applyLedgerEvent, blockedTasks, checkRemove, checkTransition, emptyLedger, LedgerError, openTasks, parseTaskStepAddInput, type Ledger } from "../../src/harness/taskLedger";
-import type { EventBody, Task } from "../../src/harness/contracts";
+import { applyLedgerEvent, blockedTasks, checkRemove, checkTransition, emptyLedger, LedgerError, openTasks, parseTaskStepAddInput, type Ledger } from "../../src/harness/core/taskLedger";
+import type { EventBody, Task } from "../../src/harness/core/contracts";
 
 const task = (id: string, dependsOn: string[] = []): Task => ({ id, title: id, acceptance: { kind: "command", command: "true" }, dependsOn, status: "pending", steps: [], evidence: [] });
 const apply = (ledger: Ledger, body: EventBody & { runId?: string }) => applyLedgerEvent(ledger, body);
