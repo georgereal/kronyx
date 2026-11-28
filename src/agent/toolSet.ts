@@ -118,7 +118,7 @@ export interface ToolSet {
  * repeat guard detects a stuck tool loop (the runner stops the run).
  */
 // biome-ignore lint/suspicious/noExplicitAny: tool inputs vary per tool
-export async function assembleToolSet(host: RunnerHost, settings: ProviderSettings, task: string, onLoop: () => void): Promise<ToolSet> {
+export async function assembleToolSet(host: RunnerHost, settings: ProviderSettings, task: string, onLoop: () => void, opts?: { repeatGuard?: boolean }): Promise<ToolSet> {
 	const tools = host.tools
 		? await host.tools()
 		: [
@@ -137,12 +137,18 @@ export async function assembleToolSet(host: RunnerHost, settings: ProviderSettin
 	// ask denies them, plan/code route them to approval, and read-only modes hide them.
 	const mcpWrites = new Set(tools.filter((t) => t.name.startsWith("mcp_") && !isReadOnlyMcpTool(t)).map((t) => t.name));
 	const pipeline = new ToolPipeline();
-	pipeline.pre(
-		createRepeatGuard({
-			onLoopDetected: (tool, count) => host.emit({ type: "loop-detected", tool, count }),
-			onStop: onLoop,
-		}),
-	);
+	// The repeat guard is the legacy engines' only loop detector. Harness runs
+	// must not include it: the kernel's LoopControlPolicy is authoritative there
+	// — recap-aware and strike-based — while this guard's fixed window counts
+	// post-compaction re-reads as loops and escalates on its own denials.
+	if (opts?.repeatGuard !== false) {
+		pipeline.pre(
+			createRepeatGuard({
+				onLoopDetected: (tool, count) => host.emit({ type: "loop-detected", tool, count }),
+				onStop: onLoop,
+			}),
+		);
+	}
 	pipeline.pre(createSavePlanGuard(host.currentMode));
 	if (host.approvals?.check) pipeline.pre(createPermissionGuard(host.approvals.check));
 	pipeline.pre(
@@ -150,6 +156,7 @@ export async function assembleToolSet(host: RunnerHost, settings: ProviderSettin
 			currentMode: host.currentMode,
 			writeTools: new Set([...WRITE_TOOL_NAMES, ...mcpWrites]),
 			root: host.workspaceRoot,
+			...(host.planDir ? { planDir: host.planDir } : {}),
 			onModeBlocked: (mode) => host.emit({ type: "mode-blocked", mode }),
 		}),
 	);

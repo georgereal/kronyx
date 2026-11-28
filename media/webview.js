@@ -13,7 +13,6 @@
 	const modelBtn = /** @type {HTMLButtonElement} */ (document.getElementById("model"));
 	const modeLabel = /** @type {HTMLElement} */ (document.getElementById("mode-label"));
 	const engineBtn = /** @type {HTMLButtonElement} */ (document.getElementById("engine"));
-	const engineLabel = /** @type {HTMLElement} */ (document.getElementById("engine-label"));
 	const harnessBtn = /** @type {HTMLButtonElement} */ (document.getElementById("harness-toggle"));
 	const modelLabel = /** @type {HTMLElement} */ (document.getElementById("model-label"));
 	const status = /** @type {HTMLElement} */ (document.getElementById("status"));
@@ -46,14 +45,19 @@
 		iteration: 0,
 		contextMsgs: 0,
 		contextBudget: 0,
+		requestTokens: 0,
+		turnOutputTokens: 0,
 	};
 	let startedAt = 0;
 
 	const persisted = vscode.getState() || {};
 	/** @type {string} */
 	let mode = persisted.mode || "code";
-	const ENGINES = ["cline", "responses", "conversations"];
-	let engine = ENGINES.includes(persisted.engine) ? persisted.engine : "cline";
+	const ENGINES = ["auto", "cline", "responses", "conversations", "chat"];
+	// Legacy picks migrate: the old "openai" auto-transport is just "auto" now.
+	let engine = persisted.engine === "openai" ? "auto" : ENGINES.includes(persisted.engine) ? persisted.engine : "auto";
+	// API shapes the active provider serves (host-computed matrix). Empty = unknown, offer everything.
+	let supportedShapes = [];
 	/** @type {string} */
 	// The composer pick (modelId + modelProfile) is host state only — never restored
 	// from webview storage, so a stale id can't pair with the wrong provider.
@@ -186,6 +190,8 @@
 
 	// ---------- markdown ----------
 	const sanitizeMd = (/** @type {any} */ html = undefined) => html.replace(/<(script|style|iframe|object|embed|form)[\s\S]*?<\/\1>/gi, "");
+	let lastAssistantText = "";
+
 	const renderMd = (/** @type {any} */ text = undefined) => {
 		const d = el("div", "md");
 		if (typeof /** @type {any} */ (globalThis).marked === "undefined") {
@@ -232,6 +238,7 @@
 	};
 
 	/** @type {any} */ let runGroup = null;
+	let groupStartedAt = 0;
 	/** The current run's top-level section — bubble, worked group and result
 	 *  card all live inside it so nothing escapes into a sibling run's area. */
 	/** @type {any} */ let runEl = null;
@@ -358,6 +365,7 @@
 		group.appendChild(body);
 		groupStats = { added: 0, removed: 0, files: new Set() };
 		lastReasoningNorm = "";
+		groupStartedAt = Date.now();
 		runGroup = group;
 		streamMsg = null;
 		streamText = "";
@@ -376,7 +384,9 @@
 
 	const updateGroupTitle = (/** @type {any} */ prefix = undefined) => {
 		if (!runGroup) return;
-		const secs = startedAt ? Math.round((Date.now() - startedAt) / 1000) : 0;
+		// Per-segment elapsed: each Working section times itself. The run's total
+		// elapsed stays in the status line by the composer.
+		const secs = groupStartedAt ? Math.round((Date.now() - groupStartedAt) / 1000) : 0;
 		const diff = groupStats.added || groupStats.removed ? ` +${groupStats.added} −${groupStats.removed}` : "";
 		const files = groupStats.files.size ? ` · ${groupStats.files.size} file${groupStats.files.size === 1 ? "" : "s"}` : "";
 		// "Finished · worked for 45s" live, just "Finished" when no duration;
@@ -397,15 +407,22 @@
 		}
 		return "";
 	};
-	// {t1}/{s3} braces are explicit refs — always resolved. Bare t1/s3 resolves
-	// only when it names a real board id, so prose like "the s3 bucket" or a
-	// stray "t2" in code talk is left alone.
-	const REF_RE = /\{[ts]\d+(?:\s*[–-]\s*s?\d+)?\}|\bt\d+\b|\bs\d+(?:\s*[–-]\s*s?\d+)?/g;
-	const REF_TEST = /\{[ts]\d|\bt\d+\b|\bs\d+/;
+	// Reference extraction is map-driven, never shape-guessed: the matcher is
+	// built from the board's own keys (longest-first, boundary-guarded), so any
+	// id shape — hierarchical t6-s2, lettered s3a, whatever comes next — resolves
+	// whole, and tokens absent from the board never match at all. Mirrors
+	// buildRefMatcher in src/harness/core/refIndex.ts.
+	const escapeRe = (/** @type {any} */ s = undefined) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const boardRefMatcher = () => {
+		const keys = [...boardTasks.keys()];
+		if (!keys.length) return null;
+		keys.sort((a, b) => b.length - a.length || a.localeCompare(b));
+		return new RegExp(`\\{[^{}\\s]{1,40}\\}|(?<![A-Za-z0-9-])(${keys.map(escapeRe).join("|")})(?![A-Za-z0-9-])`, "g");
+	};
 	const refTip = (/** @type {any} */ ref = undefined) =>
 		ref[0] === "t"
 			? boardTasks.get(ref)?.title
-			: (ref.match(/s\d+/g) || []).map(stepText).filter(Boolean).join(" / ");
+			: (ref.match(/s[\w-]*/g) || []).map(stepText).filter(Boolean).join(" / ");
 	const refChip = (/** @type {any} */ ref = undefined, /** @type {any} */ braced = undefined) => {
 		// Step ids repeat across tasks — a bare "s3" is just prose (AWS S3 says hi);
 		// steps resolve only through explicit {s3} braces. Task ids are board-unique.
@@ -421,22 +438,35 @@
 	};
 	/** Split text into text nodes and ref chips. */
 	const refNodes = (/** @type {any} */ text = undefined) => {
+		const re = boardRefMatcher();
+		if (!re) return [document.createTextNode(text)];
 		const nodes = [];
 		let last = 0;
-		for (const m of text.matchAll(REF_RE)) {
+		for (const m of text.matchAll(re)) {
 			const braced = m[0].startsWith("{");
 			const id = braced ? m[0].slice(1, -1) : m[0];
+			// Braced tokens count as refs only when id-shaped or a real key —
+			// {author}/{timeout} are prose. Bare matches are board keys by
+			// construction, so they always resolve.
+			if (braced && !boardTasks.has(id) && !/^[ts]\d/.test(id) && !stepText(id)) continue;
 			if (m.index > last) nodes.push(document.createTextNode(text.slice(last, m.index)));
 			nodes.push(refChip(id, braced));
 			last = m.index + m[0].length;
 		}
+		if (last === 0) return [document.createTextNode(text)];
 		if (last < text.length) nodes.push(document.createTextNode(text.slice(last)));
 		return nodes;
 	};
 	/** Wrap refs inside a rendered markdown tree; skips code and links. */
 	const chipify = (/** @type {any} */ root = undefined) => {
+		const probe = boardRefMatcher();
+		if (!probe) return;
 		const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-			acceptNode: (n) => (REF_TEST.test(n.nodeValue || "") ? (n.parentElement?.closest("code, pre, a") ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT) : NodeFilter.FILTER_SKIP),
+			acceptNode: (n) => {
+				if (n.parentElement?.closest("code, pre, a")) return NodeFilter.FILTER_REJECT;
+				probe.lastIndex = 0;
+				return probe.test(n.nodeValue || "") ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
+			},
 		});
 		const targets = [];
 		while (walker.nextNode()) targets.push(walker.currentNode);
@@ -583,7 +613,7 @@
 		models.find((m) => m.id === modelId)?.contextWindow ||
 		groups.flatMap((g) => g.models || []).find((m) => m.id === modelId)?.contextWindow ||
 		0;
-	const contextUsed = () => usage.inputTokens + usage.cacheReadTokens + usage.cacheWriteTokens;
+	const contextUsed = () => usage.requestTokens || usage.inputTokens + usage.cacheReadTokens + usage.cacheWriteTokens;
 
 	const updateActivityRing = () => {
 		const ctx = contextWindow();
@@ -628,7 +658,8 @@
 		meter.appendChild(fill);
 		contextPopover.appendChild(meter);
 		const rows = el("div", "context-rows");
-		rows.appendChild(usageRow("Input", usage.inputTokens.toLocaleString()));
+		if (usage.requestTokens) rows.appendChild(usageRow("Last request input", usage.requestTokens.toLocaleString()));
+		rows.appendChild(usageRow("Input (run total)", usage.inputTokens.toLocaleString()));
 		if (usage.cacheReadTokens) rows.appendChild(usageRow("Cached input", usage.cacheReadTokens.toLocaleString()));
 		if (usage.cacheWriteTokens) rows.appendChild(usageRow("Cache write", usage.cacheWriteTokens.toLocaleString()));
 		if (usage.outputTokens) rows.appendChild(usageRow("Output", usage.outputTokens.toLocaleString()));
@@ -694,9 +725,10 @@
 		updateActivityRing();
 		tokchip.hidden = total === 0;
 		if (total > 0) {
-			tokchip.textContent = `in ${fmt(usage.inputTokens)} · out ${fmt(usage.outputTokens)}` +
+			const turnIn = usage.requestTokens || usage.inputTokens;
+			tokchip.textContent = `in ${fmt(turnIn)} · out ${fmt(usage.turnOutputTokens || usage.outputTokens)}` +
 				(usage.cacheReadTokens > 0 ? ` · cached ${fmt(usage.cacheReadTokens)}` : "");
-			tokchip.title = `Tokens — input ${usage.inputTokens.toLocaleString()}, output ${usage.outputTokens.toLocaleString()}, cache read ${usage.cacheReadTokens.toLocaleString()}, cache write ${usage.cacheWriteTokens.toLocaleString()}`;
+			tokchip.title = `Last request — input ${turnIn.toLocaleString()}, output ${(usage.turnOutputTokens || usage.outputTokens).toLocaleString()}\nRun totals — input ${usage.inputTokens.toLocaleString()}, output ${usage.outputTokens.toLocaleString()}, cache read ${usage.cacheReadTokens.toLocaleString()}, cache write ${usage.cacheWriteTokens.toLocaleString()}`;
 		}
 	};
 
@@ -1116,7 +1148,51 @@
 
 	/** Per-run counters for the summary card — reset on run-started. */
 	let runStats = { toolsFailed: 0, checksPassed: 0, checksFailed: 0, files: new Map() };
-	const resetRunStats = () => { runStats = { toolsFailed: 0, checksPassed: 0, checksFailed: 0, files: new Map() }; };
+	const resetRunStats = () => { runStats = { toolsFailed: 0, checksPassed: 0, checksFailed: 0, files: new Map() }; runOutcomes.length = 0; };
+	/** Ordered (key, ok) outcome log for resolution-aware failure accounting —
+	 *  iteration failures resolve when the same target later succeeds. */
+	const runOutcomes = /** @type {{key: string, ok: boolean, label: string}[]} */ ([]);
+	/** Groups outcomes by target — a failure counts as unresolved only when its
+	 *  target's LAST outcome is still a failure. Compile-fix cycles net to zero. */
+	const resolutionSummary = () => {
+		const byKey = new Map();
+		for (const o of runOutcomes) {
+			if (!byKey.has(o.key)) byKey.set(o.key, { label: o.label, fails: 0, ok: false });
+			const g = byKey.get(o.key);
+			if (!o.ok) g.fails++;
+			g.ok = o.ok; // last outcome wins — ordered log
+		}
+		let resolvedFails = 0, unresolvedFails = 0;
+		const unresolvedKeys = [];
+		for (const g of byKey.values()) {
+			if (g.ok) resolvedFails += g.fails;
+			else if (g.fails) { unresolvedFails += g.fails; unresolvedKeys.push(g.fails > 1 ? `${g.label} ×${g.fails}` : g.label); }
+		}
+		return { resolvedFails, unresolvedFails, unresolvedKeys };
+	};
+	/** Resolution key: file operations group by path, commands by normalized invocation. */
+	const outcomeKey = (/** @type {any} */ name = undefined, /** @type {any} */ input = undefined) => {
+		const inp = input ?? {};
+		if (name === "run_command" && inp.command) {
+			let cmd = String(inp.command).trim().replace(/^cd\s+\S+\s*&&\s*/, "").split("|")[0].trim();
+			// Strip leading env assignments quote-aware (CLASSPATH="a b" java …) — naive
+			// whitespace splitting otherwise leaks the quoted interior as fake positionals.
+			for (;;) {
+				const m = cmd.match(/^\w+=("([^"]*)"|\S+)\s+/);
+				if (!m) break;
+				cmd = cmd.slice(m[0].length);
+			}
+			// Key on binary + last positional: "mvn clean compile" and "mvn compile" are the
+			// same operation for resolution — the fix succeeds when either passes.
+			const tokens = cmd.split(/\s+/).filter((t) => t && !t.startsWith("-") && !t.includes("=") && !/^\d?>>?/.test(t));
+			const binary = tokens[0] ?? "";
+			const goal = tokens.length > 1 ? tokens[tokens.length - 1] : "";
+			const sig = goal && goal !== binary ? `${binary} ${goal}` : binary;
+			return { key: `cmd:${sig}`, label: sig || "command" };
+		}
+		if (inp.path) return { key: `file:${inp.path}`, label: String(inp.path).split("/").pop() };
+		return { key: `tool:${name}`, label: name };
+	};
 
 	/** @type {Record<string, string[]>} */ const TOOL_STYLE = {
 		read_file: ["📄", "Read", "Reading"],
@@ -1167,10 +1243,95 @@
 		task.style.height = "auto";
 		task.style.height = `${Math.min(task.scrollHeight, 160)}px`;
 	};
+	// ---------- @ mention typeahead ----------
+	// Typing @<fragment> queries the host for workspace files; the dropdown
+	// completes the path as text (not an attachment). The @ token runs from the
+	// @ character to the caret — no whitespace inside.
+	const composerEl = /** @type {HTMLElement} */ (document.getElementById("composer"));
+	/** @type {any} */ let mention = null;
+	let mentionSeq = 0;
+	let mentionTimer = 0;
+
+	const closeMention = () => {
+		mention = null;
+		composerEl.querySelector(".mention-menu")?.remove();
+	};
+
+	const mentionToken = () => {
+		const pos = task.selectionStart;
+		if (pos !== task.selectionEnd) return null;
+		const m = /(?:^|\s)@([\w./+-]*)$/.exec(task.value.slice(0, pos));
+		if (!m) return null;
+		return { start: pos - m[1].length - 1, query: m[1] };
+	};
+
+	const renderMention = () => {
+		if (!mention) return;
+		let menu = /** @type {HTMLElement|null} */ (composerEl.querySelector(".mention-menu"));
+		if (!menu) {
+			menu = el("div", "mention-menu");
+			composerEl.appendChild(menu);
+		}
+		menu.replaceChildren();
+		if (!mention.matches.length) {
+			menu.appendChild(el("div", "mention-empty", "No matching files"));
+			return;
+		}
+		mention.sel = Math.min(mention.sel, mention.matches.length - 1);
+		mention.matches.forEach((/** @type {string} */ rel, /** @type {number} */ i) => {
+			const slash = rel.lastIndexOf("/");
+			const item = el("div", `mention-item${i === mention.sel ? " selected" : ""}`);
+			if (slash >= 0) {
+				item.appendChild(el("span", "mention-dir", `${rel.slice(0, slash + 1)}`));
+				item.appendChild(el("span", "mention-base", rel.slice(slash + 1)));
+			} else {
+				item.appendChild(el("span", "mention-base", rel));
+			}
+			item.addEventListener("mousedown", (e) => {
+				e.preventDefault();
+				pickMention(i);
+			});
+			menu.appendChild(item);
+		});
+	};
+
+	const pickMention = (/** @type {number} */ i) => {
+		if (!mention) return;
+		const rel = mention.matches[i];
+		if (typeof rel !== "string") return;
+		const pos = task.selectionStart;
+		task.value = `${task.value.slice(0, mention.start)}@${rel} ${task.value.slice(pos)}`;
+		const caret = mention.start + rel.length + 2;
+		task.selectionStart = task.selectionEnd = caret;
+		closeMention();
+		task.focus();
+		autogrow();
+		persist();
+	};
+
+	const updateMention = () => {
+		const tok = mentionToken();
+		if (!tok) return closeMention();
+		if (mention && mention.start === tok.start && mention.query === tok.query) return;
+		clearTimeout(mentionTimer);
+		mentionTimer = setTimeout(() => {
+			const cur = mentionToken();
+			if (!cur) return closeMention();
+			const id = `mq-${++mentionSeq}`;
+			mention = { start: cur.start, query: cur.query, id, matches: [], sel: 0 };
+			vscode.postMessage({ type: "fileQuery", id, query: cur.query });
+		}, 120);
+	};
+
 	task.addEventListener("input", () => {
 		autogrow();
 		persist();
+		updateMention();
 	});
+	task.addEventListener("click", () => {
+		if (!mentionToken()) closeMention();
+	});
+	task.addEventListener("blur", () => setTimeout(closeMention, 150));
 
 	const submit = () => {
 		const text = task.value.trim();
@@ -1185,6 +1346,30 @@
 	};
 
 	task.addEventListener("keydown", (e) => {
+		if (mention) {
+			if (e.key === "ArrowDown" || (e.key === "Tab" && !e.shiftKey)) {
+				e.preventDefault();
+				mention.sel = (mention.sel + 1) % Math.max(mention.matches.length, 1);
+				renderMention();
+				return;
+			}
+			if (e.key === "ArrowUp" || (e.key === "Tab" && e.shiftKey)) {
+				e.preventDefault();
+				mention.sel = (mention.sel - 1 + mention.matches.length) % Math.max(mention.matches.length, 1);
+				renderMention();
+				return;
+			}
+			if (e.key === "Enter" && mention.matches.length) {
+				e.preventDefault();
+				pickMention(mention.sel);
+				return;
+			}
+			if (e.key === "Escape") {
+				e.preventDefault();
+				closeMention();
+				return;
+			}
+		}
 		if (e.key === "Enter" && !e.shiftKey) {
 			e.preventDefault();
 			submit();
@@ -1310,13 +1495,14 @@
 	const modeLabelFor = (/** @type {any} */ id = undefined) => MODES.find((m) => m.id === id)?.label ?? id;
 
 	/** @type {Record<string, string>} */
-	/** @type {Record<string, string>} */ const ENGINE_LABELS = { cline: "Cline SDK", openai: "OpenAI", responses: "OpenAI Responses", conversations: "OpenAI Conversations" };
+	/** @type {Record<string, string>} */ const ENGINE_LABELS = { auto: "Auto", cline: "Cline SDK", responses: "Responses API", conversations: "Conversations API", chat: "Chat Completions" };
 	/** @type {Record<string, string>} */
 	const ENGINE_DESCS = {
+		auto: "Best shape the provider serves: Conversations on direct OpenAI, then Responses, then Chat",
 		cline: "Cline SDK transport: any provider, including Anthropic",
-		openai: "OpenAI transport: Responses for OpenAI, chat completions elsewhere",
-		responses: "OpenAI-compatible wire, stateless: Responses API for OpenAI, chat completions elsewhere",
+		responses: "OpenAI-compatible Responses API, stateless wire",
 		conversations: "OpenAI Conversations API (direct api.openai.com): server-side history, delta sends, server compaction",
+		chat: "OpenAI-compatible chat completions API",
 	};
 
 	/** @type {Record<string, string>} */ const MODE_ICONS = { code: "</>", smart: "✦", ask: "◯", plan: "≡", bypass: "⛨" };
@@ -1336,7 +1522,6 @@
 
 	const refreshChips = () => {
 		modeLabel.textContent = modeLabelFor(mode);
-		engineLabel.textContent = ENGINE_LABELS[engine];
 		/** @type {HTMLElement} */ (document.getElementById("mode-icon")).innerHTML = MODE_SVGS[mode] || MODE_SVGS.code;
 		// Selection identity is the pair profile|modelId — look up the label in
 		// the picked profile's catalog first so a same-id model elsewhere can't win.
@@ -1368,8 +1553,11 @@
 	});
 
 	engineBtn.addEventListener("click", () => {
+		// Only shapes the provider matrix supports; auto is always offered. When the
+		// host has not pushed support yet, show everything rather than an empty menu.
+		const pool = supportedShapes.length ? ENGINES.filter((id) => id === "auto" || supportedShapes.includes(id)) : ENGINES;
 		openMenu(engineBtn, {
-			items: ENGINES.map((id) => ({
+			items: pool.map((id) => ({
 				label: ENGINE_LABELS[id],
 				desc: ENGINE_DESCS[id],
 				checked: id === engine,
@@ -1578,6 +1766,7 @@
 		switch (msg.type) {
 			case "state":
 				if (ENGINES.includes(msg.engine)) engine = msg.engine;
+				if (Array.isArray(msg.supportedShapes)) supportedShapes = msg.supportedShapes;
 				mode = msg.mode || mode;
 				if (typeof msg.modelId === "string") modelId = msg.modelId;
 				models = msg.models || models;
@@ -1601,6 +1790,14 @@
 				updateActivityRing();
 				persist();
 				break;
+			case "fileMatches": {
+				// Typeahead answer — applies only to the query still open.
+				if (mention && mention.id === msg.id) {
+					mention.matches = Array.isArray(msg.matches) ? msg.matches : [];
+					renderMention();
+				}
+				break;
+			}
 			case "insertMention": {
 				const sep = task.value.length > 0 && !task.value.endsWith(" ") && !task.value.endsWith("\n") ? " " : "";
 				task.value += `${sep}@${msg.text} `;
@@ -1693,6 +1890,8 @@
 				lastCompactEl = null;
 				break;
 			case "run-started": {
+				lastAssistantText = "";
+				timeline.querySelectorAll(".qa-survey").forEach((n) => n.remove());
 				retirePaused();
 				// A new run invalidates any ask left open by the previous one —
 				// the tool call that owned it is gone.
@@ -1785,6 +1984,7 @@
 				break;
 			}
 			case "assistant-text": {
+				if (msg.text) lastAssistantText = String(msg.text);
 				// The streaming bubble already rendered these deltas — finalize it
 				// in place instead of appending the same text as a second card.
 				if (streamMsg?.isConnected) {
@@ -1888,6 +2088,11 @@
 				break;
 			}
 			case "tool-finished": {
+				{
+					const info = callInfo.get(msg.id);
+					const k = outcomeKey(info?.name ?? msg.name, info?.input);
+					runOutcomes.push({ key: k.key, ok: !!msg.ok, label: k.label });
+				}
 				const info = callInfo.get(msg.id);
 				if (info) info.ok = msg.ok;
 				markCards();
@@ -2179,6 +2384,7 @@
 				ensureSegment();
 				if (msg.ok) runStats.checksPassed++;
 				else runStats.checksFailed++;
+				runOutcomes.push({ key: `check:${String(msg.command ?? msg.name ?? "acceptance")}`, ok: !!msg.ok, label: "acceptance check" });
 				const card = el("details", `step tool ${msg.ok ? "ok" : "error"}`);
 				card.open = !msg.ok;
 				const summary = el("summary");
@@ -2341,34 +2547,41 @@
 					iteration: msg.iteration || 0,
 					contextMsgs: msg.contextMsgs || 0,
 					contextBudget: msg.contextBudget || 0,
+					requestTokens: msg.requestTokens || 0,
+					turnOutputTokens: msg.outputTokens >= usage.outputTokens ? msg.outputTokens - usage.outputTokens : msg.outputTokens,
 				};
 				setStatus("Running...");
 				break;
 			case "run-finished": {
 				retirePaused();
 				const stopped = msg.status === "stopped" || msg.status === "interrupted";
+				const pausedRun = msg.status === "paused";
 				// Fold the run's steps into one expandable line before the result card.
 				closeGroup(stopped ? "Stopped · worked for" : "Finished · worked for");
 				const secs = startedAt ? Math.round((Date.now() - startedAt) / 1000) : 0;
-				const issues = runStats.toolsFailed + runStats.checksFailed;
+				const resolution = resolutionSummary();
+				const issues = resolution.unresolvedFails;
 				settlePending("Interrupted");
 				// Zero-diff churn (binary/.pyc) isn't a meaningful change.
 				const files = [...runStats.files.values()].filter((f) => f.added + f.removed > 0);
 				const added = files.reduce((a, f) => a + f.added, 0);
 				const removed = files.reduce((a, f) => a + f.removed, 0);
-				const card = el("div", `step done result-card${stopped ? " stopped" : ""}${issues ? " has-issues" : ""}`);
+				const card = el("div", `step done result-card${stopped ? " stopped" : ""}${pausedRun ? " paused" : ""}${issues ? " has-issues" : ""}`);
 				const title = el("div", "result-title");
-				title.appendChild(el("span", stopped ? "stop-circle" : "check-circle", stopped ? "■" : "✓"));
-				title.appendChild(el("span", "result-heading", stopped ? "Stopped" : msg.status === "completed" || msg.status === "success" ? "Task completed" : `Finished (${msg.status})`));
+				title.appendChild(el("span", stopped ? "stop-circle" : pausedRun ? "pause-circle" : "check-circle", stopped ? "■" : pausedRun ? "⏸" : "✓"));
+				title.appendChild(el("span", "result-heading", stopped ? "Stopped" : pausedRun ? "Waiting for input" : msg.status === "completed" || msg.status === "success" ? "Task completed" : `Finished (${msg.status})`));
 				const pill = stopped
 					? el("span", "status-pill stopped", "Stopped")
-					: issues
-						? el("span", "status-pill warn", `${issues} issue${issues > 1 ? "s" : ""}`)
-						: el("span", "status-pill completed", "Completed");
+					: pausedRun
+						? el("span", "status-pill paused", "Paused")
+						: issues
+							? el("span", "status-pill warn", `${issues} issue${issues > 1 ? "s" : ""}`)
+							: el("span", "status-pill completed", "Completed");
 				pill.style.marginLeft = "auto";
 				title.appendChild(pill);
 				card.appendChild(title);
-				if (issues) card.appendChild(el("div", "result-issues", `${issues} command${issues > 1 ? "s" : ""} or check${issues > 1 ? "s" : ""} failed during this run — expand the cards above to inspect.`));
+				if (issues) card.appendChild(el("div", "result-issues", `${issues} failure${issues > 1 ? "s" : ""} never resolved: ${resolution.unresolvedKeys.slice(0, 5).join(", ")}${resolution.unresolvedKeys.length > 5 ? "…" : ""} — expand the cards above to inspect.`));
+				if (!issues && resolution.resolvedFails) card.appendChild(el("div", "result-resolved", `${resolution.resolvedFails} failure${resolution.resolvedFails > 1 ? "s" : ""} during the run — all later resolved (normal compile-test iteration).`));
 				const blocked = boardActive ? [...boardTasks.values()].filter((t) => t.status === "blocked").length : 0;
 				if (blocked) card.appendChild(el("div", "result-issues blocked", `${blocked} plan task${blocked > 1 ? "s" : ""} could not be completed this run — see the plan card above.`));
 				if (msg.text) {
@@ -2412,9 +2625,24 @@
 				// otherwise it is swallowed into the just-collapsed group.
 				closeGroup(stopped ? "Stopped · worked for" : "Finished · worked for");
 				add(card);
+				// A question-pause is interactive: parse the model's final text into a
+				// survey — option chips where choices exist, free text otherwise. The
+				// answers compose a message that resumes the run.
+				if (pausedRun && /^Paused \(question/.test(String(msg.text ?? ""))) {
+					// Structured ask_user questions render as-is; the heuristic text
+					// parse is only the fallback for models that ignore the tool.
+					const structured = Array.isArray(msg.questions) && msg.questions.length
+						? msg.questions.map((q) => ({ text: String(q.question ?? ""), options: Array.isArray(q.options) ? q.options : inferOptions(String(q.question ?? "")) }))
+						: [];
+					const questions = structured.length ? structured : parseQuestions(lastAssistantText);
+					if (questions.length) add(buildSurvey(questions));
+				}
+				// A completed run's next steps are one-click continuations: the model's
+				// structured suggestions plus harness-derived blocked work, as chips.
+				if (!stopped && !pausedRun && Array.isArray(msg.suggestions) && msg.suggestions.length) add(buildSuggestions(msg.suggestions));
 				setRunning(false);
 				stopTimer();
-				setStatus(stopped ? "Stopped" : `Done (${msg.status})`);
+				setStatus(stopped ? "Stopped" : pausedRun ? "Paused" : `Done (${msg.status})`);
 				break;
 			}
 			case "run-failed": {
@@ -2458,6 +2686,124 @@
 				break;
 			}
 		}
+	};
+
+	/* ---------- question survey — a paused-for-question run becomes interactive ---------- */
+	// Parse user-directed questions out of the model's final text: numbered or
+	// bulleted lines containing "?", with lettered sub-options when present and
+	// yes/no chips for closed questions. Free text is always available.
+	const inferOptions = (/** @type {any} */ questionText = undefined) =>
+		/^(should|do|does|is|are|can|could|will|would|shall|may)\b/i.test(String(questionText ?? "")) ? ["Yes", "No"] : [];
+	const parseQuestions = (/** @type {any} */ text = undefined) => {
+		const lines = String(text ?? "").split("\n");
+		const questions = /** @type {any[]} */ ([]);
+		let current = /** @type {any} */ (null);
+		const flush = () => { if (current) questions.push(current); current = null; };
+		for (const rawLine of lines) {
+			const line = rawLine.trim();
+			if (!line) continue;
+			const num = line.match(/^(\d+)[.)]\s+(.+)/);
+			if (num && num[2].includes("?")) {
+				flush();
+				current = { text: num[2].trim(), options: /** @type {string[]} */ ([]) };
+				continue;
+			}
+			if (current) {
+				const opt = line.match(/^\(?([a-eA-E])[.)]\s+(.+)/);
+				if (opt && current.options.length < 6) {
+					current.options.push(opt[2].trim());
+					continue;
+				}
+				// unnumbered continuation ending in ? merges into the question text
+				if (!current.options.length && line.endsWith("?") && current.text.length < 200) current.text += " " + line;
+				continue;
+			}
+			const bare = line.match(/^[-*•]\s+(.+\?)\s*$/) || line.match(/^(.{12,300}\?)\s*$/);
+			if (bare) {
+				flush();
+				current = { text: bare[1].trim(), options: [] };
+			}
+		}
+		flush();
+		// closed questions get yes/no quick chips unless they already have options
+		for (const q of questions) {
+			if (!q.options.length) q.options = inferOptions(q.text);
+		}
+		return questions.slice(0, 6);
+	};
+
+	// Next-step chips under a completion card: clicking sends the step as a new task.
+	const buildSuggestions = (/** @type {any} */ suggestions = undefined) => {
+		const card = el("div", "step qa-survey next-steps");
+		card.appendChild(el("div", "qa-title", "Suggested next steps — pick one, or type in the composer as usual"));
+		const chips = el("div", "qa-chips");
+		for (const s of suggestions) {
+			const label = String(s ?? "");
+			if (!label) continue;
+			const chip = el("button", "qa-chip", label.length > 72 ? `${label.slice(0, 69)}…` : label);
+			chip.title = label;
+			chip.addEventListener("click", () => {
+				card.remove();
+				vscode.postMessage(cloudEnv ? { type: "runCloud", task: label, mode } : { type: "run", task: label, mode, pick: { modelId, profile: modelProfile }, engine });
+			});
+			chips.appendChild(chip);
+		}
+		card.appendChild(chips);
+		const dismiss = el("button", "qa-dismiss", "Dismiss");
+		dismiss.addEventListener("click", () => card.remove());
+		card.appendChild(dismiss);
+		return card;
+	};
+	const buildSurvey = (/** @type {any} */ questions = undefined) => {
+		const card = el("div", "step qa-survey");
+		card.appendChild(el("div", "qa-title", "The agent is asking — answer below, or type in the composer as usual"));
+		const fields = questions.map((/** @type {any} */ q = undefined, /** @type {any} */ i = undefined) => {
+			const wrap = el("div", "qa-field");
+			wrap.appendChild(el("div", "qa-q", `${i + 1}. ${q.text}`));
+			const input = /** @type {HTMLInputElement} */ (el("input", "qa-input"));
+			input.type = "text";
+			input.placeholder = q.options.length ? "or type your own answer…" : "type your answer…";
+			if (q.options.length) {
+				const chips = el("div", "qa-chips");
+				for (const opt of q.options) {
+					const chip = el("button", "qa-chip", opt.length > 60 ? `${opt.slice(0, 57)}…` : opt);
+					chip.title = opt;
+					chip.addEventListener("click", () => {
+						const was = chip.classList.contains("selected");
+						chips.querySelectorAll(".qa-chip").forEach((c) => c.classList.remove("selected"));
+						if (!was) {
+							chip.classList.add("selected");
+							input.value = opt;
+						} else input.value = "";
+						input.dispatchEvent(new Event("input"));
+					});
+					chips.appendChild(chip);
+				}
+				wrap.appendChild(chips);
+			}
+			wrap.appendChild(input);
+			return { q, input, wrap };
+		});
+		for (const f of fields) card.appendChild(f.wrap);
+		const actions = el("div", "qa-actions");
+		const submitBtn = el("button", "continue-btn", "Send answers");
+		submitBtn.addEventListener("click", () => {
+			const lines = fields.map((f, i) => {
+				const answer = f.input.value.trim();
+				if (!answer) return null;
+				const short = f.q.text.length > 80 ? `${f.q.text.slice(0, 77)}…` : f.q.text;
+				return `${i + 1}. ${short} — ${answer}`;
+			}).filter(Boolean);
+			if (!lines.length) return;
+			const text = `Answers to your questions:\n${lines.join("\n")}`;
+			card.remove();
+			vscode.postMessage(cloudEnv ? { type: "runCloud", task: text, mode } : { type: "run", task: text, mode, pick: { modelId, profile: modelProfile }, engine });
+		});
+		const dismiss = el("button", "qa-dismiss", "Dismiss");
+		dismiss.addEventListener("click", () => card.remove());
+		actions.append(submitBtn, dismiss);
+		card.appendChild(actions);
+		return card;
 	};
 
 	/* ---------- event queue ---------- */

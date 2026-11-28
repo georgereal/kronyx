@@ -140,14 +140,32 @@ export function reduce(state: HarnessState, event: SessionEvent): HarnessState {
 		case "task.removed":
 		case "step.added":
 			ledger = applyLedgerEvent(ledger, event, outcomes);
+			// Stamp the creation seq: a dep-blocked task's steps can't open until
+			// its deps finish, but the model works ahead — proof from before
+			// startedSeq is real work and the evidence window must reach it.
+			const createdId = event.type === "task.created" ? event.task.id : event.type === "task.adopted" ? event.id : undefined;
+			if (createdId && ledger.tasks[createdId]?.createdSeq === undefined) {
+				const t = ledger.tasks[createdId]!;
+				ledger = { ...ledger, tasks: { ...ledger.tasks, [createdId]: { ...t, createdSeq: event.seq } } };
+			}
 			break;
-		case "step.updated":
+		case "step.updated": {
 			ledger = applyLedgerEvent(ledger, event, outcomes);
 			// A task whose steps move without an explicit task.updated is de
 			// facto started — open its proof window here so evidence attaches.
 			if (event.to !== "pending" && ledger.tasks[event.taskId]?.startedSeq === undefined)
 				ledger = markTaskStart(ledger, event.taskId, event.seq);
+			// Annotate the close seq so the evidence window of the NEXT step opens
+			// here: proof belongs to the step whose work it was, not the whole task.
+			if (event.to === "done" || event.to === "failed") {
+				const task = ledger.tasks[event.taskId];
+				if (task) {
+					const steps = task.steps.map((s) => (s.id === event.stepId ? { ...s, closedSeq: event.seq } : s));
+					ledger = { ...ledger, tasks: { ...ledger.tasks, [event.taskId]: { ...task, steps } } };
+				}
+			}
 			break;
+		}
 		case "task.updated":
 			ledger = applyLedgerEvent(ledger, event, outcomes);
 			if (event.to === "in_progress") ledger = markTaskStart(ledger, event.id, event.seq);
@@ -180,6 +198,12 @@ export function reduce(state: HarnessState, event: SessionEvent): HarnessState {
 			counters.inputTokens += event.usage?.inputTokens ?? 0;
 			counters.outputTokens += event.usage?.outputTokens ?? 0;
 			counters.cachedTokens += event.usage?.cachedTokens ?? 0;
+			// Compaction drops tool outputs from what the model sees, so re-reading
+			// a file after the recap is reconstruction, not looping. Pre-recap
+			// calls must not count toward repeat detection — and strikes reset,
+			// since the model acts on the recap rather than on its earlier calls.
+			history = [];
+			strikes = 0;
 			break;
 		case "context.cleared":
 			// Clear context drops what the model sees; the ledger, counters and the log stay. The server copy goes with it.

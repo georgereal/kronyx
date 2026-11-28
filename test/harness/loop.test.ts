@@ -41,7 +41,7 @@ function harness(opts: { script: Array<Partial<ModelResponse> & { calls?: ToolCa
 }
 
 const createTask = (id: string, deps: string[] = []) =>
-	call(`c-${id}`, "task_create", { id, title: id, acceptance: { kind: "command", command: "true" }, dependsOn: deps, steps: [{ id: "s1", text: `${id} work` }] });
+	call(`c-${id}`, "task_create", { id, title: id, acceptance: { kind: "command", command: "npm test" }, dependsOn: deps, steps: [{ id: "s1", text: `${id} work` }] });
 const noopSpec: ToolSpec = { name: "noop", description: "", inputSchema: {} };
 const stepUpdate = (taskId: string, stepId: string, status: string, callIds: string[], callId: string) => call(callId, "task_step_update", { taskId, stepId, status, callIds });
 /** Creates a task, proves its one step with a successful tool call, then tries to finish the task. */
@@ -54,14 +54,20 @@ const finishTaskScript = (id: string) => [
 	acting(setStatus(id, "done")),
 ];
 const setStatus = (id: string, status: string, callId = `s-${id}-${status}`) => call(callId, "task_update", { id, status });
+/** Tail of finishTaskScript minus the proving call — for scripts that supply their own proof. */
+const finishTaskScriptRest = () => [
+	acting(stepUpdate("t1", "s1", "in_progress", [], "t1-s1a")),
+	acting(stepUpdate("t1", "s1", "done", ["r1"], "t1-s1b")),
+	acting(setStatus("t1", "in_progress")),
+	acting(setStatus("t1", "done")),
+];
 
 describe("HarnessLoop: happy path", () => {
 	it("creates a task, proves its step with a tool call, verifies and completes it, then finishes", async () => {
 		const { loop, log, scripted } = harness({
 			verifier: passingVerifier,
 			tools: fakeTools([noopSpec]),
-			// Task completion queues a recap — this entry is consumed by makeRecap.
-			script: [...finishTaskScript("parser"), { text: "parser task brief" }, finish("parser is done")],
+			script: [...finishTaskScript("parser"), finish("parser is done")],
 		});
 		const outcome = await loop.run("add a parser");
 		expect(outcome).toMatchObject({ status: "completed" });
@@ -85,7 +91,7 @@ describe("HarnessLoop: steering", () => {
 			verifier: passingVerifier,
 			tools: fakeTools([noopSpec]),
 			script: [
-				acting(call("c-a", "task_create", { id: "a", title: "a", acceptance: { kind: "command", command: "true" }, steps: [{ id: "s1", text: "work", signal: { tool: "noop" } }] })),
+				acting(call("c-a", "task_create", { id: "a", title: "a", acceptance: { kind: "command", command: "npm test" }, steps: [{ id: "s1", text: "work", signal: { tool: "noop" } }] })),
 				finish("all done"),
 				acting(call("w", "noop", {})),
 				finish("now done"),
@@ -132,10 +138,11 @@ describe("HarnessLoop: steering", () => {
 	it("rejects marking a task done without a verifier configured", async () => {
 		const { loop } = harness({ script: [acting(createTask("a")), acting(setStatus("a", "in_progress")), acting(setStatus("a", "done")), finish()] , limits: { maxRefusals: 0 } });
 		const outcome = await loop.run("x");
-		expect(loop.projection.ledger.tasks.a?.status).toBe("in_progress");
+		// No frozen pause: with no user to ask, the open task is marked blocked and the run ends.
+		expect(loop.projection.ledger.tasks.a?.status).toBe("blocked");
 		const result = loop.projection.messages.find((m) => m.kind === "tool" && m.callId === "s-a-done");
 		expect(result).toMatchObject({ ok: false });
-		expect(outcome.status).toBe("paused");
+		expect(outcome.status).not.toBe("paused");
 	});
 
 	it("keeps a task open when its acceptance check fails", async () => {
@@ -146,7 +153,7 @@ describe("HarnessLoop: steering", () => {
 			script: [...finishTaskScript("a"), finish()],
 		});
 		await loop.run("x");
-		expect(loop.projection.ledger.tasks.a?.status).toBe("in_progress");
+		expect(loop.projection.ledger.tasks.a?.status).toBe("blocked");
 		expect(loop.projection.ledger.verified).toEqual([]);
 		const failed = loop.projection.messages.find((m) => m.kind === "tool" && m.callId === "s-a-done");
 		expect(failed).toMatchObject({ ok: false });
@@ -157,7 +164,7 @@ describe("HarnessLoop: steering", () => {
 		const { loop } = harness({
 			verifier: passingVerifier,
 			tools: fakeTools([noopSpec]),
-			script: [...finishTaskScript("a"), { text: "task a brief" }, acting(call("rm", "task_remove", { id: "a" })), finish()],
+			script: [...finishTaskScript("a"), acting(call("rm", "task_remove", { id: "a" })), finish()],
 		});
 		await loop.run("x");
 		expect(loop.projection.ledger.order).toEqual(["a"]);
@@ -313,12 +320,13 @@ describe("HarnessLoop: steering integration (M4)", () => {
 		expect(bad?.kind === "tool" && bad.output).toMatch(/step\.grounding|callIds/);
 	});
 
-	it("pauses when a beforeModel rule denies, without calling the model", async () => {
+	it("a beforeModel denial strips tools for the turn instead of pausing — the model writes up and the run completes", async () => {
 		const { scripted } = harness({ script: [finish()] });
 		const registry = new (await import("../../src/harness/defaults/steering")).SteeringRegistry();
-		registry.add("beforeModel", { id: "stop-here", point: "beforeModel", order: 0, decide: () => ({ kind: "deny", reason: "budget frozen" }) });
-		const paused = new HarnessLoop({ runId: "r", log: new MemoryEventLog(() => 1), model: scripted.model, tools: fakeTools(), steering: registry });
-		expect(await paused.run("x")).toMatchObject({ status: "paused", reason: "budget frozen" });
+		registry.add("beforeModel", { id: "stop-here", point: "beforeModel", order: 0, decide: () => ({ kind: "deny", rule: "stop-here", reason: "budget frozen" }) });
+		const loop = new HarnessLoop({ runId: "r", log: new MemoryEventLog(() => 1), model: scripted.model, tools: fakeTools(), steering: registry });
+		// No pause: the denial rides as a note, tools are stripped, the model's text completes the run.
+		expect(await loop.run("x")).toMatchObject({ status: "completed" });
 	});
 
 	it("fails the run with the rule id when an onStop rule throws", async () => {
@@ -352,6 +360,29 @@ describe("HarnessLoop: loop controller (M5)", () => {
 		expect(blocked).toMatchObject({ ok: false });
 	});
 
+	it("read-only repeats escalate warn → block but never strip or pause the run", async () => {
+		const readSpec: ToolSpec = { name: "read_file", description: "", inputSchema: {} };
+		const calls = [1, 2, 3, 4, 5, 6, 7].map((i) => acting(call(`r${i}`, "read_file", { path: "a" })));
+		const { loop, log, scripted } = harness({
+			verifier: passingVerifier,
+			tools: fakeTools([readSpec, noopSpec]),
+			loop: loopCfg,
+			script: [...calls, finish("done reading")],
+		});
+		const outcome = await loop.run("x");
+		expect(outcome.status).toBe("completed");
+		expect(scripted.remaining()).toBe(0);
+		const levels = (await log.read()).filter((e) => e.type === "loop.verdict").map((e) => (e.type === "loop.verdict" ? e.level : ""));
+		// First repeat warns; every later one is blocked — never strip or pause.
+		expect(levels).toEqual(["warn", "block", "block", "block", "block"]);
+		const events = await log.read();
+		const reads = events.filter((e) => e.type === "tool.finished" && e.name === "read_file");
+		expect(reads.length).toBe(7);
+		// The warned read still executed; the blocked ones were refused.
+		expect(reads.filter((e) => e.type === "tool.finished" && e.ok).length).toBe(3);
+		expect(reads.filter((e) => e.type === "tool.finished" && !e.ok && e.output.includes("Blocked")).length).toBe(4);
+	});
+
 	it("pauses with reason loop when the model keeps going after the strip level", async () => {
 		const calls = [1, 2, 3, 4, 5, 6, 7].map((i) => acting(call(`r${i}`, "noop", { path: "a" })));
 		const { loop } = harness({ verifier: passingVerifier, tools: fakeTools([noopSpec]), loop: loopCfg, script: calls });
@@ -383,6 +414,74 @@ describe("HarnessLoop: loop controller (M5)", () => {
 		await loop.run("x");
 		const verdicts = (await log.read()).filter((e) => e.type === "loop.verdict");
 		expect(verdicts.some((e) => e.type === "loop.verdict" && e.reason === "alternation")).toBe(true);
+	});
+
+	it("records off-plan writes as a divergence episode that opens and closes with plan work", async () => {
+		const writeSpec: ToolSpec = { name: "write_file", description: "", inputSchema: {} };
+		const editSpec: ToolSpec = { name: "edit_file", description: "", inputSchema: {} };
+		// Plan step is signaled on write_file pom.xml — edit_file on unrelated paths
+		// can't serve it, so those calls are divergence; the proving write closes both.
+		const createSignaled = call("c-t1", "task_create", {
+			id: "t1",
+			title: "t1",
+			acceptance: { kind: "command", command: "npm test" },
+			dependsOn: [],
+			steps: [{ id: "s1", text: "write pom", signal: { tool: "write_file", path: "pom.xml" } }],
+		});
+		const { loop, log } = harness({
+			verifier: passingVerifier,
+			tools: fakeTools([writeSpec, editSpec, noopSpec]),
+			script: [
+				acting(createSignaled),
+				acting(call("w1", "edit_file", { path: "unrelated.ts" })),
+				acting(call("w2", "edit_file", { path: "other.ts" })),
+				acting(call("r1", "write_file", { path: "pom.xml" })),
+				acting(stepUpdate("t1", "s1", "in_progress", [], "t1-s1a")),
+				acting(stepUpdate("t1", "s1", "done", ["r1"], "t1-s1b")),
+				acting(setStatus("t1", "in_progress")),
+				acting(setStatus("t1", "done")),
+				finish(),
+				finish(),
+				finish(),
+			],
+		});
+		const outcome = await loop.run("x");
+		expect(outcome.status).toBe("completed");
+		const events = await log.read();
+		const created = events.find((e) => e.type === "task.created" && e.task.id.startsWith("x"));
+		expect(created).toBeTruthy();
+		if (created?.type === "task.created") expect(created.task.origin).toBe("divergence");
+		const updates = events.filter((e) => e.type === "task.updated" && e.id === "x1").map((e) => (e.type === "task.updated" ? e.to : ""));
+		expect(updates).toEqual(["in_progress", "done"]);
+	});
+
+	it("leaves a divergence episode honestly in_progress when the run pauses mid-episode", async () => {
+		const writeSpec: ToolSpec = { name: "write_file", description: "", inputSchema: {} };
+		const editSpec: ToolSpec = { name: "edit_file", description: "", inputSchema: {} };
+		const createSignaled = call("c-t1", "task_create", {
+			id: "t1",
+			title: "t1",
+			acceptance: { kind: "command", command: "npm test" },
+			dependsOn: [],
+			steps: [{ id: "s1", text: "write pom", signal: { tool: "write_file", path: "pom.xml" } }],
+		});
+		const { loop, log } = harness({
+			verifier: passingVerifier,
+			tools: fakeTools([writeSpec, editSpec, noopSpec]),
+			limits: { maxTurns: 3 },
+			script: [
+				acting(createSignaled),
+				acting(call("w1", "edit_file", { path: "unrelated.ts" })),
+				acting(call("w2", "edit_file", { path: "other.ts" })),
+			],
+		});
+		const outcome = await loop.run("x");
+		expect(outcome.status).toBe("paused");
+		const events = await log.read();
+		const created = events.find((e) => e.type === "task.created" && e.task.id === "x1");
+		expect(created).toBeTruthy();
+		const updates = events.filter((e) => e.type === "task.updated" && e.id === "x1").map((e) => (e.type === "task.updated" ? e.to : ""));
+		expect(updates).toEqual(["in_progress"]);
 	});
 
 	it("clears strikes after progress, so a later repeat starts at warn again", async () => {
@@ -434,18 +533,16 @@ describe("HarnessLoop: steering ask verdicts", () => {
 });
 
 describe("HarnessLoop: automatic recap", () => {
-	it("writes a context.recap after a task closes, before the next model call", async () => {
+	it("does not recap on task completion alone — only pressure or the manual compact", async () => {
 		const { loop, log } = harness({
 			verifier: passingVerifier,
 			tools: fakeTools([noopSpec]),
-			// Task closes at stop-check; the following script entry is consumed by makeRecap.
-			script: [...finishTaskScript("a"), { text: "task a brief: parser written and verified" }, finish("wrapped up")],
+			script: [...finishTaskScript("a"), finish("wrapped up")],
 		});
 		const outcome = await loop.run("x");
 		expect(outcome.status).toBe("completed");
 		const recaps = (await log.read()).filter((e) => e.type === "context.recap");
-		expect(recaps.length).toBe(1);
-		expect(recaps[0]?.type === "context.recap" && recaps[0].text).toContain("parser written");
+		expect(recaps.length).toBe(0);
 	});
 
 	it("does not auto-recap when no task closed and no budget pressure", async () => {
@@ -456,5 +553,182 @@ describe("HarnessLoop: automatic recap", () => {
 		await loop.run("x");
 		const recaps = (await log.read()).filter((e) => e.type === "context.recap");
 		expect(recaps.length).toBe(0);
+	});
+});
+
+describe("verify-signal disambiguation", () => {
+	it("one compile run closes only the earliest open verify step, not every phase's", async () => {
+		const { MemoryEventLog } = await import("../../src/harness/core/eventLog");
+		const { HarnessLoop } = await import("../../src/harness/core/loop");
+		const { project } = await import("../../src/harness/core/projections");
+		const log = new MemoryEventLog(() => 1);
+		let calls = 0;
+		const model = {
+			complete: async () => {
+				calls++;
+				return calls === 1
+					? { text: "", toolCalls: [{ callId: "c1", name: "run_command", input: { command: "mvn clean compile" } }], usage: { inputTokens: 1, outputTokens: 1, cachedTokens: 0 } }
+					: { text: "done", toolCalls: [], usage: { inputTokens: 1, outputTokens: 1, cachedTokens: 0 } };
+			},
+		};
+		const tools = { specs: () => [{ name: "run_command", description: "", inputSchema: {} }], execute: async () => ({ ok: true, output: "BUILD SUCCESS" }) };
+		const loop = new HarnessLoop({ runId: "r1", log, model: model as never, tools: tools as never });
+		// Two phases, each ending in the SAME verify command — the ambiguity case.
+		await loop.run("x", undefined, undefined, {
+			seed: [
+				{ title: "Phase A", steps: ["Run `mvn clean compile` to verify"] },
+				{ title: "Phase B", steps: ["Run `mvn clean compile` to verify"] },
+			],
+		});
+		const state = project(await log.read());
+		// t1's verify step closed; t2's did NOT (it's not even active yet — chained).
+		expect(state.ledger.tasks.t1?.steps[0]?.status).toBe("done");
+		expect(state.ledger.tasks.t2?.steps[0]?.status).not.toBe("done");
+	});
+});
+
+describe("beforeModel deny handling", () => {
+	it("a beforeModel denial strips tools for one turn instead of pausing — the run converges without the user", async () => {
+		const { SteeringRegistry } = await import("../../src/harness/defaults/steering");
+		const registry = new SteeringRegistry();
+		registry.add("beforeModel", {
+			id: "test.deny",
+			point: "beforeModel",
+			order: 1,
+			decide: ({ turn }: { turn: number }) => (turn === 1 ? { kind: "deny" as const, rule: "test.deny", reason: "Stop exploring — report what you found." } : { kind: "allow" as const }),
+		});
+		const scripted = scriptedModel([
+			{ text: "Here is what I found so far." }, // the stripped first turn: text is all it can produce
+		]);
+		const log = new MemoryEventLog(() => 1);
+		const loop = new HarnessLoop({ runId: "run-1", log, model: scripted.model, tools: fakeTools([noopSpec]), steering: registry });
+		const outcome = await loop.run("investigate");
+		// never pauses on the denial — and the second turn ran with no tools
+		expect(outcome.status).not.toBe("paused");
+		const events = await log.read();
+		const denial = events.find((e) => e.type === "steer.note" && e.rule === "test.deny");
+		expect(denial).toBeTruthy();
+		expect(denial?.type === "steer.note" && denial.text).toContain("Tools are stripped");
+		// no tool ever ran — the stripped turn could only write text
+		expect(events.some((e) => e.type === "tool.finished")).toBe(false);
+		expect(scripted.remaining()).toBe(0);
+	});
+});
+
+describe("plan-mode run termination", () => {
+	const savePlan = (callId = "sp1") => call(callId, "save_plan", { slug: "x", content: "# plan" });
+	const planSpecs: ToolSpec[] = [
+		{ name: "save_plan", description: "", inputSchema: {} },
+		{ name: "write_file", description: "", inputSchema: {} },
+		noopSpec,
+	];
+
+	it("ends the run after save_plan in a read-only (plan mode) run — no implementation turns", async () => {
+		const scripted = scriptedModel([
+			acting(createTask("t1")),
+			acting(savePlan()),
+			// the script deliberately has more turns queued — if the loop continues,
+			// they execute and the test fails its assertions below
+			acting(call("w1", "write_file", { path: "src/x.ts", content: "x" })),
+			finish(),
+		]);
+		const log = new MemoryEventLog(() => 1);
+		const tools = fakeTools(planSpecs, (name) =>
+			name === "save_plan" ? { ok: true, output: "Plan saved to plans/x.md" } : { ok: true, output: "ok" },
+		);
+		const loop = new HarnessLoop({ runId: "run-1", log, model: scripted.model, tools, verifier: passingVerifier, writable: false });
+		const outcome = await loop.run("task");
+		expect(outcome.status).toBe("completed");
+		// the write turn never happened — the run ended right after the plan saved
+		const events = (log as unknown as { events: Array<{ type: string; name?: string; rule?: string }> }).events ?? [];
+		const writes = events.filter((e) => e.type === "tool.requested" && e.name === "write_file");
+		expect(writes.length).toBe(0);
+		expect(scripted.remaining()).toBe(2);
+	});
+
+	it("still continues after save_plan in a writable run — realign behavior unchanged", async () => {
+		const scripted = scriptedModel([
+			acting(createTask("t1")),
+			acting(savePlan()),
+			...finishTaskScriptRest(),
+			finish(),
+		]);
+		const log = new MemoryEventLog(() => 1);
+		const tools = fakeTools(planSpecs, (name) =>
+			name === "save_plan" ? { ok: true, output: "Plan saved to plans/x.md" } : { ok: true, output: "ok" },
+		);
+		const loop = new HarnessLoop({ runId: "run-1", log, model: scripted.model, tools, verifier: passingVerifier, writable: true });
+		const outcome = await loop.run("task");
+		expect(outcome.status).toBe("completed");
+		// the run consumed its full script — saving the plan did not end it
+		expect(scripted.remaining()).toBe(0);
+	});
+
+	it("never refusal-loops a read-only stop with open tasks — ends blocked instead", async () => {
+		const scripted = scriptedModel([
+			acting(createTask("t1")),
+			finish("the plan is ready"),
+			// if the stop is refused the loop asks the model again — scripted turns
+			// would run out and the run would fail, failing the test
+		]);
+		const log = new MemoryEventLog(() => 1);
+		const loop = new HarnessLoop({ runId: "run-1", log, model: scripted.model, tools: fakeTools(), verifier: failingVerifier, writable: false });
+		const outcome = await loop.run("task");
+		expect(outcome.status).toBe("completed");
+		const events = (log as unknown as { events: Array<{ type: string; to?: string }> }).events ?? [];
+		const blocked = events.filter((e) => e.type === "task.updated" && e.to === "blocked");
+		expect(blocked.length).toBeGreaterThan(0);
+		const refused = events.filter((e) => e.type === "stop.refused");
+		expect(refused.length).toBe(0);
+	});
+});
+
+describe("live mode accessor", () => {
+	const savePlan2 = (callId = "sp1") => call(callId, "save_plan", { slug: "x", content: "# plan" });
+	const planSpecs2: ToolSpec[] = [
+		{ name: "save_plan", description: "", inputSchema: {} },
+		{ name: "write_file", description: "", inputSchema: {} },
+		noopSpec,
+	];
+
+	it("evaluates writability at decision time — flipping to code as save_plan lands keeps the run going", async () => {
+		let writable = false;
+		const scripted = scriptedModel([
+			acting(savePlan2()),
+			acting(call("w1", "write_file", { path: "x.ts", content: "x" })),
+			finish(),
+		]);
+		const log = new MemoryEventLog(() => 1);
+		// the user flips the composer to code mode while the save_plan call is in flight —
+		// the termination decision reads the live mode, so the run continues
+		const tools = fakeTools(planSpecs2, (name) => {
+			if (name === "save_plan") {
+				writable = true;
+				return { ok: true, output: "Plan saved to plans/x.md" };
+			}
+			return { ok: true, output: "ok" };
+		});
+		const loop = new HarnessLoop({ runId: "run-1", log, model: scripted.model, tools, verifier: passingVerifier, writable: () => writable });
+		const outcome = await loop.run("task");
+		expect(outcome.status).toBe("completed");
+		const events = (log as unknown as { events: Array<{ type: string; name?: string }> }).events ?? [];
+		expect(events.filter((e) => e.type === "tool.requested" && e.name === "write_file").length).toBe(1);
+	});
+
+	it("a run already in code mode at save_plan time does not end", async () => {
+		let writable = true;
+		const scripted = scriptedModel([
+			acting(savePlan2()),
+			acting(call("w1", "write_file", { path: "x.ts", content: "x" })),
+			finish(),
+		]);
+		const log = new MemoryEventLog(() => 1);
+		const tools = fakeTools(planSpecs2, (name) =>
+			name === "save_plan" ? { ok: true, output: "Plan saved to plans/x.md" } : { ok: true, output: "ok" },
+		);
+		const loop = new HarnessLoop({ runId: "run-1", log, model: scripted.model, tools, verifier: passingVerifier, writable: () => writable });
+		const outcome = await loop.run("task");
+		expect(outcome.status).toBe("completed");
+		expect(scripted.remaining()).toBe(0);
 	});
 });

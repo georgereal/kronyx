@@ -17,6 +17,8 @@ export interface ProviderProfile {
 	/** Last fetched model catalog, persisted so the Models page renders without re-fetching. */
 	models?: ModelOption[];
 	modelsFetchedAt?: number;
+	/** Wire shape override for this provider — absent/"auto" resolves through the API-shape matrix. */
+	apiShape?: "cline" | "responses" | "conversations" | "chat" | "auto";
 }
 
 /** A provider profile's model catalog, as shown by the composer's provider filter. */

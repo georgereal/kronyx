@@ -63,3 +63,15 @@ describe("injected behavior", () => {
 		expect(outcome.status).toBe("paused");
 	});
 });
+
+describe("context-window-derived budget", () => {
+	it("scales budgetChars with the model's window; falls back when unknown", async () => {
+		const { resolveBehaviorProfile } = await import("../../src/harness/behaviors");
+		const big = resolveBehaviorProfile({ providerId: "p", modelId: "m", contextWindow: 128_000 });
+		expect(big.context.budgetChars).toBe(Math.floor(128_000 * 0.7) * 4);
+		const small = resolveBehaviorProfile({ providerId: "p", modelId: "m", contextWindow: 32_000 });
+		expect(small.context.budgetChars).toBe(Math.floor(32_000 * 0.7) * 4);
+		const unknown = resolveBehaviorProfile({ providerId: "p", modelId: "m" });
+		expect(unknown.context.budgetChars).toBe(120_000);
+	});
+});

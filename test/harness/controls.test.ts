@@ -34,7 +34,7 @@ describe("task board (step 8)", () => {
 			complete: async () => {
 				turn++;
 				return turn === 1
-					? { text: "", toolCalls: [{ callId: "c", name: "task_create", input: { id: "a", title: "Parser", acceptance: { kind: "command", command: "true" }, steps: [{ id: "s1", text: "write it" }] } }] }
+					? { text: "", toolCalls: [{ callId: "c", name: "task_create", input: { id: "a", title: "Parser", acceptance: { kind: "command", command: "npm test" }, steps: [{ id: "s1", text: "write it" }] } }] }
 					: { text: "", toolCalls: [] };
 			},
 		};
@@ -45,5 +45,36 @@ describe("task board (step 8)", () => {
 		expect(boardOf(loop.projection)).toEqual([
 			{ id: "a", title: "Parser", status: "blocked", steps: [{ id: "s1", text: "write it", status: "in_progress", callIds: [] }] },
 		]);
+	});
+});
+
+describe("intervening writes reset command-repeat detection", () => {
+	it("re-running a test command after edits is iteration, not a repeat", async () => {
+		const { detect } = await import("../../src/harness/defaults/loopControl");
+		const { DEFAULT_LOOP_DETECTOR } = await import("../../src/harness/core/contracts");
+		const cmd = "run_command:mvn clean test";
+		const write = "edit_file:src/Foo.java";
+		// 4 identical command fingerprints but writes intervened — no repeat verdict.
+		const history = [
+			{ fingerprint: cmd }, { fingerprint: write }, { fingerprint: cmd },
+			{ fingerprint: write }, { fingerprint: cmd }, { fingerprint: write }, { fingerprint: cmd },
+		].map((r, i) => ({ ...r, resultHash: "h", callId: `c${i}` }));
+		expect(detect(history, cmd, DEFAULT_LOOP_DETECTOR)).toBeUndefined();
+	});
+
+	it("the same command with no intervening writes still repeats", async () => {
+		const { detect } = await import("../../src/harness/defaults/loopControl");
+		const { DEFAULT_LOOP_DETECTOR } = await import("../../src/harness/core/contracts");
+		const cmd = "run_command:mvn clean test";
+		const history = [{ fingerprint: cmd, resultHash: "h" }, { fingerprint: cmd, resultHash: "h" }, { fingerprint: cmd, resultHash: "h" }].map((r, i) => ({ ...r, callId: `c${i}` }));
+		expect(detect(history, cmd, DEFAULT_LOOP_DETECTOR)).toBe("repeat");
+	});
+
+	it("write loops themselves are still detected — writes don't reset write fingerprints", async () => {
+		const { detect } = await import("../../src/harness/defaults/loopControl");
+		const { DEFAULT_LOOP_DETECTOR } = await import("../../src/harness/core/contracts");
+		const w = "write_file:scratch/x.txt";
+		const history = [{ fingerprint: w, resultHash: "h" }, { fingerprint: w, resultHash: "h" }, { fingerprint: w, resultHash: "h" }].map((r, i) => ({ ...r, callId: `c${i}` }));
+		expect(detect(history, w, DEFAULT_LOOP_DETECTOR)).toBe("repeat");
 	});
 });

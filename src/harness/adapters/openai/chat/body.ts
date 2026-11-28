@@ -11,5 +11,6 @@ export function chatRequestBody(config: OpenAIPortConfig, request: ModelRequest)
 		messages: toChatMessages(request.system, toAgentMessages(request.messages)),
 		tools: request.tools as ToolSpec[],
 		maxTokens: config.maxOutputTokens,
+		extras: config.extras?.(config.modelId),
 	});
 }

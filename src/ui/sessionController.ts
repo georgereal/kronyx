@@ -34,7 +34,7 @@ import { shellExec } from "../harness/tools/exec";
 import { runHarness } from "../harness/core/runner";
 import { buildHarnessReport } from "../harness/report/report";
 import type { HarnessLoop, SeedTask } from "../harness/core/loop";
-import { planSeedTasks } from "../harness/planning/planSeed";
+import { implementationIntent, planSeedTasks } from "../harness/planning/planSeed";
 import { PLAN_VISIBLE, READ_ONLY_HIDDEN } from "../agent/toolSet";
 import { createFetchTools } from "../tools/fetchTools";
 import { createMcpTools, type McpServerConfig } from "../tools/mcpTools";
@@ -55,7 +55,7 @@ const MENTION_TOTAL_CAP = 50 * 1024;
 
 /** Appended to an implement task when its plan seeded the board — the model's scope is the seed, not the session's history. */
 const IMPLEMENT_SCOPE_NOTE =
-	" The plan's steps are already on your task board — work them in order and stay inside the plan's scope. This is an implementation run: if the plan's text hedges (\"review-first\", \"no code changes\", \"pending review\"), that described the planning phase — your job now is to carry the plan out, including writing code where its steps call for deliverables. Close each step with the tool-call ids that prove it; when a check fails, fix the cause or find a working alternative, don't skip ahead.";
+	" The plan's steps are already on your task board — work them in order and stay inside the plan's scope. This is an implementation run: if the plan's text hedges (\"review-first\", \"no code changes\", \"pending review\"), that described the planning phase — your job now is to carry the plan out, including writing code where its steps call for deliverables. Close each step with task_step_update status \"done\" — the harness attaches the proving tool calls itself, never supply call ids. When a check fails, fix the cause or find a working alternative, don't skip ahead. The plan document is the record of the work: when implementation deviates from it in small ways (a file location, a renamed constant), correct the document with edit_file as you go — large scope changes are not yours to make, surface them instead.";
 
 export interface GitSettings {
 	autoBranch: boolean;
@@ -195,10 +195,10 @@ export class SessionController {
 	/** OpenAI-compatible engine for this session; recreated when the session changes (it owns a per-session transcript). */
 	private openai: OpenAIEngine | undefined;
 	private engineHost: RunnerHost | undefined;
-	private engineKind: EngineKind = "cline";
+	private engineKind: EngineKind = "auto";
 	/** Engine of the run in flight (or last run); stamped on api_calls rows for comparison. */
-	private runEngine: EngineKind = "cline";
-	private runTransport: TransportKind = "cline";
+	private runEngine: EngineKind = "auto";
+	private runTransport: TransportKind = "auto";
 	/** Resolved wire of the adapter actually in flight — the chip can ask for conversations while the provider only supports chat. */
 	private runWire: string | undefined;
 	/** Usage-row tag: harness runs are tagged by the resolved wire so fallback transports don't misreport. */
@@ -211,7 +211,7 @@ export class SessionController {
 	private harnessPaused = false;
 	/** The harness loop of the run in flight, for compact-now. */
 	private activeHarnessLoop: HarnessLoop | undefined;
-	private lastTransport: TransportKind = "cline";
+	private lastTransport: TransportKind = "auto";
 	/** MCP connections are per-session: config change rebuilds on next runner. */
 	private mcp: { key: string; tools: import("@cline/shared").AgentTool<any, string>[] } | undefined;
 	/** Per-root background process registry — disposed at each run's end. */
@@ -274,7 +274,7 @@ export class SessionController {
 		private readonly deps: SessionDeps,
 	) {
 		this.openTabs = [...new Set(deps.tabState?.get().tabs ?? [])];
-		this.engineKind = deps.tabState?.get().engines?.[name] ?? "cline";
+		this.engineKind = deps.tabState?.get().engines?.[name] ?? "auto";
 		if (!this.openTabs.includes(this.name)) this.openTabs.push(this.name);
 	}
 
@@ -284,7 +284,7 @@ export class SessionController {
 	async startNewSession(): Promise<void> {
 		this.resetEngines();
 		this.openai = undefined;
-		this.engineKind = "cline";
+		this.engineKind = "auto";
 		this.approveAll = false;
 		this.permittedTools.clear();
 		// Lowest unused N across open tabs and stored sessions — the static
@@ -323,7 +323,7 @@ export class SessionController {
 		this.approveAll = false;
 		this.permittedTools.clear();
 		this.name = name;
-		this.engineKind = this.deps.tabState?.get().engines?.[name] ?? "cline";
+		this.engineKind = this.deps.tabState?.get().engines?.[name] ?? "auto";
 		this.surface.setState({ engine: this.engineKind });
 		if (!this.openTabs.includes(name)) this.openTabs.push(name);
 		this.replayed = true;
@@ -484,6 +484,9 @@ export class SessionController {
 				break;
 			case "attach":
 				await this.attach(message.kind);
+				break;
+			case "fileQuery":
+				await this.fileQuery(message.id, String(message.query ?? ""));
 				break;
 			case "openFile":
 				{
@@ -888,8 +891,13 @@ export class SessionController {
 				this.surface.post({ type: "run-failed", error: providerErrorMessage(error!) });
 				return;
 			}
-			const transport: TransportKind = engine === "openai" || engine === "conversations" || engine === "responses" ? engine : "cline";
-			const choice = chooseTransport(settings.providerId, transport);
+			// Wire-shape resolution, strict: the session's gear pick wins; "auto" defers to
+			// the profile's API-type override, then the matrix default. No fallbacks — an
+			// unsupported explicit pick fails the run before it starts.
+			const profileShape = profiles().find((p) => p.name === settings.profile)?.apiShape;
+			const preference: TransportKind = engine === "auto" || engine === "harness" || !engine ? (profileShape && profileShape !== "auto" ? profileShape : "auto") : engine;
+			const transport: TransportKind = preference;
+			const choice = chooseTransport(settings.providerId, transport, settings.baseUrl);
 			if (!choice.ok) {
 				this.surface.post({ type: "run-failed", error: choice.message });
 				return;
@@ -926,11 +934,13 @@ export class SessionController {
 				return;
 			}
 			this.lastTransport = choice.transport;
-			// "implement <plan>.md" typed in chat: the named plan file is the board —
-			// seeded like the Implement button, or refused. Never handed to the planner.
+			// Implementation intent toward a plan document (implement/build/follow/as per):
+			// the document IS the board — parsed deterministically and seeded, never
+			// handed to the planner. Reference use of .md files never enters this path.
 			let runSeed = seed;
+			const seedNotes: string[] = [];
 			let runTask = expanded;
-			const named = !runSeed && /\bimplement\b/i.test(task) ? /@?\s*([\w./\-[\]{}()]+\.md)\b/i.exec(task)?.[1] : undefined;
+			const named = !runSeed ? implementationIntent(task) : undefined;
 			if (named) {
 				if (!(await fs.access(this.planAbs(named)).then(() => true, () => false))) {
 					return this.surface.post({ type: "run-failed", error: `${named} doesn't exist — save the plan there or fix the path, then run again.` });
@@ -938,9 +948,18 @@ export class SessionController {
 				const planned = await this.planSeed(named);
 				if ("error" in planned) return this.surface.post({ type: "run-failed", error: planned.error });
 				runSeed = planned.seed;
+				seedNotes.push(`Read ${named} — parsed ${runSeed.length} phase${runSeed.length === 1 ? "" : "s"} (${runSeed.reduce((n, t) => n + t.steps.length, 0)} steps). The document is the scope; no planner call this run.`);
 				runTask += IMPLEMENT_SCOPE_NOTE;
+				// The document is authoritative scope — its full content rides in the run
+				// context even when the user typed a bare path without @-expansion.
+				if (!task.includes("@")) {
+					try {
+						const content = await fs.readFile(this.planAbs(named), "utf8");
+						if (!runTask.includes(content.slice(0, 200))) runTask = `<plan-document path="${named}">\n${content.slice(0, 16000)}\n</plan-document>\n\n${runTask}`;
+					} catch { /* the seed already carries the steps */ }
+				}
 			}
-			await this.runOnHarness(runTask, settings, task, choice.transport, false, attachments, runSeed);
+			await this.runOnHarness(runTask, settings, task, choice.transport, false, attachments, runSeed, seedNotes);
 		} finally {
 			this.deps.runLock.release(this.name);
 		}
@@ -1103,8 +1122,14 @@ export class SessionController {
 				edits?: { old_text?: string; new_text?: string; old?: string; new?: string }[];
 				lines?: string;
 				position?: number;
+				command?: string;
+				file_text?: string;
+				old_str?: string;
+				new_str?: string;
+				old_text?: string;
+				new_text?: string;
 			};
-			if (toolName === "write_file" && typeof inp?.content === "string") {
+			const hunkDiff = async (after: string) => {
 				const { computeHunks, formatHunks } = await import("../diff/hunks");
 				let before = "";
 				try {
@@ -1112,8 +1137,9 @@ export class SessionController {
 				} catch {
 					/* new file */
 				}
-				return formatHunks(computeHunks(before, inp.content));
-			}
+				return formatHunks(computeHunks(before, after));
+			};
+			if (toolName === "write_file" && typeof inp?.content === "string") return hunkDiff(inp.content);
 			if (toolName === "edit_file" && Array.isArray(inp?.edits)) {
 				return inp.edits
 					.flatMap((e) => [
@@ -1122,6 +1148,23 @@ export class SessionController {
 					])
 					.join("\n");
 			}
+			if (toolName === "file_editor") {
+				const oldStr = inp?.old_str ?? inp?.old_text;
+				const newStr = inp?.new_str ?? inp?.new_text;
+				if (inp?.command === "create" && typeof inp.file_text === "string") return hunkDiff(inp.file_text);
+				if (inp?.command === "str_replace" && (oldStr || newStr)) {
+					return [
+						...String(oldStr ?? "").split("\n").map((l) => `-${l}`),
+						...String(newStr ?? "").split("\n").map((l) => `+${l}`),
+					].join("\n");
+				}
+				if ((inp?.command === "insert" || inp?.command === "replace_function") && typeof newStr === "string") {
+					return newStr.split("\n").map((l) => `+${l}`).join("\n");
+				}
+			}
+			if ((toolName === "append_file" || toolName === "insert_lines") && typeof inp?.content === "string") {
+				return inp.content.split("\n").map((l) => `+${l}`).join("\n");
+			}
 		} catch {
 			/* diff preview is best-effort */
 		}
@@ -1129,19 +1172,23 @@ export class SessionController {
 	}
 
 	/** One task on the harness loop (the composer's Harness engine). Local only. Acceptance commands need approval before they run. */
-	private async runOnHarness(task: string, settings: ProviderSettings, displayTask: string, transport: TransportKind, resume = false, attachments: RunnerAttachment[] = [], seed?: SeedTask[]): Promise<void> {
+	private async runOnHarness(task: string, settings: ProviderSettings, displayTask: string, transport: TransportKind, resume = false, attachments: RunnerAttachment[] = [], seed?: SeedTask[], preNotes: string[] = []): Promise<void> {
 		const root = this.runnerRoot ?? "";
 		const mode = this.deps.modeRef.current;
 		// Plan mode keeps the plan-visible exceptions offered (write_file scoped,
 		// run_command behind approval); ask mode hides all write tools.
-		const hidden =
-			mode === "plan"
-				? new Set([...READ_ONLY_HIDDEN].filter((n) => !PLAN_VISIBLE.has(n)))
+		// update_progress is hidden on every harness run: the task board is the
+		// progress display, so a parallel narrative channel is invention-prone by
+		// construction. It stays for the legacy engines (cloud worker has no board).
+		const hidden = new Set(["update_progress",
+			...(mode === "plan"
+				? [...READ_ONLY_HIDDEN].filter((n) => !PLAN_VISIBLE.has(n))
 				: mode === "ask"
-					? READ_ONLY_HIDDEN
-					: new Set<string>();
+					? [...READ_ONLY_HIDDEN]
+					: []),
+		]);
 		// Same tool set and policy pipeline as the Cline loop: mode hiding, write-mode and permission guards, parallel markers.
-		const assembled = this.engineHost ? await assembleToolSet(this.engineHost, settings, task, () => this.harnessAbort?.abort()) : undefined;
+		const assembled = this.engineHost ? await assembleToolSet(this.engineHost, settings, task, () => this.harnessAbort?.abort(), { repeatGuard: false }) : undefined;
 		const tools = assembled?.tools ?? (await this.engineHost?.tools?.()) ?? [];
 		const log = await FileEventLog.open(this.harnessFile());
 		// Index earlier runs' digests into run memory BEFORE the loop starts — the
@@ -1210,8 +1257,12 @@ export class SessionController {
 		const abort = new AbortController();
 		this.harnessAbort = abort;
 		// Stable system prompt (same builder as the Cline loop). Per-run memory and dev context go in the user message.
+		// The prompt's tool-conditional rules must reflect what the harness
+		// actually offers — the assembled set predates mode-hiding and the
+		// harness-only exclusions (update_progress), so subtract them here.
+		const offered = assembled?.available ? new Set([...assembled.available].filter((n) => !hidden.has(n))) : undefined;
 		const system =
-			buildSystemPrompt(root, mode, "", this.engineHost?.environment, undefined, assembled?.available) +
+			buildSystemPrompt(root, mode, "", this.engineHost?.environment, undefined, offered) +
 			"\n\nHarness notes: a task checklist is maintained automatically — focus on the work, not on planning tools. Batch independent reads into one read_files call; elided tool results are recovered with log_slice or recall_context. " +
 			"Earlier runs are indexed in memory — recall_context with scope 'runs' searches their digests (prompts, task outcomes, final reports, compaction briefs) across this and previous sessions; narrow with runId or task. Prefer it over re-reading files for prior work.";
 		// Memory injection on resumes too — but keep it small: rules + facts +
@@ -1224,7 +1275,24 @@ export class SessionController {
 		const digestBlock = digests.length
 			? `Earlier runs in this session (oldest first):\n${digests.map((d, i) => `${i + 1}) ${d.task} — ${d.status}. ${d.summary.slice(0, 800)}${d.filesChanged.length ? ` Files: ${d.filesChanged.join(", ")}.` : ""}`).join("\n")}`
 			: "";
-		const context = [memory, digestBlock].filter(Boolean).join("\n\n") || undefined;
+		const harnessNotes: string[] = [...preNotes];
+		// AGENTS.md is the repo's own operating guide — conventions, build/test
+		// commands, architecture. Injected deterministically into every run so the
+		// model starts with repo understanding instead of rediscovering it through
+		// exploration. It informs where to look; the model still verifies against
+		// actual source before editing.
+		let repoGuide = "";
+		try {
+			const guide = await fs.readFile(path.join(root, "AGENTS.md"), "utf8");
+			if (guide.trim()) {
+				const capped = guide.slice(0, 8000);
+				repoGuide = `Repository guide (AGENTS.md) — conventions, build/test commands and architecture. Read before exploring; prefer it over rediscovery.\n<agents-md>\n${capped}${guide.length > capped.length ? "\n[truncated]" : ""}\n</agents-md>`;
+				harnessNotes.push(`Read AGENTS.md (${guide.length > 8000 ? "first 8k of " + guide.length + " chars" : guide.length + " chars"}) — repo guide is in this run's context.`);
+			}
+		} catch {
+			/* no AGENTS.md — nothing injected */
+		}
+		const context = [repoGuide, memory, digestBlock].filter(Boolean).join("\n\n") || undefined;
 		try {
 			const nudgeWrites = WRITE_MODES.has(mode) && !isConversationalTask(task);
 			// Every real task gets a board, in every mode — in plan/ask mode the
@@ -1243,7 +1311,7 @@ export class SessionController {
 					signal: abort.signal,
 					system,
 					nudgeWrites,
-					writable: WRITE_MODES.has(mode),
+					writable: () => WRITE_MODES.has(this.deps.modeRef.current),
 					limits: { maxTurns: settings.maxIterations },
 					// Hit the turn cap → ask in chat instead of silently pausing.
 					// "Always" answers auto-continue future windows for this run.
@@ -1258,7 +1326,7 @@ export class SessionController {
 				},
 				task,
 				displayTask,
-				{ resume, context, images, plan, seed },
+				{ resume, context, images, plan, seed, notes: harnessNotes },
 			);
 			this.harnessPaused = outcome.status === "paused";
 			void this.queueHarnessReport();
@@ -1323,7 +1391,11 @@ export class SessionController {
 	}
 
 	private async confirmWrite(root: string, toolName: string, input: unknown, callId?: string): Promise<boolean> {
-		if (autoApproveWrites() || this.approveAll || this.permittedTools.has(toolName)) return true;
+		// Plan mode never auto-approves: the mode exists for human review, and a
+		// silent write there is exactly the failure the mode prevents. Explicit
+		// "always" decisions the user made this session still stand.
+		const autoOk = this.deps.modeRef.current === "plan" ? this.approveAll || this.permittedTools.has(toolName) : autoApproveWrites() || this.approveAll || this.permittedTools.has(toolName);
+		if (autoOk) return true;
 		let file =
 			(input as { path?: string })?.path ??
 			(input as { command?: string })?.command ??
@@ -1359,6 +1431,42 @@ export class SessionController {
 			this.surface.post({ type: "info", text: `Rule saved: allow ${rule} (.kronyx/permissions.local.json)` });
 		}
 		return decision !== "deny";
+	}
+
+	/** @-completion: fuzzy-match workspace files for the composer typeahead.
+	 *  Subsequence matching with gap penalty; basename hits rank first. */
+	private async fileQuery(id: string, query: string): Promise<void> {
+		const folder = vscode.workspace.workspaceFolders?.[0];
+		if (!folder || !id) return;
+		const files = await vscode.workspace.findFiles("**/*", "{**/node_modules/**,**/.git/**,**/dist/**,**/target/**,**/.devhost/**}", 2000).then((uris) => uris, () => [] as vscode.Uri[]);
+		const q = query.toLowerCase();
+		const score = (rel: string): number | null => {
+			if (!q) return 100 + rel.length;
+			const lower = rel.toLowerCase();
+			const base = lower.split("/").pop() ?? lower;
+			if (base.startsWith(q)) return base.length - q.length;
+			let ti = 0;
+			let cost = 0;
+			let first = -1;
+			for (const ch of q) {
+				const idx = lower.indexOf(ch, ti);
+				if (idx < 0) return null;
+				if (first < 0) first = idx;
+				cost += idx - ti;
+				ti = idx + 1;
+			}
+			return 10 + cost + first + rel.length / 100;
+		};
+		const matches = files
+			.map((uri) => {
+				const rel = path.relative(folder.uri.fsPath, uri.fsPath).split(path.sep).join("/");
+				return { rel, s: score(rel) };
+			})
+			.filter((m): m is { rel: string; s: number } => m.s !== null)
+			.sort((a, b) => a.s - b.s)
+			.slice(0, 15)
+			.map((m) => m.rel);
+		this.surface.post({ type: "fileMatches", id, matches });
 	}
 
 	private async attach(kind: "file" | "directory" | "upload"): Promise<void> {

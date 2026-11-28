@@ -17,9 +17,20 @@ import type { CallRecord, LoopReason, LoopControlPolicy } from "../core/policies
 
 export type { CallRecord, LoopReason };
 
+/** Write-ish tools: a state change. The fingerprint prefix is "tool:". */
+const WRITE_PREFIXES = ["write_file", "edit_file", "file_editor", "append_file", "insert_lines", "apply_patch", "rename_symbol"];
+
 export function detect(history: readonly CallRecord[], next: string, cfg: LoopDetectorConfig): LoopReason | undefined {
 	const recent = history.slice(-(cfg.window - 1));
-	const sameCalls = recent.filter((r) => r.fingerprint === next);
+	// Repetitions only count since the last write: re-running the same test or
+	// build after editing files is iteration — a new experiment on changed
+	// state — not a loop. Reads and board edits don't reset it.
+	// Scoped to run_command: a write must not reset detection of write-loop
+	// fingerprints themselves, and read repeats have their own dynamics.
+	const isCommand = next.startsWith("run_command:");
+	const lastWrite = isCommand ? recent.map((r, i) => (WRITE_PREFIXES.some((w) => r.fingerprint.startsWith(`${w}:`)) ? i : -1)).reduce((a, b) => Math.max(a, b), -1) : -1;
+	const sinceWrite = recent.slice(lastWrite + 1);
+	const sameCalls = sinceWrite.filter((r) => r.fingerprint === next);
 	if (sameCalls.length + 1 >= cfg.repeatThreshold) return "repeat";
 
 	const withResults = sameCalls.filter((r) => r.resultHash !== undefined);

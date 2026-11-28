@@ -34,6 +34,9 @@ export interface WriteModeGuardOptions {
 	writeTools: ReadonlySet<string>;
 	/** Workspace root — required for the plan-mode write allowance (.kronyx/** + the OS temp dir). */
 	root?: string;
+	/** Plan document directory relative to root (default "plans") — the only
+	 * user-content location plan mode may write, and only through approval. */
+	planDir?: string;
 	/** One-shot notice when a write is denied by mode. */
 	onModeBlocked?: (mode: AgentMode) => void;
 }
@@ -61,10 +64,24 @@ export function createWriteModeGuard(opts: WriteModeGuardOptions): PreTool {
 		}
 		if (!opts.writeTools.has(call.name)) return { kind: "allow" };
 		if (mode === "plan" && opts.root && planWriteAllowed(opts.root, call.input)) return { kind: "allow" };
-		// Plan mode stays read-only by default, but a write the model deems
-		// necessary isn't silently refused — it falls through to the approval
-		// stage so the user decides. Approval denied → the call is refused.
-		if (mode === "plan") return next();
+		// Plan mode's only legitimate file write is the plan document itself,
+		// and even that goes through user approval. Other path-carrying writes
+		// are implementation — denied outright, not deferred to approval, because
+		// approving them one-by-one defeats the mode's purpose. Path-less writeish
+		// tools (run_command, rename_symbol) can't be plan-doc writes but are
+		// legitimately useful for planning-time verification — they fall through
+		// to approval so the user decides case by case.
+		if (mode === "plan") {
+			const p = (call.input as { path?: unknown })?.path;
+			if (typeof p === "string" && p && opts.root) {
+				const abs = path.resolve(opts.root, p);
+				const plans = path.resolve(opts.root, opts.planDir ?? "plans") + path.sep;
+				if (!abs.startsWith(plans)) {
+					return { kind: "deny", reason: `Writes in plan mode are limited to the plan document (${opts.planDir ?? "plans"}/). Save findings with save_plan; implementation belongs to a code-mode run — finish the plan and let the user start it.` };
+				}
+			}
+			return next();
+		}
 		if (mode === "ask") {
 			if (!warned) {
 				warned = true;

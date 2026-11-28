@@ -60,3 +60,64 @@ describe("loop detector config", () => {
 		expect(() => parseLoopDetectorConfig({ ...DEFAULT_LOOP_DETECTOR, window: 4, alternationThreshold: 3 })).toThrow(/window/);
 	});
 });
+
+describe("task_step_update input aliases", () => {
+	it("accepts id as the task when stepId is explicit — the task_update generalization", async () => {
+		const { parseTaskStepUpdateInput } = await import("../../src/harness/core/taskLedger");
+		// The exact shape Session 12's model produced four times in a row.
+		const parsed = parseTaskStepUpdateInput({ id: "t1", stepId: "s1", status: "done" });
+		expect(parsed.taskId).toBe("t1");
+		expect(parsed.stepId).toBe("s1");
+	});
+
+	it("accepts id as the step when taskId is explicit", async () => {
+		const { parseTaskStepUpdateInput } = await import("../../src/harness/core/taskLedger");
+		const parsed = parseTaskStepUpdateInput({ taskId: "t2", id: "s3", status: "done" });
+		expect(parsed.taskId).toBe("t2");
+		expect(parsed.stepId).toBe("s3");
+	});
+
+	it("a bare id with neither field errors with a teaching message", async () => {
+		const { parseTaskStepUpdateInput } = await import("../../src/harness/core/taskLedger");
+		expect(() => parseTaskStepUpdateInput({ id: "t1", status: "done" })).toThrow(/taskId: "t1", stepId: "s1"/);
+	});
+
+	it("a step close using the id alias mutates the board end-to-end", async () => {
+		const { MemoryEventLog } = await import("../../src/harness/core/eventLog");
+		const { HarnessLoop } = await import("../../src/harness/core/loop");
+		const { project } = await import("../../src/harness/core/projections");
+		const log = new MemoryEventLog(() => 1);
+		let calls = 0;
+		const model = {
+			complete: async () => {
+				calls++;
+				return calls === 1
+					? { text: "", toolCalls: [{ callId: "c1", name: "task_step_update", input: { id: "t1", stepId: "s1", status: "done" } }], usage: { inputTokens: 1, outputTokens: 1, cachedTokens: 0 } }
+					: { text: "done", toolCalls: [], usage: { inputTokens: 1, outputTokens: 1, cachedTokens: 0 } };
+			},
+		};
+		const tools = { specs: () => [], execute: async () => ({ ok: true, output: "" }) };
+		const loop = new HarnessLoop({ runId: "r1", log, model: model as never, tools: tools as never });
+		await loop.run("x", undefined, undefined, { seed: [{ title: "A", steps: ["s one"] }] });
+		const state = project(await log.read());
+		expect(state.ledger.tasks.t1?.steps[0]?.status).toBe("done");
+	});
+});
+
+describe("run_command signal matching (token subsequence)", () => {
+	it("matches flag/pipe variations of the signaled command", async () => {
+		const { signalHits } = await import("../../src/harness/core/taskLedger");
+		const sig = { tool: "run_command", path: "mvn test" };
+		expect(signalHits(sig, { name: "run_command", input: { command: "cd /x && mvn test 2>&1" } })).toBe(true);
+		expect(signalHits(sig, { name: "run_command", input: { command: "cd /x && mvn clean test 2>&1 | tail -60" } })).toBe(true);
+		expect(signalHits(sig, { name: "run_command", input: { command: "mvn -q test" } })).toBe(true);
+	});
+
+	it("does not match different or partial commands", async () => {
+		const { signalHits } = await import("../../src/harness/core/taskLedger");
+		const sig = { tool: "run_command", path: "mvn test" };
+		expect(signalHits(sig, { name: "run_command", input: { command: "mvn verify" } })).toBe(false);
+		expect(signalHits(sig, { name: "run_command", input: { command: "npm test" } })).toBe(false);
+		expect(signalHits(sig, { name: "run_command", input: { command: "mvn" } })).toBe(false);
+	});
+});

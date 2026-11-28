@@ -42,10 +42,10 @@ const call = (callId: string, name: string, input: unknown): ToolCall => ({ call
 const acting = (...toolCalls: ToolCall[]): Partial<ModelResponse> => ({ toolCalls });
 const finish = (text = "done"): Partial<ModelResponse> => ({ text, toolCalls: [] });
 
-async function run(opts: { steps: Array<Partial<ModelResponse>>; verifier?: VerifierPort; toolPort?: ToolPort; limits?: Partial<HarnessLimits> }) {
+async function run(opts: { steps: Array<Partial<ModelResponse>>; verifier?: VerifierPort; toolPort?: ToolPort; limits?: Partial<HarnessLimits>; onSteerAsk?: (q: string) => Promise<boolean> }) {
 	const m = scripted(opts.steps);
 	const log = new MemoryEventLog(() => 1);
-	const loop = new HarnessLoop({ runId: "scenario", log, model: m.model, tools: opts.toolPort ?? tools(), verifier: opts.verifier, limits: opts.limits });
+	const loop = new HarnessLoop({ runId: "scenario", log, model: m.model, tools: opts.toolPort ?? tools(), verifier: opts.verifier, limits: opts.limits, onSteerAsk: opts.onSteerAsk });
 	const outcome = await loop.run("scenario task");
 	return { outcome, loop, log, left: m.left, requests: m.requests };
 }
@@ -193,7 +193,182 @@ describe("scenario: verifier", () => {
 				finish(),
 			],
 		});
-		expect(r.loop.projection.ledger.tasks.a?.status).toBe("in_progress");
+		// No frozen pause: the open task is honestly marked blocked and the run ends.
+		expect(r.loop.projection.ledger.tasks.a?.status).toBe("blocked");
+		expect(r.outcome.status).not.toBe("paused");
+	});
+});
+
+describe("scenario: ask_user tool", () => {
+	it("intercepts ask_user, logs structured questions, and pauses without executing", async () => {
+		const r = await run({
+			steps: [
+				acting(call("q1", "ask_user", { questions: [
+					{ question: "Which formula should estimation use?", options: ["threads = ceil(bytes/64MB)", "fixed 4 threads"] },
+					{ question: "Should config live in Config.java?" },
+				] })),
+				finish("unreachable"),
+			],
+		});
 		expect(r.outcome.status).toBe("paused");
+		expect(r.outcome.reason).toBe("question");
+		const events = await r.log.read();
+		const ask = events.find((e) => e.type === "user.question");
+		expect(ask?.type === "user.question" && ask.questions).toEqual([
+			{ question: "Which formula should estimation use?", options: ["threads = ceil(bytes/64MB)", "fixed 4 threads"] },
+			{ question: "Should config live in Config.java?" },
+		]);
+		// the call "finished" without any execution — it is a pause, not a tool run
+		const fin = events.find((e) => e.type === "tool.finished" && e.callId === "q1");
+		expect(fin?.type === "tool.finished" && fin.output).toMatch(/paused until the user answers/);
+	});
+
+	it("refuses a malformed ask_user call and lets the model retry", async () => {
+		const r = await run({
+			steps: [
+				acting(call("q1", "ask_user", { questions: [] })),
+				acting(call("q2", "ask_user", { questions: [{ question: "proceed?" }] })),
+			],
+		});
+		expect(r.outcome.status).toBe("paused");
+		const events = await r.log.read();
+		const bad = events.find((e) => e.type === "tool.finished" && e.callId === "q1");
+		expect(bad?.type === "tool.finished" && bad.ok).toBe(false);
+		expect(events.some((e) => e.type === "user.question")).toBe(true);
+	});
+});
+
+describe("scenario: non-offered tool calls", () => {
+	it("refuses a hallucinated tool with the available alternates, never executing it", async () => {
+		const r = await run({
+			steps: [acting(call("x1", "str_replace", { path: "a" })), finish("done")],
+		});
+		const events = await r.log.read();
+		const fin = events.find((e) => e.type === "tool.finished" && e.callId === "x1");
+		expect(fin?.type === "tool.finished" && fin.ok).toBe(false);
+		expect(fin?.type === "tool.finished" && fin.output).toMatch(/never offered/);
+		expect(fin?.type === "tool.finished" && fin.output).toMatch(/noop/);
+	});
+});
+
+describe("scenario: open-tasks ask", () => {
+	it("continue resets the refusal window; decline ends with tasks blocked", async () => {
+		// decline — no user willing to continue: blocked, not frozen
+		const r1 = await run({ limits: { maxRefusals: 0 }, steps: [acting(createTask("a", ["x"])), finish()] });
+		expect(r1.loop.projection.ledger.tasks.a?.status).toBe("blocked");
+		expect(r1.outcome.status).not.toBe("paused");
+		// continue — the window resets and the model gets another chance. The first
+		// finish hits the open task and fires the ask; the model then closes the work.
+		const r2 = await run({
+			verifier: pass,
+			limits: { maxRefusals: 0 },
+			onSteerAsk: async () => true,
+			steps: [
+				acting(createTask("a", ["x"])),
+				finish("nothing yet"),
+				acting(call("w", "noop", { x: 1 })),
+				acting(call("s1", "task_step_update", { taskId: "a", stepId: "s1", status: "in_progress", callIds: [] })),
+				acting(call("s2", "task_step_update", { taskId: "a", stepId: "s1", status: "done", callIds: ["w"] })),
+				acting(call("t1", "task_update", { id: "a", status: "in_progress" })),
+				acting(call("t2", "task_update", { id: "a", status: "done" })),
+				finish(),
+			],
+		});
+		expect(r2.loop.projection.ledger.tasks.a?.status).toBe("done");
+	});
+});
+
+describe("scenario: acceptance integrity", () => {
+	it("rejects trivially-passing acceptance — the task_replace gaming vector", async () => {
+		const r = await run({
+			steps: [
+				acting(call("c1", "task_create", { id: "a", title: "a", acceptance: { kind: "command", command: "echo ok" }, steps: [{ id: "s1", text: "work" }] })),
+				finish(),
+			],
+		});
+		const events = await r.log.read();
+		const fin = events.find((e) => e.type === "tool.finished" && e.callId === "c1");
+		expect(fin?.type === "tool.finished" && fin.ok).toBe(false);
+		expect(fin?.type === "tool.finished" && fin.output).toMatch(/never verifies/);
+		expect(events.some((e) => e.type === "task.created")).toBe(false);
+	});
+
+	it("rejects impossible quiet-grep acceptance with guidance toward bare commands", async () => {
+		const r = await run({
+			steps: [
+				acting(call("c1", "task_create", { id: "a", title: "a", acceptance: { kind: "command", command: "mvn test -q 2>&1 | grep -c 'Tests run:'" }, steps: [{ id: "s1", text: "work" }] })),
+				finish(),
+			],
+		});
+		const events = await r.log.read();
+		const fin = events.find((e) => e.type === "tool.finished" && e.callId === "c1");
+		expect(fin?.type === "tool.finished" && fin.ok).toBe(false);
+		expect(fin?.type === "tool.finished" && fin.output).toMatch(/quiet/);
+	});
+
+	it("accepts bare build commands — the exit code is the check", async () => {
+		const r = await run({
+			verifier: pass,
+			steps: [
+				acting(call("c1", "task_create", { id: "a", title: "a", acceptance: { kind: "command", command: "mvn test" }, steps: [{ id: "s1", text: "work" }] })),
+				finish(),
+			],
+		});
+		const events = await r.log.read();
+		expect(events.some((e) => e.type === "task.created")).toBe(true);
+	});
+});
+
+describe("scenario: user questions", () => {
+	it("pauses instead of refusing when the model ends its turn asking the user", async () => {
+		const r = await run({
+			steps: [acting(createTask("a", ["x"])), finish("The plan diverges from the code in three ways. Update the doc first, or proceed without updating?")],
+		});
+		expect(r.outcome.status).toBe("paused");
+		const events = await r.log.read();
+		expect(events.some((e) => e.type === "stop.refused")).toBe(false);
+		expect(events.some((e) => e.type === "run.status" && e.status === "paused" && e.reason === "question")).toBe(true);
+		// The board is left untouched — nothing force-closed or stalled while waiting.
+		expect(r.loop.projection.ledger.tasks.a?.status).not.toBe("done");
+		expect(r.loop.projection.ledger.tasks.a?.status).not.toBe("blocked");
+	});
+
+	it("still refuses a premature finish that is not a question", async () => {
+		const r = await run({
+			steps: [acting(createTask("a", ["x"])), finish("I am done."), acting(call("w", "noop", { x: 1 })), finish("done now")],
+		});
+		const events = await r.log.read();
+		expect(events.some((e) => e.type === "stop.refused")).toBe(true);
+	});
+});
+
+describe("scenario: plan document grounding", () => {
+	it("never feeds a plan document to the planner — doc runs are seeded deterministically upstream", async () => {
+		const m = scripted([
+			// First call is the planner: answer with a one-step board.
+			{ text: '{"tasks":[{"id":"t1","title":"cli","acceptance":{"kind":"none"},"dependsOn":[],"steps":[{"id":"s1","text":"parse args"}]}]}', toolCalls: [] },
+			acting(call("w", "noop", { x: 1 })),
+			finish("done"),
+		]);
+		const log = new MemoryEventLog(() => 1);
+		const loop = new HarnessLoop({ runId: "scenario", log, model: m.model, tools: tools(), verifier: pass });
+		await loop.run("lets build as per plans/development-plan.md", undefined, undefined, { plan: true });
+		const plannerText = m.requests[0]!.messages.map((msg) => (msg.kind === "user" ? msg.text : "")).join("\n");
+		// Seeded document runs never reach the planner at all; a free-form run that
+		// happens to mention a .md path must not have its scope hijacked either.
+		expect(plannerText).not.toContain("PLAN DOCUMENT");
+	});
+
+	it("plans without a doc block when the task references no document", async () => {
+		const m = scripted([
+			{ text: '{"tasks":[{"id":"t1","title":"x","acceptance":{"kind":"none"},"dependsOn":[],"steps":[{"id":"s1","text":"x"}]}]}', toolCalls: [] },
+			acting(call("w", "noop", { x: 1 })),
+			finish("done"),
+		]);
+		const log = new MemoryEventLog(() => 1);
+		const loop = new HarnessLoop({ runId: "scenario", log, model: m.model, tools: tools(), verifier: pass });
+		await loop.run("fix the flaky test", undefined, undefined, { plan: true });
+		const text = m.requests[0]!.messages.map((msg) => (msg.kind === "user" ? msg.text : "")).join("\n");
+		expect(text).not.toContain("PLAN DOCUMENT");
 	});
 });

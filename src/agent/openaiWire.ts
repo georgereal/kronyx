@@ -8,14 +8,13 @@
  */
 
 import type { AgentImagePart, AgentMessage, AgentToolCallPart, AgentToolDefinition, AgentToolResultPart } from "@cline/shared";
+import { providerShapes } from "../harness/adapters/apiShapes";
 
 export type WireProtocol = "responses" | "chat";
 
-/** Providers that serve the OpenAI Responses API: direct OpenAI, and the Vercel AI Gateway which proxies it. */
-const RESPONSES_PROVIDERS = new Set(["openai", "vercel-ai-gateway"]);
-
-/** Whether the provider serves the Responses API (direct OpenAI / Vercel AI Gateway) or only chat completions. */
-export const protocolFor = (providerId: string, _modelId = ""): WireProtocol => (RESPONSES_PROVIDERS.has(providerId) ? "responses" : "chat");
+/** Whether the provider serves the Responses API or only chat completions — the answer lives in the
+ *  API-shape matrix (src/harness/adapters/apiShapes.ts); this wrapper keeps the legacy call sites stable. */
+export const protocolFor = (providerId: string, _modelId = ""): WireProtocol => (providerShapes(providerId).responses ? "responses" : "chat");
 
 export const endpointFor = (protocol: WireProtocol, baseUrl: string): string =>
 	`${baseUrl.replace(/\/+$/, "")}/${protocol === "responses" ? "responses" : "chat/completions"}`;
@@ -121,6 +120,12 @@ export function toChatMessages(system: string, messages: readonly AgentMessage[]
 	return out;
 }
 
+/**
+ * Request extras (reasoning opt-ins etc.) come from the provider API-shape
+ * matrix — see src/harness/adapters/apiShapes.ts. The wire layer stays dumb:
+ * bodies merge whatever extras the caller computed.
+ */
+
 export function responsesBody(args: {
 	model: string;
 	instructions: string;
@@ -131,6 +136,8 @@ export function responsesBody(args: {
 	store?: boolean;
 	maxOutputTokens?: number;
 	compactThreshold?: number;
+	/** Provider/shape-specific extras (reasoning opt-ins) merged into the body top level. */
+	extras?: Record<string, unknown>;
 }): Record<string, unknown> {
 	const store = args.store ?? true;
 	return {
@@ -147,6 +154,7 @@ export function responsesBody(args: {
 		...(args.conversationId ? { conversation: args.conversationId } : {}),
 		...(args.maxOutputTokens ? { max_output_tokens: args.maxOutputTokens } : {}),
 		...(args.compactThreshold ? { context_management: [{ type: "compaction", compact_threshold: args.compactThreshold }] } : {}),
+		...args.extras,
 	};
 }
 
@@ -155,6 +163,8 @@ export function chatBody(args: {
 	messages: Record<string, unknown>[];
 	tools: readonly AgentToolDefinition[];
 	maxTokens?: number;
+	/** Provider/shape-specific extras (reasoning opt-ins) merged into the body top level. */
+	extras?: Record<string, unknown>;
 }): Record<string, unknown> {
 	return {
 		model: args.model,
@@ -163,6 +173,7 @@ export function chatBody(args: {
 		stream: true,
 		stream_options: { include_usage: true },
 		...(args.maxTokens ? { max_tokens: args.maxTokens } : {}),
+		...args.extras,
 	};
 }
 
@@ -282,6 +293,19 @@ export async function reduceResponses(events: AsyncIterable<SseEvent>, hooks: St
 			case "response.output_item.done": {
 				const item = j.item;
 				items.push(item);
+				// Providers that don't stream reasoning_text deltas (qwen via gateways, several
+				// OpenAI-compatible endpoints) deliver the reasoning as one completed item —
+				// surface it as a single delta so the UI still shows Thoughts live, and so the
+				// turn's reasoning field is populated for the final render.
+				if (item?.type === "reasoning" && !out.reasoning) {
+					const content = (item.content ?? []).flatMap((c: any) => (c.type === "reasoning_text" && typeof c.text === "string" ? [c.text] : [])).join("\n");
+					const summary = (item.summary ?? []).flatMap((c: any) => (c.type === "summary_text" && typeof c.text === "string" ? [c.text] : [])).join("\n");
+					const reasoning = content || summary;
+					if (reasoning) {
+						out.reasoning = reasoning;
+						hooks.onReasoning(reasoning);
+					}
+				}
 				if (item?.type === "function_call") out.calls.push({ callId: item.call_id, name: item.name, args: item.arguments ?? "" });
 				else if (item?.type === "message" && !out.text) {
 					const t = (item.content ?? []).flatMap((c: any) => (c.type === "output_text" ? [c.text] : [])).join("");
@@ -298,6 +322,21 @@ export async function reduceResponses(events: AsyncIterable<SseEvent>, hooks: St
 				out.responseId = r.id ?? out.responseId;
 				out.usage = responsesUsage(r.usage);
 				out.providerItems = Array.isArray(r.output) && r.output.length ? r.output : items.slice();
+				// Completion-time fallback: reasoning that neither streamed as deltas nor arrived
+				// as an output_item.done still surfaces — late, but visible.
+				if (!out.reasoning) {
+					for (const item of out.providerItems ?? []) {
+						const it = item as any;
+						if (it?.type !== "reasoning") continue;
+						const content = (it.content ?? []).flatMap((c: any) => (c.type === "reasoning_text" && typeof c.text === "string" ? [c.text] : [])).join("\n");
+						const summary = (it.summary ?? []).flatMap((c: any) => (c.type === "summary_text" && typeof c.text === "string" ? [c.text] : [])).join("\n");
+						if (content || summary) {
+							out.reasoning = content || summary;
+							hooks.onReasoning(out.reasoning);
+							break;
+						}
+					}
+				}
 				if (j.type === "response.incomplete") out.incomplete = r.incomplete_details?.reason ?? "incomplete";
 				finished = true;
 				break;

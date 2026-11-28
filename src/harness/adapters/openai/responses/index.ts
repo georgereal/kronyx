@@ -19,7 +19,7 @@ export class ResponsesApiPort implements ModelPort {
 	readonly capabilities: AdapterCapabilities;
 
 	constructor(private readonly config: OpenAIPortConfig) {
-		this.capabilities = { wire: "responses", serverConversations: false, reasoningItems: true, store: config.store ?? true };
+		this.capabilities = { wire: "responses", serverConversations: false, reasoningItems: true, store: config.stateless ? false : (config.store ?? true) };
 	}
 
 	async complete(request: ModelRequest): Promise<ModelResponse> {

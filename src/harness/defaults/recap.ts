@@ -55,15 +55,17 @@ export async function makeRecap(
 }
 
 /**
- * Today's trigger logic as the default RecapPolicy: the manual Compact control,
- * a just-closed task, or context pressure (the last request exceeding the
- * projected-context budget). A failed recap is not fatal — older messages stay
- * stubbed.
+ * Today's trigger logic as the default RecapPolicy: the manual Compact control
+ * or context pressure (the last request exceeding the projected-context
+ * budget). Task completion alone does NOT trigger a recap — for large-window
+ * models that compacts far below the window, and the recap drops the verbatim
+ * file contents the model then re-reads, feeding repeat-read loops. A failed
+ * recap is not fatal — older messages stay stubbed.
  */
 export const defaultRecapPolicy: RecapPolicy = {
 	async maybeRecap(ctx) {
 		const pressured = ctx.lastInputTokens * 4 > ctx.context.budgetChars;
-		if (!ctx.forced && !ctx.taskDone && !pressured) return;
+		if (!ctx.forced && !pressured) return;
 		const boundary = Math.max(0, ctx.state.messages.length - ctx.context.keepRecentMessages);
 		const covered = ctx.state.recap?.covers ?? 0;
 		if (boundary <= covered) return;

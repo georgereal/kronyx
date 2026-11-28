@@ -51,7 +51,6 @@ function Connect() {
 			// Hand the key to the editor automatically — same account, no paste.
 			window.location.href = VSCODE_URI(body.key, body.id);
 		})();
-		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [user]);
 
 	if (!user) return null;

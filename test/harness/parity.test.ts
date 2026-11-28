@@ -45,7 +45,7 @@ describe("parity: IDE view events from a harness run (step 9)", () => {
 		};
 		const r = await runScripted(
 			[
-				{ calls: [{ callId: "t", name: "task_create", input: { id: "a", title: "Parser", acceptance: { kind: "command", command: "true" }, steps: [{ id: "s1", text: "write" }] } }] },
+				{ calls: [{ callId: "t", name: "task_create", input: { id: "a", title: "Parser", acceptance: { kind: "command", command: "npm test" }, steps: [{ id: "s1", text: "write" }] } }] },
 				{ calls: [{ callId: "w", name: "noop", input: {} }] },
 				{ calls: [{ callId: "s", name: "task_step_update", input: { taskId: "a", stepId: "s1", status: "in_progress", callIds: [] } }] },
 				{ calls: [{ callId: "d", name: "task_step_update", input: { taskId: "a", stepId: "s1", status: "done", callIds: ["w"] } }] },

@@ -71,7 +71,7 @@ describe("context projection (M6)", () => {
 		const log = new MemoryEventLog(() => 1);
 		await log.append({
 			type: "task.created",
-			task: { id: "t", title: "Parse", acceptance: { kind: "command", command: "true" }, dependsOn: [], status: "pending", steps: [{ id: "s1", text: "write", status: "pending", callIds: [] }], evidence: [] },
+			task: { id: "t", title: "Parse", acceptance: { kind: "command", command: "npm test" }, dependsOn: [], status: "pending", steps: [{ id: "s1", text: "write", status: "pending", callIds: [] }], evidence: [] },
 			runId: "r",
 		});
 		const state = stateFrom(await log.read());

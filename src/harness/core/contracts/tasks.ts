@@ -48,6 +48,10 @@ export interface Task {
 	adoptedFrom?: string;
 	/** Log seq at which the task last went in_progress — the calls that prove its steps finished after this. */
 	startedSeq?: number;
+	/** Seq the task entered the board — proof done while dep-blocked still counts. */
+	createdSeq?: number;
+	/** plan = seeded or model-planned work; divergence = harness-synthesized record of off-plan work the model actually did. Absent means plan (older logs). */
+	origin?: "plan" | "divergence";
 }
 
 export function parseAcceptance(value: unknown, path = "acceptance"): Acceptance {
@@ -91,5 +95,6 @@ export function parseTask(value: unknown, path = "task"): Task {
 		...(o.runId === undefined ? {} : { runId: expectString(o.runId, `${path}.runId`) }),
 		...(o.planId === undefined ? {} : { planId: expectString(o.planId, `${path}.planId`) }),
 		...(o.adoptedFrom === undefined ? {} : { adoptedFrom: expectString(o.adoptedFrom, `${path}.adoptedFrom`) }),
+		...(o.origin === undefined ? {} : { origin: expectOneOf(o.origin, ["plan", "divergence"] as const, `${path}.origin`) }),
 	};
 }

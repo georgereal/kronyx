@@ -47,12 +47,34 @@ export const emptyLedger = (): Ledger => ({ order: [], tasks: {}, verified: [] }
  * name — their inputs (a directory or area) can't prove what the result
  * contained, so a fabricated signal path would just stall the step.
  */
+/** Write-ish tools are interchangeable as step evidence — an edit is an edit. */
+const WRITE_ISH = new Set(["write_file", "edit_file", "file_editor", "append_file", "insert_lines", "apply_patch"]);
+
 export const signalHits = (signal: { tool: string; path?: string }, call: { name: string; input?: unknown }): boolean => {
 	// A read_files batch satisfies read_file signals for any file it covered.
+	// Write-ish signals hit any write-ish tool — whether the model uses write_file,
+	// edit_file or file_editor on the step's file, the work is the same evidence.
 	const names = call.name === READ_FILES ? [READ_FILES, "read_file"] : [call.name];
-	if (!names.includes(signal.tool)) return false;
+	const toolOk = names.includes(signal.tool) || (WRITE_ISH.has(signal.tool) && WRITE_ISH.has(call.name));
+	if (!toolOk) return false;
 	if (signal.tool === "explore_codebase" || signal.tool === "list_files") return true;
 	if (!signal.path) return true;
+	// Shell steps signal on the command itself: the step "Run \`mvn clean compile\`"
+	// carries signal.path "mvn clean compile" and hits when the command contains it.
+	if (signal.tool === "run_command" && signal.path) {
+		const cmd = (call.input ?? {}) as { command?: unknown };
+		if (typeof cmd.command !== "string") return false;
+		if (cmd.command.includes(signal.path)) return true;
+		// Ordered token subsequence: the step's "\`mvn test\`" must match the real
+		// invocation "mvn clean test" / "cd x && mvn test 2>&1 | tail" — flag and
+		// pipe variations are the same work. Tokens must appear in order.
+		const tokens = signal.path.split(/\s+/).filter(Boolean);
+		let at = 0;
+		for (const tok of cmd.command.split(/\s+/)) {
+			if (at < tokens.length && (tok === tokens[at] || tok.endsWith(`/${tokens[at]}`) || tok.startsWith(`${tokens[at]}:`))) at++;
+		}
+		return at === tokens.length;
+	}
 	const input = (call.input ?? {}) as { path?: unknown; files?: unknown; pattern?: unknown; file_glob?: unknown };
 	const paths: string[] = [];
 	if (typeof input.path === "string") paths.push(input.path);
@@ -60,7 +82,17 @@ export const signalHits = (signal: { tool: string; path?: string }, call: { name
 		for (const f of input.files as { path?: unknown }[]) if (typeof f?.path === "string") paths.push(f.path);
 	}
 	if (typeof input.file_glob === "string") paths.push(input.file_glob);
-	if (paths.some((p) => ownsMatch([signal.path!], p))) return true;
+	// Basename signals ("Config.java" — how plan steps usually name files) match
+	// the file anywhere in the tree; partial paths match as a suffix. ownsMatch
+	// alone would treat the bare name as a directory prefix and never hit.
+	const sigPath = signal.path!;
+	const pathHit = (p: string): boolean => {
+		if (ownsMatch([sigPath], p)) return true;
+		const norm = p.replace(/^\.\//, "").replace(/^\//, "");
+		if (!sigPath.includes("/")) return norm.split("/").pop() === sigPath;
+		return norm === sigPath || norm.endsWith(`/${sigPath}`);
+	};
+	if (paths.some(pathHit)) return true;
 	// Filename-style signal globs (**/{a,b}) also hit when the file's literal
 	// basename appears in the call's search pattern or file glob.
 	const literals = expandBraces(signal.path).map((g) => g.split("/").pop() ?? "").filter((b) => b && !/[*?{}]/.test(b));
@@ -178,7 +210,7 @@ export function checkTransition(ledger: Ledger, id: string, to: TaskStatus): Che
 	}
 	if (to === "done") {
 		const open = task.steps.filter((s) => !stepSettled(s)).map((s) => s.id);
-		if (open.length) return invalid(`task ${id} has open steps: ${open.join(", ")}`);
+		if (open.length) return invalid(`task ${id} has open steps: ${open.join(", ")} — close each step first with task_step_update (status done, citing the tool calls that prove it in callIds), then retry closing the task`);
 		if (!ledger.verified.includes(id)) {
 			return { ok: false, code: "needs_verification", message: `task ${id} needs a passing acceptance check before it can be done` };
 		}
@@ -317,9 +349,27 @@ export const TASK_TOOL_NAMES = {
 } as const;
 export const TASK_TOOL_SET: ReadonlySet<string> = new Set(Object.values(TASK_TOOL_NAMES));
 
+/** Acceptance commands must verify something real. Constant-output commands
+ *  (echo ok, true) pass without testing anything — they are how a frustrated
+ *  model games the verifier. Piping the build through grep is the inverse trap:
+ *  quiet modes suppress the grepped output and grep's exit reflects matches, not
+ *  the build — such checks can become impossible to pass even when the work is correct. */
+export function acceptanceProblem(command: string): string | undefined {
+	const stripped = command.replace(/^\s*cd\s+\S+\s*&&\s*/, "").trim();
+	const first = stripped.split("|")[0]?.trim().split(/\s/)[0] ?? "";
+	if (new Set(["echo", "printf", "true", "exit"]).has(first)) {
+		return `acceptance command never verifies anything — "${first}" produces constant output. Use the real build/test command (e.g. mvn test, npm test): its exit code IS the check, no grep or echo needed.`;
+	}
+	if (/\|\s*(grep|egrep|fgrep)\b/.test(stripped) && /\-q\b|quiet/.test(stripped)) {
+		return `acceptance pipes a quiet-mode build through grep — quiet suppresses the output being grepped, so this can fail even when the work is correct. Run the build/test command directly; its exit code is enough.`;
+	}
+	return undefined;
+}
+
 const ACCEPTANCE_SCHEMA = {
 	type: "object",
-	description: "How to tell the task is complete. Use kind command with a shell command that exits 0 when done.",
+	description:
+		"How to tell the task is complete. Use kind command with the real build/test command (e.g. mvn test, npm test) — its exit code is the check. Never pipe through grep (quiet output plus grep semantics make impossible checks) and never use constant-output commands like echo ok — the harness rejects both.",
 	properties: {
 		kind: { type: "string", enum: ["command"] },
 		command: { type: "string" },
@@ -406,6 +456,17 @@ export const TASK_TOOLS: readonly ToolSpec[] = [
 	},
 ];
 
+
+/** Ids must be single tokens: the ref-index resolves ids by matching them in
+ * text and in {braces} — a whitespace-bearing id can never resolve, so it
+ * breaks the map's core use. Any other shape (hierarchical, lettered) is
+ * legal by design — the index owns resolution, not the shape. */
+const expectIdToken = (value: unknown, path: string): string => {
+	const id = expectString(value, path);
+	if (/\s/.test(id)) throw new SchemaError(`${path}: ids must be single tokens without whitespace (got "${id}") — use a compact id like t5 or s3; any shape otherwise is fine, the board resolves it`);
+	return id;
+};
+
 export interface TaskCreateInput {
 	id: string;
 	title: string;
@@ -418,14 +479,14 @@ export function parseTaskCreateInput(value: unknown): TaskCreateInput {
 	const o = expectObject(value, "input");
 	const steps = expectArray(o.steps, "input.steps");
 	return {
-		id: expectString(o.id, "input.id"),
+		id: expectIdToken(o.id, "input.id"),
 		title: expectString(o.title, "input.title"),
 		acceptance: parseAcceptance(o.acceptance, "input.acceptance"),
 		dependsOn: o.dependsOn === undefined ? [] : expectArray(o.dependsOn, "input.dependsOn").map((d, i) => expectString(d, `input.dependsOn[${i}]`)),
 		steps: steps.map((s, i) => {
 			const step = expectObject(s, `input.steps[${i}]`);
 			return parseStep(
-				{ id: step.id, text: step.text, status: "pending", callIds: [], ...(step.signal === undefined ? {} : { signal: step.signal }) },
+				{ id: expectIdToken(step.id, `input.steps[${i}].id`), text: step.text, status: "pending", callIds: [], ...(step.signal === undefined ? {} : { signal: step.signal }) },
 				`input.steps[${i}]`,
 			);
 		}),
@@ -434,20 +495,32 @@ export function parseTaskCreateInput(value: unknown): TaskCreateInput {
 
 export function parseTaskStepAddInput(value: unknown): { taskId: string; step: Step } {
 	const o = expectObject(value, "input");
+	// Models reliably produce the step's sN but guess the task field's name —
+	// accept the common aliases so a field-name slip isn't a failed call. Here
+	// `id` is the step's own id, so it can't alias the task.
+	const taskId = o.taskId ?? o.task ?? o.task_id;
+	if (taskId === undefined) throw new SchemaError(`input.taskId: missing — pass the task's board id as taskId (e.g. { taskId: "t1", ... }); task_update's "id" is the same id`);
 	return {
-		// Models reliably produce the step's sN but guess the task field's name —
-		// accept the common aliases so a field-name slip isn't a failed call.
-		taskId: expectString(o.taskId ?? o.task ?? o.task_id, "input.taskId"),
-		step: parseStep({ id: o.id, text: o.text, status: "pending", callIds: [], ...(o.signal === undefined ? {} : { signal: o.signal }) }, "input"),
+		taskId: expectString(taskId, "input.taskId"),
+		step: parseStep({ id: expectIdToken(o.id, "input.id"), text: o.text, status: "pending", callIds: [], ...(o.signal === undefined ? {} : { signal: o.signal }) }, "input"),
 	};
 }
 
 export function parseTaskStepUpdateInput(value: unknown): { taskId: string; stepId: string; status: StepStatus; callIds: string[]; reason?: string; replacement?: { id: string; text: string } } {
 	const o = expectObject(value, "input");
 	const r = o.replacement === undefined ? undefined : expectObject(o.replacement, "input.replacement");
+	// `id` is ambiguous: models copy it from task_update, where it names the task.
+	// It means the task when a step field is explicit, the step when a task field
+	// is explicit — a bare `id` with neither is a schema slip worth teaching.
+	const explicitTask = o.taskId ?? o.task ?? o.task_id;
+	const explicitStep = o.stepId ?? o.step ?? o.step_id;
+	const rawTask = explicitTask ?? (explicitStep !== undefined ? o.id : undefined);
+	const rawStep = explicitStep ?? (explicitTask !== undefined ? o.id : undefined);
+	if (rawTask === undefined) throw new SchemaError(`input.taskId: missing — pass the task's board id as taskId (e.g. { taskId: "t1", stepId: "s1", status: "done" }); task_update's "id" is the same id`);
+	if (rawStep === undefined) throw new SchemaError(`input.stepId: missing — pass the step id as stepId (e.g. { taskId: "t1", stepId: "s1", status: "done" })`);
 	return {
-		taskId: expectString(o.taskId ?? o.task ?? o.task_id, "input.taskId"),
-		stepId: expectString(o.stepId ?? o.step ?? o.step_id ?? o.id, "input.stepId"),
+		taskId: expectString(rawTask, "input.taskId"),
+		stepId: expectString(rawStep, "input.stepId"),
 		status: expectOneOf(o.status, STEP_STATUSES, "input.status"),
 		callIds: o.callIds === undefined ? [] : expectStringArray(o.callIds, "input.callIds"),
 		...(o.reason === undefined ? {} : { reason: expectString(o.reason, "input.reason") }),

@@ -240,3 +240,27 @@ describe("list_files and search_files", () => {
 		expect(globToRegExp("src/*.ts").test("src/a/b.ts")).toBe(false);
 	});
 });
+
+describe("file_editor edit_file-shape tolerance", () => {
+	it("applies an edits array when command is missing — the schema mix case", async () => {
+		const out = await run("file_editor", {
+			path: "a.ts",
+			edits: [{ old_text: "return a + b;", new_text: "return a * b;" }],
+		});
+		expect(out).toContain("Edited a.ts");
+		expect(read("a.ts")).toContain("return a * b;");
+	});
+
+	it("accepts edits as a JSON string — models sometimes serialize arrays", async () => {
+		const out = await run("file_editor", {
+			path: "a.ts",
+			edits: JSON.stringify([{ old_str: "add(a, b)", new_str: "add(a, b, c)" }]),
+		});
+		expect(out).toContain("Edited a.ts");
+		expect(read("a.ts")).toContain("add(a, b, c)");
+	});
+
+	it("missing command without edits errors with a teaching message", async () => {
+		await expect(run("file_editor", { path: "a.ts" })).rejects.toThrow(/needs a command/);
+	});
+});

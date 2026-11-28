@@ -7,7 +7,7 @@
 
 import type { AgentMode, ProviderSettings, RunDigest, RunnerAttachment } from "./runner";
 
-export type EngineKind = "cline" | "openai" | "conversations" | "responses" | "harness";
+export type EngineKind = "cline" | "openai" | "conversations" | "responses" | "chat" | "auto" | "harness";
 
 export interface AgentEngine {
 	readonly isRunning: boolean;

@@ -17,5 +17,6 @@ export function conversationsRequestBody(config: OpenAIPortConfig, request: Mode
 		conversationId: request.conversation?.id,
 		maxOutputTokens: config.maxOutputTokens,
 		compactThreshold: request.conversation ? compactThreshold(config) : undefined,
+		extras: config.extras?.(config.modelId),
 	});
 }

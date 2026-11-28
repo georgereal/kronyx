@@ -766,6 +766,17 @@ function settingsJs(httpMode: boolean): string {
 		}
 		provSel.addEventListener("change", () => { p.providerId = provSel.value; saveProfiles(); showSaved(); });
 		fld("Provider", provSel);
+
+		const shapeSel = document.createElement("select");
+		for (const [val, label] of [["auto", "Auto (matrix default)"], ["responses", "Responses API"], ["conversations", "Conversations (OpenAI)"], ["chat", "Chat completions"], ["cline", "Cline SDK"]]) {
+			const opt = document.createElement("option");
+			opt.value = val;
+			opt.textContent = label;
+			if ((p.apiShape || "auto") === val) opt.selected = true;
+			shapeSel.appendChild(opt);
+		}
+		shapeSel.addEventListener("change", () => { p.apiShape = shapeSel.value; saveProfiles(); showSaved(); });
+		fld("API type", shapeSel);
 		fld("Base URL", textInput("baseUrl", "https://…/v1"), true);
 
 		const modelInput = textInput("modelId", p.models?.length ? "search " + p.models.length + " models…" : "model-id — fetch the catalog below to pick");

@@ -50,6 +50,7 @@ export type EventBody =
 	| { type: "stop.refused"; openTaskIds: string[] }
 	| { type: "budget.warning"; kind: "input_tokens"; used: number; limit: number }
 	| { type: "steer.note"; rule: string; text: string }
+	| { type: "user.question"; questions: Array<{ question: string; options?: string[] }> }
 	| { type: "context.recap"; covers: number; text: string; usage?: Usage }
 	| { type: "context.cleared" }
 	| { type: "loop.verdict"; level: LoopLevel; fingerprint: string; reason?: string }
@@ -110,6 +111,7 @@ const EVENT_TYPES: readonly EventType[] = [
 	"stop.refused",
 	"budget.warning",
 	"steer.note",
+	"user.question",
 	"context.recap",
 	"context.cleared",
 	"loop.verdict",
@@ -209,6 +211,18 @@ function parseBody(o: Record<string, unknown>, type: EventType): EventBody {
 			return { type, kind: "input_tokens", used: expectInteger(o.used, "event.used"), limit: expectInteger(o.limit, "event.limit", 1) };
 		case "steer.note":
 			return { type, rule: expectString(o.rule, "event.rule"), text: expectString(o.text, "event.text") };
+		case "user.question": {
+			if (!Array.isArray(o.questions)) throw new SchemaError("event.questions: expected an array");
+			const questions = o.questions.map((q: unknown, i: number) => {
+				const item = expectObject(q, `event.questions[${i}]`);
+				return {
+					question: expectString(item.question, `event.questions[${i}].question`),
+					...(item.options === undefined ? {} : { options: expectStringArray(item.options, `event.questions[${i}].options`) }),
+				};
+			});
+			if (!questions.length) throw new SchemaError("event.questions: expected at least one question");
+			return { type, questions };
+		}
 		case "context.recap": {
 			const usage = o.usage === undefined ? undefined : parseUsage(o.usage, "event.usage");
 			return { type, covers: expectInteger(o.covers, "event.covers", 1), text: expectString(o.text, "event.text"), ...(usage ? { usage } : {}) };

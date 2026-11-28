@@ -37,6 +37,7 @@ import {
 	type TurnOutcome,
 	zeroUsage,
 } from "./openaiWire";
+import { providerShapes } from "../harness/adapters/apiShapes";
 
 const MAX_DIGESTS = 3;
 const INTERRUPTED = "[interrupted — the run was stopped before this tool returned]";
@@ -283,7 +284,7 @@ export class OpenAIEngine implements AgentEngine {
 				}),
 			];
 			this.record({ id: `asst-${randomUUID()}`, role: "assistant", content, createdAt: Date.now() });
-			this.chain = turn.responseId && protocolFor(settings.providerId, settings.modelId) === "responses" ? { responseId: turn.responseId, from: this.mirror.length } : undefined;
+			this.chain = turn.responseId && protocolFor(settings.providerId, settings.modelId) === "responses" && !providerShapes(settings.providerId, settings.baseUrl).responses?.stateless ? { responseId: turn.responseId, from: this.mirror.length } : undefined;
 			this.emitTurn(turn);
 			if (turn.text) this.lastText = turn.text;
 			if (!turn.calls.length) {
@@ -355,6 +356,11 @@ export class OpenAIEngine implements AgentEngine {
 		const protocol = protocolFor(settings.providerId, settings.modelId);
 		const url = endpointFor(protocol, settings.baseUrl);
 		if (this.forceCompactRef.current) this.chain = undefined;
+		// Matrix constraints: stateless endpoints (OpenRouter Responses) reject
+		// store:true and id chaining outright — never chain, never store there.
+		const shapeConstraints = providerShapes(settings.providerId, settings.baseUrl)[protocol === "responses" ? "responses" : "chat"];
+		const stateless = shapeConstraints?.stateless === true;
+		if (stateless) this.chain = undefined;
 		const send = async (chain: Chain | undefined): Promise<TurnOutcome> => {
 			const body =
 				protocol === "responses"
@@ -363,15 +369,18 @@ export class OpenAIEngine implements AgentEngine {
 							instructions: ts.systemPrompt,
 							input: toResponsesInput(chain ? this.mirror.slice(chain.from) : await this.projected(settings, ts, iteration)),
 							tools: ts.tools,
-							previousResponseId: chain?.responseId,
+							previousResponseId: stateless ? undefined : chain?.responseId,
+							store: stateless ? false : undefined,
 							maxOutputTokens: settings.maxTokens,
-							compactThreshold: this.budget ? Math.max(1000, this.budget) : undefined,
+							compactThreshold: stateless ? undefined : this.budget ? Math.max(1000, this.budget) : undefined,
+							extras: shapeConstraints?.extras?.(settings.modelId),
 						})
 					: chatBody({
 							model: settings.modelId,
 							messages: toChatMessages(ts.systemPrompt, await this.projected(settings, ts, iteration)),
 							tools: ts.tools,
 							maxTokens: settings.maxTokens,
+							extras: shapeConstraints?.extras?.(settings.modelId),
 						});
 			const stream = await postStream(url, settings.apiKey, body, this.abort?.signal);
 			const hooks = {

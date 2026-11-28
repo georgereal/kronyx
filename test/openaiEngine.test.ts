@@ -141,7 +141,8 @@ describe("OpenAIEngine", () => {
 		expect(events.at(-1)).toMatchObject({ type: "run-finished", status: "completed", text: "Done." });
 	});
 
-	it("uses stateless chat completions for non-OpenAI providers and resends the full history", async () => {
+	it("uses stateless chat completions for chat-only providers and resends the full history", async () => {
+		// OpenRouter is deliberately not the fixture here: the matrix serves it Responses now.
 		const chatStream = sse([
 			{ choices: [{ delta: { content: "Hi" } }] },
 			{ choices: [{ delta: {}, finish_reason: "stop" }] },
@@ -152,7 +153,7 @@ describe("OpenAIEngine", () => {
 		const { host, events } = makeHost();
 		const engine = new OpenAIEngine(host);
 
-		await engine.run("hello", { ...openaiSettings, providerId: "openrouter" });
+		await engine.run("hello", { ...openaiSettings, providerId: "custom-local" });
 
 		const [url] = fetchMock.mock.calls[0] as [string];
 		expect(url).toBe("https://api.example.test/v1/chat/completions");

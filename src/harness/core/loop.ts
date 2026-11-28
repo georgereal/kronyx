@@ -36,7 +36,8 @@ import type { RequestStrategy, StrategyCtx } from "./policies/requestStrategy";
 import { defaultBehavior, type HarnessBehavior } from "./behavior";
 import { initialState, project, reduce, type HarnessState } from "./projections";
 import { callIsReadOnly, SteeringRegistry } from "../defaults/steering";
-import {
+import { inferStepSignal } from "../planning/planSeed";
+import { acceptanceProblem,
 	applyLedgerEvent,
 	checkCreate,
 	checkRemove,
@@ -119,6 +120,50 @@ export interface HarnessLimits {
 const STRIP_STRIKES = 3;
 const LOG_SLICE_CAP = 8000;
 
+/** Structured user questions: the model asks through the tool instead of ending
+ *  a turn with prose questions. The kernel intercepts the call, logs the
+ *  questions as data, and pauses — the UI renders them as an interactive
+ *  survey rather than parsing natural text. */
+export const ASK_USER = "ask_user";
+const ASK_USER_SPEC: ToolSpec = {
+	name: ASK_USER,
+	description:
+		"Ask the user questions and wait for their answers. Use whenever you need information only the user has — decisions, missing requirements, credentials, or a choice between approaches. Each question may carry options the user can pick from; the user can always answer in free text instead. The run pauses until they reply, so ask everything blocking you in one call. Do not end a turn with questions in plain text — always use this tool.",
+	inputSchema: {
+		type: "object",
+		properties: {
+			questions: {
+				type: "array",
+				items: {
+					type: "object",
+					properties: {
+						question: { type: "string", description: "One concrete question." },
+						options: { type: "array", items: { type: "string" }, description: "Selectable choices, when the answer space is known." },
+					},
+					required: ["question"],
+				},
+			},
+		},
+		required: ["questions"],
+	},
+};
+
+/** Reads ask_user input into the logged shape — tolerates the loose objects models emit. */
+function sanitizeQuestions(input: unknown): Array<{ question: string; options?: string[] }> {
+	const list = (input as { questions?: unknown } | null)?.questions;
+	if (!Array.isArray(list)) return [];
+	const out: Array<{ question: string; options?: string[] }> = [];
+	for (const item of list.slice(0, 8)) {
+		const q = (item as { question?: unknown })?.question;
+		const question = typeof q === "string" ? q.trim() : "";
+		if (!question) continue;
+		const raw = (item as { options?: unknown }).options;
+		const options = Array.isArray(raw) ? raw.filter((o): o is string => typeof o === "string" && o.trim().length > 0).slice(0, 6) : undefined;
+		out.push(options?.length ? { question, options } : { question });
+	}
+	return out;
+}
+
 export const DEFAULT_LIMITS: HarnessLimits = { maxTurns: 50, maxInputTokens: 2_000_000, maxRefusals: 3 };
 
 export interface HarnessDeps {
@@ -142,8 +187,11 @@ export interface HarnessDeps {
 	signal?: AbortSignal;
 	/** Write modes: a run that ends without any tool call gets one nudge to proceed. */
 	nudgeWrites?: boolean;
-	/** False in read-only modes (ask/plan): the planner must not emit write steps and command acceptances are coerced to none. Defaults to true. */
-	writable?: boolean;
+	/** False in read-only modes (ask/plan): the planner must not emit write steps and command acceptances are coerced to none. Defaults to true.
+	 * May be an accessor — mode decisions (write gating, stop logic, plan
+	 * termination) evaluate the mode at the moment they're made, so a composer
+	 * mode flip mid-run takes effect instead of the run keeping its birth mode. */
+	writable?: boolean | (() => boolean);
 	/** Called after each event is applied to the projection. Used by the UI for the task board. */
 	onState?: (state: HarnessState, event: SessionEvent) => void;
 	/** System prompt for every request. Defaults to the harness instructions. Must stay identical across runs for cache hits. */
@@ -192,6 +240,11 @@ export class HarnessLoop {
 	/** Last request's input usage — the real context size, unlike the cumulative counter. */
 	private lastInputTokens = 0;
 	private lastCachedTokens = 0;
+	/** Open divergence episode id. Off-plan write/run work is recorded as board
+	 *  tasks (origin: divergence) with the normal lifecycle — the report reads
+	 *  them as what the model actually did outside the plan, not noise. */
+	private divergenceId: string | undefined;
+	private divergenceScanned = false;
 	private running = false;
 	private readonly limits: HarnessLimits;
 	/** Per-extension quantum when the user continues past a turn limit. */
@@ -220,12 +273,12 @@ export class HarnessLoop {
 		this.behavior = deps.behavior ?? defaultBehavior();
 		this.loopCfg = this.behavior.loopControl.config(deps.loop);
 		this.strategy = deps.model.strategy ?? statelessStrategy;
-		this.steering = deps.steering ?? registryFor(this.behavior.steering.rules({ writable: deps.writable !== false, runId: deps.runId }));
+		this.steering = deps.steering ?? registryFor(this.behavior.steering.rules({ writable: typeof deps.writable === "function" ? deps.writable() : deps.writable !== false, runId: deps.runId }));
 		this.system = deps.system ?? SYSTEM_INSTRUCTIONS;
 		const external = deps.tools.specs();
-		const clash = external.find((t) => TASK_TOOL_SET.has(t.name) || t.name === LOG_SLICE);
+		const clash = external.find((t) => TASK_TOOL_SET.has(t.name) || t.name === LOG_SLICE || t.name === ASK_USER);
 		if (clash) throw new Error(`tool name ${clash.name} is reserved by the harness`);
-		this.tools = [...TASK_TOOLS, LOG_SLICE_SPEC, ...external];
+		this.tools = [...TASK_TOOLS, LOG_SLICE_SPEC, ASK_USER_SPEC, ...external];
 		// Task creation/removal stays planner-owned. Revisions and status moves are
 		// the model's job — steering already names task_step_add/task_update, so they
 		// must be callable. The kernel validates every proposal before it lands.
@@ -259,10 +312,15 @@ export class HarnessLoop {
 	 * Starts a run. `context` is per-run material (memory, workspace state) placed
 	 * at the start of this run's user message, so the system prompt stays identical.
 	 */
-	async run(text: string, context?: string, images?: ImageInput[], opts?: { plan?: boolean; seed?: SeedTask[] }): Promise<RunOutcome> {
+	async run(text: string, context?: string, images?: ImageInput[], opts?: { plan?: boolean; seed?: SeedTask[]; notes?: string[] }): Promise<RunOutcome> {
 		this.begin();
+		this.planDelivered = false;
 		await this.emit({ type: "run.status", status: "running" });
+		// Internal steps the harness performed before the loop (reading AGENTS.md,
+		// parsing the plan document) are surfaced as durable notes — visible in the
+		// chat like every other harness decision, and replayed with the session.
 		await this.emit({ type: "user.input", text: context ? `${context}\n\n${text}` : text, ...(images?.length ? { images } : {}) });
+		for (const note of opts?.notes ?? []) await this.emit({ type: "steer.note", rule: "harness.step", text: note });
 		this.planDocFromTaskText(text);
 		if (opts?.seed?.length) await this.seedBoard(opts.seed);
 		else if (opts?.plan) await this.planBoard(text);
@@ -282,13 +340,25 @@ export class HarnessLoop {
 		const base = this.state.ledger.order.length;
 		let seeded = 0;
 		for (const s of seed) {
+			// Plan phases are sequential by construction — chaining dependencies is
+			// what keeps one phase active at a time. Without it every seeded task
+			// activates at once and the model works all phases in parallel while
+			// the drift detector counts that in-order work as unproductive.
 			const task: Task = {
 				id: `t${base + seeded + 1}`,
 				title: s.title,
 				acceptance: s.acceptance ?? { kind: "none" },
-				dependsOn: [],
+				dependsOn: seeded > 0 ? [`t${base + seeded}`] : [],
 				status: "pending",
-				steps: s.steps.map((text, i) => ({ id: `s${i + 1}`, text, status: "pending", callIds: [] })),
+				steps: s.steps.map((text, i) => {
+					// Seeded steps carry inferred signals where the plan names a
+					// command — the harness then auto-closes them when the work
+					// happens, and the model only manually closes what inference
+					// can't cover. State moves both ways: the board flows to the
+					// model each turn, tool evidence flows back into the board.
+					const signal = inferStepSignal(text);
+					return { id: `s${i + 1}`, text, status: "pending" as const, callIds: [], ...(signal ? { signal } : {}) };
+				}),
 				evidence: [],
 				runId: this.deps.runId,
 				planId: activePlanId(this.state.ledger, this.deps.runId) ?? nextPlanId(this.state.ledger),
@@ -301,7 +371,7 @@ export class HarnessLoop {
 			await this.emit({ type: "task.created", task });
 			seeded++;
 		}
-		if (seeded) await this.emit({ type: "steer.note", rule: "plan.seed", text: `Plan seeded: ${seeded} task${seeded === 1 ? "" : "s"} on the board. Work the steps in order and stay inside the plan's scope.` });
+		if (seeded) await this.emit({ type: "steer.note", rule: "plan.seed", text: `Plan seeded: ${seeded} task${seeded === 1 ? "" : "s"} on the board, one phase at a time. Work the active task's steps in order; when a step's work is done close it — task_step_update with status "done" (the harness attaches the proving calls itself).` });
 		await this.advanceBoard();
 	}
 
@@ -323,6 +393,14 @@ export class HarnessLoop {
 		if (planish) this.planDoc = { label: planish, how: `edit_file/write_file on ${planish}` };
 	}
 
+	private planDelivered = false;
+
+	/** The run's writability right now — live when the host passes an accessor. */
+	private isWritable(): boolean {
+		const w = this.deps.writable;
+		return typeof w === "function" ? w() : w !== false;
+	}
+
 	private planDocFromCall(call: ToolCall, ok: boolean, output: string): void {
 		if (!ok) return;
 		if (call.name === "save_plan") {
@@ -335,7 +413,7 @@ export class HarnessLoop {
 	}
 
 	private async planBoard(taskText: string): Promise<void> {
-		const writable = this.deps.writable !== false;
+		const writable = this.isWritable();
 		// Give the planner the earlier runs' plans, grouped per run, so a
 		// continuation ("redo", "same task") adopts the matching layer instead of
 		// minting meta-tasks to rediscover prior work.
@@ -351,6 +429,10 @@ export class HarnessLoop {
 				savedPlans = undefined;
 			}
 		}
+		// No plan-document injection here: implementation intent toward a doc is
+		// seeded deterministically upstream and never reaches the planner, and
+		// reference docs ride in the task text via @-expansion. The planner
+		// grounds free-form tasks only.
 		// The planner call is a full unstreamed model call — surface it so the
 		// gap between run start and the first task reads as work, not a hang.
 		await this.emit({ type: "steer.note", rule: "plan.start", text: "Planning this run's task board…" });
@@ -466,6 +548,7 @@ export class HarnessLoop {
 		this.window = { turns: 0, refusals: 0, calls: 0, nudged: false };
 		this.phases = [];
 		this.reason = undefined;
+		this.userAsked = false;
 	}
 
 	private async guarded(step: () => Promise<RunOutcome>): Promise<RunOutcome> {
@@ -561,6 +644,12 @@ export class HarnessLoop {
 	}
 
 	private async modelCall(): Promise<void> {
+		if (this.planDelivered) {
+			// The plan document is saved — the run's deliverable exists. End here
+			// rather than handing the model another turn it would spend implementing.
+			await this.emit({ type: "steer.note", rule: "plan.delivered", text: "Plan saved — the run ends here. Review the plan and start implementation when ready." });
+			return this.enter("Done");
+		}
 		const turn = this.state.counters.turns + 1;
 		const recentTurns = this.state.messages
 			.flatMap((m) =>
@@ -571,7 +660,17 @@ export class HarnessLoop {
 			.slice(-24);
 		const before = await this.steering.run("beforeModel", { turn, ledger: this.state.ledger, recentTurns });
 		await this.noteAll(before.notes);
-		if (before.verdict.kind === "deny") return this.pause(before.verdict.reason);
+		// A beforeModel denial instructs the MODEL ("stop exploring — report what
+		// you found") — pausing here froze the run so it could never comply, and
+		// the user inherited a model-behavior problem. Instead the denial rides
+		// as a strong note and this turn's tools are stripped: with nothing to
+		// call, the model can only write up or state its blocker, then the run
+		// finishes or continues honestly. The deny rules carry their own
+		// hysteresis, so compliance is never punished by an instant re-deny.
+		if (before.verdict.kind === "deny") {
+			await this.noteAll([{ rule: before.verdict.rule, text: `${before.verdict.reason} Tools are stripped for this turn — respond with text.` }]);
+			this.stripOnce = true;
+		}
 		if (before.verdict.kind === "ask") {
 			const proceed = this.deps.onSteerAsk ? await this.deps.onSteerAsk(before.verdict.question) : false;
 			if (!proceed) return this.pause(before.verdict.question);
@@ -589,7 +688,11 @@ export class HarnessLoop {
 			await this.emit({ type: "steer.note", rule: "context.budget", text: `This run has spent ${Math.round(this.runSpend() / 1000)}k input tokens — allowance extended to ${Math.round(this.limits.maxInputTokens / 1000)}k. Context is unchanged.` });
 		}
 		// Strip level (after two flagged calls) removes tools for the next model turn; derived from strikes so it survives recovery.
-		const tools = this.state.strikes === STRIP_STRIKES ? [] : this.offered;
+		const tools = this.state.strikes === STRIP_STRIKES || this.stripOnce ? [] : this.offered;
+		this.stripOnce = false;
+		// ask_user is always available, even on stripped turns — a model ordered
+		// to write up may instead need the user, and that is a legitimate escape.
+		this.turnTools = new Set([...tools.map((t) => t.name), ASK_USER]);
 		// Recap triggers are consumed here and handed to the strategy, which decides whether they apply (the stateless lifecycle recaps; server-side lifecycles compact remotely).
 		const recap = { lastInputTokens: this.lastInputTokens, taskDone: this.taskRecapPending, forced: this.forceRecap };
 		this.taskRecapPending = false;
@@ -685,6 +788,20 @@ export class HarnessLoop {
 				continue;
 			}
 			if (this.state.outcomes[call.callId] !== undefined) continue;
+			// Structured user questions bypass the gates — nothing executes, the
+			// questions are logged as data and the run pauses once the batch drains.
+			if (call.name === ASK_USER) {
+				await flush();
+				const questions = sanitizeQuestions(call.input);
+				if (!questions.length) {
+					await this.finish(call, false, "ask_user needs at least one question — ask what is blocking you, with options when the choices are known.");
+					continue;
+				}
+				await this.emit({ type: "user.question", questions });
+				this.userAsked = true;
+				await this.finish(call, true, "Questions delivered. The run is paused until the user answers — do not call more tools this turn.");
+				continue;
+			}
 			const gate = await this.gate(call);
 			if (gate === "stop") {
 				await flush();
@@ -693,6 +810,20 @@ export class HarnessLoop {
 			}
 			if (gate === "done") {
 				await flush();
+				continue;
+			}
+			// Defense in depth: a call the model was never offered (hallucinated,
+			// or stripped this turn) never executes — it is refused with the
+			// alternates the model does have, so it can adapt instead of stopping.
+			// This runs after the loop gate on purpose: repetition of even a
+			// refused call is still a loop, and the detector must see it.
+			if (!TASK_TOOL_SET.has(call.name) && call.name !== LOG_SLICE && !this.turnTools.has(call.name)) {
+				await flush();
+				const alternates = this.offered.filter((t) => this.turnTools.has(t.name)).map((t) => t.name);
+				const why = alternates.length
+					? `"${call.name}" is not available — it was never offered this turn. Use what you have: ${alternates.slice(0, 12).join(", ")}${alternates.length > 12 ? "…" : ""}.`
+					: `"${call.name}" is not available — no tools are offered this turn. Respond with text only.`;
+				await this.finish(call, false, `Refused: ${why}`);
 				continue;
 			}
 			if (gate === "parallel") {
@@ -706,10 +837,17 @@ export class HarnessLoop {
 		await flush();
 		this.pendingCalls = [];
 		if (stopped) return this.pause(stopped);
+		if (this.userAsked) return this.pause("question");
 		this.enter("ModelCall");
 	}
 
 	private stopReason: string | undefined;
+	/** One-turn tool strip from a beforeModel denial — forces a write-up turn instead of pausing the run. */
+	private stripOnce = false;
+	/** Tools actually offered on the current turn — calls outside this set are refused, never executed. */
+	private turnTools: ReadonlySet<string> = new Set();
+	/** Set when the model asked the user through ask_user — the batch completes, then the run pauses. */
+	private userAsked = false;
 
 	/** Per-call gates: loop control, then steering. Returns what the batch should do with the call. */
 
@@ -773,9 +911,17 @@ export class HarnessLoop {
 			if (this.state.strikes > 0) await this.emit({ type: "loop.verdict", level: "none", fingerprint });
 			return { level: "none", fingerprint };
 		}
+		// Read-only calls escalate warn → block but never strip/pause. Warnings are
+		// demonstrably ineffective on weaker models — the reasoning acknowledges
+		// them and the action repeats anyway, so the second offense is refused:
+		// a refusal forces a different action, a note doesn't. The first repeat
+		// still only warns, so legitimate re-reads after compaction (which need
+		// exactly one re-read, not a streak) are never blocked; and a blocked
+		// read never strips tools or kills the run.
 		const level = this.behavior.loopControl.levelForStrikes(this.state.strikes);
-		await this.emit({ type: "loop.verdict", level, fingerprint, reason: reason });
-		return { level, fingerprint, reason };
+		const capped = callIsReadOnly(call.name, call.input) && level !== "none" ? (level === "warn" ? "warn" : "block") : level;
+		await this.emit({ type: "loop.verdict", level: capped, fingerprint, reason: reason });
+		return { level: capped, fingerprint, reason };
 	}
 
 	private async refused(call: ToolCall, output: string): Promise<void> {
@@ -791,7 +937,15 @@ export class HarnessLoop {
 		// A saved/updated plan replaces what the run's board was built from —
 		// nudge the model to realign open tasks before drift scores the new plan
 		// as unproductive turns.
-		if (ok && call.name === "save_plan" && openSteps(this.state.ledger, this.deps.runId).length) {
+		if (ok && call.name === "save_plan" && !this.isWritable()) {
+			// Plan mode's deliverable is the saved plan document, and saving it
+			// ENDS the run — the user reviews the plan card and starts implementation
+			// (or doesn't). Anything else traps the model: the board's implementation
+			// tasks plus the open-work stop refusal physically force it to implement
+			// the plan it just wrote, inside the mode that exists to prevent exactly
+			// that. The batch drains first (call pairing), then modelCall ends the run.
+			this.planDelivered = true;
+		} else if (ok && call.name === "save_plan" && openSteps(this.state.ledger, this.deps.runId).length) {
 			await this.noteAll([{ rule: "plan.saved", text: "Plan saved. If it replaces the current plan, realign the board now — task_replace rewrites it to the plan's phases in one call. Steps that no longer match the real work will stall and count as drift." }]);
 		}
 		// A replaced board strands the plan document this run works from — ask
@@ -813,6 +967,7 @@ export class HarnessLoop {
 				await this.noteAll([{ rule: "plan.doc-sync", text: `${doc.label} no longer matches the board — update it (${doc.how}) to keep the record current.` }]);
 			}
 		}
+		await this.trackDivergence(call, ok);
 		await this.advanceBoard(call, ok);
 	}
 
@@ -823,6 +978,86 @@ export class HarnessLoop {
 	 * steps move to in_progress. All transitions are pre-checked, so this is a
 	 * no-op when the board is already current.
 	 */
+	/** Write/run tools that count as work for divergence purposes — reads never do. */
+	private static readonly DIVERGENCE_WRITES = new Set(["write_file", "edit_file", "file_editor", "append_file", "insert_lines", "apply_patch", "rename_symbol", "run_command", "start_process"]);
+
+	/**
+	 * Divergence tracking: the same on-plan test as the plan.offstep tripwire,
+	 * but instead of only warning, the harness records the work as a board task
+	 * (origin: divergence) with the normal lifecycle — opened pending →
+	 * in_progress on the first off-plan write/run call, closed done when the
+	 * model returns to plan work. Episodes left open at run end stay in_progress
+	 * — the honest state of abandoned divergence. Reads and board edits are
+	 * neutral: they neither extend nor close an episode. When no open step
+	 * carries a signal the board predicts nothing, so nothing can diverge —
+	 * an open episode closes there rather than branding all post-plan work.
+	 */
+	private async trackDivergence(call: ToolCall, ok: boolean): Promise<void> {
+		if (TASK_TOOL_SET.has(call.name) || call.name === LOG_SLICE) return;
+		if (callIsReadOnly(call.name, call.input)) return;
+		if (!HarnessLoop.DIVERGENCE_WRITES.has(call.name)) return;
+		// Resume-safe: the episode lives in the ledger, so rebuild the in-memory
+		// pointer once rather than trusting constructor state.
+		if (!this.divergenceScanned) {
+			this.divergenceScanned = true;
+			this.divergenceId = tasksOfRun(this.state.ledger, this.deps.runId)
+				.filter((id) => this.state.ledger.tasks[id]?.origin === "divergence" && this.state.ledger.tasks[id]?.status === "in_progress")
+				.at(-1);
+		}
+		const planTasks = tasksOfRun(this.state.ledger, this.deps.runId).filter((id) => {
+			const t = this.state.ledger.tasks[id];
+			return t && t.origin !== "divergence" && t.status !== "stale";
+		});
+		const open = planTasks
+			.filter((id) => this.state.ledger.tasks[id]?.status !== "done")
+			.flatMap((id) => (this.state.ledger.tasks[id]?.steps ?? []).filter((s) => s.status !== "done" && s.status !== "failed" && s.status !== "blocked" && s.signal).map((s) => ({ taskId: id, step: s })))
+			.slice(0, 4);
+		// Tracking is active once the board carries any signaled step, settled or
+		// not — a fully-worked plan doesn't license unchecked writing: post-plan
+		// writes are the purest divergence. A board that never had signals (seeded
+		// signal-less steps) predicts nothing, so nothing can diverge from it.
+		const anySignals = planTasks.some((id) => (this.state.ledger.tasks[id]?.steps ?? []).some((s) => s.signal));
+		if (!anySignals) return;
+		const onPlan =
+			open.some((o) => signalHits(o.step.signal!, call)) ||
+			// Writes serving a verify step are its fixup loop, not divergence.
+			(HarnessLoop.DIVERGENCE_WRITES.has(call.name) && call.name !== "run_command" && call.name !== "start_process" && open.some((o) => o.step.signal!.tool === "run_command"));
+		if (onPlan) {
+			if (this.divergenceId) await this.closeDivergence();
+			return;
+		}
+		if (this.divergenceId) return; // episode continues — the report reads the window
+		// First off-plan call: open the episode. Ids use the x-prefix so they
+		// never collide with plan tasks (t-prefix) — still scanned for safety.
+		let n = 0;
+		for (const id of Object.keys(this.state.ledger.tasks)) {
+			const m = /^x(\d+)$/.exec(id);
+			if (m) n = Math.max(n, Number(m[1]));
+		}
+		let id = `x${n + 1}`;
+		while (this.state.ledger.tasks[id]) id = `x${++n + 1}`;
+		this.divergenceId = id;
+		const target = typeof (call.input as { path?: unknown })?.path === "string" ? ` ${(call.input as { path: string }).path.split("/").pop()}` : "";
+		await this.emit({
+			type: "task.created",
+			task: { id, title: `Unplanned work — starting with ${call.name}${target}`, acceptance: { kind: "none" }, dependsOn: [], status: "pending", steps: [], evidence: [], runId: this.deps.runId, origin: "divergence" },
+		});
+		if (checkTransition(this.state.ledger, id, "in_progress").ok) {
+			await this.emit({ type: "task.updated", id, to: "in_progress" });
+		}
+	}
+
+	private async closeDivergence(): Promise<void> {
+		const id = this.divergenceId!;
+		this.divergenceId = undefined;
+		// acceptance:none auto-verifies — the harness emits the result itself so
+		// the done transition passes the verified-check.
+		await this.emit({ type: "verifier.result", taskId: id, ok: true, detail: "no acceptance check" });
+		if (checkTransition(this.state.ledger, id, "done").ok) {
+			await this.emit({ type: "task.updated", id, to: "done" });
+		}
+	}
+
 	private async advanceBoard(call?: ToolCall, ok = false): Promise<void> {
 		// The board is run-scoped: only this run's tasks (incl. adopted ones) advance.
 		const runTasks = () => tasksOfRun(this.state.ledger, this.deps.runId);
@@ -839,6 +1074,9 @@ export class HarnessLoop {
 			return false;
 		};
 		if (call && ok) {
+			// First hit only: identical verify commands recur across phases (every
+			// plan ends each phase with the same `mvn compile`), and one run must
+			// close exactly one step — the earliest open one — not all of them.
 			for (const id of runTasks()) {
 				const task = this.state.ledger.tasks[id];
 				if (!task || task.status === "done" || task.status === "blocked") continue;
@@ -853,6 +1091,7 @@ export class HarnessLoop {
 				if (checkStepUpdate(this.state.ledger, id, step.id, "done", [call.callId], this.state.outcomes).ok) {
 					await this.emit({ type: "step.updated", taskId: id, stepId: step.id, to: "done", callIds: [call.callId] });
 				}
+				break;
 			}
 		}
 		for (const id of runTasks()) {
@@ -891,6 +1130,9 @@ export class HarnessLoop {
 		for (const id of [...tasksOfRun(this.state.ledger, this.deps.runId)]) {
 			const task = this.state.ledger.tasks[id];
 			if (!task || task.status === "done" || task.status === "blocked") continue;
+			// Divergence records are harness-managed — they close on the return to
+			// plan work or stay honestly in_progress, never force-closed here.
+			if (task.origin === "divergence") continue;
 			// A blocked dependency can never go done, so its dependents can't either.
 			const blockedDep = task.dependsOn.find((d) => this.state.ledger.tasks[d]?.status === "blocked");
 			if (blockedDep) {
@@ -937,6 +1179,24 @@ export class HarnessLoop {
 			}
 			if (checkTransition(this.state.ledger, id, "done").ok) await this.emit({ type: "task.updated", id, to: "done" });
 		}
+	}
+
+	/** Where a dep-blocked model should actually work: walk the dependency chain to the deepest unfinished task and name its first open step. */
+	private depRedirect(depId: string): string {
+		let current = depId;
+		for (let depth = 0; depth < 8; depth++) {
+			const task = this.state.ledger.tasks[current];
+			if (!task) break;
+			const waiting = task.status === "pending" ? task.dependsOn.find((d) => this.state.ledger.tasks[d]?.status !== "done") : undefined;
+			if (waiting) {
+				current = waiting;
+				continue;
+			}
+			const open = task.steps.find((s) => s.status === "in_progress") ?? task.steps.find((s) => s.status !== "done" && s.status !== "failed" && s.status !== "blocked");
+			if (open) return ` The open step is ${current}/${open.id} "${open.text.slice(0, 80)}" — work on that.`;
+			return ` Finish ${current} first.`;
+		}
+		return ` Finish ${depId} first.`;
 	}
 
 	/** Close-out attempts per task — a stalled task gets one refusal cycle to recover before the harness marks it blocked. */
@@ -988,6 +1248,10 @@ export class HarnessLoop {
 				case TASK_TOOL_NAMES.create: {
 					const input = parseTaskCreateInput(call.input);
 					if (input.acceptance.kind === "reviewer") return rejected("Reviewer acceptance is not enabled yet; use kind command.");
+					if (input.acceptance.kind === "command") {
+						const problem = acceptanceProblem(input.acceptance.command);
+						if (problem) return rejected(`Refused: ${problem}`);
+					}
 					const task: Task = {
 						id: input.id,
 						title: input.title,
@@ -1009,13 +1273,21 @@ export class HarnessLoop {
 					// validated against a simulated ledger first — a bad
 					// replacement leaves the old board untouched.
 					const { tasks } = parseTaskReplaceInput(call.input);
+					// Verification integrity: a replacement may not carry trivially-passing or
+					// impossible acceptance commands — rewriting the board is not a way out of verification.
+					for (const t of tasks) {
+						if (t.acceptance.kind === "command") {
+							const problem = acceptanceProblem(t.acceptance.command);
+							if (problem) return rejected(`Refused: task ${t.id} — ${problem}`);
+						}
+					}
 					const planId = nextPlanId(this.state.ledger);
 					const prevPlan = activePlanId(this.state.ledger, this.deps.runId);
 					// The old plan isn't deleted — its unfinished tasks go stale so
 					// the board keeps the superseded plan as visible history.
 					const drop = tasksOfRun(this.state.ledger, this.deps.runId).filter((id) => {
-						const st = this.state.ledger.tasks[id]?.status;
-						return st !== "done" && st !== "stale";
+						const t = this.state.ledger.tasks[id];
+						return t?.origin !== "divergence" && t?.status !== "done" && t?.status !== "stale";
 					});
 					let sim = this.state.ledger;
 					for (const id of drop) sim = applyLedgerEvent(sim, { type: "task.updated", id, to: "stale" });
@@ -1074,7 +1346,7 @@ export class HarnessLoop {
 					if (step0 && step0.status === input.status) return { ok: true, output: `Step ${input.stepId} is already ${input.status}.` };
 					// A dep-blocked task can't run, so its steps can't move — finish the dependency first.
 					const depBlock = stepTask?.status === "pending" ? stepTask.dependsOn.find((d) => this.state.ledger.tasks[d]?.status !== "done") : undefined;
-					if (depBlock && input.status !== "pending") return rejected(`task ${input.taskId} is waiting on ${depBlock} — its steps can't move until the dependency is done`);
+					if (depBlock && input.status !== "pending") return rejected(`task ${input.taskId} is waiting on ${depBlock} — its steps can't move until the dependency is done.${this.depRedirect(depBlock)}`);
 					const check = checkStepUpdate(this.state.ledger, input.taskId, input.stepId, input.status, input.callIds, this.state.outcomes, input.reason);
 					if (!check.ok) return rejected(check.message);
 					if (input.replacement && input.status !== "failed") return rejected("A replacement step only goes with status failed.");
@@ -1143,7 +1415,20 @@ export class HarnessLoop {
 		return { ok: true, output: `Task ${input.id} is done; the acceptance check passed.` };
 	}
 
+	/** The model ended its turn with a user-directed question — waiting for the
+	 *  answer is the correct state, not a premature finish. The run pauses and
+	 *  the user's reply continues the session. */
+	private endsWithUserQuestion(): boolean {
+		const last = [...this.state.messages].reverse().find((m) => m.kind === "assistant");
+		if (!last || last.kind !== "assistant" || last.toolCalls.length) return false;
+		return last.text.trimEnd().replace(/[*_`#>\s]+$/g, "").endsWith("?");
+	}
+
 	private async stopCheck(): Promise<void> {
+		// A user-directed question pauses before any board mutation — the model is
+		// waiting for an answer, not claiming the work is done.
+		const asksUser = this.endsWithUserQuestion();
+		if (asksUser) return this.pause("question");
 		await this.closeBoard();
 		const ledger: Ledger = this.state.ledger;
 		const open = openTasks(ledger, this.deps.runId);
@@ -1164,7 +1449,30 @@ export class HarnessLoop {
 				return this.enter("Verify");
 			}
 		}
-		if (this.window.refusals >= this.limits.maxRefusals) return this.pause("open_tasks");
+		if (open.length && !this.isWritable()) {
+			// Read-only runs can't finish implementation-shaped open work — refusing
+			// the stop traps the model into implementing inside plan/ask mode, the
+			// exact inversion of what the mode is for. End honestly: blocked, named.
+			const names = open.map((id) => `${id} "${ledger.tasks[id]?.title ?? ""}"`).join(", ");
+			for (const id of open) await this.emit({ type: "task.updated", id, to: "blocked", reason: "read-only run ended — implementation belongs to a code-mode run" });
+			await this.emit({ type: "steer.note", rule: "finish.readonly", text: `Run ended in a read-only mode with task(s) not implementable here: ${names}` });
+			return this.enter("Verify");
+		}
+		if (this.window.refusals >= this.limits.maxRefusals) {
+			const names = open.map((id) => `${id} "${ledger.tasks[id]?.title ?? ""}"`).join(", ");
+			const question = `The agent keeps trying to finish but these tasks are still open: ${names}. Continue working, or end the run here (they will be marked blocked)?`;
+			const proceed = this.deps.onSteerAsk ? await this.deps.onSteerAsk(question) : false;
+			if (proceed) {
+				// Fresh refusal window — the user chose to let it keep working.
+				this.window.refusals = 0;
+			} else {
+				// No frozen run: the open tasks are honestly marked blocked and the
+				// run ends. The blocked list is surfaced in the finish note.
+				for (const id of open) await this.emit({ type: "task.updated", id, to: "blocked", reason: "ended with the work unfinished" });
+				await this.emit({ type: "steer.note", rule: "finish.blocked", text: `Run ended with open work marked blocked: ${names}` });
+				return this.enter("Verify");
+			}
+		}
 		this.window.refusals++;
 		await this.emit({ type: "stop.refused", openTaskIds: openTasks(this.state.ledger, this.deps.runId) });
 		this.enter("ModelCall");

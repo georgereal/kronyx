@@ -5,6 +5,7 @@ import * as vscode from "vscode";
 import { AgentRunner, type ProviderSettings, type RunnerHost } from "./agent/runner";
 import type { AgentEngine, EngineKind } from "./agent/engine";
 import { OpenAIEngine } from "./agent/openaiEngine";
+import { resolveShape } from "./harness/adapters/apiShapes";
 
 export interface EvalCase {
 	name: string;
@@ -58,8 +59,25 @@ export async function runSuite(
 	const cases = await loadSuite(root);
 	const results: EvalResult[] = [];
 	for (const engine of engines) {
+		// Same matrix rules as the product path: "auto"/"openai" resolve to the best
+		// shape the provider serves; an explicit shape the matrix doesn't support
+		// fails loudly instead of running a different protocol than asked.
+		const pref = engine === "cline" ? "cline" : engine === "auto" || engine === "openai" || engine === "harness" ? "auto" : engine;
+		const resolved = resolveShape(settings.providerId, settings.baseUrl, pref as Parameters<typeof resolveShape>[2]);
+		if (!resolved.ok) {
+			log(`Eval engine "${engine}": ${resolved.message}`);
+			for (const evalCase of cases) {
+				results.push({
+					name: evalCase.name, model: settings.modelId, engine, status: "failed", passed: false,
+					details: resolved.message, iterations: 0, durationMs: 0,
+					inputTokens: 0, cachedTokens: 0, outputTokens: 0, toolCalls: 0,
+				});
+			}
+			continue;
+		}
+		const tag = engine === "auto" || engine === "openai" ? `${engine}:${resolved.shape}` : engine;
 		for (const evalCase of cases) {
-			log(`Eval "${evalCase.name}" [${engine}] started`);
+			log(`Eval "${evalCase.name}" [${tag}] started`);
 			const started = Date.now();
 			const m = { status: "failed", iterations: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, toolCalls: 0 };
 			const host: RunnerHost = {
@@ -81,7 +99,7 @@ export async function runSuite(
 					} else if (event.type === "tool-started") m.toolCalls++;
 				},
 			};
-			const agent: AgentEngine = engine === "openai" ? new OpenAIEngine(host) : new AgentRunner(host);
+			const agent: AgentEngine = resolved.shape === "cline" ? new AgentRunner(host) : new OpenAIEngine(host);
 			await agent.run(evalCase.task, settings);
 			const details = await verify(root, evalCase);
 			const passed = m.status === "completed" && details.length === 0;

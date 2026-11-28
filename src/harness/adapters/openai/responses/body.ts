@@ -12,7 +12,10 @@ export function responsesRequestBody(config: OpenAIPortConfig, request: ModelReq
 		instructions: request.system,
 		input: toResponsesItems(request.messages, target),
 		tools: request.tools as ToolSpec[],
-		store: config.store,
+		// Stateless endpoints (OpenRouter) reject store:true outright — the matrix
+		// constraint forces it off here regardless of the global setting.
+		store: config.stateless ? false : config.store,
 		maxOutputTokens: config.maxOutputTokens,
+		extras: config.extras?.(config.modelId),
 	});
 }

@@ -158,17 +158,23 @@ describe("write-mode guard", () => {
 		expect((await h.run("file_editor", { command: "view" })).kind).toBe("allow");
 	});
 
-	it("plan mode allows scoped writes free and sends repo writes to approval", async () => {
+	it("plan mode allows scoped writes free, plan-doc writes go to approval, other file writes are denied", async () => {
 		const os = await import("node:os");
 		const h = harness({ mode: "plan", root: "/repo" });
 		expect((await h.run("write_file", { path: ".kronyx/plans/x.md" })).kind).toBe("allow");
 		expect((await h.run("write_file", { path: `${os.tmpdir()}/scratch.md` })).kind).toBe("allow");
-		// Out-of-scope writes ask the user instead of dead-ending.
+		// Repo writes outside the plan document are implementation — denied
+		// outright in plan mode, not deferred to approval.
 		const yes = harness({ mode: "plan", root: "/repo", confirm: async () => true });
-		expect((await yes.run("write_file", { path: "src/x.ts" })).kind).toBe("allow");
+		expect((await yes.run("write_file", { path: "src/x.ts" })).kind).toBe("deny");
+		expect((await yes.run("write_file", { path: "../escape.md" })).kind).toBe("deny");
+		// Plan-document writes are the one exception — the user decides.
+		expect((await yes.run("write_file", { path: "plans/follow-up.md" })).kind).toBe("allow");
 		const no = harness({ mode: "plan", root: "/repo", confirm: async () => false });
-		expect((await no.run("write_file", { path: "src/x.ts" })).kind).toBe("deny");
-		expect((await no.run("write_file", { path: "../escape.md" })).kind).toBe("deny");
+		expect((await no.run("write_file", { path: "plans/follow-up.md" })).kind).toBe("deny");
+		// Edit tools carry the same scoping.
+		expect((await yes.run("edit_file", { path: "plans/x.md", edits: [] })).kind).toBe("allow");
+		expect((await yes.run("edit_file", { path: "src/x.ts", edits: [] })).kind).toBe("deny");
 		// Ask mode gets no write scope at all.
 		const ask = harness({ mode: "ask", root: "/repo" });
 		expect((await ask.run("write_file", { path: ".kronyx/plans/x.md" })).kind).toBe("deny");

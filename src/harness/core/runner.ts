@@ -34,7 +34,7 @@ export interface HarnessRunDeps {
 	system?: string;
 	nudgeWrites?: boolean;
 	/** False in read-only modes (ask/plan): the planner must not emit write steps. Defaults to true. */
-	writable?: boolean;
+	writable?: boolean | (() => boolean);
 	/** kronyx.harness.debug — surface harness decisions (steer rule ids, per-turn tokens, recaps) as chat lines. */
 	debug?: boolean;
 }
@@ -45,6 +45,11 @@ interface Tracker {
 	 *  while e.turn counts model turns for the whole session. */
 	runStart: number;
 	lastText: string;
+	questions?: Array<{ question: string; options?: string[] }>;
+	/** Task titles by id, for rendering blocked-work suggestions. */
+	taskTitles: Map<string, string>;
+	/** Tasks marked blocked in this run — they become deterministic next-step suggestions. */
+	blocked: string[];
 	starts: Map<string, number>;
 	usage: Usage;
 }
@@ -87,6 +92,23 @@ class ObservedLog implements EventLog {
 const fmtK = (n: number): string => (n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n));
 
 /** Maps one durable event to zero or more run-view events. Pure apart from the tracker. `debug` adds harness-decision lines (steer rule ids, per-turn tokens, recaps). */
+/** Extracts the fenced ```suggestions block a finished run's summary may end with.
+ *  Format-parsing, not prose heuristics: the block is either well-formed JSON or ignored. */
+export function extractSuggestions(text: string): { text: string; suggestions: string[] } {
+	const match = text.match(/```suggestions\s*\n([\s\S]*?)```\s*$/);
+	if (!match) return { text, suggestions: [] };
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(match[1]!);
+	} catch {
+		return { text, suggestions: [] };
+	}
+	if (!Array.isArray(parsed)) return { text, suggestions: [] };
+	const suggestions = parsed.filter((s): s is string => typeof s === "string" && s.trim().length > 0).slice(0, 5).map((s) => s.trim());
+	if (!suggestions.length) return { text, suggestions: [] };
+	return { text: text.slice(0, match.index).trimEnd(), suggestions };
+}
+
 export function toViewEvents(e: SessionEvent, st: Tracker, _limit: number, debug = false): RunViewEvent[] {
 	switch (e.type) {
 		case "model.response": {
@@ -139,6 +161,7 @@ export function toViewEvents(e: SessionEvent, st: Tracker, _limit: number, debug
 		case "task.created": {
 			// task-named feeds the view's ref table so "t1" in narration and info
 			// lines resolves to the task title — independent of the debug board.
+			st.taskTitles.set(e.task.id, e.task.title);
 			const named: RunViewEvent = { type: "task-named", id: e.task.id, title: e.task.title, steps: e.task.steps.map((s) => ({ id: s.id, text: s.text })) };
 			return e.usage ? [named, usageEvent(e.usage, st)] : [named];
 		}
@@ -148,7 +171,12 @@ export function toViewEvents(e: SessionEvent, st: Tracker, _limit: number, debug
 			return [{ type: "info", text: `Continuing task ${e.id} from an earlier run.` }];
 		case "task.updated":
 			// Blocked carries a reason the user should see; other transitions are board noise.
-			return e.to === "blocked" ? [{ type: "info", text: `Task ${e.id} is blocked${e.reason ? ` — ${e.reason}` : ""}` }] : [];
+			if (e.to === "blocked") {
+				const title = st.taskTitles.get(e.id) ?? e.id;
+				if (!st.blocked.includes(title)) st.blocked.push(title);
+				return [{ type: "info", text: `Task ${e.id} is blocked${e.reason ? ` — ${e.reason}` : ""}` }];
+			}
+			return [];
 		case "step.updated":
 			return [];
 		case "verifier.result":
@@ -172,14 +200,28 @@ export function toViewEvents(e: SessionEvent, st: Tracker, _limit: number, debug
 			return [{ type: "info", text: `Finish refused: open work remains (${e.openTaskIds.join(", ")}).` }];
 		case "loop.verdict":
 			return e.level === "none" ? [] : [{ type: "info", text: `Loop control: ${e.level}${e.reason ? ` (${e.reason})` : ""}` }];
+		case "user.question":
+			st.questions = e.questions;
+			return [];
 		case "run.status":
 			if (e.status === "running") {
 				st.runStart = st.turn;
 				return [];
 			}
-			if (e.status === "completed") return [{ type: "run-finished", status: "completed", text: st.lastText, iterations: st.turn - st.runStart }];
+			if (e.status === "completed") {
+				const { text, suggestions } = extractSuggestions(st.lastText);
+				// Blocked work is a deterministic next step whether or not the model wrote the block.
+				for (const title of st.blocked) {
+					const s = `Finish the blocked work: ${title}`;
+					if (!suggestions.includes(s) && suggestions.length < 5) suggestions.unshift(s);
+				}
+				return [{ type: "run-finished", status: "completed", text, iterations: st.turn - st.runStart, ...(suggestions.length ? { suggestions } : {}) }];
+			}
 			// A paused run has no resume button on this path; the next message resumes it from the log.
-			if (e.status === "paused") return [{ type: "run-finished", status: "stopped", text: `Paused (${e.reason ?? "limit"}). Send a message to continue.`, iterations: st.turn - st.runStart }];
+			// A pause is not a stop — the run is resumable, often simply waiting on
+			// the user's answer. The distinct status lets the UI render it as
+			// waiting rather than failure.
+			if (e.status === "paused") return [{ type: "run-finished", status: "paused", text: `Paused (${e.reason ?? "limit"}). Send a message to continue.`, iterations: st.turn - st.runStart, ...(st.questions?.length ? { questions: st.questions } : {}) }];
 			if (e.status === "failed") {
 				const { errorKind, retryable } = classifyRunError(e.reason ?? "");
 				return [{ type: "run-failed", error: e.reason ?? "The run failed.", errorKind, retryable }];
@@ -190,8 +232,8 @@ export function toViewEvents(e: SessionEvent, st: Tracker, _limit: number, debug
 	}
 }
 
-export async function runHarness(deps: HarnessRunDeps, task: string, displayTask?: string, opts: { resume?: boolean; context?: string; images?: ImageInput[]; plan?: boolean; seed?: SeedTask[] } = {}): Promise<RunOutcome> {
-	const st: Tracker = { turn: 0, runStart: 0, lastText: "", starts: new Map(), usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 } };
+export async function runHarness(deps: HarnessRunDeps, task: string, displayTask?: string, opts: { resume?: boolean; context?: string; images?: ImageInput[]; plan?: boolean; seed?: SeedTask[]; notes?: string[] } = {}): Promise<RunOutcome> {
+	const st: Tracker = { turn: 0, runStart: 0, lastText: "", starts: new Map(), usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 }, taskTitles: new Map(), blocked: [] };
 	const limit = deps.limits?.maxTurns ?? DEFAULT_LIMITS.maxTurns;
 	const log = new ObservedLog(deps.log, (e) => {
 		for (const view of toViewEvents(e, st, limit, deps.debug === true)) deps.emit(view);
@@ -220,7 +262,7 @@ export async function runHarness(deps: HarnessRunDeps, task: string, displayTask
 	deps.onLoop?.(loop);
 	await loop.recover();
 	deps.emit({ type: "run-started", task: displayTask ?? task });
-	return opts.resume ? loop.resume() : loop.run(task, opts.context, opts.images, { plan: opts.plan, seed: opts.seed });
+	return opts.resume ? loop.resume() : loop.run(task, opts.context, opts.images, { plan: opts.plan, seed: opts.seed, notes: opts.notes });
 }
 
 /** Task board snapshot for the UI: this run's tasks in creation order with their steps. */

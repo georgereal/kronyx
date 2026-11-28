@@ -454,7 +454,11 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 			const script = shell ? `set -o pipefail; ${input.command}` : input.command;
 			return new Promise((resolve, reject) => {
 				exec(script, { cwd: options.root, timeout, shell }, (error, stdout, stderr) => {
-					const out = clampCmdOut(`${stdout}${stderr}`.trim());
+					let out = clampCmdOut(`${stdout}${stderr}`.trim());
+					// A bare exit code is an information-free failure — models respond to the
+					// void by retrying blind variations or repeating themselves. Name the
+					// silence and point at the fix so the next attempt produces evidence.
+					if (error && !out) out = "(no output — the command failed silently: stdout and stderr were both empty. Drop quiet flags like -q, break pipelines into steps, or add echo/verbose output so the failing step shows its error.)";
 					if (error) reject(new Error(`exit ${error.code ?? 1}\n${out}`));
 					else resolve(`exit 0\n${out}`);
 				});
@@ -536,6 +540,43 @@ export function createFileTools(options: FileToolOptions): AgentTool<any, string
 		async execute(input) {
 			const abs = guard.resolve(input.path);
 			const cmd = input.command;
+			const snapshot0 = async () => {
+				const stack = undoStack.get(abs) ?? [];
+				stack.push((await exists(abs)) ? await readText(abs) : null);
+				undoStack.set(abs, stack);
+			};
+			// edit_file-shaped input ({path, edits}) — the tools are offered together
+			// and models mix the schemas. Apply the edits as sequential str_replaces
+			// rather than failing the call over a missing command field.
+			if ((cmd as unknown) === undefined || cmd === null) {
+				const raw = (input as unknown as { edits?: unknown }).edits;
+				const edits = typeof raw === "string" ? (() => { try { return JSON.parse(raw) as unknown; } catch { return undefined; } })() : raw;
+				if (Array.isArray(edits) && edits.length) {
+					const original = await readText(abs);
+					const eol = original.includes("\r\n") ? "\r\n" : "\n";
+					let text = normalizeEol(original);
+					const report: string[] = [];
+					await snapshot0();
+					edits.forEach((edit, index) => {
+						const e = edit as { old_text?: string; new_text?: string; old_str?: string; new_str?: string };
+						const oldText = normalizeEol(e.old_text ?? e.old_str ?? "");
+						const newText = normalizeEol(e.new_text ?? e.new_str ?? "");
+						if (!oldText.trim()) throw new Error(`Edit ${index + 1}: old_text is empty — pass the exact text to replace.`);
+						const matches = findMatches(text, oldText);
+						if (matches.length === 0) throw new Error(noMatchMessage(`Edit ${index + 1}`, guard.relative(abs), text, oldText));
+						if (matches.length > 1) throw new Error(`Edit ${index + 1}: old_text matches ${matches.length} places — add surrounding lines to make it unique.`);
+						const m = matches[0]!;
+						const replacement = m.strategy === "exact" ? newText : adaptIndentation(text.slice(m.start, m.end), oldText, newText);
+						text = text.slice(0, m.start) + replacement + text.slice(m.end);
+						report.push(`Edit ${index + 1}: replaced at line ${lineNumberAt(text, m.start)} (${m.strategy}).`);
+					});
+					assertWritable(abs);
+					await writeText(abs, eol === "\n" ? text : text.replace(/\n/g, "\r\n"));
+					return `Edited ${guard.relative(abs)}.\n${report.join("\n")}`;
+				}
+				const keys = Object.keys(input as object).filter((k) => (input as unknown as Record<string, unknown>)[k] != null).join(", ");
+				throw new Error(`file_editor needs a command (view/create/str_replace/insert/symbols/replace_function/undo_edit) — received keys: ${keys || "none"}. For multi-edit input pass edit_file instead.`);
+			}
 			const snapshot = async () => {
 				const stack = undoStack.get(abs) ?? [];
 				stack.push((await exists(abs)) ? await readText(abs) : null);

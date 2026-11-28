@@ -119,7 +119,7 @@ export default function RunDetail() {
 				})}
 				{events.length === 0 && <div className="muted">Waiting for events…</div>}
 			</div>
-			{harnessReport && <HarnessReportSection report={harnessReport} />}
+			{harnessReport && <HarnessReportSection report={harnessReport} runId={id} />}
 		</div>
 	);
 }

@@ -496,14 +496,17 @@
 					"items": {
 						"type": "string",
 						"enum": [
+							"auto",
 							"cline",
-							"openai"
+							"responses",
+							"conversations",
+							"chat"
 						]
 					},
 					"default": [
-						"cline"
+						"auto"
 					],
-					"description": "Execution engines to run the eval suite on. Include both to compare them on the same cases."
+					"description": "API shapes to run the eval suite on, resolved through the provider matrix. 'auto' picks the best shape the provider serves; explicit shapes fail loudly when unsupported. Include several to compare them on the same cases."
 				},
 				"kronyx.memory.embeddingModel": {
 					"type": "string",
@@ -641,12 +644,14 @@
 		"check": "npm run typecheck && npm run lint && npm run test && node scripts/check-boundaries.mjs && npm run build"
 	},
 	"devDependencies": {
+		"@types/jsdom": "^30.0.0",
 		"@types/node": "^22.20.5",
 		"@types/sql.js": "^1.4.11",
 		"@types/vscode": "^1.105.0",
 		"@vscode/vsce": "^4.1.0",
 		"esbuild": "^0.28.2",
 		"eslint": "^10.14.0",
+		"jsdom": "^29.1.1",
 		"typescript": "^5.9.3",
 		"typescript-eslint": "^8.72.1",
 		"vitest": "^5.0.5"

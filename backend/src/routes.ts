@@ -96,6 +96,7 @@ export const routes: Route[] = makeRoutes([
 	["POST", "/api/github/link", gh.link],
 	["GET", "/api/jobs", jobsH.listJobs],
 	["POST", "/api/jobs/:id/requeue", jobsH.requeueJob],
+	["GET", "/api/harness-analytics", runsH.harnessAnalytics],
 	["GET", "/api/runs", runsH.listRuns],
 	["GET", "/api/runs/:id/report", runsH.runReport],
 	["GET", "/api/runs/:id", runsH.getRun],

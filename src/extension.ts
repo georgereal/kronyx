@@ -13,6 +13,7 @@ import { refreshUserConfig, saveUserConfig, seedUserConfig, setUserConfigSavedLi
 import { SettingsSync, deviceName, getDeviceId } from "./settingsSync";
 import { loadSuite, runSuite, writeReport } from "./evals";
 import type { EngineKind } from "./agent/engine";
+import { providerShapes } from "./harness/adapters/apiShapes";
 import { appendEvent, clearEvents, insertApiCall, insertRun, insertTranscript, insertUsage, kvGet, kvSet, listEvents, listRuns, listSessions, listTranscripts, openStore, refreshStore, migrateLegacyStore, setStorageDir, setWasmDir, storeError } from "./store";
 import { RunLock, type SessionDeps } from "./ui/sessionController";
 import { RunComments } from "./ui/comments";
@@ -153,7 +154,10 @@ export function activate(context: vscode.ExtensionContext): void {
 	/** The composer pick lives in the shared config — every surface reads it from there, never from a copy. */
 	const selectionOf = () => ({ modelId: currentSelection()?.modelId ?? "", modelProfile: currentSelection()?.profile ?? "" });
 	const pushViewState = (): void => {
-		for (const surface of deps.surfaces) surface.setState({ ...deps.viewState, ...selectionOf() });
+		const pick = currentSelection();
+		const active = profiles().find((p) => p.name === pick?.profile);
+		const shapes = Object.keys(providerShapes(active?.providerId ?? "anthropic", active?.baseUrl ?? ""));
+		for (const surface of deps.surfaces) surface.setState({ ...deps.viewState, ...selectionOf(), supportedShapes: shapes });
 	};
 	const deps: SessionDeps = {
 		context,
@@ -422,7 +426,7 @@ export function activate(context: vscode.ExtensionContext): void {
 					return;
 				}
 				output.show();
-				const engines = vscode.workspace.getConfiguration("kronyx").get<EngineKind[]>("eval.engines", ["cline"]);
+				const engines = vscode.workspace.getConfiguration("kronyx").get<EngineKind[]>("eval.engines", ["auto"]);
 				output.appendLine(`Running ${cases.length} eval case(s) × ${engines.join(", ")} with ${settings.modelId}...`);
 				const results = await vscode.window.withProgress(
 					{ location: vscode.ProgressLocation.Notification, title: "Kronyx: running evals", cancellable: false },

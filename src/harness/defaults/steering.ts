@@ -11,6 +11,7 @@ import type { HookPoint, HookRule, ToolCall } from "../core/contracts";
 import type { SteeringPolicy } from "../core/policies/steering";
 import { isReadOnlyCommand } from "../tools/shellReadOnly";
 import { openSteps, openTasks, signalHits, TASK_TOOL_NAMES, TASK_TOOL_SET, tasksOfRun, type Ledger } from "../core/taskLedger";
+import { buildRefIndex, scanUnknownRefTokens } from "../core/refIndex";
 
 export interface SteerContext {
 	/** `readOnly[i]` marks call i as provably read-only — a read tool, or a shell
@@ -360,8 +361,16 @@ const planDrift = (runId?: string): HookRule<SteerContext["beforeModel"]> => {
 				nudged = 0;
 				return { kind: "allow" };
 			}
-			const lastTurnCalls = recentTurns.length ? recentTurns[recentTurns.length - 1]!.calls.length > 0 : true;
-			if (lastTurnCalls) unprod++;
+			const lastTurn = recentTurns.length ? recentTurns[recentTurns.length - 1]! : undefined;
+			const lastTurnCalls = lastTurn ? lastTurn.calls.length > 0 : true;
+			// A turn that writes is productive by definition — the board is accounting
+			// that lags the work. Big steps legitimately take many write-heavy turns
+			// (new classes, edits, tests); counting them as drift punished exactly the
+			// work the step asked for. Only genuine writes count — task_* bookkeeping
+			// is accounting, not output, and reads don't produce anything.
+			const wrote = lastTurn !== undefined && lastTurn.calls.some((name, i) => !name.startsWith("task_") && lastTurn.readOnly?.[i] === false);
+			if (lastTurnCalls && !wrote) unprod++;
+			else if (wrote) unprod = 0;
 			// The user is asked only after repeated nudges go unanswered — the
 			// model had its chances to realign, replan, or explain itself.
 			if (nudged >= DRIFT_NUDGES_BEFORE_ASK && unprod > lastAsked + DRIFT_NUDGE_EVERY) {
@@ -380,7 +389,7 @@ const planDrift = (runId?: string): HookRule<SteerContext["beforeModel"]> => {
 					.flatMap((id) => (ledger.tasks[id]?.steps ?? []).filter((s) => s.status !== "done" && s.status !== "failed" && s.status !== "blocked").map((s) => `${id}/${s.id} "${s.text}"`))[0];
 				return {
 					kind: "note",
-					text: `Step ${firstOpen ?? "on the board"} is still open after ${unprod} tool-calling turns. Either finish it, or if the board no longer matches the work, replace it — task_replace rewrites the whole board in one call. Calls only count once the board reflects what you are actually doing.`,
+					text: `Step ${firstOpen ?? "on the board"} is still open after ${unprod} tool-calling turns. When its work is done, close it — task_step_update with status "done" (the harness attaches the proving calls itself). If the board no longer matches the work, task_replace rewrites it in one call. Calls only count once the board reflects what you are actually doing.`,
 				};
 			}
 			return { kind: "allow" };
@@ -389,6 +398,39 @@ const planDrift = (runId?: string): HookRule<SteerContext["beforeModel"]> => {
 };
 
 /** Built-in rules, registered by the loop unless the caller supplies its own registry. `writable=false` (ask/plan) relaxes read-streak rules — reads are the whole job there. `runId` scopes board checks to this run's plan. */
+
+/**
+ * Hallucinated-reference capture. Ids resolve through the ref-index — the map
+ * owns resolution — so a reference to an id the map doesn't hold is either a
+ * hallucination or a forward reference. Either way the model should know what
+ * the board actually holds. Advisory only, once per unique token: the cost of
+ * a prose false positive (an s3 bucket) is one sentence, the benefit is
+ * catching the cascade where a model invents board structure wholesale.
+ */
+const unknownRefs = (runId?: string): HookRule<SteerContext["beforeModel"]> => {
+	const noted = new Set<string>();
+	return {
+		id: "refs.unknown",
+		point: "beforeModel",
+		order: 34,
+		decide: ({ ledger, recentTurns }) => {
+			const scoped = ledger.order.filter((id) => runId === undefined || ledger.tasks[id]?.runId === runId);
+			if (scoped.length === 0) return { kind: "allow" };
+			const lastTurn = recentTurns.length ? recentTurns[recentTurns.length - 1]! : undefined;
+			if (!lastTurn?.text) return { kind: "allow" };
+			const index = buildRefIndex(ledger, runId);
+			const fresh = scanUnknownRefTokens(lastTurn.text, index).filter((t) => !noted.has(t));
+			if (fresh.length === 0) return { kind: "allow" };
+			for (const t of fresh) noted.add(t);
+			const real = scoped.slice(0, 12).join(", ");
+			return {
+				kind: "note",
+				text: `You referenced ${fresh.map((t) => `{${t}}`).join(", ")} — no such task or step exists on the board (current tasks: ${real}). If you meant real work, refer to the actual ids; if the work is missing from the board, create or replan it rather than citing phantom structure.`,
+			};
+		},
+	};
+};
+
 export function builtinRules(opts: { writable?: boolean; runId?: string } = {}): RegisteredRule[] {
 	const writable = opts.writable !== false;
 	const finishOpenWork: HookRule<SteerContext["onStop"]> = {
@@ -396,7 +438,9 @@ export function builtinRules(opts: { writable?: boolean; runId?: string } = {}):
 		point: "onStop",
 		order: 10,
 		decide: ({ ledger }) => {
-			const open = openTasks(ledger, opts.runId);
+			// Divergence records are harness-managed — the model can't close them,
+			// so they must never gate completion; an open one is honest state, not owed work.
+			const open = openTasks(ledger, opts.runId).filter((id) => ledger.tasks[id]?.origin !== "divergence");
 			return open.length ? { kind: "deny", reason: `Open work remains: ${open.join(", ")}. Finish it — if a task cannot be done in this run (e.g. it needs a write this mode forbids), say so plainly so the harness can mark it blocked.` } : { kind: "allow" };
 		},
 	};
@@ -453,6 +497,8 @@ export function builtinRules(opts: { writable?: boolean; runId?: string } = {}):
 	 * read-only calls are excused — context reads before the proving call are
 	 * legitimate.
 	 */
+	const WRITE_TOOLS = new Set(["write_file", "edit_file", "file_editor", "append_file", "insert_lines", "apply_patch", "rename_symbol"]);
+
 	const planOffstep = (runId?: string): HookRule<SteerContext["afterTool"]> => {
 		let off = 0;
 		let notedAt = 0;
@@ -460,18 +506,25 @@ export function builtinRules(opts: { writable?: boolean; runId?: string } = {}):
 			id: "plan.offstep",
 			point: "afterTool",
 			order: 20,
-			decide: ({ call, ok, ledger }) => {
+			decide: ({ call, ledger }) => {
 				if (TASK_TOOL_SET.has(call.name)) return { kind: "allow" };
 				const open = (runId ? tasksOfRun(ledger, runId) : ledger.order)
 					.filter((id) => ledger.tasks[id]?.status !== "stale" && ledger.tasks[id]?.status !== "done")
 					.flatMap((id) => (ledger.tasks[id]?.steps ?? []).filter((s) => s.status !== "done" && s.status !== "failed" && s.status !== "blocked" && s.signal).map((s) => ({ taskId: id, step: s })))
 					.slice(0, 4);
 				if (!open.length) return { kind: "allow" };
-				if (ok && open.some((o) => signalHits(o.step.signal!, call))) {
+				// Attempting the proving call is engagement even when it fails —
+				// a verify step's failing run IS its work (fix any failures). Only
+				// the auto-close stays success-gated; this counter is about direction.
+				if (open.some((o) => signalHits(o.step.signal!, call))) {
 					off = 0;
 					return { kind: "allow" };
 				}
 				if (callIsReadOnly(call.name, call.input)) return { kind: "allow" };
+				// Writes serving a verify step are its fixup loop, not off-plan work:
+				// the step text says "fix any failures", and the fixes are edits.
+				// Writes still count when the open signals are file/edit-type steps.
+				if (WRITE_TOOLS.has(call.name) && open.some((o) => o.step.signal!.tool === "run_command")) return { kind: "allow" };
 				if (++off < 3 || off <= notedAt + 3) return { kind: "allow" };
 				notedAt = off;
 				const want = open[0]!;
@@ -482,34 +535,10 @@ export function builtinRules(opts: { writable?: boolean; runId?: string } = {}):
 			},
 		};
 	};
-	/**
-	 * update_progress publishes a UI status line — it moves nothing on the
-	 * board. Models reach for it when they mean "change the plan" (the name
-	 * reads that way), so the first time it lands while steps are open, say
-	 * which tools actually move the board.
-	 */
-	const progressShadow = (runId?: string): HookRule<SteerContext["afterTool"]> => {
-		let noted = 0;
-		return {
-			id: "plan.progress-shadow",
-			point: "afterTool",
-			order: 21,
-			decide: ({ call, ledger }) => {
-				if (call.name !== "update_progress") return { kind: "allow" };
-				const open = openSteps(ledger, runId);
-				if (!open.length || ++noted !== 2) return { kind: "allow" };
-				return {
-					kind: "note",
-					text: `update_progress only updates the UI — the board still has ${open.length} open step(s), starting with ${open[0]}. To change the plan call task_replace; to close a step call task_step_update.`,
-				};
-			},
-		};
-	};
 	const reads = readsBatchRules();
 	return [
 		{ point: "onStop", rule: finishOpenWork as HookRule<unknown> },
 		{ point: "afterTool", rule: planOffstep(opts.runId) as HookRule<unknown> },
-		{ point: "afterTool", rule: progressShadow(opts.runId) as HookRule<unknown> },
 		{ point: "beforeTool", rule: stepGrounding as HookRule<unknown> },
 		{ point: "beforeTool", rule: listRepeat() as HookRule<unknown> },
 		{ point: "beforeTool", rule: shellReads() as HookRule<unknown> },
@@ -519,6 +548,7 @@ export function builtinRules(opts: { writable?: boolean; runId?: string } = {}):
 		{ point: "beforeModel", rule: readsConverge() as HookRule<unknown> },
 		{ point: "beforeModel", rule: planDrift(opts.runId) as HookRule<unknown> },
 		{ point: "beforeModel", rule: treeRecount() as HookRule<unknown> },
+		{ point: "beforeModel", rule: unknownRefs(opts.runId) as HookRule<unknown> },
 	];
 }
 

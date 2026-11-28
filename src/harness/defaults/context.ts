@@ -35,6 +35,8 @@ export const SYSTEM_INSTRUCTIONS = [
 	"Ledger ids (t1, s3) are internal bookkeeping — in anything the user reads, refer to tasks and steps by their content. If you must cite one, wrap it in braces ({t1}, {s3}) so it renders as the item's title.",
 	"Match answer depth to the ask: a survey gets a concise map and an offer to go deeper on any section; write exhaustive detail only when asked.",
 	"Format the final answer for scanning: short ## section headers, bold key terms, bullets over paragraphs — never a wall of text.",
+	"Don't narrate board status or restate what you are about to do — the user watches the board and the tool calls live. Report outcomes and decisions, not intentions.",
+	"When you finish a run, end the summary with a fenced ```suggestions block holding a JSON array of 2-4 short next steps the user might want — pending work, natural follow-ups, or decisions they may want to make. Each is something the user can pick to continue; write them as imperatives a user could hand back as a task. Omit the block only when nothing meaningful remains.",
 	"Before redoing analysis, check what earlier work produced — list_plans/read_plan recall saved deliverables, and prior tool results stay recoverable via log_slice/recall_context. Reuse fresh findings instead of re-deriving them.",
 	"Tool results may be elided to a stub that cites a seq. Recover the full text with log_slice.",
 ].join("\n");
@@ -152,7 +154,7 @@ export const capResult = (m: Extract<Message, { kind: "tool" }>): Message =>
 				output: `${m.output.slice(0, RECENT_RESULT_HEAD)}\n[... ${m.output.length - RECENT_RESULT_HEAD - RECENT_RESULT_TAIL} chars elided at seq ${m.seq}. log_slice from ${m.seq} to ${m.seq} recovers the full result.]\n${m.output.slice(-RECENT_RESULT_TAIL)}`,
 			};
 
-export function buildContext(state: HarnessState, tools: readonly ToolSpec[], system = SYSTEM_INSTRUCTIONS, runId?: string): ProjectedContext {
+export function buildContext(state: HarnessState, tools: readonly ToolSpec[], system = SYSTEM_INSTRUCTIONS, runId?: string, budgetChars = CONTEXT_BUDGET_CHARS): ProjectedContext {
 	const toolMessages = state.messages.filter((m): m is Extract<Message, { kind: "tool" }> => m.kind === "tool");
 	const recentSeqs = new Set(toolMessages.slice(-KEEP_RECENT_RESULTS).map((m) => m.seq));
 	const originalLength = new Map(toolMessages.map((m) => [m.seq, m.output.length]));
@@ -178,7 +180,7 @@ export function buildContext(state: HarnessState, tools: readonly ToolSpec[], sy
 	let digested = digest(DIGEST_HEAD_CHARS);
 	let messages = assemble(digested);
 	// Hard budget: if the projection is still too large, collapse old digests to bare pointers.
-	if (estimateChars(messages) > CONTEXT_BUDGET_CHARS) {
+	if (estimateChars(messages) > budgetChars) {
 		digested = digest(0);
 		messages = assemble(digested);
 	}
@@ -190,11 +192,20 @@ export function buildContext(state: HarnessState, tools: readonly ToolSpec[], sy
 	};
 }
 
-/** Today's behavior as the default ContextPolicy. */
-export const defaultContextPolicy: ContextPolicy = {
-	build: buildContext,
-	capResult,
-	taskBoard,
-	keepRecentMessages: KEEP_RECENT_MESSAGES,
-	budgetChars: CONTEXT_BUDGET_CHARS,
-};
+/**
+ * Today's behavior as the default ContextPolicy — a factory because the budget
+ * scales with the model's context window: compacting at a fixed size throws
+ * away most of a large-window model's usable context (and compaction amnesia
+ * is a loop generator). resolveBehaviorProfile passes the scaled budget.
+ */
+export function makeContextPolicy(budgetChars = CONTEXT_BUDGET_CHARS): ContextPolicy {
+	return {
+		build: (state, tools, system, runId) => buildContext(state, tools, system, runId, budgetChars),
+		capResult,
+		taskBoard,
+		keepRecentMessages: KEEP_RECENT_MESSAGES,
+		budgetChars,
+	};
+}
+
+export const defaultContextPolicy: ContextPolicy = makeContextPolicy();

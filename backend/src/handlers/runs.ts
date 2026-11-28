@@ -52,6 +52,25 @@ export async function getRun(req: Request, p: Record<string, string>): Promise<R
 	});
 }
 
+/** GET /api/harness-analytics — cross-run harness-improvement aggregation over uploaded reports. */
+export async function harnessAnalytics(req: Request): Promise<Response> {
+	const uid = await authenticate(req);
+	if (!uid) return json({ error: "unauthorized" }, { status: 401 });
+	const db = await getDb();
+	const docs = await db
+		.collection("harness_reports")
+		.find({ uid }, { projection: { _id: 0, report: 1, session: 1, runId: 1 } })
+		.limit(200)
+		.toArray();
+	const { buildHarnessAnalytics } = await import("../../../src/harness/report/report");
+	const analytics = buildHarnessAnalytics(
+		docs
+			.filter((d) => d.report)
+			.map((d) => ({ report: d.report as never, ...(d.session ? { session: String(d.session) } : {}), ...(d.runId ? { runId: String(d.runId) } : {}) })),
+	);
+	return json({ analytics });
+}
+
 /** GET /api/runs/:id/report — collated usage+trace JSON; builds on demand when missing. */
 export async function runReport(req: Request, p: Record<string, string>): Promise<Response> {
 	const uid = await authenticate(req);

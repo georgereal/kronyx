@@ -21,6 +21,7 @@ export type WebviewMessage =
 	| { type: "setMode"; mode: AgentMode }
 	| { type: "setModel"; modelId: string; profile?: string }
 	| { type: "attach"; kind: "file" | "directory" | "upload" }
+	| { type: "fileQuery"; id: string; query: string }
 	| { type: "newSession" }
 	| { type: "switchSession"; name: string }
 	| { type: "closeSession"; name: string }
@@ -50,6 +51,8 @@ export interface ViewState {
 	modelProfile?: string;
 	/** Execution engine for the session's next run. */
 	engine?: EngineKind;
+	/** API shapes the current provider supports — the composer gear lists these. */
+	supportedShapes?: string[];
 	signedIn?: boolean;
 	userEmail?: string;
 	cloudRepo?: string;
@@ -80,7 +83,8 @@ export type ViewEvent =
 	| { type: "cloud-status"; text: string; key?: string }
 	| { type: "setup"; step: number; label: string; state: "run" | "ok" | "fail"; detail?: string }
 	| { type: "setupStatus"; items: { key: string; label: string; ok: boolean; detail?: string; fixLabel?: string }[] }
-	| { type: "github-enable"; repo: string; url: string };
+	| { type: "github-enable"; repo: string; url: string }
+	| { type: "fileMatches"; id: string; matches: string[] };
 
 /**
  * Hosts the run UI in one or more webview surfaces (sidebar views, editor panels).

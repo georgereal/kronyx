@@ -2,8 +2,9 @@
  * Default evidence policy (vscode-free). The model-facing `task_step_update`
  * spec omits `callIds` entirely — evidence ids are harness-internal and never
  * leave the harness in either direction. On `status: done` the harness
- * attaches every successful external call since the task's proof window
- * opened (`startedSeq`), so the model marks steps done without citing ids.
+ * attaches the successful external calls since the step's own window opened
+ * (the previous sibling's close, or the task start) — degrading to the
+ * task-wide window when the work pre-dates a batch close.
  */
 
 import { LOG_SLICE } from "./context";
@@ -22,6 +23,26 @@ export function settledCalls(state: HarnessState, seq: number): Array<{ call: To
 	});
 }
 
+/**
+ * Evidence window for a step: opens at the LATER of the task's start and the
+ * close of the last settled sibling step before it. The model works ahead of
+ * the board, so a step's proof often lands before the step formally opens —
+ * but it never lands before the previous sibling's work ended. Task-start
+ * scoping alone attaches the same shared pile of calls to every step.
+ */
+const stepWindowStart = (state: HarnessState, taskId: string | undefined, stepId: unknown): number => {
+	const task = taskId ? state.ledger.tasks[taskId] : undefined;
+	if (!task) return 0;
+	let start = task.createdSeq ?? task.startedSeq ?? 0;
+	const idx = task.steps.findIndex((s) => s.id === stepId);
+	const siblings = idx >= 0 ? task.steps.slice(0, idx) : task.steps;
+	for (const s of siblings) {
+		const closed = (s as { closedSeq?: number }).closedSeq;
+		if (typeof closed === "number" && closed > start) start = closed;
+	}
+	return start;
+};
+
 const stepSpec = (): ToolSpec => {
 	const spec = TASK_TOOLS.find((t) => t.name === TASK_TOOL_NAMES.stepUpdate);
 	if (!spec) throw new Error("task_step_update spec missing");
@@ -35,6 +56,13 @@ export const defaultEvidencePolicy: EvidencePolicy = {
 		const input = (call.input ?? {}) as { taskId?: unknown; status?: unknown; callIds?: unknown };
 		if (input.status !== "done" || (!opts?.ignoreCited && Array.isArray(input.callIds) && input.callIds.length > 0)) return call;
 		const task = state.ledger.tasks[String(input.taskId)];
-		return { ...call, input: { ...input, callIds: settledCalls(state, task?.startedSeq ?? 0).map((s) => s.call.callId) } };
+		const windowStart = stepWindowStart(state, String(input.taskId), (input as { stepId?: unknown }).stepId);
+		// Tighten to the step's own window when it holds evidence — but a batch
+		// close (all the work done, then steps closed in a row) legitimately
+		// shares the task-wide pile: the work pre-dates every close, so falling
+		// back is correct rather than noise.
+		const own = settledCalls(state, windowStart);
+		const calls = own.length ? own : settledCalls(state, task?.createdSeq ?? task?.startedSeq ?? 0);
+		return { ...call, input: { ...input, callIds: calls.map((s) => s.call.callId) } };
 	},
 };

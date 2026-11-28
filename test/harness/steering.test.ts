@@ -363,8 +363,158 @@ describe("plan.drift rule", () => {
 		expect(await drain(r, 5, ledger("done"))).toEqual({ kind: "allow" });
 	});
 
+	it("write turns are productive — a big implementation step never reads as drift", async () => {
+		const r = rule();
+		await r.decide(ctx(ledger())); // baseline
+		// 25 turns of genuine writes (the Session-20 false positive: three new
+		// classes, edits, tests while the big step stayed in_progress) — no drift.
+		const writing: SteerContext["beforeModel"] = { turn: 1, ledger: ledger(), recentTurns: [{ calls: ["write_file"], readOnly: [false] }] };
+		for (let i = 0; i < 25; i++) expect((await r.decide(writing)).kind).toBe("allow");
+		// but task bookkeeping alone is accounting, not output — it must not evade drift
+		const bookkeeping: SteerContext["beforeModel"] = { turn: 1, ledger: ledger(), recentTurns: [{ calls: ["task_step_update"], readOnly: [false] }] };
+		let sawNote = false;
+		for (let i = 0; i < 8; i++) if ((await r.decide(bookkeeping)).kind === "note") sawNote = true;
+		expect(sawNote).toBe(true);
+	});
+
+	it("reads interleaved with writes still count when the writes stop", async () => {
+		const r = rule();
+		await r.decide(ctx(ledger())); // baseline
+		const writing: SteerContext["beforeModel"] = { turn: 1, ledger: ledger(), recentTurns: [{ calls: ["edit_file"], readOnly: [false] }] };
+		for (let i = 0; i < 4; i++) await r.decide(writing);
+		// writes stop — read-only turns accrue from zero, so the first nudge lands at the usual threshold
+		const reading: SteerContext["beforeModel"] = { turn: 1, ledger: ledger(), recentTurns: [{ calls: ["read_file"], readOnly: [true] }] };
+		const kinds: string[] = [];
+		for (let i = 0; i < 7; i++) kinds.push((await r.decide(reading)).kind);
+		expect(kinds).toContain("note");
+	});
+
 	it("skips runs with no board", async () => {
 		const r = rule();
 		for (let i = 0; i < 20; i++) expect(await r.decide({ turn: i, ledger: emptyLedger(), recentTurns: [{ calls: ["write_file"], readOnly: [false] }] })).toEqual({ kind: "allow" });
+	});
+});
+
+describe("plan.offstep — verify-step iteration", () => {
+	const ledgerWithVerifyStep = async () => {
+		const { emptyLedger, applyLedgerEvent } = await import("../../src/harness/core/taskLedger");
+		let ledger = emptyLedger();
+		ledger = applyLedgerEvent(ledger, {
+			type: "task.created",
+			task: {
+				id: "t1", title: "Tests", acceptance: { kind: "command", command: "mvn test" },
+				dependsOn: [], status: "pending", evidence: [], planId: "p1",
+				steps: [{ id: "s1", text: "`mvn test` passes; fix any failures", status: "pending", callIds: [], signal: { tool: "run_command", path: "mvn test" } }],
+			},
+		});
+		ledger = applyLedgerEvent(ledger, { type: "task.updated", id: "t1", to: "in_progress" });
+		ledger = applyLedgerEvent(ledger, { type: "step.updated", taskId: "t1", stepId: "s1", to: "in_progress", callIds: [] });
+		return ledger;
+	};
+	const mkRegistry = async () => {
+		const { SteeringRegistry, builtinRules } = await import("../../src/harness/defaults/steering");
+		const reg = new SteeringRegistry();
+		for (const r of builtinRules()) reg.add(r.point, r.rule);
+		return reg;
+	};
+
+	it("a failing attempt at the proving command resets the off-plan counter", async () => {
+		const ledger = await ledgerWithVerifyStep();
+		const reg = await mkRegistry();
+		const write = { callId: "w", name: "write_file", input: { path: "src/X.java" } };
+		const test = { callId: "t", name: "run_command", input: { command: "cd x && mvn clean test 2>&1" } };
+		// Two writes, then a FAILED test run — then more writes. No offstep note should appear.
+		for (let i = 0; i < 2; i++) await reg.run("afterTool", { call: { ...write, callId: `w${i}` }, ok: true, ledger });
+		await reg.run("afterTool", { call: test, ok: false, ledger });
+		let noted = false;
+		for (let i = 0; i < 6; i++) {
+			const r = await reg.run("afterTool", { call: { ...write, callId: `x${i}` }, ok: true, ledger });
+			if (r.notes.some((n) => n.rule === "plan.offstep")) noted = true;
+		}
+		expect(noted).toBe(false);
+	});
+
+	it("writes during a run_command verify step are excused as fixup work", async () => {
+		const ledger = await ledgerWithVerifyStep();
+		const reg = await mkRegistry();
+		let noted = false;
+		for (let i = 0; i < 8; i++) {
+			const r = await reg.run("afterTool", { call: { callId: `e${i}`, name: "edit_file", input: { path: "src/X.java" } }, ok: true, ledger });
+			if (r.notes.some((n) => n.rule === "plan.offstep")) noted = true;
+		}
+		expect(noted).toBe(false);
+	});
+
+	it("writes still count as off-plan when the open signal is a file-type step", async () => {
+		const { emptyLedger, applyLedgerEvent } = await import("../../src/harness/core/taskLedger");
+		let ledger = emptyLedger();
+		ledger = applyLedgerEvent(ledger, {
+			type: "task.created",
+			task: {
+				id: "t1", title: "Write", acceptance: { kind: "command", command: "tsc" },
+				dependsOn: [], status: "pending", evidence: [], planId: "p1",
+				steps: [{ id: "s1", text: "create Config.java", status: "pending", callIds: [], signal: { tool: "write_file", path: "Config.java" } }],
+			},
+		});
+		ledger = applyLedgerEvent(ledger, { type: "task.updated", id: "t1", to: "in_progress" });
+		ledger = applyLedgerEvent(ledger, { type: "step.updated", taskId: "t1", stepId: "s1", to: "in_progress", callIds: [] });
+		const reg = await mkRegistry();
+		let notes = 0;
+		for (let i = 0; i < 10; i++) {
+			const r = await reg.run("afterTool", { call: { callId: `e${i}`, name: "write_file", input: { path: "unrelated/Other.java" } }, ok: true, ledger });
+			notes += r.notes.filter((n) => n.rule === "plan.offstep").length;
+		}
+		expect(notes).toBeGreaterThan(0);
+	});
+});
+
+describe("refs.unknown — hallucinated-reference capture", () => {
+	const ledgerWithBoard = async () => {
+		const { applyLedgerEvent } = await import("../../src/harness/core/taskLedger");
+		const mk = (id: string, runId: string) => ({ id, title: id, acceptance: { kind: "none" as const }, dependsOn: [], status: "pending" as const, steps: [], evidence: [], runId });
+		let ledger = emptyLedger();
+		for (const id of ["t1", "t2", "t3"]) ledger = applyLedgerEvent(ledger, { type: "task.created", task: mk(id, "r1") });
+		return ledger;
+	};
+	const beforeModelCtx = (ledger: import("../../src/harness/core/taskLedger").Ledger, text: string): SteerContext["beforeModel"] => ({
+		turn: 1, ledger, recentTurns: [{ calls: ["read_file"], text }],
+	});
+	const runRule = async (ledger: import("../../src/harness/core/taskLedger").Ledger, text: string) => {
+		const reg = new SteeringRegistry();
+		for (const r of builtinRules({ runId: "r1" })) reg.add(r.point, r.rule);
+		return reg.run("beforeModel", beforeModelCtx(ledger, text));
+	};
+
+	it("notes a reference to a task that does not exist", async () => {
+		const ledger = await ledgerWithBoard();
+		const result = await runRule(ledger, "now closing t9 and moving to s7");
+		const note = result.notes.find((n) => n.rule === "refs.unknown");
+		expect(note?.text).toMatch(/\{t9\}/);
+		expect(note?.text).toMatch(/\{s7\}/);
+		expect(note?.text).toMatch(/t1, t2, t3/);
+	});
+
+	it("stays silent when references are real", async () => {
+		const ledger = await ledgerWithBoard();
+		const result = await runRule(ledger, "t1 is done, moving to t2 then t3");
+		expect(result.notes.find((n) => n.rule === "refs.unknown")).toBeUndefined();
+	});
+
+	it("stays silent on an empty board — pre-planning text can't hallucinate", async () => {
+		const result = await runRule(emptyLedger(), "I will create t1 through t9");
+		expect(result.notes.find((n) => n.rule === "refs.unknown")).toBeUndefined();
+	});
+
+	it("notes each unique token once — no nagging on repetition", async () => {
+		const ledger = await ledgerWithBoard();
+		const reg = new SteeringRegistry();
+		for (const r of builtinRules({ runId: "r1" })) reg.add(r.point, r.rule);
+		const first = await reg.run("beforeModel", beforeModelCtx(ledger, "closing t9"));
+		expect(first.notes.find((n) => n.rule === "refs.unknown")).toBeDefined();
+		const second = await reg.run("beforeModel", beforeModelCtx(ledger, "still closing t9"));
+		expect(second.notes.find((n) => n.rule === "refs.unknown")).toBeUndefined();
+		// a NEW phantom still notes
+		const third = await reg.run("beforeModel", beforeModelCtx(ledger, "and then t42"));
+		expect(third.notes.find((n) => n.rule === "refs.unknown")?.text).toMatch(/\{t42\}/);
 	});
 });

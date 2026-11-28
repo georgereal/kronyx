@@ -404,7 +404,7 @@ describe("harness-owned board", () => {
 	it("plan seeds carry plain step text — completion is the model's to prove, not inferred from prose", async () => {
 		const { parsePlanSeed } = await import("../../src/harness/planning/planSeed");
 		const seed = parsePlanSeed("# Plan: X\n\n## Steps\n1. Review `src/harness/loop.ts` for regressions\n2. Run `npx vitest run test/harness`\n");
-		expect(seed?.steps).toEqual(["Review `src/harness/loop.ts` for regressions", "Run `npx vitest run test/harness`"]);
+		expect(seed?.tasks[0]?.steps).toEqual(["Review `src/harness/loop.ts` for regressions", "Run `npx vitest run test/harness`"]);
 	});
 
 	it("an implement plan seeds its steps and verify gate, or refuses — never a planner fallback", async () => {
@@ -416,7 +416,7 @@ describe("harness-owned board", () => {
 			acceptance: { kind: "command", command: "npm run check" },
 		});
 		const bad = planSeedTasks("plans/y.md", "# Plan: Y\n\nJust some prose, no steps.\n");
-		expect("error" in bad && bad.error).toContain("plans/y.md has no numbered steps");
+		expect("error" in bad && bad.error).toContain("plans/y.md has no implementable steps");
 	});
 
 	it("a search_files pattern hits a filename-glob signal — brace globs included", async () => {

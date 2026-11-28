@@ -10,7 +10,10 @@ let panel: vscode.WebviewPanel | undefined;
 type HarnessMessage =
 	| { type: "list" }
 	| { type: "report"; session: string; runId?: string }
-	| { type: "upload"; session: string; runId: string };
+	| { type: "upload"; session: string; runId: string }
+	| { type: "export"; session: string }
+	| { type: "rawEvents"; session: string }
+	| { type: "analytics" };
 
 /**
  * Live harness report: tails the session JSONL logs under .kronyx/harness/
@@ -41,12 +44,13 @@ export function openHarnessPage(context: vscode.ExtensionContext): void {
 <body>
 <header>
   <div class="title-row">
-    <h1>Harness report <span id="live" class="live-badge" hidden>● live</span></h1>
+    <h1>Harness report <span id="live" class="live-badge" hidden>● live</span> <span class="build-tag" title="redesign build — drawer, correlation graph, auto-loading Run Data">r2</span></h1>
     <div class="filters">
       <select id="session"><option value="">Select a session…</option></select>
       <select id="run"><option value="">All runs</option></select>
       <button id="refresh" title="Reload">⟳</button>
       <button id="upload" title="Queue this run's report for the dashboard (uploads on the next sync flush)">Queue ↗</button>
+      <button id="export" title="Export the raw event log (JSONL) for this session">JSONL ⬇</button>
     </div>
   </div>
   <div class="hint" id="hint">Pick a session to see what the harness did.</div>
@@ -91,14 +95,15 @@ async function listSessions(): Promise<{ name: string; file: string; at: number 
 	return out.sort((a, b) => b.at - a.at);
 }
 
-async function readReport(session: string, runId?: string): Promise<{ report?: HarnessReport; error?: string }> {
+async function readReport(session: string, runId?: string): Promise<{ report?: HarnessReport; events?: number; error?: string }> {
 	const dir = harnessDir();
 	if (!dir) return { error: "No workspace folder open." };
 	const file = path.join(dir, `${session.replace(/[^\w-]+/g, "-")}.jsonl`);
 	try {
 		const log = await logFor(file);
 		await log.sync();
-		return { report: buildHarnessReport(await log.read(), { runId }) };
+		const events = await log.read();
+		return { report: buildHarnessReport(events, { runId }), events: events.length };
 	} catch (err) {
 		return { error: err instanceof Error ? err.message : String(err) };
 	}
@@ -113,8 +118,8 @@ async function handle(message: HarnessMessage): Promise<void> {
 			break;
 		}
 		case "report": {
-			const { report, error } = await readReport(message.session, message.runId);
-			void panel.webview.postMessage(error ? { type: "error", text: error } : { type: "report", report, runId: message.runId ?? "" });
+			const { report, events, error } = await readReport(message.session, message.runId);
+			void panel.webview.postMessage(error ? { type: "error", text: error } : { type: "report", report, runId: message.runId ?? "", events });
 			break;
 		}
 		case "upload": {
@@ -129,6 +134,53 @@ async function handle(message: HarnessMessage): Promise<void> {
 				void panel.webview.postMessage({ type: "queued", runId: message.runId });
 			} catch (err) {
 				void panel.webview.postMessage({ type: "error", text: `Queue failed: ${err instanceof Error ? err.message : String(err)}` });
+			}
+			break;
+		}
+		case "rawEvents": {
+			const dir = harnessDir();
+			const file = dir ? path.join(dir, `${message.session.replace(/[^\w-]+/g, "-")}.jsonl`) : "";
+			try {
+				const text = await fs.readFile(file, "utf8");
+				void panel.webview.postMessage({ type: "rawEvents", session: message.session, lines: text.trim().split("\n") });
+			} catch (err) {
+				void panel.webview.postMessage({ type: "error", text: `Raw events failed: ${err instanceof Error ? err.message : String(err)}` });
+			}
+			break;
+		}
+		case "analytics": {
+			try {
+				const sessions = await listSessions();
+				const { buildHarnessAnalytics } = await import("../harness/report/report");
+				const reports = [];
+				for (const s of sessions.slice(0, 30)) {
+					const dir = harnessDir();
+					const file = dir ? path.join(dir, `${s.name.replace(/[^\w-]+/g, "-")}.jsonl`) : "";
+					try {
+						const log = await logFor(file);
+						await log.sync();
+						reports.push({ report: buildHarnessReport(await log.read()), session: s.name });
+					} catch { /* skip unreadable logs */ }
+				}
+				void panel.webview.postMessage({ type: "analytics", analytics: buildHarnessAnalytics(reports) });
+			} catch (err) {
+				void panel.webview.postMessage({ type: "error", text: `Analytics failed: ${err instanceof Error ? err.message : String(err)}` });
+			}
+			break;
+		}
+		case "export": {
+			const dir = harnessDir();
+			const file = dir ? path.join(dir, `${message.session.replace(/[^\w-]+/g, "-")}.jsonl`) : "";
+			try {
+				const target = await vscode.window.showSaveDialog({
+					defaultUri: vscode.Uri.file(path.join(dir ?? "", `${message.session.replace(/[^\w-]+/g, "-")}.jsonl`)),
+					filters: { "JSONL event log": ["jsonl"] },
+				});
+				if (!target) break;
+				await vscode.workspace.fs.copy(vscode.Uri.file(file), target, { overwrite: true });
+				void panel.webview.postMessage({ type: "exported", path: target.fsPath });
+			} catch (err) {
+				void panel.webview.postMessage({ type: "error", text: `Export failed: ${err instanceof Error ? err.message : String(err)}` });
 			}
 			break;
 		}

@@ -72,7 +72,7 @@ describe("OpenAI model port", () => {
 			),
 		);
 		vi.stubGlobal("fetch", fetchMock);
-		const port = openaiAdapter({ providerId: "openai", baseUrl: "https://api.example.test/v1", apiKey: "k", modelId: "m" });
+		const port = openaiAdapter({ providerId: "openai", baseUrl: "https://api.example.test/v1", apiKey: "k", modelId: "m", shape: "responses" });
 		const response = await port.complete(request());
 		const body = JSON.parse((fetchMock.mock.calls[0]![1] as RequestInit).body as string);
 		expect(body.instructions).toBe("SYS");
@@ -87,7 +87,7 @@ describe("OpenAI model port", () => {
 			sseResponse(sse([{ choices: [{ delta: { content: "hi" } }] }, { choices: [{ delta: {}, finish_reason: "stop" }] }]) + "data: [DONE]\n\n"),
 		);
 		vi.stubGlobal("fetch", fetchMock);
-		const port = openaiAdapter({ providerId: "openrouter", baseUrl: "https://gw.example.test/v1", apiKey: "k", modelId: "m" });
+		const port = openaiAdapter({ providerId: "openrouter", baseUrl: "https://gw.example.test/v1", apiKey: "k", modelId: "m", shape: "chat" });
 		const response = await port.complete(request());
 		expect(String(fetchMock.mock.calls[0]![0])).toMatch(/chat\/completions$/);
 		expect(response.text).toBe("hi");
@@ -95,7 +95,7 @@ describe("OpenAI model port", () => {
 });
 
 describe("OpenAI model port: conversations and output items", () => {
-	const direct = { providerId: "openai", baseUrl: "https://api.openai.com/v1", apiKey: "k", modelId: "m" };
+	const direct = { providerId: "openai", baseUrl: "https://api.openai.com/v1", apiKey: "k", modelId: "m", shape: "conversations" as const };
 	const completed = () => sseResponse(sse([{ type: "response.created", response: { id: "r1" } }, { type: "response.completed", response: { id: "r1", output: [] } }]));
 
 	it("offers conversations only for direct OpenAI Responses with store on", () => {
@@ -103,7 +103,8 @@ describe("OpenAI model port: conversations and output items", () => {
 		expect(openaiAdapter({ ...direct, store: false }).conversations).toBeUndefined();
 		expect(openaiAdapter({ ...direct, conversations: false }).conversations).toBeUndefined();
 		expect(openaiAdapter({ ...direct, baseUrl: "https://ai-gateway.vercel.sh/v1" }).conversations).toBeUndefined();
-		expect(openaiAdapter({ ...direct, providerId: "openai-compatible" }).conversations).toBeUndefined();
+		// Eligibility is host-based: the endpoint is what serves conversations, not the provider label.
+		expect(openaiAdapter({ ...direct, providerId: "openai-compatible" }).conversations).toBeDefined();
 	});
 
 	it("sends only the delta to a conversation, with server compaction at 70% of the window", async () => {
@@ -231,5 +232,52 @@ describe("Cline model port: stream folding", () => {
 			yield { type: "done", success: false, error: "rate limited", id: "1" };
 		}
 		await expect(collectTurn(stream())).rejects.toThrow(/rate limited/);
+	});
+});
+
+describe("matrix-driven factory (createModelAdapter)", () => {
+	it("openrouter responses forces store:false and sends the reasoning override", async () => {
+		const fetchMock = vi.fn().mockResolvedValueOnce(
+			sseResponse(sse([{ type: "response.created", response: { id: "r1" } }, { type: "response.completed", response: { id: "r1", output: [] } }])),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+		const { createModelAdapter } = await import("../../src/harness/adapters");
+		const port = createModelAdapter("responses", { providerId: "openrouter", baseUrl: "https://openrouter.ai/api/v1", apiKey: "k", modelId: "alibaba/qwen3.7-flash" });
+		await port.complete(request());
+		const body = JSON.parse((fetchMock.mock.calls[0]![1] as RequestInit).body as string);
+		expect(String(fetchMock.mock.calls[0]![0])).toMatch(/responses$/);
+		expect(body.store).toBe(false);
+		expect(body.reasoning).toEqual({ effort: "medium" });
+		// The chat-shape qwen opt-in must never leak into a Responses body.
+		expect(body.enable_thinking).toBeUndefined();
+		expect(body.previous_response_id).toBeUndefined();
+	});
+
+	it("openrouter chat shape carries the qwen enable_thinking opt-in", async () => {
+		const fetchMock = vi.fn().mockResolvedValueOnce(
+			sseResponse(sse([{ choices: [{ delta: { content: "hi" } }] }, { choices: [{ delta: {}, finish_reason: "stop" }] }]) + "data: [DONE]\n\n"),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+		const { createModelAdapter } = await import("../../src/harness/adapters");
+		const port = createModelAdapter("chat", { providerId: "openrouter", baseUrl: "https://openrouter.ai/api/v1", apiKey: "k", modelId: "alibaba/qwen3.7-flash" });
+		await port.complete(request());
+		const body = JSON.parse((fetchMock.mock.calls[0]![1] as RequestInit).body as string);
+		expect(String(fetchMock.mock.calls[0]![0])).toMatch(/chat\/completions$/);
+		expect(body.enable_thinking).toBe(true);
+	});
+
+	it("an unsupported explicit pick throws instead of falling back", async () => {
+		const { createModelAdapter } = await import("../../src/harness/adapters");
+		expect(() =>
+			createModelAdapter("conversations", { providerId: "openrouter", baseUrl: "https://openrouter.ai/api/v1", apiKey: "k", modelId: "m" }),
+		).toThrow(/does not serve the conversations API/);
+	});
+
+	it("auto on openai direct resolves to conversations; on openrouter to responses", async () => {
+		const { createModelAdapter } = await import("../../src/harness/adapters");
+		const direct = createModelAdapter("auto", { providerId: "openai", baseUrl: "https://api.openai.com/v1", apiKey: "k", modelId: "gpt-5-mini" });
+		expect(direct.conversations).toBeDefined();
+		const or = createModelAdapter("auto", { providerId: "openrouter", baseUrl: "https://openrouter.ai/api/v1", apiKey: "k", modelId: "m" });
+		expect(or.conversations).toBeUndefined();
 	});
 });
