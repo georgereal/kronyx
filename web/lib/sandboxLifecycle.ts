@@ -98,7 +98,7 @@ export const fmtTick = (ts: number) => {
 };
 
 export const eventColor = (e?: string) =>
-	e === "kill" || e === "stop" ? "var(--err)" : e === "pause" ? "var(--amber, #facc15)" : e === "checkpoint" ? "#60a5fa" : "var(--ok, #4ade80)";
+	e === "kill" || e === "stop" || e === "provider-gone" ? "var(--err)" : e === "pause" || e === "inaccessible" ? "var(--amber, #facc15)" : e === "checkpoint" ? "#60a5fa" : "var(--ok, #4ade80)";
 
 export const BOOT_SOURCE: Record<string, string> = {
 	connect: "Reused live VM",
@@ -113,6 +113,8 @@ export const BOOT_SOURCE: Record<string, string> = {
 
 const EVENT_LABEL: Record<string, string> = {
 	connect: "Reconnected — live VM",
+	inaccessible: "Marked inaccessible — retained, not reused",
+	"provider-gone": "Provider no longer has this sandbox",
 	resume: "Resumed — memory + disk",
 	"resume-disk": "Resumed — disk only (cold boot)",
 };

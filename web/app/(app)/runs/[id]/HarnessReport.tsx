@@ -126,6 +126,12 @@ export interface HarnessReport {
 		recaps: number;
 		clears: number;
 		budgetWarnings: number;
+		manifests?: number;
+		compactions?: number;
+		closeouts?: number;
+		compactionRecords?: { compactionId: string; scope: string; version: number; from: number; to: number; preservedReferences: number }[];
+		closeoutSummaries?: { closeoutId: string; runId?: string; outcome: string; objective: string; validation: string; filesModified: number; unresolvedIssues: number; version: number }[];
+		latestManifest?: { invocationId: string; purpose: string; payloadMode: string; inputTokenCount: number; compactionApplied: boolean; compactionAuthority: string; truncationApplied: boolean; omittedContent: number };
 	};
 	execution: {
 		tools: { name: string; calls: number; failures: number }[];

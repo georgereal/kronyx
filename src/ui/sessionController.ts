@@ -2,9 +2,8 @@ import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { AgentRunner, type AgentMode, type ProviderSettings, type RunnerAttachment, type RunDigest, type RunnerHost } from "../agent/runner";
-import type { AgentEngine, EngineKind } from "../agent/engine";
-import { OpenAIEngine } from "../agent/openaiEngine";
+import type { AgentMode, ProviderSettings, RunnerAttachment, RunDigest, RunnerHost } from "../agent/types";
+import type { EngineKind } from "../agent/engine";
 import { chooseTransport, type TransportKind } from "../harness/adapters";
 import { buildSystemPrompt } from "../agent/systemPrompt";
 import { assembleToolSet } from "../agent/toolSet";
@@ -12,9 +11,8 @@ import { withExplore } from "../harness/tools/explore";
 import { withBatchReads } from "../harness/tools/batchReads";
 import { withReadCache } from "../harness/tools/readCache";
 import { withRecall } from "../harness/tools/recall";
-import { WRITE_MODES } from "../agent/runner";
+import { WRITE_MODES } from "../agent/types";
 import { isConversationalTask } from "../agent/taskGuard";
-import { deriveMessages, type KronyxEvent } from "../agent/events";
 import { acceptsImages } from "../agent/vision";
 import { evaluate, parsePermissionsText, ruleFor, type PermissionLayers, type PermissionRules } from "../agent/permissions";
 import { readGlobalModePermissions, readGlobalPermissions } from "../permStore";
@@ -22,7 +20,7 @@ import type { PriorTranscript } from "../agent/recall";
 import type { AgentMessage } from "@cline/shared";
 import { checksOnFinish, runChecks } from "../checks";
 import { E2bSandbox, sandboxBackend, sandboxEnabled } from "./e2b";
-import { appendFact, createIdeRecallScorer, indexFile, loadMemoryContext, logEpisode } from "./memory";
+import { appendFact, createIdeRecallScorer, embedTexts, embeddingModel, indexFile, loadMemoryContext, logEpisode } from "./memory";
 import { buildRunIndex, indexRunDigests, searchRunDigests } from "./runMemory";
 import { createFileTools } from "../tools/fileTools";
 import { FileEventLog } from "../harness/core/eventLog";
@@ -42,6 +40,8 @@ import { createProcessTools, type ProcTools } from "../tools/procTools";
 import { createLocalBrowserTools, type LocalBrowserTools } from "../tools/localBrowserTools";
 import { userConfig } from "../userConfig";
 import { insertMemoryEvent, openStore, upsertHarnessReport } from "../store";
+import { SqliteKnowledgeStore } from "../context/knowledge/sqliteKnowledgeStore";
+import { SqliteExecutionStateStore } from "../context/state/sqliteExecutionStateStore";
 import { createIdeTools } from "./ideTools";
 import { autoApproveWrites, currentSelection, estimateCostUsd, implementPrompt, modelPricing, networkAllowHosts, pickModel, planDir, type ProfileCatalog, profiles, promptForApiKey, providerErrorMessage, readProviderSettings, resolveProvider } from "../config";
 import { log } from "../log";
@@ -191,9 +191,8 @@ function diagCounts(): { errors: number; warnings: number } {
 
 /** Owns one session surface (sidebar view or editor tab): runner, messages, git hooks. */
 export class SessionController {
-	private runner: AgentRunner | undefined;
 	/** OpenAI-compatible engine for this session; recreated when the session changes (it owns a per-session transcript). */
-	private openai: OpenAIEngine | undefined;
+	private legacyDigests: RunDigest[] = [];
 	private engineHost: RunnerHost | undefined;
 	private engineKind: EngineKind = "auto";
 	/** Engine of the run in flight (or last run); stamped on api_calls rows for comparison. */
@@ -283,7 +282,6 @@ export class SessionController {
 	/** Start a fresh named session in the same window — like Copilot's "new chat". */
 	async startNewSession(): Promise<void> {
 		this.resetEngines();
-		this.openai = undefined;
 		this.engineKind = "auto";
 		this.approveAll = false;
 		this.permittedTools.clear();
@@ -319,7 +317,6 @@ export class SessionController {
 	async openSession(name: string): Promise<void> {
 		if (this.name === name) return;
 		this.stopEngines();
-		this.openai = undefined;
 		this.approveAll = false;
 		this.permittedTools.clear();
 		this.name = name;
@@ -387,24 +384,16 @@ export class SessionController {
 	}
 
 	get isRunning(): boolean {
-		return !!(this.runner?.isRunning || this.openai?.isRunning);
-	}
-
-	private activeEngine(): AgentEngine | undefined {
-		return this.engineKind === "openai" ? this.openai : this.runner;
+		return !!this.harnessAbort;
 	}
 
 	private stopEngines(): void {
-		this.runner?.stop();
-		this.openai?.stop();
 		this.harnessAbort?.abort();
 	}
 
 	private resetEngines(): void {
 		this.procs?.dispose();
 		void this.browserTools?.dispose();
-		this.runner?.reset();
-		this.openai?.reset();
 	}
 
 	private setEngineKind(kind: EngineKind): void {
@@ -561,14 +550,14 @@ export class SessionController {
 		}
 	}
 
-	private async getRunner(kind: EngineKind): Promise<AgentEngine | undefined> {
+	private async getRunner(_kind: EngineKind): Promise<RunnerHost | undefined> {
 		const folder = vscode.workspace.workspaceFolders?.[0];
 		if (!folder) {
 			void vscode.window.showErrorMessage("Kronyx: open a folder first.");
 			return undefined;
 		}
 		const root = folder.uri.fsPath;
-		if (!this.runner || this.runnerRoot !== root) {
+		if (!this.engineHost || this.runnerRoot !== root) {
 			this.runnerRoot = root;
 			this.permLayers = await this.loadPermissionLayers(root);
 			this.procs = createProcessTools({ root });
@@ -649,21 +638,14 @@ export class SessionController {
 				events: { record: (e) => this.deps.persistEvent(this.name, e as Parameters<RunViewProvider["post"]>[0], this.runId) },
 			};
 			this.engineHost = host;
-			this.runner = new AgentRunner(host);
-			this.openai = undefined;
-			void this.deps.loadDigest?.(this.name).then((d) => this.runner?.setRunDigests(d));
+			void this.deps.loadDigest?.(this.name).then((d) => {
+				this.legacyDigests = d.slice(-3);
+			});
 			void this.deps.loadTranscripts?.(this.name).then((t) => {
 				this.transcripts = t;
 			});
 		}
-		if (!this.openai && this.engineHost) {
-			this.openai = new OpenAIEngine({
-				...this.engineHost,
-				resume: { resumeLog: async () => deriveMessages((await this.deps.loadEvents(this.name)) as KronyxEvent[]) },
-			});
-			void this.deps.loadDigest?.(this.name).then((d) => this.openai?.setRunDigests(d));
-		}
-		return kind === "openai" ? this.openai : this.runner;
+		return this.engineHost;
 	}
 
 	/** Re-indexes a changed file after 500 ms of quiet, so rapid agent edits embed once. */
@@ -834,9 +816,8 @@ export class SessionController {
 			this.runnerRoot ? path.relative(this.runnerRoot, abs).split(path.sep).join("/") : abs,
 		);
 		const digest = { task: this.runTask, status, summary, filesChanged: files, at: Date.now() };
-		this.runner?.addRunDigest(digest);
-		this.openai?.addRunDigest(digest);
-		this.deps.saveDigest?.(this.name, this.runner?.runDigests ?? []);
+		this.legacyDigests = [...this.legacyDigests, digest].slice(-3);
+		this.deps.saveDigest?.(this.name, this.legacyDigests);
 	}
 
 	/** `pick` is the composer chip's pair; the run uses exactly that pair, or none of them. */
@@ -1223,6 +1204,7 @@ export class SessionController {
 			modelId: settings.modelId,
 			profile: settings.profile,
 			contextWindow: settings.contextWindow,
+			maxOutputTokens: settings.maxTokens,
 			capabilities: model.capabilities,
 		});
 		const run = shellExec(root);
@@ -1271,7 +1253,7 @@ export class SessionController {
 		const baseMemory = (await this.engineHost?.memory?.context?.("", settings)) ?? "";
 		const runIndex = buildRunIndex(priorEvents, this.name);
 		const memory = [baseMemory, runIndex].filter(Boolean).join("\n\n");
-		const digests = resume ? [] : (this.runner?.runDigests ?? []);
+		const digests = resume ? [] : this.legacyDigests;
 		const digestBlock = digests.length
 			? `Earlier runs in this session (oldest first):\n${digests.map((d, i) => `${i + 1}) ${d.task} — ${d.status}. ${d.summary.slice(0, 800)}${d.filesChanged.length ? ` Files: ${d.filesChanged.join(", ")}.` : ""}`).join("\n")}`
 			: "";
@@ -1299,9 +1281,21 @@ export class SessionController {
 			// board IS the deliverable; signals for unavailable tools are stripped.
 			const plan = !isConversationalTask(task);
 			const images = attachments.flatMap((a) => (a.data?.byteLength && a.mediaType.startsWith("image/") ? [{ mediaType: a.mediaType, base64: Buffer.from(a.data).toString("base64") }] : []));
+			const store = await openStore(root);
+			const knowledgeStore = store ? new SqliteKnowledgeStore(store) : undefined;
+			const executionStateStore = store ? new SqliteExecutionStateStore(store) : undefined;
+			const knowledgeEmbedder = knowledgeStore
+				? {
+						model: embeddingModel() || "local",
+						embed: (texts: string[], op: string) => embedTexts(settings.baseUrl, settings.apiKey, texts, op, root),
+					}
+				: undefined;
 			const outcome = await runHarness(
 				{
 					runId: this.runId,
+					sessionId: this.name,
+					...(knowledgeStore ? { knowledgeStore, knowledgeScope: { root, sessionId: this.name }, ...(knowledgeEmbedder ? { knowledgeEmbedder } : {}) } : {}),
+					...(executionStateStore ? { executionStateStore } : {}),
 					log,
 					model,
 					behavior,

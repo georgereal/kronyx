@@ -35,7 +35,7 @@ Copy `web/.env.local` → `.env` (the backend reads the same file), or export:
 | `CRON_SECRET` | Optional — gates the janitor/cron route |
 | `BACKEND_PORT`, `BACKEND_RUN_WORKER`, `BACKEND_DEBUG` | Runtime knobs |
 
-Idle/timeout tunables: `SESSION_IDLE_KILL_MINUTES`, `PAUSED_KILL_MINUTES`, `SANDBOX_IDLE_PAUSE_MINUTES`, `JANITOR_MAX_SANDBOX_MINUTES`.
+Idle/timeout tunables: `SANDBOX_IDLE_PAUSE_MINUTES`, `JANITOR_MAX_SANDBOX_MINUTES`. `SESSION_IDLE_KILL_MINUTES` and `PAUSED_KILL_MINUTES` are retired: attached paused sandboxes are retained indefinitely (E2B paused VMs do not consume running concurrency), inaccessible VMs are marked rather than immediately reaped, disconnected VMs are reaped whether running or paused, and genuine concurrency-pressure cleanup may additionally pause the oldest idle attached running VMs (killing one only if pausing fails).
 
 ## Browser/GUI sandboxes
 

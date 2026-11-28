@@ -171,13 +171,34 @@ export const e2bProvider: SandboxProvider = {
 	},
 
 	async listLive(creds) {
-		const res = await fetch("https://api.e2b.app/v2/sandboxes", {
-			headers: { "X-API-KEY": apiKey(creds) },
-			signal: AbortSignal.timeout(15_000),
-		}).catch(swallow("e2b", "op"));
-		if (!res?.ok) return [];
-		const list = (await res.json()) as { sandboxID?: string; sandboxId?: string; startedAt?: string }[];
-		return list.map((s) => ({ id: s.sandboxID ?? s.sandboxId ?? "", startedAt: s.startedAt })).filter((s) => s.id);
+		const out: { id: string; startedAt?: string; state?: "running" | "paused" }[] = [];
+		let nextToken = "";
+		// v2 paginates and includes running+paused by default. Orphan cleanup is
+		// incomplete (and can mislabel rows) if only the first page is inspected.
+		for (let page = 0; page < 50; page++) {
+			const url = new URL("https://api.e2b.app/v2/sandboxes");
+			url.searchParams.set("limit", "100");
+			if (nextToken) url.searchParams.set("nextToken", nextToken);
+			const res = await fetch(url, {
+				headers: { "X-API-KEY": apiKey(creds) },
+				signal: AbortSignal.timeout(15_000),
+			}).catch(swallow("e2b", "op"));
+			if (!res?.ok) break;
+			const list = (await res.json().catch(swallow("e2b", "op", []))) as {
+				sandboxID?: string;
+				sandboxId?: string;
+				startedAt?: string;
+				state?: string;
+			}[];
+			for (const s of Array.isArray(list) ? list : []) {
+				const id = s.sandboxID ?? s.sandboxId ?? "";
+				if (!id) continue;
+				out.push({ id, startedAt: s.startedAt, state: s.state === "paused" ? "paused" : s.state === "running" ? "running" : undefined });
+			}
+			nextToken = res.headers.get("x-next-token") ?? "";
+			if (!nextToken) break;
+		}
+		return out;
 	},
 
 	async listTemplates(creds) {

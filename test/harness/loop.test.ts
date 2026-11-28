@@ -207,7 +207,7 @@ describe("HarnessLoop: budgets and terminal states", () => {
 		const events = await log.read();
 		expect(events.filter((e) => e.type === "budget.warning")).toHaveLength(1);
 		expect(events.some((e) => e.type === "steer.note" && e.rule === "context.budget")).toBe(true);
-		expect(events.some((e) => e.type === "context.recap")).toBe(false);
+		expect(events.filter((e) => e.type === "context.recap").every((e) => e.type === "context.recap" && e.text.includes("Closeout of prior run"))).toBe(true);
 	});
 
 	it("each run gets its own input allowance — a prior run's spend does not carry over", async () => {
@@ -542,7 +542,7 @@ describe("HarnessLoop: automatic recap", () => {
 		const outcome = await loop.run("x");
 		expect(outcome.status).toBe("completed");
 		const recaps = (await log.read()).filter((e) => e.type === "context.recap");
-		expect(recaps.length).toBe(0);
+		expect(recaps.every((e) => e.type === "context.recap" && e.text.includes("Closeout of prior run"))).toBe(true);
 	});
 
 	it("does not auto-recap when no task closed and no budget pressure", async () => {
@@ -552,7 +552,7 @@ describe("HarnessLoop: automatic recap", () => {
 		});
 		await loop.run("x");
 		const recaps = (await log.read()).filter((e) => e.type === "context.recap");
-		expect(recaps.length).toBe(0);
+		expect(recaps.every((e) => e.type === "context.recap" && e.text.includes("Closeout of prior run"))).toBe(true);
 	});
 });
 
@@ -716,7 +716,7 @@ describe("live mode accessor", () => {
 	});
 
 	it("a run already in code mode at save_plan time does not end", async () => {
-		let writable = true;
+		const writable = true;
 		const scripted = scriptedModel([
 			acting(savePlan2()),
 			acting(call("w1", "write_file", { path: "x.ts", content: "x" })),

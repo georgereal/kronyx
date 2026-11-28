@@ -163,7 +163,7 @@ export default function SandboxesPage() {
 				<div className="sbx-stat">
 					<div className="k">History</div>
 					<div className="v">{deadRows.length}</div>
-					<div className="s">dead / replaced</div>
+					<div className="s">dead / inaccessible / replaced</div>
 				</div>
 			</div>
 

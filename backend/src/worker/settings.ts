@@ -1,5 +1,5 @@
 import type { Db } from "mongodb";
-import type { ProviderSettings } from "../../../src/agent/runner";
+import type { ProviderSettings } from "../../../src/agent/types";
 import { getCache } from "./cache";
 
 export interface UserSettings {
@@ -13,7 +13,8 @@ interface Profile {
 	baseUrl?: string;
 	modelId?: string;
 	enabled?: boolean;
-	models?: { id: string }[];
+	models?: { id: string; contextWindow?: number; maxTokens?: number }[];
+	apiShape?: "cline" | "responses" | "conversations" | "chat" | "auto";
 }
 
 /** Read users/{uid}.settings — BYOK profiles + secrets synced from the editors/web. */
@@ -49,7 +50,8 @@ export function resolveProvider(
 	if (!profile) return { error: `Provider "${job.profile}" is not configured — add it in Settings → Provider.` };
 	if (profile.enabled === false) return { error: `Provider "${job.profile}" is disabled — enable it in Settings.` };
 	if (!profile.providerId || !profile.baseUrl) return { error: `Provider "${job.profile}" is missing its provider id or base URL — complete it in Settings → Provider.` };
-	if (profile.models?.length && !profile.models.some((m) => m.id === job.modelId))
+	const selectedModel = profile.models?.find((m) => m.id === job.modelId);
+	if (profile.models?.length && !selectedModel)
 		return { error: `Model "${job.modelId}" is not in the "${job.profile}" catalog — refresh its models or pick again.` };
 	const apiKey = profileKey(settings.secrets, profile.name ?? job.profile);
 	if (!apiKey) return { error: `No API key for provider "${job.profile}" — set it in Settings → Provider.` };
@@ -60,6 +62,9 @@ export function resolveProvider(
 			modelId: job.modelId,
 			apiKey,
 			profile: job.profile,
+			...(profile.apiShape && profile.apiShape !== "auto" ? { apiShape: profile.apiShape } : {}),
+			...(selectedModel?.contextWindow ? { contextWindow: selectedModel.contextWindow } : {}),
+			...(selectedModel?.maxTokens ? { maxTokens: selectedModel.maxTokens } : {}),
 			maxIterations: Number(settings.data.agentMaxIterations) || 300,
 		},
 	};

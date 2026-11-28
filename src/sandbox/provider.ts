@@ -99,7 +99,7 @@ export interface SandboxProvider {
 	 *  resume with `memory:false` instead of condemning it. */
 	getInfoById?(id: string, creds: ProviderCreds): Promise<{ state: "running" | "paused" | "gone"; templateId?: string; name?: string; envdUnresponsiveAtPause?: boolean } | null>;
 	killById(id: string, creds: ProviderCreds): Promise<boolean>;
-	listLive?(creds: ProviderCreds): Promise<{ id: string; startedAt?: string }[]>;
+	listLive?(creds: ProviderCreds): Promise<{ id: string; startedAt?: string; state?: "running" | "paused" }[]>;
 	/** Templates usable with this account — public fleet plus account-built images. */
 	listTemplates?(creds: ProviderCreds): Promise<{ id: string; names: string[]; public: boolean }[]>;
 }

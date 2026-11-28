@@ -5,12 +5,15 @@
  * same plan the model is held to.
  */
 
-import type { RunViewEvent } from "../../agent/runner";
+import type { RunViewEvent } from "../../agent/types";
 import { classifyRunError } from "../../agent/errorKind";
 import type { ImageInput, ModelPort, SessionEvent, ToolPort, Usage, VerifierPort } from "./contracts";
 import type { HarnessBehavior } from "./behavior";
 import type { EventLog } from "./eventLog";
 import { DEFAULT_LIMITS, HarnessLoop, type HarnessLimits, type RunOutcome, type SeedTask } from "./loop";
+import type { EmbeddingProvider, KnowledgeRecord, KnowledgeStore } from "../../context/knowledge/record";
+import type { ExecutionStateStore } from "../../context/contracts/ports";
+import { persistCloseoutKnowledge, retrieveCloseoutKnowledge } from "../../context/knowledge/extractCloseout";
 
 const LEDGER_EVENTS = new Set(["task.created", "task.updated", "task.removed", "task.adopted", "step.added", "step.updated", "verifier.result"]);
 
@@ -18,6 +21,8 @@ export interface HarnessRunDeps {
 	/** Receives the live loop, so the UI can compact a running run. */
 	onLoop?: (loop: HarnessLoop) => void;
 	runId: string;
+	/** Owning harness session; used in context manifests/state snapshots. */
+	sessionId?: string;
 	log: EventLog;
 	model: ModelPort;
 	/** Resolved provider/model behavior; defaults inside the loop. */
@@ -37,6 +42,12 @@ export interface HarnessRunDeps {
 	writable?: boolean | (() => boolean);
 	/** kronyx.harness.debug — surface harness decisions (steer rule ids, per-turn tokens, recaps) as chat lines. */
 	debug?: boolean;
+	/** Optional shared knowledge store; closeout records are extracted here for cross-run retrieval. */
+	knowledgeStore?: KnowledgeStore;
+	knowledgeScope?: KnowledgeRecord["scope"];
+	/** Optional embedding writer for closeout knowledge chunks; retrieval degrades to keyword without it. */
+	knowledgeEmbedder?: EmbeddingProvider;
+	executionStateStore?: ExecutionStateStore;
 }
 
 interface Tracker {
@@ -191,7 +202,21 @@ export function toViewEvents(e: SessionEvent, st: Tracker, _limit: number, debug
 			if (e.rule === "plan.start") return [{ type: "info", text: e.text }];
 			return [{ type: "info", text: debug ? `[${e.rule}] ${e.text}` : e.text, meta: { kind: "harness", rule: e.rule } }];
 		case "context.recap":
-			return [{ type: "info", text: `Context compacted — recap covers the first ${e.covers} messages.`, meta: { kind: "context_compaction" } }];
+			return [{ type: "info", text: `Context compacted — recap covers the first ${e.covers} messages.`, meta: { kind: "context_compaction", covers: e.covers } }];
+		case "context.compaction":
+			return [{
+				type: "info",
+				text: `Context compaction recorded (${e.record.scope}, v${e.record.version}).`,
+				meta: {
+					kind: "context_compaction",
+					compactionId: e.record.compactionId,
+					scope: e.record.scope,
+					version: e.record.version,
+					modelGenerated: e.record.modelGenerated,
+					sourceEventRange: e.record.sourceEventRange,
+					preservedReferences: e.record.preservedReferences.length,
+				},
+			}];
 		case "context.cleared":
 			return [{ type: "info", text: "context cleared" }];
 		case "budget.warning":
@@ -232,14 +257,20 @@ export function toViewEvents(e: SessionEvent, st: Tracker, _limit: number, debug
 	}
 }
 
-export async function runHarness(deps: HarnessRunDeps, task: string, displayTask?: string, opts: { resume?: boolean; context?: string; images?: ImageInput[]; plan?: boolean; seed?: SeedTask[]; notes?: string[] } = {}): Promise<RunOutcome> {
+export async function runHarness(deps: HarnessRunDeps, task: string, displayTask?: string, opts: { resume?: boolean; resumeInput?: string; context?: string; images?: ImageInput[]; plan?: boolean; seed?: SeedTask[]; notes?: string[] } = {}): Promise<RunOutcome> {
 	const st: Tracker = { turn: 0, runStart: 0, lastText: "", starts: new Map(), usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 }, taskTitles: new Map(), blocked: [] };
 	const limit = deps.limits?.maxTurns ?? DEFAULT_LIMITS.maxTurns;
+	const closeoutWrites: Promise<unknown>[] = [];
 	const log = new ObservedLog(deps.log, (e) => {
+		if (e.type === "context.closeout" && deps.knowledgeStore && deps.knowledgeScope) {
+			closeoutWrites.push(persistCloseoutKnowledge(deps.knowledgeStore, e.record, deps.knowledgeScope, deps.knowledgeEmbedder).catch(() => {}));
+		}
 		for (const view of toViewEvents(e, st, limit, deps.debug === true)) deps.emit(view);
 	});
 	const loop = new HarnessLoop({
 		runId: deps.runId,
+		...(deps.sessionId ? { sessionId: deps.sessionId } : {}),
+		...(deps.executionStateStore ? { executionStateStore: deps.executionStateStore } : {}),
 		log,
 		model: deps.model,
 		behavior: deps.behavior,
@@ -262,7 +293,15 @@ export async function runHarness(deps: HarnessRunDeps, task: string, displayTask
 	deps.onLoop?.(loop);
 	await loop.recover();
 	deps.emit({ type: "run-started", task: displayTask ?? task });
-	return opts.resume ? loop.resume() : loop.run(task, opts.context, opts.images, { plan: opts.plan, seed: opts.seed, notes: opts.notes });
+	const retrievedKnowledge = !opts.resume && deps.knowledgeStore && deps.knowledgeScope
+		? await retrieveCloseoutKnowledge(deps.knowledgeStore, deps.knowledgeScope, task, deps.knowledgeEmbedder).catch(() => undefined)
+		: undefined;
+	const context = [opts.context, retrievedKnowledge].filter(Boolean).join("\n\n") || undefined;
+	const outcome = await (opts.resume ? loop.resume(opts.resumeInput) : loop.run(task, context, opts.images, { plan: opts.plan, seed: opts.seed, notes: opts.notes }));
+	// Closeout knowledge is the cross-task memory lane. Do not let the host tear
+	// down or report completion before the extraction write has settled.
+	await Promise.allSettled(closeoutWrites);
+	return outcome;
 }
 
 /** Task board snapshot for the UI: this run's tasks in creation order with their steps. */

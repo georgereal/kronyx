@@ -1,6 +1,6 @@
 import type { Db } from "mongodb";
 import { swallow } from "../lib/log";
-import type { RunViewEvent } from "../../../src/agent/runner";
+import type { RunViewEvent } from "../../../src/agent/types";
 
 /**
  * Seq-numbered event writer for one run — same `run_events` shape as the

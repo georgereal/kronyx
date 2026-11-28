@@ -10,7 +10,7 @@
  */
 
 import type { AgentMessage } from "@cline/shared";
-import type { RunViewEvent } from "./runner";
+import type { RunViewEvent } from "./types";
 
 export type KronyxEvent =
 	| RunViewEvent

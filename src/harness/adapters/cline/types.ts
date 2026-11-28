@@ -6,6 +6,7 @@ export interface ClinePortConfig {
 	apiKey: string;
 	modelId: string;
 	maxOutputTokens?: number;
+	contextWindow?: number;
 	signal?: AbortSignal;
 }
 

@@ -9,6 +9,7 @@
 
 import { defaultBehavior, type HarnessBehavior } from "../core/behavior";
 import { makeContextPolicy } from "../defaults/context";
+import { inputBudgetForWindow } from "../../context/adapters/harnessProjection";
 import type { AdapterCapabilities } from "../core/contracts";
 
 /** Normalized descriptor for profile selection. */
@@ -17,6 +18,7 @@ export interface ModelDescriptor {
 	modelId: string;
 	profile?: string;
 	contextWindow?: number;
+	maxOutputTokens?: number;
 	capabilities?: AdapterCapabilities;
 }
 
@@ -32,26 +34,15 @@ export function registerBehaviorProfile(profile: BehaviorProfile): void {
 	profiles.push(profile);
 }
 
-/**
- * Budget share of the model window the harness may use before compacting.
- * The window must also carry the model's own output and the system/tools
- * overhead, so pressure starts well before the hard limit.
- */
-const BUDGET_WINDOW_SHARE = 0.7;
-/** Fallback when the window is unknown — matches the legacy fixed budget (~30k tokens). */
-const FALLBACK_BUDGET_CHARS = 120_000;
-
 /** Defaults merged under the first matching profile's overrides. */
 export function resolveBehaviorProfile(descriptor: ModelDescriptor): HarnessBehavior {
 	const base = defaultBehavior();
-	// The compaction budget scales with the model's real window: a fixed budget
+	// The input budget is derived in real tokens: window minus the model's
+	// output reserve minus the provider/tokenizer safety margin. A fixed budget
 	// compacts a large-window model needlessly (amnesia loops) and a small-window
-	// one far too late. Input tokens are per-request (usage.inputTokens), so the
-	// recap trigger compares real per-turn size against this budget.
-	const budgetChars = descriptor.contextWindow
-		? Math.floor(descriptor.contextWindow * BUDGET_WINDOW_SHARE) * 4
-		: FALLBACK_BUDGET_CHARS;
-	if (budgetChars !== base.context.budgetChars) base.context = makeContextPolicy(budgetChars);
+	// one far too late; chars-based heuristics miscount code by 20-40%.
+	const budget = inputBudgetForWindow(descriptor.contextWindow, descriptor.maxOutputTokens);
+	if (budget.inputTokens !== base.context.budgetTokens) base.context = makeContextPolicy(budget);
 	const profile = profiles.find((p) => p.matches(descriptor));
 	return profile ? { ...base, ...profile.overrides } : base;
 }

@@ -5,7 +5,7 @@
  * never call it.
  */
 
-import type { EventBody, ModelPort } from "../contracts";
+import type { EventBody, ModelPort, ModelRequest } from "../contracts";
 import type { HarnessState } from "../projections";
 import type { ContextPolicy } from "./context";
 
@@ -13,6 +13,8 @@ export interface RecapCtx {
 	model: ModelPort;
 	emit(body: EventBody): Promise<void>;
 	state: HarnessState;
+	/** Run identity used in durable compaction ids when available. */
+	runId?: string;
 	signal: AbortSignal;
 	/** Last request's real input size — the pressure trigger. */
 	lastInputTokens: number;
@@ -22,6 +24,8 @@ export interface RecapCtx {
 	forced: boolean;
 	/** Resolved context policy (boundary + budget). */
 	context: ContextPolicy;
+	/** Observability hook invoked immediately before an auxiliary recap model call. */
+	onModelRequest?: (request: Pick<ModelRequest, "system" | "messages">) => Promise<void>;
 }
 
 export interface RecapPolicy {

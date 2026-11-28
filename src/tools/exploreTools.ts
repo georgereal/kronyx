@@ -1,5 +1,5 @@
 import type { AgentTool } from "@cline/shared";
-import type { ProviderSettings } from "../agent/runner";
+import type { ProviderSettings } from "../agent/types";
 import { InProcessSubagent } from "../agent/subagents";
 
 /**

@@ -103,7 +103,7 @@ async function searchSemantic(events: readonly SessionEvent[], query: string, sc
 
 export function withRecall(base: ToolPort, log: EventLog, scorer?: RecallScorer, searchRuns?: RunSearch): ToolPort {
 	return {
-		specs: () => [...base.specs(), SPEC],
+		specs: () => [...base.specs().filter((s) => s.name !== RECALL_TOOL), SPEC],
 		async execute(name, input, callId): Promise<ToolResult> {
 			if (name !== RECALL_TOOL) return base.execute(name, input, callId);
 			const args = (input ?? {}) as { toolCallId?: unknown; query?: unknown; scope?: unknown; runId?: unknown; task?: unknown; runIndex?: unknown };

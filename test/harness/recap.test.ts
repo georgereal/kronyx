@@ -60,6 +60,9 @@ describe("recap compaction (step 6, manual only)", () => {
 		const recaps = (await log.read()).filter((e) => e.type === "context.recap");
 		expect(recaps.length).toBeGreaterThanOrEqual(1);
 		expect(recaps.length).toBe(recapCalls.length);
+		const compactions = (await log.read()).filter((e) => e.type === "context.compaction");
+		expect(compactions).toHaveLength(recaps.length);
+		expect(compactions[0]).toMatchObject({ record: { scope: "interaction_history", modelGenerated: true, version: 1 } });
 		const ctx = buildContext(loop.projection, tools.specs());
 		expect(ctx.messages[0]).toMatchObject({ kind: "system", text: expect.stringContaining("RECAP TEXT") });
 	});
@@ -89,9 +92,42 @@ describe("recap compaction (step 6, manual only)", () => {
 	});
 
 	it("the recap replaces covered messages in the request and keeps the rest", () => {
-		const state = { ...initialState(), messages: Array.from({ length: 30 }, (_, i) => ({ kind: "user" as const, text: `m${i}`, seq: i + 1 })), recap: { covers: 16, text: "R" } };
+		const filler = (i: number) => ({ kind: "assistant" as const, text: `a${i}`, toolCalls: [], seq: i + 1 });
+		const state = { ...initialState(), messages: Array.from({ length: 30 }, (_, i) => filler(i)), recap: { covers: 16, text: "R" } };
 		const ctx = buildContext(state, []);
 		expect(ctx.messages[0]).toMatchObject({ kind: "system", text: expect.stringContaining("R") });
-		expect(ctx.messages[1]).toMatchObject({ kind: "user", text: "m16" });
+		expect(ctx.messages[1]).toMatchObject({ kind: "assistant", text: "a16" });
+	});
+
+	it("an interaction recap never drops covered user inputs — the active objective and constraints are always retained", () => {
+		const messages = [
+			{ kind: "user" as const, text: "build the feature", seq: 1 },
+			...Array.from({ length: 28 }, (_, i) => ({ kind: "assistant" as const, text: `a${i}`, toolCalls: [], seq: i + 2 })),
+		];
+		const state = { ...initialState(), messages, recap: { covers: 16, text: "R", scope: "interaction_history" as const } };
+		const ctx = buildContext(state, []);
+		expect(ctx.messages[0]).toMatchObject({ kind: "system", text: expect.stringContaining("R") });
+		// The verbatim user input is re-injected right after the recap, before the uncovered tail.
+		expect(ctx.messages[1]).toMatchObject({ kind: "user", text: "build the feature" });
+		expect(ctx.messages[2]).toMatchObject({ kind: "assistant", text: "a15" });
+	});
+
+	it("a task-closeout recap supersedes prior user inputs — cross-task context stays compact", () => {
+		const messages = [
+			{ kind: "user" as const, text: "finished task objective", seq: 1 },
+			...Array.from({ length: 28 }, (_, i) => ({ kind: "assistant" as const, text: `a${i}`, toolCalls: [], seq: i + 2 })),
+			{ kind: "user" as const, text: "new objective", seq: 31 },
+		];
+		const state = {
+			...initialState(),
+			messages,
+			recap: { covers: 29, text: "R", scope: "task_closeout" as const },
+			closeoutCovers: 29,
+		};
+		const ctx = buildContext(state, []);
+		expect(ctx.messages[0]).toMatchObject({ kind: "system", text: expect.stringContaining("R") });
+		// The finished task's objective stays compacted; the uncovered tail begins with the new objective.
+		expect(ctx.messages.some((m) => m.kind === "user" && m.text === "finished task objective")).toBe(false);
+		expect(ctx.messages[1]).toMatchObject({ kind: "user", text: "new objective" });
 	});
 });

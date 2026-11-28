@@ -1,4 +1,4 @@
-import type { ProviderSettings } from "./agent/runner";
+import type { ProviderSettings } from "./agent/types";
 
 /** The composer's model pick: the only selection a run may use. */
 export interface ModelSelection {
@@ -13,6 +13,7 @@ export interface SelectableProfile {
 	baseUrl?: string;
 	enabled?: boolean;
 	models?: { id: string; contextWindow?: number }[];
+	apiShape?: "cline" | "responses" | "conversations" | "chat" | "auto";
 }
 
 /** Typed error describing why the selected provider and model can't run. */
@@ -69,6 +70,7 @@ export async function selectProvider(
 			baseUrl: profile.baseUrl!,
 			modelId,
 			profile: name,
+			...(profile.apiShape && profile.apiShape !== "auto" ? { apiShape: profile.apiShape } : {}),
 			maxIterations,
 			apiKey,
 			contextWindow: known?.contextWindow,

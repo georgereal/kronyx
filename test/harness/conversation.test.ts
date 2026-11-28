@@ -123,6 +123,23 @@ describe("HarnessLoop: conversation mode", () => {
 		expect(textOf(requests[1]!.messages)).toEqual(["go", "again"]);
 	});
 
+	it("task closeout rebinds the next run from the compact projection instead of carrying raw history", async () => {
+		const log = new MemoryEventLog(() => 1);
+		const first = conversationalModel([act({ callId: "c1", name: "noop", input: {} }), finish()]);
+		await new HarnessLoop({ runId: "run-one", log, model: first.port, tools: tools() }).run("do work");
+		expect((await log.read()).some((e) => e.type === "context.compaction" && e.record.scope === "task_closeout")).toBe(true);
+
+		const second = conversationalModel([finish("next")]);
+		const loop = new HarnessLoop({ runId: "run-two", log, model: second.port, tools: tools() });
+		await loop.recover();
+		expect(loop.projection.conversation).toBeUndefined();
+		await loop.run("next task");
+		expect(second.created).toEqual(["conv_1"]);
+		const text = JSON.stringify(second.requests[0]!.messages);
+		expect(text).toContain("Closeout of prior run");
+		expect(text).not.toContain('"output":"ok"');
+	});
+
 	it("stateless models never log conversation events", async () => {
 		const requests: ModelRequest[] = [];
 		const model: ModelPort = {
@@ -150,6 +167,9 @@ describe("harness projection: conversation state", () => {
 		expect(synced.conversation).toMatchObject({ syncedSeq: 3, inFlight: false });
 		expect(project([bound, ev(2, { type: "context.cleared" })]).conversation).toBeUndefined();
 		expect(project([bound, ev(2, { type: "conversation.reset", reason: "missing" })]).conversation).toBeUndefined();
+		const versions = { taskSummaryVersion: 0, planVersion: 0, decisionSetVersion: 0, repositoryContextVersion: 0, fileChangeVersion: 0, toolResultVersion: 0, validationVersion: 0, compactionVersion: 1, capabilityVersion: 0 };
+		const closeoutCompaction = ev(2, { type: "context.compaction", record: { schemaVersion: 1, compactionId: "cmp", scope: "task_closeout", sourceEventRange: { from: 1, to: 1 }, preservedReferences: [], createdAt: "2026-01-01T00:00:00.000Z", version: 1, componentVersions: versions, modelGenerated: false } });
+		expect(project([bound, closeoutCompaction]).conversation).toBeUndefined();
 	});
 });
 

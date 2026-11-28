@@ -65,13 +65,20 @@ describe("injected behavior", () => {
 });
 
 describe("context-window-derived budget", () => {
-	it("scales budgetChars with the model's window; falls back when unknown", async () => {
+	it("derives the input budget in real tokens: window minus output reserve minus safety margin", async () => {
 		const { resolveBehaviorProfile } = await import("../../src/harness/behaviors");
 		const big = resolveBehaviorProfile({ providerId: "p", modelId: "m", contextWindow: 128_000 });
-		expect(big.context.budgetChars).toBe(Math.floor(128_000 * 0.7) * 4);
+		// 128000 - 8000 reserve - max(1024, 3% of 128k = 3840) margin
+		expect(big.context.budgetTokens).toBe(128_000 - 8_000 - 3_840);
+		expect(big.context.outputReserveTokens).toBe(8_000);
 		const small = resolveBehaviorProfile({ providerId: "p", modelId: "m", contextWindow: 32_000 });
-		expect(small.context.budgetChars).toBe(Math.floor(32_000 * 0.7) * 4);
+		// 32000 - 8000 - max(1024, 960) = 22976
+		expect(small.context.budgetTokens).toBe(32_000 - 8_000 - 1_024);
+		const reserved = resolveBehaviorProfile({ providerId: "p", modelId: "m", contextWindow: 128_000, maxOutputTokens: 16_000 });
+		expect(reserved.context.budgetTokens).toBe(128_000 - 16_000 - 3_840);
+		expect(reserved.context.outputReserveTokens).toBe(16_000);
 		const unknown = resolveBehaviorProfile({ providerId: "p", modelId: "m" });
-		expect(unknown.context.budgetChars).toBe(120_000);
+		// unknown window: conservative 32k assumption, same math as the small model
+		expect(unknown.context.budgetTokens).toBe(32_000 - 8_000 - 1_024);
 	});
 });

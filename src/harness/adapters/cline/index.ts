@@ -21,7 +21,10 @@ export class ClineModelPort implements ModelPort {
 	readonly capabilities: AdapterCapabilities = { wire: "cline", serverConversations: false, reasoningItems: false, store: false };
 	private readonly handler: ApiHandler;
 
+	readonly identity: { providerId: string; modelId: string; contextWindow?: number };
+
 	constructor(private readonly config: ClinePortConfig) {
+		this.identity = { providerId: config.providerId, modelId: config.modelId, ...(config.contextWindow !== undefined ? { contextWindow: config.contextWindow } : {}) };
 		this.handler = createHandler({
 			providerId: (config.providerId === "azure" ? "openai-compatible" : config.providerId) as never,
 			modelId: config.modelId,

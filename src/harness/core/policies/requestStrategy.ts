@@ -20,6 +20,8 @@ export interface StrategyCtx {
 	system: string;
 	turn: number;
 	runId: string;
+	/** Harness session identity when the host has one; falls back to runId in lightweight/test contexts. */
+	sessionId?: string;
 	/** Loop-owned emit; strategies append lifecycle events only through it. */
 	emit(body: EventBody): Promise<void>;
 	signal: AbortSignal;

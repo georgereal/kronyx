@@ -22,7 +22,7 @@ import { createRepeatGuard } from "./guards/repeatGuard";
 import { createPermissionGuard } from "./guards/permissionGuard";
 import { createSavePlanGuard, createWriteModeGuard } from "./guards/modeGuard";
 import { createApprovalGuard } from "./guards/approvalGuard";
-import type { ProviderSettings, RunnerHost } from "./runner";
+import type { ProviderSettings, RunnerHost } from "./types";
 
 /** Tools hidden from the model in read-only modes (ask/plan). */
 /** Tools READ_ONLY_HIDDEN keeps out of ask/plan, except plan mode still offers these — writes stay visible so a necessary one can be asked for instead of dead-ending. */

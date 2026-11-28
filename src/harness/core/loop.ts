@@ -34,6 +34,11 @@ import type { EventLog } from "./eventLog";
 import type { LoopReason } from "./policies/loopControl";
 import type { RequestStrategy, StrategyCtx } from "./policies/requestStrategy";
 import { defaultBehavior, type HarnessBehavior } from "./behavior";
+import { normalizeToolResult } from "../../context/ingest/normalizeToolResult";
+import { snapshotHarnessExecutionState } from "../../context/adapters/harnessStateSnapshot";
+import { buildRunCloseout } from "../../context/compaction/taskCloseout";
+import { buildHarnessContextManifest } from "../../context/adapters/harnessManifest";
+import type { ExecutionStateStore } from "../../context/contracts/ports";
 import { initialState, project, reduce, type HarnessState } from "./projections";
 import { callIsReadOnly, SteeringRegistry } from "../defaults/steering";
 import { inferStepSignal } from "../planning/planSeed";
@@ -168,6 +173,10 @@ export const DEFAULT_LIMITS: HarnessLimits = { maxTurns: 50, maxInputTokens: 2_0
 
 export interface HarnessDeps {
 	runId: string;
+	/** Owning harness session; used in context manifests/state snapshots. */
+	sessionId?: string;
+	/** Optional derived-state snapshot store. The event log remains authoritative. */
+	executionStateStore?: ExecutionStateStore;
 	log: EventLog;
 	model: ModelPort;
 	tools: ToolPort;
@@ -412,6 +421,26 @@ export class HarnessLoop {
 		}
 	}
 
+	/** Auxiliary model calls (planner/recap) are context-managed invocations too:
+	 *  emit the same manifest accounting even though they do not execute tools. */
+	private async emitAuxiliaryManifest(request: { system: string; messages: readonly import("./projections").Message[] }, purpose: import("../../context/contracts/context").CallPurpose): Promise<void> {
+		const manifestRequest = {
+			state: this.state,
+			tools: [],
+			system: request.system,
+			turn: this.state.counters.turns + 1,
+			runId: this.deps.runId,
+			...(this.deps.sessionId ? { sessionId: this.deps.sessionId } : {}),
+			messages: request.messages,
+			payloadMode: "full" as const,
+			purpose,
+			...(this.deps.model.identity?.providerId ? { providerId: this.deps.model.identity.providerId } : {}),
+			...(this.deps.model.identity?.modelId ? { modelId: this.deps.model.identity.modelId } : {}),
+		};
+		const manifest = this.behavior.context.manifest ? await this.behavior.context.manifest(manifestRequest) : buildHarnessContextManifest(manifestRequest);
+		await this.emit({ type: "context.manifest", manifest });
+	}
+
 	private async planBoard(taskText: string): Promise<void> {
 		const writable = this.isWritable();
 		// Give the planner the earlier runs' plans, grouped per run, so a
@@ -436,7 +465,13 @@ export class HarnessLoop {
 		// The planner call is a full unstreamed model call — surface it so the
 		// gap between run start and the first task reads as work, not a hang.
 		await this.emit({ type: "steer.note", rule: "plan.start", text: "Planning this run's task board…" });
-		const plan = await this.behavior.planner.plan(this.deps.model, taskText, { signal: this.abort.signal, writable, board, plans: savedPlans });
+		const plan = await this.behavior.planner.plan(this.deps.model, taskText, {
+			signal: this.abort.signal,
+			writable,
+			board,
+			plans: savedPlans,
+			onRequest: async (request) => this.emitAuxiliaryManifest(request, "planning"),
+		});
 		// The planner failed or returned garbage — the fallback board ("Complete
 		// the task") fits nothing, so every real call scores as drift. Ask the
 		// user before burning turns on a dead board: continue means the model
@@ -522,7 +557,9 @@ export class HarnessLoop {
 			if (e.type === "tool.finished") pending.delete(e.callId);
 		}
 		for (const [callId, name] of pending) {
-			await this.emit({ type: "tool.finished", callId, name, ok: false, output: "interrupted: the harness stopped before this tool returned. Its result is unknown; retry it if it is still needed." });
+			const output = "interrupted: the harness stopped before this tool returned. Its result is unknown; retry it if it is still needed.";
+			const envelope = normalizeToolResult({ toolExecutionId: callId, toolName: name, output, ok: false, interrupted: true });
+			await this.emit({ type: "tool.finished", callId, name, ok: false, output, envelope, evidenceRef: envelope.evidenceRef });
 		}
 		if (this.state.run.status === "running") {
 			this.phases = [];
@@ -532,10 +569,11 @@ export class HarnessLoop {
 	}
 
 	/** Continues a paused run with a fresh window of turns and refusals. Loop strikes persist. */
-	async resume(): Promise<RunOutcome> {
+	async resume(input?: string): Promise<RunOutcome> {
 		if (this.phase !== "Paused") throw new Error(`cannot resume from ${this.phase}`);
 		this.begin();
 		await this.emit({ type: "run.status", status: "running" });
+		if (input?.trim()) await this.emit({ type: "user.input", text: input });
 		this.enter("ModelCall");
 		return this.guarded(() => this.drive());
 	}
@@ -571,6 +609,34 @@ export class HarnessLoop {
 		this.deps.onState?.(this.state, event);
 	}
 
+	/** End-of-task closeout: future runs inherit the compact durable handoff, not the completed run's bulky interaction tail. */
+	private async closeoutRun(outcome: "completed" | "failed"): Promise<void> {
+		const closeout = buildRunCloseout({
+			events: await this.deps.log.read(),
+			sessionId: this.deps.sessionId ?? this.deps.runId,
+			runId: this.deps.runId,
+			outcome,
+			version: this.state.closeouts.length + 1,
+		});
+		if (!closeout) return;
+		await this.emit({ type: "context.closeout", record: closeout.record });
+		const covers = this.state.messages.length;
+		const recapSeq = this.state.lastSeq + 1;
+		await this.emit({ type: "context.recap", covers, text: closeout.recapText, scope: "task_closeout" });
+		await this.emit({ type: "context.compaction", record: { ...closeout.compaction, summaryRef: `execution://seq/${recapSeq}` } });
+	}
+
+	/** Durable snapshot metadata at a run boundary. The full canonical state is derivable from the ledger; the hash makes drift/corruption detectable. */
+	private async snapshotExecutionState(): Promise<void> {
+		try {
+			const snapshot = snapshotHarnessExecutionState(await this.deps.log.read(), this.deps.sessionId ?? this.deps.runId, this.deps.runId);
+			if (this.deps.executionStateStore) await this.deps.executionStateStore.save(snapshot.state);
+			await this.emit({ type: "execution.state_snapshotted", stateVersion: snapshot.stateVersion, eventCursor: snapshot.eventCursor, stateHash: snapshot.stateHash });
+		} catch (err) {
+			await this.emit({ type: "steer.note", rule: "context.state_snapshot", text: `execution-state snapshot failed — ledger remains authoritative (${err instanceof Error ? err.message : String(err)})` });
+		}
+	}
+
 	private async noteAll(notes: Array<{ rule: string; text: string }>): Promise<void> {
 		for (const note of notes) await this.emit({ type: "steer.note", rule: note.rule, text: note.text });
 	}
@@ -604,7 +670,12 @@ export class HarnessLoop {
 						await this.verify();
 						break;
 					case "Done":
+						// Closeout precedes the terminal run status so UI/event consumers still
+						// see run-finished as the final live card; the compact handoff is already
+						// durable before completion is announced.
+						await this.closeoutRun("completed");
 						await this.emit({ type: "run.status", status: "completed" });
+						await this.snapshotExecutionState();
 						return this.outcome("completed");
 					case "Paused":
 						return this.outcome("paused");
@@ -635,12 +706,18 @@ export class HarnessLoop {
 		this.reason = reason;
 		this.enter("Paused");
 		await this.emit({ type: "run.status", status: "paused", reason });
+		await this.snapshotExecutionState();
 	}
 
 	private async fail(reason: string): Promise<void> {
 		this.reason = reason;
 		this.enter("Failed");
+		// Failed runs are terminal too: preserve the debugging facts as a closeout
+		// before the next task, then compact the bulky interaction tail. Closeout
+		// precedes the terminal status for the same ordering contract as Done.
+		await this.closeoutRun("failed").catch(() => undefined);
 		await this.emit({ type: "run.status", status: "failed", reason });
+		await this.snapshotExecutionState();
 	}
 
 	private async modelCall(): Promise<void> {
@@ -707,6 +784,7 @@ export class HarnessLoop {
 			system: this.system,
 			turn,
 			runId: this.deps.runId,
+			...(this.deps.sessionId ? { sessionId: this.deps.sessionId } : {}),
 			emit: (body) => this.emit(body),
 			signal: this.abort.signal,
 			onReasoningDelta: this.deps.onReasoningDelta,
@@ -930,7 +1008,8 @@ export class HarnessLoop {
 	}
 
 	private async finish(call: ToolCall, ok: boolean, output: string, usage?: Usage): Promise<void> {
-		await this.emit({ type: "tool.finished", callId: call.callId, name: call.name, ok, output, ...(usage ? { usage } : {}) });
+		const envelope = normalizeToolResult({ toolExecutionId: call.callId, toolName: call.name, input: call.input, output, ok });
+		await this.emit({ type: "tool.finished", callId: call.callId, name: call.name, ok, output, ...(usage ? { usage } : {}), envelope, evidenceRef: envelope.evidenceRef });
 		this.planDocFromCall(call, ok, output);
 		const after = await this.steering.run("afterTool", { call, ok, ledger: this.state.ledger });
 		await this.noteAll(after.notes);
@@ -992,7 +1071,7 @@ export class HarnessLoop {
 	 * carries a signal the board predicts nothing, so nothing can diverge —
 	 * an open episode closes there rather than branding all post-plan work.
 	 */
-	private async trackDivergence(call: ToolCall, ok: boolean): Promise<void> {
+	private async trackDivergence(call: ToolCall, _ok: boolean): Promise<void> {
 		if (TASK_TOOL_SET.has(call.name) || call.name === LOG_SLICE) return;
 		if (callIsReadOnly(call.name, call.input)) return;
 		if (!HarnessLoop.DIVERGENCE_WRITES.has(call.name)) return;

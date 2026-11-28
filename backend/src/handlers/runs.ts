@@ -213,11 +213,11 @@ export async function listSandboxes(req: Request): Promise<Response> {
 		const err = p.validate(creds);
 		return err ? { name: p.name, configured: false, reason: err } : { name: p.name, configured: true };
 	});
-	let live: { sandboxId: string; provider?: string; startedAt?: string }[] = [];
+	let live: { sandboxId: string; provider?: string; startedAt?: string; state?: string }[] = [];
 	for (const p of Object.values(providers)) {
 		if (!p.listLive || p.validate(creds)) continue;
 		const items = await p.listLive(creds).catch(swallow("runs", "op", []));
-		live = live.concat(items.map((s) => ({ sandboxId: s.id, provider: p.name, startedAt: s.startedAt })));
+		live = live.concat(items.map((s) => ({ sandboxId: s.id, provider: p.name, startedAt: s.startedAt, state: s.state })));
 	}
 	return json({
 		live,

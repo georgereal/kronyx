@@ -11,7 +11,7 @@
 import type { AgentMessage, AgentTool } from "@cline/shared";
 import type { PermissionDecision } from "./permissions";
 import type { PriorTranscript, RecallScorer } from "./recall";
-import type { ProviderSettings } from "./runner";
+import type { ProviderSettings } from "./types";
 
 export const SEAM_TOOLS = "tools";
 export const SEAM_APPROVALS = "approvals";

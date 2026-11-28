@@ -4,12 +4,74 @@ import { DEFAULT_LOOP_DETECTOR, parseLoopDetectorConfig, parseSessionEvent, pars
 const meta = { seq: 1, at: 1_700_000_000_000, runId: "run-1" };
 const task = { id: "t1", title: "Add parser", acceptance: { kind: "command", command: "npm test" }, dependsOn: [], status: "pending", steps: [{ id: "s1", text: "write it", status: "pending", callIds: [] }], evidence: [] };
 
+
+const componentVersions = { taskSummaryVersion: 1, planVersion: 2, decisionSetVersion: 0, repositoryContextVersion: 0, fileChangeVersion: 1, toolResultVersion: 3, validationVersion: 1, compactionVersion: 0, capabilityVersion: 1 };
+const tokenBreakdown = { totalInput: 100, effectiveInput: 100, wireInput: 40, outputReserve: 8000, byComponent: { system_instructions: 20, interaction_tail: 80 }, estimationMethod: "tokenizer" };
+const manifest = {
+	schemaVersion: 1,
+	invocationId: "inv-1",
+	sessionId: "session-1",
+	runId: "run-1",
+	turn: 1,
+	purpose: "implementation",
+	providerId: "openai",
+	modelId: "gpt-5",
+	payloadMode: "full",
+	contextVersion: 3,
+	componentVersions,
+	includedEvents: ["execution://seq/1-3"],
+	includedToolResults: ["c1"],
+	retrievedRepositoryItems: [],
+	compactionApplied: false,
+	compactionAuthority: "none",
+	compactionRecords: [],
+	inputTokenCount: 100,
+	effectiveInputTokenCount: 100,
+	wireInputTokenCount: 100,
+	tokenBreakdown,
+	outputTokenReservation: 8000,
+	estimationMethod: "tokenizer",
+	omittedContent: [{ reference: "execution://tool/c1/full-output", reason: "digest included" }],
+	truncationApplied: true,
+	createdAt: "2026-01-01T00:00:00.000Z",
+};
+const compactionRecord = {
+	schemaVersion: 1,
+	compactionId: "cmp-1",
+	scope: "interaction_history",
+	sourceEventRange: { from: 1, to: 8 },
+	summaryRef: "execution://seq/9",
+	preservedReferences: ["execution://seq/3"],
+	createdAt: "2026-01-01T00:00:00.000Z",
+	version: 1,
+	componentVersions,
+	modelGenerated: true,
+};
+const envelope = {
+	schemaVersion: 1,
+	toolExecutionId: "c1",
+	toolName: "run_command",
+	status: "completed",
+	summary: "run_command exit 0",
+	structuredResult: { exitCode: 0 },
+	evidenceRef: "execution://tool/c1/full-output",
+	truncated: true,
+	rawChars: 5000,
+	rawSha256: "abc123",
+	retentionClass: "critical",
+	provenance: { source: "tool_execution", verification: "observed" },
+};
+
 const samples: Array<Record<string, unknown>> = [
 	{ type: "user.input", text: "hi" },
 	{ type: "model.response", turn: 1, text: "ok", toolCalls: [{ callId: "c1", name: "task_create", input: { id: "t1" } }], usage: { inputTokens: 10, outputTokens: 2, cachedTokens: 4 } },
 	{ type: "model.response", turn: 2, text: "", toolCalls: [] },
 	{ type: "tool.requested", callId: "c1", name: "read_file", input: { path: "a.ts" } },
 	{ type: "tool.finished", callId: "c1", name: "read_file", ok: false, output: "missing" },
+	{ type: "tool.finished", callId: "c1", name: "run_command", ok: true, output: "exit 0", envelope, evidenceRef: envelope.evidenceRef },
+	{ type: "context.manifest", manifest },
+	{ type: "context.compaction", record: compactionRecord },
+	{ type: "execution.state_snapshotted", stateVersion: 2, eventCursor: 10, stateHash: "hash", storeRef: "state://x" },
 	{ type: "task.created", task },
 	{ type: "task.updated", id: "t1", to: "in_progress", reason: "started" },
 	{ type: "task.removed", id: "t1" },
@@ -36,6 +98,18 @@ describe("session event contract", () => {
 
 	it("rejects a missing field with its path", () => {
 		expect(() => parseSessionEvent({ ...meta, type: "tool.finished", callId: "c1", name: "x", output: "" })).toThrow(/event\.ok/);
+	});
+
+	it("rejects malformed context manifests with a nested path", () => {
+		const bad = JSON.parse(JSON.stringify(manifest));
+		delete bad.componentVersions.planVersion;
+		expect(() => parseSessionEvent({ ...meta, type: "context.manifest", manifest: bad })).toThrow(/componentVersions\.planVersion/);
+	});
+
+	it("rejects malformed tool envelopes with a nested path", () => {
+		const bad = JSON.parse(JSON.stringify(envelope));
+		delete bad.provenance.verification;
+		expect(() => parseSessionEvent({ ...meta, type: "tool.finished", callId: "c1", name: "run_command", ok: true, output: "x", envelope: bad })).toThrow(/provenance\.verification/);
 	});
 
 	it("rejects a task status outside the allowed set", () => {

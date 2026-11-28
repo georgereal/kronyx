@@ -79,6 +79,23 @@ describe("crash recovery (M7)", () => {
 		expect(second).toEqual([]);
 	});
 
+	it("resumes with recovery input on the same run ledger", async () => {
+		const log = new MemoryEventLog(() => 1);
+		const first: string[] = [];
+		await new HarnessLoop({ runId: "r", log, model: model(), tools: tools(first) }).run("go");
+		const events = (await log.read()).filter((e) => !(e.type === "run.status" && e.status === "completed"));
+		const replay = new MemoryEventLog(() => 1);
+		for (const e of events) await replay.append({ ...stripMeta(e), runId: "r" } as never);
+
+		const loop = new HarnessLoop({ runId: "r", log: replay, model: { complete: async () => ({ text: "recovered", toolCalls: [] }) }, tools: tools([]) });
+		await loop.recover();
+		const outcome = await loop.resume("The sandbox died; check state and continue.");
+		expect(outcome.status).toBe("completed");
+		const inputs = (await replay.read()).filter((e) => e.type === "user.input").map((e) => e.type === "user.input" ? e.text : "");
+		expect(inputs.at(-1)).toContain("sandbox died");
+		expect((await replay.read()).filter((e) => e.type === "run.status" && e.status === "running")).toHaveLength(2);
+	});
+
 	it("survives a restart with the file log: reopen, recover, and the log stays valid", async () => {
 		const dir = await mkdtemp(path.join(tmpdir(), "harness-recover-"));
 		const file = path.join(dir, "session.jsonl");
@@ -92,7 +109,9 @@ describe("crash recovery (M7)", () => {
 		const loop = new HarnessLoop({ runId: "r", log: reopened, model: model(), tools: tools([]) });
 		expect((await loop.recover()).interrupted).toBe(1);
 		const after = await FileEventLog.open(file, () => 1);
-		expect((await after.read()).at(-1)?.type).toBe("run.status");
+		const events = await after.read();
+		expect(events.some((e) => e.type === "run.status" && e.status === "paused")).toBe(true);
+		expect(events.at(-1)?.type).toBe("execution.state_snapshotted");
 	});
 });
 

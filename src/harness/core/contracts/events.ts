@@ -8,6 +8,7 @@ import { expectBoolean, expectInteger, expectObject, expectOneOf, expectString, 
 import { parseStep, parseTask, STEP_STATUSES, TASK_STATUSES } from "./tasks";
 import type { Step, StepStatus, Task, TaskStatus } from "./tasks";
 import type { LoopDetectorConfig } from "./ports";
+import type { CompactionRecord, ContextManifest, TaskCloseoutRecord, ToolResultEnvelope } from "../../../context";
 
 export interface ToolCall {
 	callId: string;
@@ -39,7 +40,7 @@ export type EventBody =
 	| { type: "user.input"; text: string; images?: ImageInput[] }
 	| { type: "model.response"; turn: number; text: string; toolCalls: ToolCall[]; usage?: Usage; reasoning?: string; providerItems?: ProviderItems }
 	| { type: "tool.requested"; callId: string; name: string; input: unknown }
-	| { type: "tool.finished"; callId: string; name: string; ok: boolean; output: string; usage?: Usage }
+	| { type: "tool.finished"; callId: string; name: string; ok: boolean; output: string; usage?: Usage; envelope?: ToolResultEnvelope; evidenceRef?: string }
 	| { type: "task.created"; task: Task; usage?: Usage }
 	| { type: "task.updated"; id: string; to: TaskStatus; reason?: string }
 	| { type: "task.removed"; id: string }
@@ -51,7 +52,11 @@ export type EventBody =
 	| { type: "budget.warning"; kind: "input_tokens"; used: number; limit: number }
 	| { type: "steer.note"; rule: string; text: string }
 	| { type: "user.question"; questions: Array<{ question: string; options?: string[] }> }
-	| { type: "context.recap"; covers: number; text: string; usage?: Usage }
+	| { type: "context.recap"; covers: number; text: string; usage?: Usage; scope?: "interaction_history" | "task_closeout" }
+	| { type: "context.manifest"; manifest: ContextManifest }
+	| { type: "context.compaction"; record: CompactionRecord }
+	| { type: "context.closeout"; record: TaskCloseoutRecord }
+	| { type: "execution.state_snapshotted"; stateVersion: number; eventCursor: number; stateHash: string; storeRef?: string }
 	| { type: "context.cleared" }
 	| { type: "loop.verdict"; level: LoopLevel; fingerprint: string; reason?: string }
 	| { type: "run.status"; status: RunStatus; reason?: string }
@@ -113,6 +118,10 @@ const EVENT_TYPES: readonly EventType[] = [
 	"steer.note",
 	"user.question",
 	"context.recap",
+	"context.manifest",
+	"context.compaction",
+	"context.closeout",
+	"execution.state_snapshotted",
 	"context.cleared",
 	"loop.verdict",
 	"run.status",
@@ -134,6 +143,179 @@ function parseImages(value: unknown): ImageInput[] {
 		const o = expectObject(v, `event.images[${i}]`);
 		return { mediaType: expectString(o.mediaType, `event.images[${i}].mediaType`), base64: expectString(o.base64, `event.images[${i}].base64`) };
 	});
+}
+
+
+const VERIFICATION_STATUSES = ["verified", "observed", "inferred", "unverified", "stale"] as const;
+const TOOL_ENVELOPE_STATUSES = ["completed", "failed", "interrupted"] as const;
+const RETENTION_CLASSES = ["critical", "active", "compactable", "ephemeral"] as const;
+const CALL_PURPOSES = ["planning", "exploration", "implementation", "debugging", "test-analysis", "review", "verification", "final-response", "general"] as const;
+const PAYLOAD_MODES = ["full", "conversation-bind", "conversation-delta", "legacy-projection"] as const;
+const COMPACTION_AUTHORITIES = ["local", "provider", "none"] as const;
+const ESTIMATION_METHODS = ["tokenizer", "provider", "chars-estimate"] as const;
+const COMPACTION_SCOPES = ["tool_output", "interaction_history", "task_milestone", "task_closeout", "repository_context"] as const;
+
+function parseComponentVersions(value: unknown, path: string): import("../../../context").ComponentVersions {
+	const o = expectObject(value, path);
+	return {
+		taskSummaryVersion: expectInteger(o.taskSummaryVersion, `${path}.taskSummaryVersion`),
+		planVersion: expectInteger(o.planVersion, `${path}.planVersion`),
+		decisionSetVersion: expectInteger(o.decisionSetVersion, `${path}.decisionSetVersion`),
+		repositoryContextVersion: expectInteger(o.repositoryContextVersion, `${path}.repositoryContextVersion`),
+		fileChangeVersion: expectInteger(o.fileChangeVersion, `${path}.fileChangeVersion`),
+		toolResultVersion: expectInteger(o.toolResultVersion, `${path}.toolResultVersion`),
+		validationVersion: expectInteger(o.validationVersion, `${path}.validationVersion`),
+		compactionVersion: expectInteger(o.compactionVersion, `${path}.compactionVersion`),
+		capabilityVersion: expectInteger(o.capabilityVersion, `${path}.capabilityVersion`),
+	};
+}
+
+function parseToolResultEnvelope(value: unknown, path: string): ToolResultEnvelope {
+	const o = expectObject(value, path);
+	if (o.schemaVersion !== 1) throw new SchemaError(`${path}.schemaVersion: expected 1`);
+	const provenance = expectObject(o.provenance, `${path}.provenance`);
+	if (provenance.source !== "tool_execution") throw new SchemaError(`${path}.provenance.source: expected tool_execution`);
+	return {
+		schemaVersion: 1,
+		toolExecutionId: expectString(o.toolExecutionId, `${path}.toolExecutionId`),
+		toolName: expectString(o.toolName, `${path}.toolName`),
+		status: expectOneOf(o.status, TOOL_ENVELOPE_STATUSES, `${path}.status`),
+		summary: expectString(o.summary, `${path}.summary`, { allowEmpty: true }),
+		...(o.structuredResult === undefined ? {} : { structuredResult: expectObject(o.structuredResult, `${path}.structuredResult`) }),
+		evidenceRef: expectString(o.evidenceRef, `${path}.evidenceRef`),
+		truncated: expectBoolean(o.truncated, `${path}.truncated`),
+		rawChars: expectInteger(o.rawChars, `${path}.rawChars`),
+		...(o.rawSha256 === undefined ? {} : { rawSha256: expectString(o.rawSha256, `${path}.rawSha256`) }),
+		retentionClass: expectOneOf(o.retentionClass, RETENTION_CLASSES, `${path}.retentionClass`),
+		provenance: { source: "tool_execution", verification: expectOneOf(provenance.verification, VERIFICATION_STATUSES, `${path}.provenance.verification`) },
+	};
+}
+
+function parseTokenBreakdown(value: unknown, path: string): import("../../../context").TokenBreakdown {
+	const o = expectObject(value, path);
+	const byComponentValue = expectObject(o.byComponent, `${path}.byComponent`);
+	const byComponent: import("../../../context").TokenBreakdown["byComponent"] = {};
+	for (const [key, tokens] of Object.entries(byComponentValue)) byComponent[key as keyof typeof byComponent] = expectInteger(tokens, `${path}.byComponent.${key}`);
+	return {
+		totalInput: expectInteger(o.totalInput, `${path}.totalInput`),
+		effectiveInput: expectInteger(o.effectiveInput, `${path}.effectiveInput`),
+		wireInput: expectInteger(o.wireInput, `${path}.wireInput`),
+		outputReserve: expectInteger(o.outputReserve, `${path}.outputReserve`),
+		byComponent,
+		estimationMethod: expectOneOf(o.estimationMethod, ESTIMATION_METHODS, `${path}.estimationMethod`),
+	};
+}
+
+function parseContextManifest(value: unknown, path: string): ContextManifest {
+	const o = expectObject(value, path);
+	if (o.schemaVersion !== 1) throw new SchemaError(`${path}.schemaVersion: expected 1`);
+	if (!Array.isArray(o.omittedContent)) throw new SchemaError(`${path}.omittedContent: expected an array`);
+	const omittedContent = o.omittedContent.map((entry, i) => {
+		const item = expectObject(entry, `${path}.omittedContent[${i}]`);
+		return { reference: expectString(item.reference, `${path}.omittedContent[${i}].reference`), reason: expectString(item.reason, `${path}.omittedContent[${i}].reason`) };
+	});
+	return {
+		schemaVersion: 1,
+		invocationId: expectString(o.invocationId, `${path}.invocationId`),
+		sessionId: expectString(o.sessionId, `${path}.sessionId`),
+		...(o.runId === undefined ? {} : { runId: expectString(o.runId, `${path}.runId`) }),
+		...(o.turn === undefined ? {} : { turn: expectInteger(o.turn, `${path}.turn`, 1) }),
+		purpose: expectOneOf(o.purpose, CALL_PURPOSES, `${path}.purpose`),
+		providerId: expectString(o.providerId, `${path}.providerId`),
+		modelId: expectString(o.modelId, `${path}.modelId`),
+		payloadMode: expectOneOf(o.payloadMode, PAYLOAD_MODES, `${path}.payloadMode`),
+		contextVersion: expectInteger(o.contextVersion, `${path}.contextVersion`, 1),
+		componentVersions: parseComponentVersions(o.componentVersions, `${path}.componentVersions`),
+		includedEvents: expectStringArray(o.includedEvents, `${path}.includedEvents`),
+		includedToolResults: expectStringArray(o.includedToolResults, `${path}.includedToolResults`),
+		retrievedRepositoryItems: expectStringArray(o.retrievedRepositoryItems, `${path}.retrievedRepositoryItems`),
+		compactionApplied: expectBoolean(o.compactionApplied, `${path}.compactionApplied`),
+		compactionAuthority: expectOneOf(o.compactionAuthority, COMPACTION_AUTHORITIES, `${path}.compactionAuthority`),
+		compactionRecords: expectStringArray(o.compactionRecords, `${path}.compactionRecords`),
+		inputTokenCount: expectInteger(o.inputTokenCount, `${path}.inputTokenCount`),
+		effectiveInputTokenCount: expectInteger(o.effectiveInputTokenCount, `${path}.effectiveInputTokenCount`),
+		wireInputTokenCount: expectInteger(o.wireInputTokenCount, `${path}.wireInputTokenCount`),
+		tokenBreakdown: parseTokenBreakdown(o.tokenBreakdown, `${path}.tokenBreakdown`),
+		outputTokenReservation: expectInteger(o.outputTokenReservation, `${path}.outputTokenReservation`),
+		estimationMethod: expectOneOf(o.estimationMethod, ESTIMATION_METHODS, `${path}.estimationMethod`),
+		omittedContent,
+		truncationApplied: expectBoolean(o.truncationApplied, `${path}.truncationApplied`),
+		createdAt: expectString(o.createdAt, `${path}.createdAt`),
+	};
+}
+
+function parseCompactionRecord(value: unknown, path: string): CompactionRecord {
+	const o = expectObject(value, path);
+	if (o.schemaVersion !== 1) throw new SchemaError(`${path}.schemaVersion: expected 1`);
+	const range = expectObject(o.sourceEventRange, `${path}.sourceEventRange`);
+	return {
+		schemaVersion: 1,
+		compactionId: expectString(o.compactionId, `${path}.compactionId`),
+		scope: expectOneOf(o.scope, COMPACTION_SCOPES, `${path}.scope`),
+		sourceEventRange: { from: expectInteger(range.from, `${path}.sourceEventRange.from`, 1), to: expectInteger(range.to, `${path}.sourceEventRange.to`, 1) },
+		...(o.summaryRef === undefined ? {} : { summaryRef: expectString(o.summaryRef, `${path}.summaryRef`) }),
+		preservedReferences: expectStringArray(o.preservedReferences, `${path}.preservedReferences`),
+		createdAt: expectString(o.createdAt, `${path}.createdAt`),
+		version: expectInteger(o.version, `${path}.version`, 1),
+		componentVersions: parseComponentVersions(o.componentVersions, `${path}.componentVersions`),
+		modelGenerated: expectBoolean(o.modelGenerated, `${path}.modelGenerated`),
+	};
+}
+
+function parseTaskCloseoutRecord(value: unknown, path: string): TaskCloseoutRecord {
+	const o = expectObject(value, path);
+	if (o.schemaVersion !== 1) throw new SchemaError(`${path}.schemaVersion: expected 1`);
+	const range = expectObject(o.sourceEventRange, `${path}.sourceEventRange`);
+	const validation = expectObject(o.validation, `${path}.validation`);
+	const decisions = Array.isArray(o.decisions) ? o.decisions.map((entry, i) => {
+		const item = expectObject(entry, `${path}.decisions[${i}]`);
+		return {
+			decision: expectString(item.decision, `${path}.decisions[${i}].decision`),
+			...(item.reason === undefined ? {} : { reason: expectString(item.reason, `${path}.decisions[${i}].reason`) }),
+			evidenceRefs: expectStringArray(item.evidenceRefs, `${path}.decisions[${i}].evidenceRefs`),
+		};
+	}) : (() => { throw new SchemaError(`${path}.decisions: expected an array`); })();
+	const filesModified = Array.isArray(o.filesModified) ? o.filesModified.map((entry, i) => {
+		const item = expectObject(entry, `${path}.filesModified[${i}]`);
+		return {
+			path: expectString(item.path, `${path}.filesModified[${i}].path`),
+			...(item.changeSummary === undefined ? {} : { changeSummary: expectString(item.changeSummary, `${path}.filesModified[${i}].changeSummary`) }),
+			...(item.evidenceRef === undefined ? {} : { evidenceRef: expectString(item.evidenceRef, `${path}.filesModified[${i}].evidenceRef`) }),
+		};
+	}) : (() => { throw new SchemaError(`${path}.filesModified: expected an array`); })();
+	const unresolvedIssues = Array.isArray(o.unresolvedIssues) ? o.unresolvedIssues.map((entry, i) => {
+		const item = expectObject(entry, `${path}.unresolvedIssues[${i}]`);
+		return {
+			description: expectString(item.description, `${path}.unresolvedIssues[${i}].description`),
+			...(item.severity === undefined ? {} : { severity: expectString(item.severity, `${path}.unresolvedIssues[${i}].severity`) }),
+			evidenceRefs: expectStringArray(item.evidenceRefs, `${path}.unresolvedIssues[${i}].evidenceRefs`),
+		};
+	}) : (() => { throw new SchemaError(`${path}.unresolvedIssues: expected an array`); })();
+	return {
+		schemaVersion: 1,
+		closeoutId: expectString(o.closeoutId, `${path}.closeoutId`),
+		sessionId: expectString(o.sessionId, `${path}.sessionId`),
+		...(o.runId === undefined ? {} : { runId: expectString(o.runId, `${path}.runId`) }),
+		...(o.taskId === undefined ? {} : { taskId: expectString(o.taskId, `${path}.taskId`) }),
+		sourceEventRange: { fromSeq: expectInteger(range.fromSeq, `${path}.sourceEventRange.fromSeq`, 1), toSeq: expectInteger(range.toSeq, `${path}.sourceEventRange.toSeq`, 1) },
+		objective: expectString(o.objective, `${path}.objective`, { allowEmpty: true }),
+		outcome: expectOneOf(o.outcome, ["completed", "failed", "stopped", "paused"] as const, `${path}.outcome`),
+		summary: expectString(o.summary, `${path}.summary`, { allowEmpty: true }),
+		decisions,
+		filesModified,
+		validation: {
+			status: expectOneOf(validation.status, ["passed", "failed", "not-run", "partial"] as const, `${path}.validation.status`),
+			...(validation.commands === undefined ? {} : { commands: expectStringArray(validation.commands, `${path}.validation.commands`) }),
+			...(validation.failureSummary === undefined ? {} : { failureSummary: expectString(validation.failureSummary, `${path}.validation.failureSummary`) }),
+			evidenceRefs: expectStringArray(validation.evidenceRefs, `${path}.validation.evidenceRefs`),
+		},
+		unresolvedIssues,
+		reusableKnowledgeRefs: expectStringArray(o.reusableKnowledgeRefs, `${path}.reusableKnowledgeRefs`),
+		preservedEvidenceRefs: expectStringArray(o.preservedEvidenceRefs, `${path}.preservedEvidenceRefs`),
+		componentVersions: parseComponentVersions(o.componentVersions, `${path}.componentVersions`),
+		version: expectInteger(o.version, `${path}.version`, 1),
+		createdAt: expectString(o.createdAt, `${path}.createdAt`),
+	};
 }
 
 function parseBody(o: Record<string, unknown>, type: EventType): EventBody {
@@ -161,6 +343,7 @@ function parseBody(o: Record<string, unknown>, type: EventType): EventBody {
 			return { type, callId: expectString(o.callId, "event.callId"), name: expectString(o.name, "event.name"), input: o.input };
 		case "tool.finished": {
 			const usage = o.usage === undefined ? undefined : parseUsage(o.usage, "event.usage");
+			const envelope = o.envelope === undefined ? undefined : parseToolResultEnvelope(o.envelope, "event.envelope");
 			return {
 				type,
 				callId: expectString(o.callId, "event.callId"),
@@ -168,6 +351,8 @@ function parseBody(o: Record<string, unknown>, type: EventType): EventBody {
 				ok: expectBoolean(o.ok, "event.ok"),
 				output: expectString(o.output, "event.output", { allowEmpty: true }),
 				...(usage ? { usage } : {}),
+				...(envelope ? { envelope } : {}),
+				...(o.evidenceRef === undefined ? {} : { evidenceRef: expectString(o.evidenceRef, "event.evidenceRef") }),
 			};
 		}
 		case "task.created": {
@@ -227,6 +412,20 @@ function parseBody(o: Record<string, unknown>, type: EventType): EventBody {
 			const usage = o.usage === undefined ? undefined : parseUsage(o.usage, "event.usage");
 			return { type, covers: expectInteger(o.covers, "event.covers", 1), text: expectString(o.text, "event.text"), ...(usage ? { usage } : {}) };
 		}
+		case "context.manifest":
+			return { type, manifest: parseContextManifest(o.manifest, "event.manifest") };
+		case "context.compaction":
+			return { type, record: parseCompactionRecord(o.record, "event.record") };
+		case "context.closeout":
+			return { type, record: parseTaskCloseoutRecord(o.record, "event.record") };
+		case "execution.state_snapshotted":
+			return {
+				type,
+				stateVersion: expectInteger(o.stateVersion, "event.stateVersion", 1),
+				eventCursor: expectInteger(o.eventCursor, "event.eventCursor", 1),
+				stateHash: expectString(o.stateHash, "event.stateHash"),
+				...(o.storeRef === undefined ? {} : { storeRef: expectString(o.storeRef, "event.storeRef") }),
+			};
 		case "context.cleared":
 			return { type };
 		case "loop.verdict":

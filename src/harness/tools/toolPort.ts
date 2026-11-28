@@ -29,7 +29,7 @@ export function createHarnessToolPort(opts: HarnessToolPortOptions): ToolPort {
 			if (decision === "deny") return { ok: false, output: `Denied by permission rules: ${name}.` };
 			if (decision === "ask" && !(await opts.confirm(name, input, callId))) return { ok: false, output: `${name} needs approval, and it was not granted.` };
 			try {
-				const out = await tool.execute(input as never, { agentId: "harness", iteration: 0 });
+				const out = await tool.execute(input as never, { agentId: "harness", iteration: 0, ...(callId ? { toolCallId: callId } : {}) });
 				return { ok: true, output: typeof out === "string" ? out : JSON.stringify(out) };
 			} catch (err) {
 				return { ok: false, output: `tool error: ${err instanceof Error ? err.message : String(err)}` };

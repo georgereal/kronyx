@@ -1,6 +1,6 @@
 import { Agent } from "@cline/agents";
 import type { AgentTool } from "@cline/shared";
-import type { ProviderSettings } from "./runner";
+import type { ProviderSettings } from "./types";
 
 /**
  * Subagent seam (vscode-free): a uniform handle for child agents that work

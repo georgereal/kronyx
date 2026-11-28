@@ -4,7 +4,7 @@ import type { AgentMessage, AgentTool } from "@cline/shared";
 import type { Db } from "mongodb";
 import { swallow } from "../lib/log";
 import { getCache } from "./cache";
-import type { RunDigest } from "../../../src/agent/runner";
+import type { RunDigest } from "../../../src/agent/types";
 import type { PriorTranscript, RecallScorer } from "../../../src/agent/recall";
 import { isRunSummaryFact } from "../../../src/agent/taskGuard";
 
@@ -161,7 +161,7 @@ export interface EmbedProvider {
 
 const DEFAULT_EMBED_MODEL = "openai/text-embedding-3-small";
 /** Must match the `memories_vector` Atlas index numDimensions. */
-const EMBEDDING_DIMS = 1536;
+export const EMBEDDING_DIMS = 1536;
 let dimsWarned = false;
 
 /** OpenAI-compatible /embeddings call (works on AI Gateway, OpenAI, OpenRouter). */

@@ -12,6 +12,8 @@ import { hashText } from "../../../core/canonical";
 import type { ConversationPort } from "../../../core/contracts";
 import type { RequestStrategy, RequestTurn, StrategyCtx } from "../../../core/policies/requestStrategy";
 import type { Message } from "../../../core/projections";
+import { emitHarnessContextManifest } from "../../../../context/adapters/harnessManifest";
+import { executionStateNote } from "../../../../context/adapters/harnessProjection";
 
 /** A conversation request must never carry a call without its result. Resume's recover() closes any left open. */
 const assertPaired = (messages: readonly Message[]): void => {
@@ -34,21 +36,29 @@ export class ConversationStrategy implements RequestStrategy {
 		if (!ctx.state.conversation) await emit({ type: "conversation.bound", conversationId: await this.port.create(), provider: this.port.provider, model: this.port.model });
 		const conv = ctx.state.conversation!;
 		const board = ctx.behavior.context.taskBoard(ctx.state, ctx.runId);
-		const boardHash = board === undefined ? undefined : hashText(board);
+		// The execution-state note rides with the board: both are trailing
+		// snapshot components the server must not hold a stale copy of.
+		const stateNote = executionStateNote(ctx.state);
+		const snapshot = [stateNote, board].filter(Boolean).join("\n\n");
+		const boardHash = snapshot === "" ? undefined : hashText(snapshot);
 		let sent: Message[];
+		let reduction: { reductionLevel?: number; overBudget?: boolean } = {};
 		if (conv.syncedSeq === undefined) {
 			// A new conversation starts from the projected context (recap, digests, board), so a long session binds within the window.
-			sent = ctx.behavior.context.build(ctx.state, ctx.offered, ctx.system, ctx.runId).messages;
+			const bound = ctx.behavior.context.build(ctx.state, ctx.offered, ctx.system, ctx.runId);
+			sent = bound.messages;
+			reduction = { ...(bound.reductionLevel ? { reductionLevel: bound.reductionLevel } : {}), ...(bound.overBudget ? { overBudget: bound.overBudget } : {}) };
 		} else {
 			// Only what the server lacks: events after the last synced one. Long results keep a head and a log_slice pointer.
 			sent = ctx.state.messages.filter((m) => (m.seq ?? 0) > conv.syncedSeq!).map((m) => (m.kind === "tool" ? ctx.behavior.context.capResult(m) : m));
 			// The task board is a snapshot: it goes in only when it changed since the server last saw it.
 			// Earlier snapshots stay in the conversation, so each resend marks them stale.
-			if (board !== undefined && boardHash !== conv.boardHash)
-				sent.push({ kind: "system", text: `${board}\n(This is the latest task board — it supersedes every earlier task board in this conversation.)` });
+			if (snapshot !== "" && boardHash !== conv.boardHash)
+				sent.push({ kind: "system", text: `${snapshot}\n(This is the latest execution state and task board — it supersedes every earlier snapshot in this conversation.)` });
 		}
 		assertPaired(ctx.state.messages);
 		await emit({ type: "conversation.sent", throughSeq: ctx.state.lastSeq });
+		await emitHarnessContextManifest(ctx, sent, conv.syncedSeq === undefined ? "conversation-bind" : "conversation-delta", { compactionAuthority: "provider", compactionApplied: false, ...reduction });
 		try {
 			const response = await ctx.complete({
 				turn: ctx.turn,

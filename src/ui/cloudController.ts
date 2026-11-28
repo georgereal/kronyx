@@ -1,6 +1,12 @@
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
-import { AgentRunner, type AgentMode, type ProviderSettings } from "../agent/runner";
+import { type AgentMode, type ProviderSettings, type RunnerHost } from "../agent/types";
+import type { AgentEngine } from "../agent/engine";
+import { HarnessAgentEngine } from "../harness/agentEngine";
+import { FileEventLog } from "../harness/core/eventLog";
+import { CommandVerifier } from "../harness/defaults/verifier";
+import { SqliteKnowledgeStore } from "../context/knowledge/sqliteKnowledgeStore";
+import { SqliteExecutionStateStore } from "../context/state/sqliteExecutionStateStore";
 import { estimateCostUsd, modelPricing, pickModel, providerErrorMessage, resolveProvider } from "../config";
 import { insertPr, insertSandboxEvent, kvGet, kvSet, openStore } from "../store";
 import { deviceName, getDeviceId } from "../settingsSync";
@@ -15,6 +21,7 @@ import type { SessionDeps } from "./sessionController";
 import { apiKey, webAppUrl } from "../auth";
 import { currentUser } from "../auth";
 import { log } from "../log";
+import { embedTexts, embeddingModel } from "./memory";
 
 const REUSE_KEY = "kronyx.cloudState";
 const REPO_DIR = "/home/user/repo";
@@ -88,7 +95,7 @@ export class CloudController {
 	}
 	private readonly sandbox = new E2bSandbox();
 	private state: CloudState = {};
-	private runner: AgentRunner | undefined;
+	private runner: AgentEngine | undefined;
 	private running = false;
 	private postRunPause: ReturnType<typeof setTimeout> | undefined;
 	private lastUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, totalCost: 0 };
@@ -508,11 +515,11 @@ export class CloudController {
 		this.persist();
 	}
 
-	private async ensureRunner(_settings: ProviderSettings): Promise<AgentRunner> {
+	private async ensureRunner(settings: ProviderSettings): Promise<AgentEngine> {
 		if (this.runner) return this.runner;
 		const sbx = this.sandbox;
 		const modeRef = this.deps.modeRef;
-		const runner = new AgentRunner({
+		const host: RunnerHost = {
 			workspaceRoot: REPO_DIR,
 			relativePath: (abs) => abs.replace(`${REPO_DIR}/`, ""),
 			isDirty: () => false,
@@ -544,6 +551,33 @@ export class CloudController {
 				if (event.type === "run-started") this.deps.setStatus("running");
 				if (event.type === "run-finished" || event.type === "run-failed") this.deps.setStatus("idle");
 			},
+		};
+		const logPath = vscode.Uri.joinPath(this.deps.context.globalStorageUri, "harness", `${this.name.replace(/[^\w-]+/g, "-")}.jsonl`).fsPath;
+		const harnessLog = await FileEventLog.open(logPath);
+		const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+		const store = root ? await openStore(root) : undefined;
+		const runner = new HarnessAgentEngine({
+			host,
+			log: harnessLog,
+			runId: this.currentRunId || randomUUID(),
+			sessionId: this.name,
+			...(store
+				? {
+						knowledgeStore: new SqliteKnowledgeStore(store),
+						knowledgeScope: { root: REPO_DIR, repo: this.state.repo, branch: this.state.branch, sessionId: this.name },
+						knowledgeEmbedder: {
+							model: embeddingModel() || "local",
+							embed: (texts: string[], op: string) => embedTexts(settings.baseUrl, settings.apiKey, texts, op, root),
+						},
+						executionStateStore: new SqliteExecutionStateStore(store),
+					}
+				: {}),
+			verifier: new CommandVerifier(async (command) => {
+				const h = sbx.inner;
+				if (!h) return { ok: false, output: "No live sandbox handle." };
+				const r = await h.run(command, { cwd: REPO_DIR, timeoutMs: 120_000 });
+				return { ok: r.exitCode === 0, output: `${r.stdout}${r.stderr}`.trim() };
+			}),
 		});
 		this.runner = runner;
 		return runner;
@@ -585,6 +619,7 @@ export class CloudController {
 			this.cloudStatus("Running agent…");
 			this.info("Note: your provider API key runs inside the E2B sandbox.");
 			const runner = await this.ensureRunner(settings);
+			if (runner instanceof HarnessAgentEngine) runner.setRunId(this.currentRunId);
 			await runner.run(task, settings);
 			this.deps.recordRun({
 				task,

@@ -1191,6 +1191,7 @@ tbody tr:hover {
 .sbx-pill.paused { color: var(--warn); border-color: rgba(216, 166, 87, 0.4); }
 .sbx-pill.running, .sbx-pill.active { color: var(--ok); border-color: rgba(95, 168, 127, 0.4); }
 .sbx-pill.dead, .sbx-pill.failed, .sbx-pill.error { color: var(--err); border-color: rgba(214, 123, 123, 0.4); }
+.sbx-pill.inaccessible, .sbx-pill.unknown, .sbx-pill.replaced { color: var(--warn); border-color: rgba(216, 166, 87, 0.4); }
 .sbx-pill.baking, .sbx-pill.building { color: var(--accent); border-color: var(--accent); }
 
 .sbx-btn {

@@ -16,7 +16,11 @@ export { parseArguments } from "./args";
 export class ChatCompletionsPort implements ModelPort {
 	readonly capabilities: AdapterCapabilities = { wire: "chat", serverConversations: false, reasoningItems: false, store: false };
 
-	constructor(private readonly config: OpenAIPortConfig) {}
+	readonly identity: { providerId: string; modelId: string; contextWindow?: number };
+
+	constructor(private readonly config: OpenAIPortConfig) {
+		this.identity = { providerId: config.providerId, modelId: config.modelId, ...(config.contextWindow !== undefined ? { contextWindow: config.contextWindow } : {}) };
+	}
 
 	async complete(request: ModelRequest): Promise<ModelResponse> {
 		const hooks = { onText: (text: string) => request.onTextDelta?.(text), onReasoning: (text: string) => request.onReasoningDelta?.(text) };

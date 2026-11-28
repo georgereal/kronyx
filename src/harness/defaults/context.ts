@@ -1,22 +1,49 @@
 /**
- * Context projection (vscode-free). Builds each model request from the projection:
- *
- *   1. stable prefix: system instructions and tool specs. Byte-identical across tasks.
- *   2. messages: append-only history. Large tool results older than the most recent
- *      few are replaced by stubs citing their seq; the full output stays in the log
- *      and `log_slice` recovers it.
- *   3. task board: a snapshot of the ledger, placed last so the earlier messages
- *      keep their cached prefix when the board changes.
+ * Context policy adapter (vscode-free). The mechanical projection/compaction
+ * implementation lives in src/context/adapters/harnessProjection.ts so the IDE
+ * and cloud harness use one shared context pipeline; this file exposes it
+ * through the kernel ContextPolicy seam and owns harness-facing instructions.
  */
 
-import { canonicalJson, hashText } from "../core/canonical";
-import { tasksOfRun } from "../core/taskLedger";
 import type { ToolSpec } from "../core/contracts";
-import type { ToolCall } from "../core/contracts";
-import type { HarnessState, Message } from "../core/projections";
-import type { ContextPolicy, ProjectedContext } from "../core/policies/context";
+import type { HarnessState } from "../core/projections";
+import type { ContextPolicy } from "../core/policies/context";
+import {
+	COMPACT_CHUNK,
+	COMPACT_HEAD_CHARS,
+	COMPACT_OVER_CHARS,
+	DEFAULT_PROJECTION_BUDGET,
+	DIGEST_HEAD_CHARS,
+	DIGEST_OVER_CHARS,
+	KEEP_RECENT_MESSAGES,
+	KEEP_RECENT_RESULTS,
+	RECENT_RESULT_CAP_CHARS,
+	buildHarnessContextProjection,
+	capResult,
+	compactHistory,
+	inputBudgetForWindow,
+	prefixHash,
+	taskBoard,
+	type ProjectionBudget,
+} from "../../context/adapters/harnessProjection";
+import { createHarnessContextManager } from "../../context/adapters/harnessContextManager";
 
-export type { ProjectedContext };
+export type { ProjectedContext } from "../core/policies/context";
+export {
+	COMPACT_CHUNK,
+	COMPACT_HEAD_CHARS,
+	COMPACT_OVER_CHARS,
+	DIGEST_HEAD_CHARS,
+	DIGEST_OVER_CHARS,
+	KEEP_RECENT_MESSAGES,
+	KEEP_RECENT_RESULTS,
+	RECENT_RESULT_CAP_CHARS,
+	capResult,
+	compactHistory,
+	inputBudgetForWindow,
+	prefixHash,
+	taskBoard,
+};
 
 export const LOG_SLICE = "log_slice";
 export const LOG_SLICE_SPEC: ToolSpec = {
@@ -41,170 +68,27 @@ export const SYSTEM_INSTRUCTIONS = [
 	"Tool results may be elided to a stub that cites a seq. Recover the full text with log_slice.",
 ].join("\n");
 
-/** Messages newer than this many are never compacted. */
-export const KEEP_RECENT_MESSAGES = 12;
-/** Old messages are compacted in whole chunks of this size, so the rendered prefix changes once per chunk, not every turn. */
-export const COMPACT_CHUNK = 8;
-/** Old user and assistant text longer than this is cut to a head plus an elision note. */
-export const COMPACT_OVER_CHARS = 2000;
-export const COMPACT_HEAD_CHARS = 600;
-/** Tool results longer than this are digested once they are no longer recent. */
-export const DIGEST_OVER_CHARS = 400;
-/** Head of a digested tool result kept in context; the rest stays in the log. */
-export const DIGEST_HEAD_CHARS = 600;
-/** The most recent tool results are kept beyond digesting, but still capped — a single read_files or test run can be tens of KB and otherwise rides in context for several turns. */
-export const KEEP_RECENT_RESULTS = 6;
-/** Recent results longer than this are cut to head + tail with a log_slice pointer. */
-export const RECENT_RESULT_CAP_CHARS = 6000;
-const RECENT_RESULT_HEAD = 4200;
-const RECENT_RESULT_TAIL = 800;
-/** Hard cap on the projected message size; older digests collapse to pointers until under it. */
-export const CONTEXT_BUDGET_CHARS = 120_000;
-
-
-
-export const prefixHash = (system: string, tools: readonly ToolSpec[]): string => hashText(system + canonicalJson(tools));
-
-/** Task board as text, or undefined when there are no tasks. With runId, only that run's tasks. */
-export function taskBoard(state: HarnessState, runId?: string): string | undefined {
-	const { ledger } = state;
-	const ids = runId === undefined ? ledger.order : tasksOfRun(ledger, runId);
-	if (ids.length === 0) return undefined;
-	const lines = ids.map((id) => {
-		const task = ledger.tasks[id]!;
-		const steps = task.steps.map((s) => `    - ${s.id} [${s.status}] ${s.text}`).join("\n");
-		return `- ${task.id} [${task.status}] ${task.title}${steps ? `\n${steps}` : ""}`;
-	});
-	// Pin the last written plan so a post-recap model knows where it lives without re-hunting files.
-	// Covers save_plan ("Plan saved to X") and a write_file landing a .md under a plans-ish dir.
-	let planPath: string | undefined;
-	for (const m of state.messages) {
-		if (m.kind !== "tool") continue;
-		if (m.name === "save_plan") {
-			const hit = /Plan saved to (\S+)/.exec(m.output);
-			if (hit) planPath = hit[1];
-		} else if (m.name === "write_file") {
-			const hit = /(?:Overwrote|Created) (\S+\.md)/.exec(m.output);
-			if (hit && /(^|\/)plans?\//i.test(hit[1]!)) planPath = hit[1];
-		}
-	}
-	const footer = planPath ? `\n\nActive plan: ${planPath} (read_plan or read_file fetches it — no need to search)` : "";
-	return `Task board:\n${lines.join("\n")}${footer}`;
-}
-
-const digestFor = (m: Extract<Message, { kind: "tool" }>, seq: number, headChars: number): string => {
-	// Always leave at least ~150 chars elided so the digest is smaller than the original.
-	const head = Math.min(headChars, Math.max(0, m.output.length - 150));
-	const elided = m.output.length - head;
-	const text = head > 0 ? `${m.output.slice(0, head)}\n` : "";
-	return `${text}[tool result digest: ${m.name} returned ${m.output.length} chars at seq ${seq}; ${elided} chars elided. Recover the full text with log_slice from ${seq} to ${seq} or recall_context.]`;
-};
-
-const pointerFor = (m: Extract<Message, { kind: "tool" }>, seq: number): string =>
-	`[tool result elided: ${m.name} returned ${m.output.length} chars at seq ${seq}. Recover it with log_slice from ${seq} to ${seq} or recall_context.]`;
-
-const elision = (chars: number, seq: number): string =>
-	`[... ${chars} chars elided at seq ${seq}. log_slice from ${seq} to ${seq} recovers the full message.]`;
-
-function compactText(text: string, seq: number): string {
-	if (text.length <= COMPACT_OVER_CHARS) return text;
-	return `${text.slice(0, COMPACT_HEAD_CHARS)}\n${elision(text.length - COMPACT_HEAD_CHARS, seq)}`;
-}
-
-function compactCalls(calls: ToolCall[], seq: number): ToolCall[] {
-	return calls.map((c) => {
-		const size = canonicalJson(c.input).length;
-		if (size <= COMPACT_OVER_CHARS) return c;
-		return { ...c, input: { elided: `${size} chars of arguments at seq ${seq}; log_slice from ${seq} to ${seq} recovers them.` } };
-	});
-}
-
-/**
- * Compacts old user and assistant messages. Messages before the boundary are
- * compacted; the boundary moves in whole chunks, so an old message's rendering
- * changes once and then stays fixed, which keeps the cached prefix stable.
- * Nothing is lost: the full text stays in the log and log_slice returns it.
- */
-export function compactHistory(messages: readonly Message[]): Message[] {
-	const boundary = Math.max(0, Math.floor((messages.length - KEEP_RECENT_MESSAGES) / COMPACT_CHUNK) * COMPACT_CHUNK);
-	return messages.map((m, i) => {
-		if (i >= boundary) return m;
-		if (m.kind === "user") return { ...m, text: compactText(m.text, m.seq) };
-		if (m.kind === "assistant") return { ...m, text: compactText(m.text, m.seq), toolCalls: compactCalls(m.toolCalls, m.seq) };
-		return m;
-	});
-}
-
-export function estimateChars(messages: readonly Message[]): number {
-	let total = 0;
-	for (const m of messages) {
-		if (m.kind === "tool") total += m.output.length + m.name.length + 32;
-		else if (m.kind === "assistant") total += m.text.length + canonicalJson(m.toolCalls).length;
-		else total += m.text.length;
-	}
-	return total;
-}
-
-/** A tool result over the cap keeps its head and tail, with a log_slice pointer to the full text. */
-export const capResult = (m: Extract<Message, { kind: "tool" }>): Message =>
-	m.output.length <= RECENT_RESULT_CAP_CHARS
-		? m
-		: {
-				...m,
-				output: `${m.output.slice(0, RECENT_RESULT_HEAD)}\n[... ${m.output.length - RECENT_RESULT_HEAD - RECENT_RESULT_TAIL} chars elided at seq ${m.seq}. log_slice from ${m.seq} to ${m.seq} recovers the full result.]\n${m.output.slice(-RECENT_RESULT_TAIL)}`,
-			};
-
-export function buildContext(state: HarnessState, tools: readonly ToolSpec[], system = SYSTEM_INSTRUCTIONS, runId?: string, budgetChars = CONTEXT_BUDGET_CHARS): ProjectedContext {
-	const toolMessages = state.messages.filter((m): m is Extract<Message, { kind: "tool" }> => m.kind === "tool");
-	const recentSeqs = new Set(toolMessages.slice(-KEEP_RECENT_RESULTS).map((m) => m.seq));
-	const originalLength = new Map(toolMessages.map((m) => [m.seq, m.output.length]));
-	// Old tool results become digests: a head plus a pointer into the session log.
-	// The full output is never dropped — log_slice and recall_context recover it by seq.
-	const digest = (headChars: number): Message[] =>
-		state.messages.map((m) => {
-			if (m.kind !== "tool") return m;
-			if (recentSeqs.has(m.seq)) return capResult(m);
-			const len = originalLength.get(m.seq) ?? m.output.length;
-			if (len <= DIGEST_OVER_CHARS) return m;
-			return { ...m, output: headChars === 0 ? pointerFor(m, m.seq) : digestFor(m, m.seq, headChars) };
-		});
-	const assemble = (digested: readonly Message[]): Message[] => {
-		const compacted = compactHistory(digested);
-		// Messages covered by a recap are replaced by it; the recap boundary sits on a chunk edge, so the prefix stays stable.
-		const messages: Message[] = state.recap
-			? [{ kind: "system", text: `Recap of earlier work in this session:\n${state.recap.text}` }, ...compacted.slice(state.recap.covers)]
-			: compacted;
-		const board = taskBoard(state, runId);
-		return board ? [...messages, { kind: "system", text: board }] : messages;
-	};
-	let digested = digest(DIGEST_HEAD_CHARS);
-	let messages = assemble(digested);
-	// Hard budget: if the projection is still too large, collapse old digests to bare pointers.
-	if (estimateChars(messages) > budgetChars) {
-		digested = digest(0);
-		messages = assemble(digested);
-	}
-	return {
-		system,
-		tools: [...tools],
-		messages,
-		prefixHash: prefixHash(system, tools),
-	};
+export function buildContext(state: HarnessState, tools: readonly ToolSpec[], system = SYSTEM_INSTRUCTIONS, runId?: string, budget?: ProjectionBudget) {
+	return buildHarnessContextProjection(state, tools, system, runId, budget);
 }
 
 /**
  * Today's behavior as the default ContextPolicy — a factory because the budget
  * scales with the model's context window: compacting at a fixed size throws
  * away most of a large-window model's usable context (and compaction amnesia
- * is a loop generator). resolveBehaviorProfile passes the scaled budget.
+ * is a loop generator). resolveBehaviorProfile passes the token-measured
+ * budget derived from the model's window and output reserve.
  */
-export function makeContextPolicy(budgetChars = CONTEXT_BUDGET_CHARS): ContextPolicy {
+export function makeContextPolicy(budget: ProjectionBudget = DEFAULT_PROJECTION_BUDGET): ContextPolicy {
+	const manager = createHarnessContextManager(budget);
 	return {
-		build: (state, tools, system, runId) => buildContext(state, tools, system, runId, budgetChars),
-		capResult,
-		taskBoard,
-		keepRecentMessages: KEEP_RECENT_MESSAGES,
-		budgetChars,
+		build: (state, tools, system, runId) => manager.build(state, tools, system, runId),
+		capResult: (message) => manager.capResult(message),
+		taskBoard: (state, runId) => manager.taskBoard(state, runId),
+		keepRecentMessages: manager.keepRecentMessages,
+		budgetTokens: manager.budgetTokens,
+		outputReserveTokens: manager.outputReserveTokens,
+		manifest: (request) => manager.manifest(request),
 	};
 }
 

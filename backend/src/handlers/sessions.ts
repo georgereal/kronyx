@@ -6,6 +6,7 @@ import { getDb } from "../lib/mongo";
 import { installationRepos, installationToken, listInstallations } from "../lib/githubApp";
 import { getProvider, providers, type ProviderCreds } from "../../../src/sandbox/provider";
 import { githubPat, loadUserSettings, resolveProvider } from "../worker/settings";
+import { isInaccessibleSandboxState, isTerminalSandboxState } from "../lib/sandboxCleanup";
 import { listPlans, loadPlan } from "../lib/planStore";
 import { json } from "../routes";
 
@@ -427,17 +428,22 @@ export async function preflight(req: Request, p: Record<string, string>): Promis
 		checks.push({ name: "Repo", ok: false, detail: "none connected" });
 	}
 
-	// Sandbox
-	const sbxRow = await db
-		.collection("sandboxes")
-		.find({ uid, sessionId: p.id, state: { $nin: ["killed", "dead", "terminated"] } })
-		.sort({ createdAt: -1 })
-		.limit(1)
-		.next();
+	// Sandbox — only the session's current sandbox counts. Historical rows keep
+	// the sessionId for audit, but terminal/inaccessible rows are never reused.
+	const sbxRow = session.sandboxId
+		? await db.collection("sandboxes").findOne({ uid, sandboxId: session.sandboxId })
+		: null;
+	const reusable = !!sbxRow && !isTerminalSandboxState(sbxRow.state) && !isInaccessibleSandboxState(sbxRow.state);
 	checks.push({
 		name: "Sandbox",
-		ok: !!sbxRow && sbxRow.state !== "unreachable",
-		detail: sbxRow ? `${sbxRow.sandboxId} (${sbxRow.state})` : "none — will create on first run",
+		ok: !sbxRow || reusable,
+		detail: !session.sandboxId
+			? "none — will create on first run"
+			: sbxRow
+				? reusable
+					? `${sbxRow.sandboxId} (${sbxRow.state})`
+					: `${sbxRow.sandboxId} is ${sbxRow.state} — a replacement will be created`
+				: `${session.sandboxId} missing from lifecycle history — a replacement will be created`,
 	});
 
 	// Provider

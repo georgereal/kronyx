@@ -108,6 +108,8 @@ export interface AdapterCapabilities {
 
 export interface ModelPort {
 	complete(request: ModelRequest): Promise<ModelResponse>;
+	/** Provider/model identity for manifests and behavior decisions. Optional only for tests/lightweight fakes. */
+	readonly identity?: { providerId: string; modelId: string; contextWindow?: number };
 	/** Present when the endpoint keeps server-side conversations. Absent means every request carries the full projection. */
 	readonly conversations?: ConversationPort;
 	/** Request lifecycle override (e.g. a server-side conversation bind/delta/sync). Absent → the stateless projection strategy. */

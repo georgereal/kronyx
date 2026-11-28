@@ -1,7 +1,7 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import type { AgentMode, RunDigest } from "./agent/runner";
+import type { AgentMode, RunDigest } from "./agent/types";
 import type { PriorTranscript } from "./agent/recall";
 import { activeProfile, clearApiKey, configuredModels, currentSelection, fetchModelCatalog, pickModel, planDir, profileCatalogs, profiles, promptForApiKey, readProviderSettings } from "./config";
 import type { ModelSelection } from "./providerSelection";

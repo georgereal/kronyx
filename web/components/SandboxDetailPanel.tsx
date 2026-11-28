@@ -114,7 +114,7 @@ export function SandboxDetailPanel({ id, detail }: { id: string; detail?: Sandbo
 						["Branch", d.session?.branch ?? "—"],
 						["Created", fmt(sb.createdAt)],
 						["Last event", fmt(sb.at)],
-						["Idle policy", "auto-pause after 15m idle · killed only when unreachable or orphaned"],
+						["Idle policy", "auto-pause after 15m idle · attached VMs retained · disconnected VMs reaped"],
 					] as const).map(([k, v]) => (
 						<div key={k} className="sbx-kv">
 							<span className="k">{k}</span>

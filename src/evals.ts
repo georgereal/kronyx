@@ -2,10 +2,11 @@ import { exec } from "node:child_process";
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { AgentRunner, type ProviderSettings, type RunnerHost } from "./agent/runner";
+import type { ProviderSettings, RunnerHost } from "./agent/types";
 import type { AgentEngine, EngineKind } from "./agent/engine";
-import { OpenAIEngine } from "./agent/openaiEngine";
 import { resolveShape } from "./harness/adapters/apiShapes";
+import { HarnessAgentEngine } from "./harness/agentEngine";
+import { MemoryEventLog } from "./harness/core/eventLog";
 
 export interface EvalCase {
 	name: string;
@@ -99,7 +100,13 @@ export async function runSuite(
 					} else if (event.type === "tool-started") m.toolCalls++;
 				},
 			};
-			const agent: AgentEngine = resolved.shape === "cline" ? new AgentRunner(host) : new OpenAIEngine(host);
+			const agent: AgentEngine = new HarnessAgentEngine({
+				host,
+				log: new MemoryEventLog(),
+				runId: `eval-${evalCase.name}-${engine}`,
+				sessionId: `eval-${evalCase.name}`,
+				transport: resolved.shape,
+			});
 			await agent.run(evalCase.task, settings);
 			const details = await verify(root, evalCase);
 			const passed = m.status === "completed" && details.length === 0;

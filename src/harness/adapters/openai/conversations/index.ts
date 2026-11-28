@@ -21,7 +21,10 @@ export class ConversationsApiPort implements ModelPort {
 	readonly conversations: ConversationPort;
 	readonly strategy: RequestStrategy;
 
+	readonly identity: { providerId: string; modelId: string; contextWindow?: number };
+
 	constructor(private readonly config: OpenAIPortConfig) {
+		this.identity = { providerId: config.providerId, modelId: config.modelId, ...(config.contextWindow !== undefined ? { contextWindow: config.contextWindow } : {}) };
 		this.conversations = conversationPort(config);
 		this.strategy = new ConversationStrategy(this.conversations);
 	}

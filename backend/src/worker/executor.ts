@@ -1,8 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import type { Db } from "mongodb";
-import { dbg, swallow } from "../lib/log";
-import { AgentRunner, type AgentMode, type ProviderSettings, type RunnerAttachment, type RunViewEvent } from "../../../src/agent/runner";
+import { dbg, errlog, swallow } from "../lib/log";
+import type { AgentMode, ProviderSettings, RunnerAttachment, RunnerHost, RunViewEvent } from "../../../src/agent/types";
+import type { AgentEngine } from "../../../src/agent/engine";
+import { HarnessAgentEngine } from "../../../src/harness/agentEngine";
+import { CommandVerifier } from "../../../src/harness/defaults/verifier";
+import { buildHarnessReport } from "../../../src/harness/report/report";
 import { acceptsImages } from "../../../src/agent/vision";
 import { deriveMessages, type KronyxEvent } from "../../../src/agent/events";
 import { getProvider, type ProviderCreds, type SandboxHandle, type SandboxProvider } from "../../../src/sandbox/provider";
@@ -19,6 +23,15 @@ import { installationToken } from "../lib/githubApp";
 import { fetchModels, type ModelOption } from "../lib/models";
 import { getCache } from "./cache";
 import { recordSandboxEvent } from "../lib/sandboxEvents";
+import {
+	isInaccessibleSandboxState,
+	isSandboxConcurrencyQuotaError,
+	isTerminalSandboxState,
+	markInaccessible as markInaccessibleRow,
+	markProviderGone,
+	reapSandbox,
+	runningQuotaCleanupCandidates,
+} from "../lib/sandboxCleanup";
 import { listPlans, loadPlan, savePlanFile } from "../lib/planStore";
 import { newDumpRef, saveDump } from "../lib/dumpStore";
 import { FLAGS, flag, flagOff } from "../lib/flags";
@@ -27,6 +40,9 @@ import { IMAGE_RECIPES } from "./imageRecipes";
 import { buildE2bTemplate } from "../lib/e2bTemplateBuild";
 import { DEP_FILES, decideWarm, depsFingerprint, stderrTail, type WarmDoc } from "./warmState";
 import type { RunSink } from "./events";
+import { MongoHarnessEventLog } from "./harnessEventLog";
+import { MongoExecutionStateStore } from "./executionStateStore";
+import { MongoKnowledgeStore } from "./knowledgeStore";
 import type { AgentMessage } from "@cline/shared";
 import type { PriorTranscript } from "../../../src/agent/recall";
 import { evaluate, parseModePermissions, parsePermissions, parsePermissionsText, type PermissionLayers } from "../../../src/agent/permissions";
@@ -34,6 +50,8 @@ import { DECOMPOSE_PROMPT, isSharedManifest, ownsMatch, parseSlices, type Parsed
 import { isTrivialTask } from "../../../src/agent/taskGuard";
 import {
 	createRecallScorer,
+	EMBEDDING_DIMS,
+	embedText,
 	loadTranscripts,
 	memoryWriteTool,
 	recordDigests,
@@ -218,17 +236,17 @@ export const delegatingHandle = (live: LiveSlot): SandboxHandle => {
 };
 
 export class E2bOrchestratedExecutor implements RunExecutor {
-	private runner: AgentRunner | undefined;
+	private runner: AgentEngine | undefined;
 	private live: LiveSlot | undefined;
-	/** Warm per-session runners: the same AgentRunner serves all runs in a session. */
-	private static runnerCache = new Map<string, { runner: AgentRunner; route: RunnerRoute; live: LiveSlot; lastUsedAt: number }>();
+	/** Warm per-session engines: the same harness facade serves all runs in a session. */
+	private static runnerCache = new Map<string, { runner: AgentEngine; route: RunnerRoute; live: LiveSlot; lastUsedAt: number }>();
 	private static readonly MAX_CACHED = 20;
 	/** Idle runners hold tools + transcripts — evict after this much quiet time. */
 	private static readonly RUNNER_TTL_MS = 30 * 60_000;
 	/** Pending transcript saves — a list because parallel slice agents each save their own. */
 	private pendingSaves: Promise<void>[] = [];
 	/** Slice/coordinator runners that finished — their digests feed afterRun. */
-	private finishedSliceRunners: { runner: AgentRunner; agentIndex: number }[] = [];
+	private finishedSliceRunners: { runner: AgentEngine; agentIndex: number }[] = [];
 	private embedProvider: EmbedProvider | undefined;
 	/** Per-run usage ledger for usage_events rows (web runs bypass /api/ingest). */
 	private runProvider: ProviderSettings | undefined;
@@ -247,7 +265,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		}
 	>();
 	/** Live slice agents of a multi run — requestStop fans out to all of them. */
-	private sliceAgents: { runner: AgentRunner; live: LiveSlot }[] = [];
+	private sliceAgents: { runner: AgentEngine; live: LiveSlot }[] = [];
 	/** MCP toolsets shared process-wide — server connections persist across
 	 *  jobs like the runner cache; keyed by config so edits respawn. */
 	private static mcpCache = new Map<string, { set: McpToolSet; secrets: Set<string>; lastUsedAt: number }>();
@@ -299,6 +317,8 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	private keepaliveTimer: ReturnType<typeof setInterval> | undefined;
 	/** Agent's run-finished text — carried into the run-completed card. */
 	private lastRunSummary = "";
+	/** Model/API failure reported by the harness facade — the job must end failed, not continue into push/PR/verify. */
+	private mainRunFailed: string | undefined;
 	/** The run parked at its step cap: the job ends without the push/PR tail or run-completed. */
 	private pausedRun = false;
 	get paused(): boolean {
@@ -371,7 +391,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		private readonly sink: RunSink,
 	) {}
 
-	get agentRunner(): AgentRunner | undefined {
+	get agentRunner(): AgentEngine | undefined {
 		return this.runner;
 	}
 
@@ -686,7 +706,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		mode: AgentMode,
 		makeTools: () => Promise<import("@cline/shared").AgentTool<any, string>[]>,
 		sandbox?: SandboxCore,
-	): Promise<{ runner: AgentRunner; live: LiveSlot }> {
+	): Promise<{ runner: AgentEngine; live: LiveSlot }> {
 		// Provider fingerprint in the key: switching model/profile mid-session
 		// rebuilds the agent instead of reusing one bound to stale credentials.
 		const p = this.runProvider;
@@ -694,6 +714,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		// Mode is part of the key — a plan-mode runner must never be reused for
 		// an agent job (its currentMode/toolset are bound at creation).
 		const key = `${job.sessionId}:${kind}:${mode}:${fp}`;
+		const clearContextRequested = (session as { clearRequested?: boolean }).clearRequested === true;
 		const now = Date.now();
 		for (const [k, e] of E2bOrchestratedExecutor.runnerCache) {
 			if (!e.runner.isRunning && now - e.lastUsedAt > E2bOrchestratedExecutor.RUNNER_TTL_MS) {
@@ -705,7 +726,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		if (cached) {
 			// Manual "clear context" (POST /api/sessions/:id/clear) — drop the live
 			// agent so this run starts fresh, digests still carried forward.
-			if ((session as { clearRequested?: boolean }).clearRequested) {
+			if (clearContextRequested) {
 				void this.db
 					.collection("sessions")
 					.updateOne({ uid: job.uid, sessionId: job.sessionId }, { $unset: { clearRequested: "" } })
@@ -714,12 +735,13 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			}
 			cached.lastUsedAt = now;
 			cached.live.stopped = false; // new run — clear a previous stop
+			if (cached.runner instanceof HarnessAgentEngine) cached.runner.setRunId(job.resumeRunId ?? job.runId);
 			cached.route.job = job;
 			cached.route.sink = this.sink;
 			cached.route.track = (e) => this.trackUsage(e, job);
 			return { runner: (this.runner = cached.runner), live: (this.live = cached.live) };
 		}
-		if ((session as { clearRequested?: boolean }).clearRequested) {
+		if (clearContextRequested) {
 			void this.db
 				.collection("sessions")
 				.updateOne({ uid: job.uid, sessionId: job.sessionId }, { $unset: { clearRequested: "" } })
@@ -758,7 +780,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		await this.sink.patchRun({ contextManifest: manifest }).catch(swallow("executor", "op"));
 		const route: RunnerRoute = { job, sink: this.sink, track: (e) => this.trackUsage(e, job) };
 		let permLayers: PermissionLayers | undefined;
-		const runner = new AgentRunner({
+		const host: RunnerHost = {
 			events: {
 				// Durable record → run_events (same collection, distinct types).
 				record: (e) => void this.sink.emit(e as Record<string, unknown>),
@@ -784,7 +806,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				confirm: async (toolName, input) => {
 					if (kind === "ask") return false;
 					if (session.securityProfile !== "controlled") return true;
-					return this.awaitPermission(job, toolName, input);
+					return this.awaitPermission(route.job ?? job, toolName, input);
 				},
 				check: async (toolName, input) => {
 					// Lazy-load once per runner: global rules from the user's synced
@@ -815,10 +837,11 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				if (fresh) void sessCache?.set(sessKey, fresh, 5_000).catch(() => {});
 				// Cold-start already searched for this exact task — reuse it.
 				let mem = memories;
-				if (task !== job.task) {
+				const activeJob = route.job ?? job;
+				if (task !== activeJob.task) {
 					mem = isTrivialTask(task)
 						? []
-						: await searchMemories(this.db, job.uid, job.sessionId, task, embed, session.repo ?? undefined, this.memoryReport, job.runId, session.base ?? undefined).catch(
+						: await searchMemories(this.db, job.uid, job.sessionId, task, embed, session.repo ?? undefined, this.memoryReport, activeJob.runId, session.base ?? undefined).catch(
 								swallow("executor", "op", memories),
 							);
 					// A different recall set is being injected — merge it into the
@@ -828,7 +851,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 						void this.db
 							.collection("runs")
 							.updateOne(
-								{ uid: job.uid, runId: job.runId },
+								{ uid: job.uid, runId: activeJob.runId },
 								{ $addToSet: { "contextManifest.memoryIdsUsed": { $each: newIds } } },
 							)
 							.catch(swallow("executor", "op"));
@@ -883,6 +906,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			tools: makeTools as () => Promise<never>,
 			emit: (e) => {
 				if (e.type !== "assistant-delta" && e.type !== "reasoning-delta") dbg("run", e.type, e);
+				if (e.type === "run-failed") this.mainRunFailed = String(e.error ?? "Run failed");
 				if (e.type === "run-finished" || e.type === "run-failed") {
 					// Mirror of the extension's recordDigest — without this the
 					// worker never populates runDigests, so sessions.digests stays
@@ -900,8 +924,30 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				route.track?.(e);
 				void route.sink?.emit(e);
 			},
+		};
+		const harnessLog = new MongoHarnessEventLog(this.db, job.uid, job.sessionId);
+		const runner = new HarnessAgentEngine({
+			host,
+			log: harnessLog,
+			runId: job.resumeRunId ?? job.runId,
+			sessionId: job.sessionId,
+			executionStateStore: new MongoExecutionStateStore(this.db, job.uid),
+			knowledgeStore: new MongoKnowledgeStore(this.db),
+			knowledgeScope: { uid: job.uid, repo: session.repo, branch: session.base, sessionId: job.sessionId },
+			...(this.knowledgeEmbedder() ? { knowledgeEmbedder: this.knowledgeEmbedder()! } : {}),
+			...(kind === "sandboxed"
+				? {
+						verifier: new CommandVerifier(async (command) => {
+							const h = this.live?.handle;
+							if (!h) return { ok: false, output: "No live sandbox handle." };
+							const r = await h.run(command, { cwd: REPO_DIR, timeoutMs: 120_000 });
+							return { ok: r.exitCode === 0, output: `${r.stdout}${r.stderr}`.trim() };
+						}),
+					}
+				: {}),
 		});
-		const sessionDoc = session as SessionDoc & { digests?: import("../../../src/agent/runner").RunDigest[]; stateNote?: string };
+		const sessionDoc = session as SessionDoc & { digests?: import("../../../src/agent/types").RunDigest[]; stateNote?: string };
+		if (clearContextRequested) runner.clearContext();
 		if (sessionDoc.digests?.length) runner.setRunDigests(sessionDoc.digests);
 		runner.setStateNote(sessionDoc.stateNote);
 		sessionDoc.stateNote = undefined;
@@ -1110,12 +1156,44 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			.catch(swallow("usage", "insert"));
 	}
 
+	/** Shared knowledge-store embedding adapter over the worker's OpenAI-compatible memory embedder. */
+	private knowledgeEmbedder(): import("../../../src/context/knowledge/record").EmbeddingProvider | undefined {
+		const provider = this.embedProvider;
+		if (!provider) return undefined;
+		return {
+			model: provider.embeddingModel ?? "openai/text-embedding-3-small",
+			dimensions: EMBEDDING_DIMS,
+			embed: async (texts, op) => Promise.all(texts.map((text) => embedText(provider, text, op))),
+		};
+	}
+
+	/** Build and store the harness report from the durable Mongo ledger. The
+	 *  report key is the web-visible run id; the event filter is the harness's
+	 *  internal run id (different on continue jobs). */
+	private async persistHarnessReport(job: CloudJob, opts: { laneScope?: string; eventRunId?: string; reportRunId?: string } = {}): Promise<void> {
+		try {
+			const laneScope = opts.laneScope ?? job.sessionId;
+			const events = await new MongoHarnessEventLog(this.db, job.uid, laneScope).read();
+			if (!events.length) return;
+			const eventRunId = opts.eventRunId ?? job.resumeRunId ?? job.runId;
+			const report = buildHarnessReport(events, { runId: eventRunId });
+			await this.db.collection("harness_reports").updateOne(
+				{ uid: job.uid, runId: opts.reportRunId ?? job.runId },
+				{ $set: { uid: job.uid, runId: opts.reportRunId ?? job.runId, session: job.sessionId, report, updatedAt: new Date() }, $setOnInsert: { at: new Date() } },
+				{ upsert: true },
+			);
+		} catch (err) {
+			errlog("executor", "harness report", err);
+		}
+	}
+
 	/** Persist transcript + digests after a run. */
 	private async afterRun(job: CloudJob): Promise<void> {
 		await Promise.allSettled(this.pendingSaves);
 		this.flushToolOutput();
 		// Events must land before terminal status — SSE reads run status to close.
 		await this.sink.drain().catch(swallow("executor", "op"));
+		await this.persistHarnessReport(job);
 		if (this.runner?.runDigests.length) {
 			const digests = this.runner.runDigests.map((d) => ({ ...d, runId: job.runId, endSha: d.endSha ?? this.lastHeadSha }));
 			await recordDigests(this.db, job.uid, job.sessionId, digests).catch(swallow("executor", "op"));
@@ -1289,6 +1367,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		this.assertCanViewImages(s, atts);
 		await runner.run(this.taskWithInline(job.task, atts), s, this.runnerAttachments(atts));
 		await this.afterRun(job);
+		if (this.mainRunFailed) throw new Error(this.mainRunFailed);
 	}
 
 	/** Live template catalog per account, cached 10 min (public + account-built). */
@@ -1627,7 +1706,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 						{
 							$set: {
 								uid: this.sink.uid, sessionId: session.sessionId, sandboxId, provider: providerName, event, at: new Date(),
-								...(state ? { state: { $cond: [{ $in: ["$state", ["dead", "replaced"]] }, "$state", state] } } : {}),
+								...(state ? { state: { $cond: [{ $in: ["$state", ["dead", "replaced", "inaccessible", "unknown"]] }, "$state", state] } } : {}),
 								createdAt: { $ifNull: ["$createdAt", "$$NOW"] },
 							},
 						},
@@ -1679,17 +1758,24 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			.catch(swallow("executor", "op"));
 	}
 
-	/** Flag a dead VM for the janitor (the single owner of kills) and link it
-	 *  to its successor. `detach` also clears sessionId — used when the old
-	 *  VM was proven unreachable rather than cleanly replaced. */
-	private async markReplaced(oldId: string, newId: string | undefined, reason: string, detach = false): Promise<void> {
-		await this.db
-			.collection("sandboxes")
-			.updateOne(
-				{ uid: this.sink.uid, sandboxId: oldId },
-				{ $set: { state: "replaced", replacedBy: newId, killPending: true, reason, replacedAt: new Date(), ...(detach ? { sessionId: null } : {}) } },
-			)
-			.catch(swallow("executor", "op"));
+	/** Mark a VM unusable without destroying it. The row keeps its historical
+	 *  session association; reuse is prevented by the state, not by detaching
+	 *  the row and turning it into a false orphan. */
+	private async markInaccessible(oldId: string, newId: string | undefined, reason: string, session?: SessionDoc, providerName?: string): Promise<void> {
+		await markInaccessibleRow(this.db, { uid: this.sink.uid, sandboxId: oldId, sessionId: session?.sessionId, provider: providerName, reason, replacedBy: newId });
+	}
+
+	/** Finalize the old VM's lifecycle state after the reuse ladder has
+	 *  exhausted its recovery attempts. Provider-not-found is terminal;
+	 *  anything merely unreachable is retained as inaccessible history. */
+	private async condemnUnreusableSandbox(oldId: string, providerState?: string, session?: SessionDoc, providerName?: string): Promise<void> {
+		const row = await this.db.collection("sandboxes").findOne({ uid: this.sink.uid, sandboxId: oldId }).catch(swallow("executor", "op", null));
+		if (!row || isTerminalSandboxState(row.state)) return;
+		if (providerState === "gone") {
+			await markProviderGone(this.db, row);
+			return;
+		}
+		if (!isInaccessibleSandboxState(row.state)) await this.markInaccessible(oldId, undefined, "unreachable", session, providerName);
 	}
 
 	/** Reuse the session's existing VM: connect + probe, then the resume
@@ -1697,6 +1783,11 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 	 *  sandbox can still cold-boot from its disk snapshot, keeping the repo
 	 *  AND worktree where a kill+reclone loses uncommitted work. */
 	private async reuseSandbox(sbx: SandboxCore, session: SessionDoc, oldId: string, provider: SandboxProvider, providerName: string, creds: ProviderCreds): Promise<boolean> {
+		const lifecycle = (await this.db.collection("sandboxes").findOne({ uid: this.sink.uid, sandboxId: oldId }, { projection: { state: 1 } }).catch(swallow("executor", "op", null))) as { state?: string } | null;
+		if (isTerminalSandboxState(lifecycle?.state) || isInaccessibleSandboxState(lifecycle?.state)) {
+			dbg("sandbox", "not reusing terminal or inaccessible sandbox", { sandboxId: oldId, state: lifecycle?.state });
+			return false;
+		}
 		// Retry connect before concluding it's dead — transient API/network
 		// blips must not churn sandboxes.
 		let connected = false;
@@ -1731,7 +1822,10 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			dbg("sandbox", "connected but unresponsive", { sandboxId: oldId });
 		}
 		dbg("sandbox", "unreachable after retries", { sandboxId: oldId });
-		if (!provider.capabilities.resume) return false;
+		if (!provider.capabilities.resume) {
+			await this.condemnUnreusableSandbox(oldId, undefined, session, providerName);
+			return false;
+		}
 		let info = await provider.getInfoById?.(oldId, creds).catch(() => null);
 		// A VM mid-pause still reports "running" while connect already
 		// fails — wait out the transition and re-probe once so a pausing
@@ -1793,6 +1887,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				}
 			}
 		}
+		await this.condemnUnreusableSandbox(oldId, info?.state, session, providerName);
 		return false;
 	}
 
@@ -1834,7 +1929,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				await sbx.close().catch(swallow("executor", "op"));
 			} else {
 				await sbx.keepalive(60);
-				if (oldId) await this.markReplaced(oldId, sbx.sandboxId, "snapshot-restore");
+				if (oldId) await this.markInaccessible(oldId, sbx.sandboxId, "snapshot-restore", session, providerName);
 				session.cloned = true;
 				await this.sink.patchSession({ sandboxId: sbx.sandboxId, cloned: true });
 				await this.db
@@ -1939,9 +2034,10 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 
 	/** Walk the template candidates until one boots; stock base (undefined)
 	 *  is appended as the last resort. Only reached after reuse + snapshot
-	 *  restore both failed, so any oldId here is proven dead → replaced.
-	 *  Unresolvable names were filtered in bootTemplates, so reaching the
-	 *  quota path means a genuine create failure — safe to free a paused VM. */
+	 *  restore both failed, so any oldId here is non-reusable → inaccessible.
+	 *  Quota recovery uses only running VMs, ordered inaccessible →
+	 *  disconnected → oldest idle attached (paused first, killed only if the
+	 *  pause fails). Paused VMs do not consume E2B running concurrency. */
 	private async createSandbox(
 		sbx: SandboxCore,
 		session: SessionDoc,
@@ -2002,26 +2098,64 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			}
 		}
 		if (!created) {
-			// A name-resolution failure must never masquerade as quota — killing
-			// a paused VM wouldn't help and the retry would fail identically.
-			if (isTemplateMiss(createErr)) throw createErr;
-			if (provider.name !== "e2b") throw createErr;
-			const oldestPaused = await this.db
-				.collection("sandboxes")
-				.findOne({ uid: this.sink.uid, state: "paused" }, { sort: { at: 1 } })
-				.catch(swallow("executor", "op", null));
-			if (!oldestPaused) throw createErr;
-			const pausedId = String(oldestPaused.sandboxId);
-			await this.sink.emit({ type: "info", text: `Sandbox quota hit — killing oldest paused sandbox ${pausedId} to make room` });
-			console.log(`[executor] quota fallback: killing paused ${pausedId} for ${session.sessionId}`);
-			await this.db.collection("sandboxes").updateOne(
-				{ uid: this.sink.uid, sandboxId: pausedId },
-				{ $set: { killPending: true, reason: "quota-fallback" } },
-			).catch(swallow("executor", "op"));
-			await provider.killById(pausedId, creds).catch(swallow("executor", "op"));
-			await sbx.create({ creds, provider: providerName, template, timeoutMs: 60 * 60_000, autoPause, autoResume: autoPause }).catch(() => {
-				throw createErr instanceof Error ? createErr : new Error(String(createErr));
-			});
+			// A name-resolution or generic create failure must never masquerade
+			// as concurrency exhaustion — destructive cleanup is justified only
+			// when the provider explicitly says the running-sandbox quota is full.
+			if (isTemplateMiss(createErr) || provider.name !== "e2b" || !isSandboxConcurrencyQuotaError(createErr)) throw createErr;
+			const candidates = await runningQuotaCleanupCandidates(this.db, this.sink.uid, providerName, creds);
+			if (!candidates.length) {
+				throw new Error("E2B sandbox concurrency quota reached, and no running inaccessible, disconnected, or idle attached sandboxes were available to reclaim or pause. Paused sandboxes do not count toward this quota.");
+			}
+			let lastErr: unknown = createErr;
+			for (const candidate of candidates) {
+				const victimId = String(candidate.sandboxId);
+				let capacityFreed = false;
+				// Attached VMs are the explicit last-resort exception. Pausing
+				// one frees E2B running concurrency without destroying its disk;
+				// only if that pause fails do we use the approved kill fallback.
+				if (candidate.quotaAction === "pause" && provider.pauseById) {
+					await this.sink.emit({ type: "info", key: "sandbox", text: `Sandbox concurrency quota hit — pausing idle running sandbox ${victimId} to free capacity` });
+					console.log(`[executor] quota fallback: pausing idle attached ${victimId} for ${session.sessionId}`);
+					capacityFreed = await provider.pauseById(victimId, creds).catch(swallow("executor", "op", false));
+					if (capacityFreed) {
+						await this.db
+							.collection("sandboxes")
+							.updateOne({ uid: this.sink.uid, sandboxId: victimId }, { $set: { state: "paused", reason: "quota-pause", killPending: false, at: new Date() } })
+							.catch(swallow("executor", "op"));
+						void recordSandboxEvent(this.db, {
+							uid: this.sink.uid,
+							sandboxId: victimId,
+							sessionId: typeof candidate.sessionId === "string" ? candidate.sessionId : undefined,
+							provider: providerName,
+							event: "pause",
+							state: "paused",
+							reason: "quota-pause",
+						});
+					}
+				}
+				if (!capacityFreed) {
+					await this.sink.emit({ type: "info", key: "sandbox", text: `Sandbox concurrency quota hit — reaping running sandbox ${victimId} to free capacity` });
+					console.log(`[executor] quota fallback: reaping running ${victimId} for ${session.sessionId}`);
+					capacityFreed = await reapSandbox(this.db, candidate, creds, "quota-fallback");
+				}
+				if (!capacityFreed) continue;
+				for (let attempt = 0; ; attempt++) {
+					try {
+						await sbx.create({ creds, provider: providerName, template, timeoutMs: 60 * 60_000, autoPause, autoResume: autoPause });
+						created = true;
+						break;
+					} catch (e) {
+						lastErr = e;
+						if (!isSandboxConcurrencyQuotaError(e)) throw e;
+						// E2B's concurrency ledger can lag a successful kill briefly.
+						// Retry once before sacrificing another candidate.
+						if (attempt > 0) break;
+						await new Promise((r) => setTimeout(r, 3000));
+					}
+				}
+				if (created) break;
+			}
+			if (!created) throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 		}
 		// Don't persist a warm snapshot id as the session template — snapshots
 		// expire; the session template must stay a named template.
@@ -2031,9 +2165,9 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		// Persist the provider-verified template identity — the requested name
 		// is what we asked for; getInfo reports what actually booted.
 		const createdInfo = newId ? await provider.getInfoById?.(newId, creds).catch(() => null) : null;
-		// Old sandbox proven unreachable after retries — disassociate it from
-		// the session; it shows up as an orphan in the janitor.
-		if (oldId) await this.markReplaced(oldId, newId, "unreachable", true);
+		// Old sandbox proven unreachable after retries — retain the historical
+		// session link, but mark it non-reusable for future boots.
+		if (oldId) await this.markInaccessible(oldId, newId, "unreachable", session, providerName);
 		await this.db
 			.collection("sandboxes")
 			.updateOne(
@@ -2399,16 +2533,12 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			let preservedWorktree = false;
 			for (;;) {
 				live.dead = undefined;
+				const recoveryInput = preservedWorktree
+					? "The sandbox VM running your tools stopped responding and was recovered — its disk was preserved, so the worktree (including uncommitted changes) should be intact. Check git status and the files you were editing, then continue the task."
+					: "The sandbox VM running your tools died and was recreated — the repository was re-cloned to your session branch, but any uncommitted changes were lost. Check the current state (git status, the files you were editing) and continue the task.";
 				if (job.resumeRunId && !resumed) await runner.resume(provider);
-				else await runner.run(
-					resumed
-						? preservedWorktree
-							? "The sandbox VM running your tools stopped responding and was recovered — its disk was preserved, so the worktree (including uncommitted changes) should be intact. Check git status and the files you were editing, then continue the task."
-							: "The sandbox VM running your tools died and was recreated — the repository was re-cloned to your session branch, but any uncommitted changes were lost. Check the current state (git status, the files you were editing) and continue the task."
-						: this.taskWithInline(job.task, atts, `${ATTACH_DIR}/`),
-					provider,
-					tailAtts,
-				);
+				else if (resumed && runner instanceof HarnessAgentEngine) await runner.resumeWithMessage(recoveryInput, provider);
+				else await runner.run(resumed ? recoveryInput : this.taskWithInline(job.task, atts, `${ATTACH_DIR}/`), provider, tailAtts);
 				if (!live.dead || resumed || this.stopRequested) break;
 				resumed = true;
 				// Wedged (envd dead, VM maybe alive): snapshot/pause first — the
@@ -2426,7 +2556,9 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				});
 				await this.sink.emit({ type: "sandbox-recreated", reason: "mid-run" } as Record<string, unknown>).catch(swallow("executor", "op"));
 				if (!preservedWorktree) {
-					// Drop the dead id so ensureSandbox creates instead of reconnecting.
+					// Drop the dead id so ensureSandbox creates instead of reconnecting,
+					// but keep the sandbox row attached as lifecycle history.
+					if (session.sandboxId) await this.markInaccessible(session.sandboxId, undefined, wedged ? "mid-run-unresponsive" : "mid-run-death", session, session.provider ?? String(settings.data.sandboxProvider ?? "e2b"));
 					session.sandboxId = undefined;
 					session.cloned = false;
 					await this.sink.patchSession({ sandboxId: null, cloned: false });
@@ -2448,6 +2580,13 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			this.pausedRun = true;
 			await this.sink.patchRun({ status: "paused" }).catch(swallow("executor", "op"));
 			return;
+		}
+		if (this.mainRunFailed) {
+			// Preserve the durable harness report/digests first, then fail the job.
+			// A model failure is not a completed agent run, so checkpoint/PR/verify
+			// must not repackage it as success.
+			await this.afterRun(job);
+			throw new Error(this.mainRunFailed);
 		}
 		// HEAD now = the point this run's work rests on; afterRun stamps it
 		// onto the run's digests so a later restore can verify ancestry.
@@ -2521,7 +2660,9 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				});
 				await this.sink.emit({ type: "sandbox-recreated", reason: "run-tail" } as Record<string, unknown>).catch(swallow("executor", "op"));
 				if (!preserved) {
-					// Drop the dead id so ensureSandbox creates instead of reconnecting.
+					// Drop the dead id so ensureSandbox creates instead of reconnecting,
+					// but keep the sandbox row attached as lifecycle history.
+					if (session.sandboxId) await this.markInaccessible(session.sandboxId, undefined, wedged ? "run-tail-unresponsive" : "run-tail-death", session, session.provider ?? String(settings.data.sandboxProvider ?? "e2b"));
 					session.sandboxId = undefined;
 					session.cloned = false;
 					await this.sink.patchSession({ sandboxId: null, cloned: false });
@@ -2542,10 +2683,14 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		const ctx = this.sliceForkCtx;
 		for (const h of this.sliceForks.values()) {
 			const dead = ctx ? await ctx.provider.killById(h.id, ctx.creds).catch(swallow("executor", "op", false)) : false;
-			await this.db
-				.collection("sandboxes")
-				.updateOne({ sandboxId: h.id }, { $set: { state: dead ? "dead" : "unknown", deadAt: new Date() } })
-				.catch(swallow("executor", "op"));
+			if (dead) {
+				await this.db
+					.collection("sandboxes")
+					.updateOne({ uid: this.sink.uid, sandboxId: h.id }, { $set: { state: "dead", deadAt: new Date(), killPending: false } })
+					.catch(swallow("executor", "op"));
+			} else {
+				await markInaccessibleRow(this.db, { uid: this.sink.uid, sandboxId: h.id, reason: "slice-fork-cleanup-failed" });
+			}
 		}
 		this.sliceForks.clear();
 	}
@@ -2746,8 +2891,9 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			this.sliceAgents.push({ runner, live: sliceLive });
 			await markSlice(s, "running");
 			try {
-				// AgentRunner.run() never throws — failures arrive as run-failed events.
+				// HarnessAgentEngine.run() never throws model failures — they arrive as run-failed events.
 				await runner.run(this.sliceTask(s), provider);
+				await this.persistHarnessReport(job, { laneScope: `${job.sessionId}:${job.runId}-s${s.index}`, eventRunId: `${job.runId}-s${s.index}`, reportRunId: `${job.runId}-s${s.index}` });
 				if (finishText.failed && !this.stopRequested) await markSlice(s, "failed", finishText.failed.slice(0, 400));
 				else await markSlice(s, this.stopRequested ? "stopped" : "done", finishText.value || "Done.");
 				if (!this.stopRequested) await this.recordMemoryOutcome(job, finishText.failed ? "failed" : "completed", `${job.runId}-s${s.index}`);
@@ -3128,7 +3274,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		finishText: { value: string; failed?: string },
 		mem: { embed: EmbedProvider | undefined; baseMemories: MemoryDoc[]; planSlugs: string[]; transcripts: PriorTranscript[] },
 		coordinator = false,
-	): AgentRunner {
+	): AgentEngine {
 		const dir = coordinator || this.sliceForks.has(slice.index) ? REPO_DIR : SLICE_DIR(slice.index);
 		const handle = delegatingHandle(sliceLive);
 		let permLayers: PermissionLayers | undefined;
@@ -3137,7 +3283,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 		/** Memory report events for this slice — tagged with agentIndex so the
 		 *  events page can attribute them to the right sub-agent. */
 		const sliceReport = (d: Record<string, unknown>) => void this.sink.emit({ type: "memory", ...d }, { agentIndex });
-		const runner = new AgentRunner({
+		const host: RunnerHost = {
 			events: {
 				record: (e) => void this.sink.emit(e as Record<string, unknown>, { agentIndex }),
 			},
@@ -3235,6 +3381,22 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 				this.trackUsage(e, job, agentIndex);
 				void this.sink.emit(e, { agentIndex });
 			},
+		};
+		const runner = new HarnessAgentEngine({
+			host,
+			log: new MongoHarnessEventLog(this.db, job.uid, `${job.sessionId}:${sliceRunId}`),
+			runId: sliceRunId,
+			sessionId: job.sessionId,
+			executionStateStore: new MongoExecutionStateStore(this.db, job.uid),
+			knowledgeStore: new MongoKnowledgeStore(this.db),
+			knowledgeScope: { uid: job.uid, repo: session.repo, branch: session.base, sessionId: job.sessionId, module: `slice-${agentIndex}` },
+			...(this.knowledgeEmbedder() ? { knowledgeEmbedder: this.knowledgeEmbedder()! } : {}),
+			verifier: new CommandVerifier(async (command) => {
+				const h = sliceLive.handle;
+				if (!h) return { ok: false, output: "No live sandbox handle." };
+				const r = await h.run(command, { cwd: dir, timeoutMs: 120_000 });
+				return { ok: r.exitCode === 0, output: `${r.stdout}${r.stderr}`.trim() };
+			}),
 		});
 		return runner;
 	}
@@ -4029,6 +4191,7 @@ export class E2bOrchestratedExecutor implements RunExecutor {
 			} catch (err) {
 				if (attempt > 0 || !isSandboxDeath(err) || this.stopRequested) throw err;
 				await this.sink.emit({ type: "info", text: "Sandbox died — recreating and retrying the plan push." });
+				if (session.sandboxId) await this.markInaccessible(session.sandboxId, undefined, "push-plan-death", session, session.provider ?? String(settings.data.sandboxProvider ?? "e2b"));
 				session.sandboxId = undefined;
 				session.cloned = false;
 				await this.sink.patchSession({ sandboxId: null, cloned: false });

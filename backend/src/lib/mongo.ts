@@ -52,6 +52,19 @@ export async function getDb(): Promise<Db> {
 	await db.collection("memory_events").createIndex({ uid: 1, at: -1 });
 	await db.collection("memories").createIndex({ uid: 1, memoryId: 1 }, { unique: true });
 	await db.collection("memories").createIndex({ uid: 1, sessionId: 1, scope: 1, status: 1 });
+	// Shared knowledge-store shape (mirrors the SQLite knowledge_records/knowledge_chunks tables).
+	// Atlas vector search index knowledge_chunks_vector is managed alongside memories_vector:
+	// path embedding, cosine similarity, dimensions matching the active embedding model,
+	// with scopeKey/lifecycleStatus/type filter fields.
+	await db.collection("knowledge_records").createIndex({ scopeKey: 1, knowledgeId: 1 }, { unique: true });
+	await db.collection("knowledge_records").createIndex({ scopeKey: 1, type: 1, "lifecycle.status": 1 });
+	await db.collection("knowledge_chunks").createIndex({ scopeKey: 1, knowledgeId: 1, chunkIndex: 1 }, { unique: true });
+	await db.collection("knowledge_chunks").createIndex({ scopeKey: 1, lifecycleStatus: 1, updatedAt: -1 });
+	await db.collection("execution_states").dropIndex("sessionId_1_runId_1").catch(() => undefined);
+	await db.collection("execution_states").createIndex({ uid: 1, sessionId: 1, runId: 1 }, { unique: true });
+	await db.collection("execution_states").createIndex({ uid: 1, sessionId: 1, eventCursor: -1 });
+	await db.collection("harness_events").createIndex({ uid: 1, scope: 1, seq: 1 }, { unique: true });
+	await db.collection("harness_events").createIndex({ uid: 1, scope: 1, runId: 1, type: 1 });
 	await db.collection("sandboxes").createIndex({ uid: 1, sessionId: 1, at: 1 });
 	await db.collection("sandboxes").createIndex({ uid: 1, state: 1 });
 	await db.collection("sandbox_events").createIndex({ uid: 1, sandboxId: 1, at: -1 });

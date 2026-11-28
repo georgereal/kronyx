@@ -1,11 +1,10 @@
 /**
- * Execution-engine seam: the session controller drives any engine through this
- * surface. `AgentRunner` (Cline SDK) and `OpenAIEngine` (OpenAI-compatible
- * endpoints) both implement it and emit the same RunViewEvent stream.
- * vscode-free.
+ * Execution-engine seam: hosts drive an engine through this surface and consume
+ * the shared RunViewEvent stream. Production implementations are harness-backed;
+ * the legacy runners remaining in the tree are test-only. vscode-free.
  */
 
-import type { AgentMode, ProviderSettings, RunDigest, RunnerAttachment } from "./runner";
+import type { AgentMode, ProviderSettings, RunDigest, RunnerAttachment } from "./types";
 
 export type EngineKind = "cline" | "openai" | "conversations" | "responses" | "chat" | "auto" | "harness";
 

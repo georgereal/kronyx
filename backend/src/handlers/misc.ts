@@ -6,6 +6,15 @@ import { authenticate } from "../lib/apiKeys";
 import { getDb } from "../lib/mongo";
 import { fetchModels } from "../lib/models";
 import { recordSandboxEvent } from "../lib/sandboxEvents";
+import {
+	REAP_SCAN_STATES,
+	TERMINAL_SANDBOX_STATES,
+	isOrphanedSandboxRow,
+	owningSession,
+	markProviderGone,
+	normalizeLegacyInaccessible,
+	reapSandbox,
+} from "../lib/sandboxCleanup";
 import { loadPlan } from "../lib/planStore";
 import { json } from "../routes";
 
@@ -113,23 +122,16 @@ export async function runJanitorSweep(db: Db): Promise<{ users: number; killed: 
 		.find({ "settings.secrets": { $exists: true } })
 		.toArray() as unknown as { _id: string; settings?: { secrets?: Record<string, string>; data?: Record<string, unknown> } }[];
 	const cutoff = Date.now() - MAX_MINUTES * 60_000;
-	// Kill policy: a sandbox attached to a session is never killed for age —
-	// idle running VMs get paused above, paused VMs cost nothing and may be
-	// resumed months later. Kills happen only when the executor proved the VM
-	// unreachable (killPending) or the row is orphaned (no session association).
-	// SESSION_IDLE_KILL_MINUTES / PAUSED_KILL_MINUTES are retired.
+	// Kill policy: a sandbox that is the session's current VM is never killed
+	// for age. Idle running VMs get paused above; attached paused VMs cost no
+	// compute and may be resumed months later. Reaps are only for true orphans
+	// or explicit reap requests. Mere unreachability is `inaccessible`, not a
+	// kill verdict. SESSION_IDLE_KILL_MINUTES / PAUSED_KILL_MINUTES are retired.
 	const credsFor = (uid: string): ProviderCreds => {
 		const u = users.find((x) => x._id === uid);
 		return { secrets: u?.settings?.secrets ?? {}, data: u?.settings?.data ?? {} };
 	};
 	const providerFor = (row: Record<string, any>) => getProvider(typeof row.provider === "string" ? row.provider : "e2b");
-	const kill = async (uid: string, id: string, providerName?: string): Promise<boolean> => {
-		try {
-			return await getProvider(providerName).killById(id, credsFor(uid));
-		} catch {
-			return false;
-		}
-	};
 
 	const IDLE_PAUSE_MIN = Number(process.env.SANDBOX_IDLE_PAUSE_MINUTES || 15);
 	const idlePauseCutoff = new Date(Date.now() - IDLE_PAUSE_MIN * 60_000);
@@ -157,7 +159,9 @@ export async function runJanitorSweep(db: Db): Promise<{ users: number; killed: 
 		})
 		.toArray();
 	for (const row of idleRows) {
-		if (row.sessionId && busySessions.has(`${row.uid}:${row.sessionId}`)) continue;
+		const owner = await owningSession(db, row);
+		const ownerSessionId = typeof owner?.sessionId === "string" ? owner.sessionId : undefined;
+		if (ownerSessionId && busySessions.has(`${row.uid}:${ownerSessionId}`)) continue;
 		const provider = providerFor(row);
 		if (!provider.capabilities.pause || !provider.pauseById) continue;
 		// Verify actual provider state — the DB row can lag an in-process pause
@@ -169,15 +173,15 @@ export async function runJanitorSweep(db: Db): Promise<{ users: number; killed: 
 			continue;
 		}
 		if (info?.state === "gone") {
-			await db.collection("sandboxes").updateOne({ _id: row._id }, { $set: { state: "dead", at: new Date() } });
+			await markProviderGone(db, row);
 			continue;
 		}
 		// Fresh liveness check at the moment of pause — the busy snapshot was
 		// taken at sweep start and a run may have started mid-scan.
-		if (row.sessionId) {
+		if (ownerSessionId) {
 			const live =
-				(await db.collection("runs").countDocuments({ uid: row.uid, sessionId: row.sessionId, status: { $in: ["queued", "claimed", "running", "stopping"] } })) > 0 ||
-				(await db.collection("sessions").countDocuments({ uid: row.uid, sessionId: row.sessionId, activeRunId: { $ne: null } })) > 0;
+				(await db.collection("runs").countDocuments({ uid: row.uid, sessionId: ownerSessionId, status: { $in: ["queued", "claimed", "running", "stopping"] } })) > 0 ||
+				(await db.collection("sessions").countDocuments({ uid: row.uid, sessionId: ownerSessionId, activeRunId: { $ne: null } })) > 0;
 			if (live) continue;
 		}
 		const ok = await provider.pauseById(String(row.sandboxId), credsFor(row.uid)).catch(swallow("misc", "op", false));
@@ -192,58 +196,60 @@ export async function runJanitorSweep(db: Db): Promise<{ users: number; killed: 
 			paused++;
 		}
 	}
-	// Policy kills — only orphan rows (no session association) or killPending
-	// (executor-proven unreachable / quota fallback). Never killed while a
-	// session is merely resting, however long it's been.
+	// Policy reaps — true orphans or explicit reap requests only. The scan is
+	// deliberately state-based: Mongo `{ sessionId: null }` also matches rows
+	// where the field is missing, which previously re-scanned terminal dead rows
+	// forever and appended duplicate kill events whenever DELETE 404ed.
 	const rows: Record<string, any>[] = await db
 		.collection("sandboxes")
-		.find({ $or: [{ killPending: true }, { sessionId: null }, { state: { $in: ["active", "running", "paused"] } }] })
+		.find({
+			$and: [
+				{ state: { $nin: [...TERMINAL_SANDBOX_STATES] } },
+				{ $or: [{ killPending: true }, { state: { $in: REAP_SCAN_STATES } }, { state: null }, { state: { $exists: false } }] },
+			],
+		})
 		.toArray();
 	for (const row of rows) {
-		const session = row.sessionId
-			? await db.collection("sessions").findOne({ uid: row.uid, sessionId: row.sessionId })
-			: null;
-		// Orphans need a 60-min grace — in-flight warm bakes register with no
-		// sessionId and a 30-min E2B timeout; killing them at the next sweep
-		// would abort the bake. After the grace the VM has self-destructed
-		// anyway, so this only cleans up the row.
-		const orphaned = !session && (!row.at || new Date(row.at).getTime() < Date.now() - 60 * 60_000);
-		if (!row.killPending && !orphaned) continue;
-		// Provider truth before any kill: a "gone" VM only needs the row marked;
-		// a "running" VM mislabeled paused (resumed between sweeps) must never be
-		// killed by a stale pausedLong verdict.
+		await normalizeLegacyInaccessible(db, row);
+		const session = await owningSession(db, row);
+		const attached = !!session?.sandboxId && session.sandboxId === row.sandboxId;
+		// A stale quota-fallback marker must not kill a healthy attached paused
+		// VM under the new policy. Orphaned paused VMs are still reaped below.
+		if (row.killPending && row.reason === "quota-fallback" && row.state === "paused" && attached) {
+			await db.collection("sandboxes").updateOne({ _id: row._id }, { $set: { killPending: false } });
+			row.killPending = false;
+		}
+
 		const provider = providerFor(row);
-		if (provider.getInfoById) {
-			const info = await provider.getInfoById(String(row.sandboxId), credsFor(row.uid)).catch(() => null);
-			if (info?.state === "gone") {
-				await db.collection("sandboxes").updateOne({ _id: row._id }, { $set: { killPending: false, state: "dead", reason: "provider-gone", deadAt: new Date() } });
-				continue;
-			}
-			if (!row.killPending && info?.state === "running" && row.state === "paused") {
-				// Resumed underneath us — refresh the row and re-evaluate next
-				// sweep rather than kill a live VM on a stale verdict.
+		const canProbe = !!provider.getInfoById;
+		const info = canProbe ? await provider.getInfoById!(String(row.sandboxId), credsFor(row.uid)).catch(() => null) : undefined;
+		if (info?.state === "gone") {
+			await markProviderGone(db, row);
+			continue;
+		}
+
+		const orphaned = await isOrphanedSandboxRow(db, row);
+		const explicitReap = !!row.killPending;
+		// Inaccessibility alone is not a reap verdict: while the row is still
+		// connected to a session it is retained for audit/recovery. Once it is
+		// disconnected (orphaned), the normal disconnected-only cleanup rule
+		// applies whether the provider-side VM is running or paused.
+		if (!explicitReap && !orphaned) {
+			// Resumed underneath us — refresh the row rather than treating a stale
+			// paused state as truth on a later sweep.
+			if (info?.state === "running" && row.state === "paused") {
 				await db.collection("sandboxes").updateOne({ _id: row._id }, { $set: { state: "running", at: new Date() } });
-				continue;
 			}
+			continue;
 		}
-		// busySessions was snapshotted at sweep start — a run can start while
-		// the sweep is mid-scan. Re-check liveness at the moment of the kill.
-		if (!row.killPending && row.sessionId) {
-			const live =
-				(await db.collection("runs").countDocuments({ uid: row.uid, sessionId: row.sessionId, status: { $in: ["queued", "claimed", "running", "stopping"] } })) > 0 ||
-				(await db.collection("sessions").countDocuments({ uid: row.uid, sessionId: row.sessionId, activeRunId: { $ne: null } })) > 0;
-			if (live) continue;
-		}
-		const reason = row.reason ?? (row.killPending ? "unreachable" : "orphaned");
-		if (await kill(row.uid, String(row.sandboxId), typeof row.provider === "string" ? row.provider : undefined)) {
+		// A probe failure is non-evidence. In particular, E2B DELETE treats 404
+		// as success, so using it without a positive provider state would turn a
+		// transient inventory failure into a false "killed" terminal row.
+		if (canProbe && !info) continue;
+
+		const reason = orphaned ? "orphaned" : (row.reason ?? "reap-requested");
+		if (await reapSandbox(db, row, credsFor(row.uid), reason)) {
 			console.log(`[janitor] killed ${row.sandboxId} (${reason})`);
-			await db
-				.collection("sandboxes")
-				.updateOne({ _id: row._id }, { $set: { killPending: false, state: "dead", reason, deadAt: new Date() } });
-			await recordSandboxEvent(db, {
-				uid: row.uid, sandboxId: String(row.sandboxId), sessionId: row.sessionId,
-				provider: typeof row.provider === "string" ? row.provider : "e2b", event: "kill", state: "dead", reason,
-			});
 			killed++;
 		}
 	}

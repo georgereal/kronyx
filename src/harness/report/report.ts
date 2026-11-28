@@ -272,6 +272,24 @@ export interface HarnessReport {
 		recaps: number;
 		clears: number;
 		budgetWarnings: number;
+		/** Count of per-invocation context manifests in scope. */
+		manifests: number;
+		/** Structured compaction records emitted in scope. */
+		compactions: number;
+		/** End-of-run closeouts emitted in scope. */
+		closeouts: number;
+		compactionRecords: { compactionId: string; scope: string; version: number; from: number; to: number; preservedReferences: number }[];
+		closeoutSummaries: { closeoutId: string; runId?: string; outcome: string; objective: string; validation: string; filesModified: number; unresolvedIssues: number; version: number }[];
+		latestManifest?: {
+			invocationId: string;
+			purpose: string;
+			payloadMode: string;
+			inputTokenCount: number;
+			compactionApplied: boolean;
+			compactionAuthority: string;
+			truncationApplied: boolean;
+			omittedContent: number;
+		};
 	};
 	execution: {
 		tools: { name: string; calls: number; failures: number }[];
@@ -368,6 +386,12 @@ export function buildHarnessReport(events: readonly SessionEvent[], opts: { runI
 		recaps: 0,
 		clears: 0,
 		budgetWarnings: 0,
+		manifests: 0,
+		compactions: 0,
+		closeouts: 0,
+		compactionRecords: [] as { compactionId: string; scope: string; version: number; from: number; to: number; preservedReferences: number }[],
+		closeoutSummaries: [] as { closeoutId: string; runId?: string; outcome: string; objective: string; validation: string; filesModified: number; unresolvedIssues: number; version: number }[],
+		latestManifest: undefined as HarnessReport["context"]["latestManifest"],
 	};
 	const toolStats = new Map<string, { calls: number; failures: number }>();
 	// callId → requested input, enriched with the outcome when it finishes — the
@@ -678,6 +702,45 @@ export function buildHarnessReport(events: readonly SessionEvent[], opts: { runI
 				case "context.recap":
 					context.recaps++;
 					addTokens(e.usage, "recap");
+					break;
+				case "context.manifest":
+					context.manifests++;
+					context.latestManifest = {
+						invocationId: e.manifest.invocationId,
+						purpose: e.manifest.purpose,
+						payloadMode: e.manifest.payloadMode,
+						inputTokenCount: e.manifest.inputTokenCount,
+						compactionApplied: e.manifest.compactionApplied,
+						compactionAuthority: e.manifest.compactionAuthority,
+						truncationApplied: e.manifest.truncationApplied,
+						omittedContent: e.manifest.omittedContent.length,
+					};
+					break;
+				case "context.compaction":
+					context.compactions++;
+					context.compactionRecords.push({
+						compactionId: e.record.compactionId,
+						scope: e.record.scope,
+						version: e.record.version,
+						from: e.record.sourceEventRange.from,
+						to: e.record.sourceEventRange.to,
+						preservedReferences: e.record.preservedReferences.length,
+					});
+					if (context.compactionRecords.length > 30) context.compactionRecords.shift();
+					break;
+				case "context.closeout":
+					context.closeouts++;
+					context.closeoutSummaries.push({
+						closeoutId: e.record.closeoutId,
+						...(e.record.runId ? { runId: e.record.runId } : {}),
+						outcome: e.record.outcome,
+						objective: clip(e.record.objective, 180),
+						validation: e.record.validation.status,
+						filesModified: e.record.filesModified.length,
+						unresolvedIssues: e.record.unresolvedIssues.length,
+						version: e.record.version,
+					});
+					if (context.closeoutSummaries.length > 20) context.closeoutSummaries.shift();
 					break;
 				case "context.cleared":
 					context.clears++;

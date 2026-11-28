@@ -1,4 +1,4 @@
-import type { AgentMode } from "./runner";
+import type { AgentMode } from "./types";
 
 const MODE_LINES: Partial<Record<AgentMode, string>> = {
 	ask: "The user is in Ask mode: answer the question directly and concisely. Use read tools only as needed to inspect the codebase; cite file paths. Never propose edits or describe changes to make (that is Code/Plan mode). Write tools are disabled. Format answers in markdown.",

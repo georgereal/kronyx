@@ -158,7 +158,7 @@ export function fallbackPlan(taskText: string): Task[] {
  * When `board` is given (the current ledger rendered as text), the planner may
  * answer {"tasks":[]} — meaning the existing board already covers the request.
  */
-export async function makePlan(model: ModelPort, taskText: string, opts: { signal?: AbortSignal; writable?: boolean; board?: string; plans?: string[] } = {}): Promise<PlanResult> {
+export async function makePlan(model: ModelPort, taskText: string, opts: { signal?: AbortSignal; writable?: boolean; board?: string; plans?: string[]; onRequest?: (request: { system: string; messages: { kind: "user"; text: string; seq: number }[] }) => Promise<void> } = {}): Promise<PlanResult> {
 	try {
 		const boardBlock = opts.board
 			? `\n\nPLANS FROM EARLIER RUNS IN THIS SESSION (context only — a run's board holds only the tasks you create for it; prior work is never adopted):\n${opts.board}\nReply {"tasks":[]} when nothing new is needed at all. Emit new tasks only for genuinely new work the earlier plans miss.`
@@ -166,10 +166,15 @@ export async function makePlan(model: ModelPort, taskText: string, opts: { signa
 		const plansBlock = opts.plans?.length
 			? `\n\nSAVED DELIVERABLES FROM EARLIER WORK (in .kronyx/plans/):\n${opts.plans.map((p) => `- ${p}`).join("\n")}\nIf the task is a question one of these already answers (e.g. "what did the analysis conclude?"), reply {"reuse_plan":"<slug>"} — the run will answer from the artifact instead of re-deriving it. Reuse is ONLY for recall questions: it creates no tasks and no new work. NEVER reply reuse_plan when the ask is to plan, create, extend, or implement anything — a request for new work (including "plan the next steps") always gets fresh tasks. If the ask is to continue or implement one of them, plan that plan's phases as implementation steps (write_file/edit_file/run_command signals) — never re-plan exploration.`
 			: "";
+		const request = {
+			system: opts.writable === false ? `${PLANNER_SYSTEM}\n${READ_ONLY_RULES}` : PLANNER_SYSTEM,
+			messages: [{ kind: "user" as const, text: `TASK:\n${taskText.slice(0, 4000)}${boardBlock}${plansBlock}`, seq: 0 }],
+		};
+		await opts.onRequest?.(request);
 		const response = await model.complete({
 			turn: 0,
-			system: opts.writable === false ? `${PLANNER_SYSTEM}\n${READ_ONLY_RULES}` : PLANNER_SYSTEM,
-			messages: [{ kind: "user", text: `TASK:\n${taskText.slice(0, 4000)}${boardBlock}${plansBlock}`, seq: 0 }],
+			system: request.system,
+			messages: request.messages,
 			ledger: emptyLedger(),
 			tools: [],
 			signal: opts.signal,

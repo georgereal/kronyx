@@ -1,4 +1,4 @@
-import type { ProviderSettings } from "../../../src/agent/runner";
+import type { ProviderSettings } from "../../../src/agent/types";
 import { describeCatalog, isSelectable, resolveTemplateName, type TemplateInfo } from "../../../src/sandbox/templateCatalog";
 import { swallow } from "../lib/log";
 

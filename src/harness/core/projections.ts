@@ -11,7 +11,7 @@ import { applyLedgerEvent, emptyLedger, openTasks, type Ledger } from "./taskLed
 export type Message =
 	| { kind: "user"; text: string; seq: number; images?: ImageInput[] }
 	| { kind: "assistant"; text: string; toolCalls: ToolCall[]; seq: number; providerItems?: ProviderItems }
-	| { kind: "tool"; callId: string; name: string; ok: boolean; output: string; seq: number }
+	| { kind: "tool"; callId: string; name: string; ok: boolean; output: string; seq: number; envelope?: import("../../context").ToolResultEnvelope }
 	/** `seq` is set for messages that come from log events; projected context lines (board, recap) have none. */
 	| { kind: "system"; text: string; seq?: number };
 
@@ -57,9 +57,14 @@ export interface HarnessState {
 	/** Consecutive flagged tool calls since the last unflagged one. Drives the loop ladder. */
 	strikes: number;
 	/** Model-written recap of the first `covers` messages; the messages themselves stay in the log. */
-	recap?: { covers: number; text: string };
+	recap?: { covers: number; text: string; scope?: "interaction_history" | "task_closeout" };
+	/** Highest message index any task-closeout recap has covered. User inputs at or after this boundary belong to the active task and are never compacted away. */
+	closeoutCovers: number;
 	/** The harness's own acceptance-check results, in log order. */
 	verdicts: Array<{ command: string; seq: number; ok: boolean }>;
+	contextManifests: import("../../context").ContextManifest[];
+	compactions: import("../../context").CompactionRecord[];
+	closeouts: import("../../context").TaskCloseoutRecord[];
 	conversation?: ConversationState;
 	lastSeq: number;
 }
@@ -80,6 +85,10 @@ export const initialState = (): HarnessState => ({
 	history: [],
 	strikes: 0,
 	verdicts: [],
+	contextManifests: [],
+	compactions: [],
+	closeouts: [],
+	closeoutCovers: 0,
 	lastSeq: 0,
 });
 
@@ -100,8 +109,12 @@ export function reduce(state: HarnessState, event: SessionEvent): HarnessState {
 	let outcomes = state.outcomes;
 	let history = state.history;
 	let verdicts = state.verdicts;
+	let contextManifests = state.contextManifests;
+	let compactions = state.compactions;
+	let closeouts = state.closeouts;
 	let strikes = state.strikes;
 	let recap = state.recap;
+	let closeoutCovers = state.closeoutCovers;
 	let conversation = state.conversation;
 	const push = (message: Message) => {
 		messages = [...messages, message];
@@ -130,7 +143,7 @@ export function reduce(state: HarnessState, event: SessionEvent): HarnessState {
 			history = history.map((r) =>
 				r.callId === event.callId ? { ...r, resultHash: hashText(event.output), ...(event.ok ? {} : { failSig: failureSignature(event.output) }) } : r,
 			);
-			push({ kind: "tool", callId: event.callId, name: event.name, ok: event.ok, output: event.output, seq: event.seq });
+			push({ kind: "tool", callId: event.callId, name: event.name, ok: event.ok, output: event.output, seq: event.seq, ...(event.envelope ? { envelope: event.envelope } : {}) });
 			break;
 		case "task.created":
 			counters.inputTokens += event.usage?.inputTokens ?? 0;
@@ -193,7 +206,8 @@ export function reduce(state: HarnessState, event: SessionEvent): HarnessState {
 			strikes = event.level === "none" ? Math.max(0, strikes - 1) : strikes + 1;
 			break;
 		case "context.recap":
-			recap = { covers: event.covers, text: event.text };
+			recap = { covers: event.covers, text: event.text, ...(event.scope ? { scope: event.scope } : {}) };
+			if (event.scope === "task_closeout") closeoutCovers = Math.max(closeoutCovers, event.covers);
 			// A recap call is a real model call: its tokens count against the session budget.
 			counters.inputTokens += event.usage?.inputTokens ?? 0;
 			counters.outputTokens += event.usage?.outputTokens ?? 0;
@@ -205,10 +219,29 @@ export function reduce(state: HarnessState, event: SessionEvent): HarnessState {
 			history = [];
 			strikes = 0;
 			break;
+		case "context.manifest":
+			contextManifests = [...contextManifests, event.manifest].slice(-200);
+			break;
+		case "context.compaction":
+			compactions = [...compactions, event.record].slice(-100);
+			history = [];
+			strikes = 0;
+			// A task-closeout compaction is a rebind boundary for server-side
+			// conversations too: the next request bootstraps from the compact
+			// projection instead of carrying the completed task's raw tail forward.
+			if (event.record.scope === "task_closeout") conversation = undefined;
+			break;
+		case "context.closeout":
+			closeouts = [...closeouts, event.record].slice(-100);
+			break;
+		case "execution.state_snapshotted":
+			break;
 		case "context.cleared":
 			// Clear context drops what the model sees; the ledger, counters and the log stay. The server copy goes with it.
 			messages = [];
 			recap = undefined;
+			contextManifests = [];
+			compactions = [];
 			conversation = undefined;
 			break;
 		case "run.status":
@@ -227,7 +260,7 @@ export function reduce(state: HarnessState, event: SessionEvent): HarnessState {
 			conversation = undefined;
 			break;
 	}
-	return { messages, ledger, counters, run, outcomes, history, strikes, recap, verdicts, conversation, lastSeq: event.seq };
+	return { messages, ledger, counters, run, outcomes, history, strikes, recap, closeoutCovers, verdicts, contextManifests, compactions, closeouts, conversation, lastSeq: event.seq };
 }
 
 /** Replays a whole log from scratch. */

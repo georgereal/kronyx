@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { log } from "./log";
-import type { ProviderSettings } from "./agent/runner";
+import type { ProviderSettings } from "./agent/types";
 import { isProviderKey, providerKeyToField, saveUserConfig, userConfig, type UserProviderConfig } from "./userConfig";
 import { selectProvider, type ModelSelection, type ProviderError } from "./providerSelection";
 

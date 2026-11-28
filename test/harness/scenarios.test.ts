@@ -60,7 +60,10 @@ describe("scenario: loops", () => {
 		expect(r.outcome.status).toBe("completed");
 		expect(r.left()).toBe(0);
 		// Strikes persist until a call makes progress; finishing alone does not clear them.
-		expect(r.loop.projection.strikes).toBe(3);
+		// End-of-run closeout is a later context boundary, so inspect the projection just before it.
+		const events = await r.log.read();
+		const closeoutAt = events.findIndex((e) => e.type === "context.closeout");
+		expect(project(events.slice(0, closeoutAt)).strikes).toBe(3);
 	});
 
 	it("pauses a model that keeps looping past the strip level, with the detector named", async () => {

@@ -2,6 +2,8 @@ import { existsSync, promises as fs } from "node:fs";
 import * as path from "node:path";
 import Sqlite, { type Database } from "better-sqlite3";
 import { isConversationalTask } from "./agent/taskGuard";
+import { migrateKnowledgeStore } from "./context/knowledge/sqliteKnowledgeStore";
+import { migrateExecutionStateStore } from "./context/state/sqliteExecutionStateStore";
 
 export type Store = Database;
 
@@ -122,6 +124,8 @@ export async function openStore(root: string): Promise<Store | undefined> {
 		db.exec(`CREATE TABLE IF NOT EXISTS chunks(
 			root TEXT, path TEXT, idx INTEGER, text TEXT, embedding BLOB,
 			PRIMARY KEY(root, path, idx))`);
+		migrateKnowledgeStore(db);
+		migrateExecutionStateStore(db);
 		db.exec(`CREATE TABLE IF NOT EXISTS embedding_cache(
 			hash TEXT, model TEXT, embedding BLOB, PRIMARY KEY(hash, model))`);
 	} catch (error) {

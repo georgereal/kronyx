@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import type { AgentMode, RunViewEvent } from "../agent/runner";
+import type { AgentMode, RunViewEvent } from "../agent/types";
 import type { EngineKind } from "../agent/engine";
 import type { ModelOption, ProfileCatalog } from "../config";
 import { renderPage } from "./pageHtml";

@@ -665,6 +665,33 @@ export default function HarnessDashboardPage() {
 				model {fmtTok(srcv.model)} · planner {fmtTok(srcv.planner)} · tools {fmtTok(srcv.tools)} · recap {fmtTok(srcv.recap)}
 			</div>
 			<div style={{ fontSize: 11, opacity: 0.8, marginTop: 6 }}>recaps {c.recaps} · context clears {c.clears} · budget warnings {c.budgetWarnings} · finish refusals {c.refusals}</div>
+			<div style={{ fontSize: 11, opacity: 0.8, marginTop: 6 }}>manifests {c.manifests ?? 0} · structured compactions {c.compactions ?? 0} · closeouts {c.closeouts ?? 0}</div>
+			{c.latestManifest && (
+				<div style={{ fontSize: 11, opacity: 0.8, marginTop: 6 }}>
+					latest invocation {c.latestManifest.invocationId}: {c.latestManifest.purpose} / {c.latestManifest.payloadMode}, {fmtTok(c.latestManifest.inputTokenCount)} input tokens
+					{c.latestManifest.compactionApplied ? `, compacted (${c.latestManifest.compactionAuthority})` : ""}{c.latestManifest.truncationApplied ? `, ${c.latestManifest.omittedContent} omitted refs` : ""}
+				</div>
+			)}
+			{(c.closeoutSummaries ?? []).length > 0 && (
+				<>
+					<h3 style={{ fontSize: 12, textTransform: "uppercase", opacity: 0.7, margin: "12px 0 6px" }}>Closeouts</h3>
+					{(c.closeoutSummaries ?? []).map((x) => (
+						<div key={x.closeoutId} style={{ fontSize: 11, padding: "4px 0", borderBottom: "1px solid #2a2a2a" }}>
+							<strong>{x.outcome}</strong> · {x.objective || "objective unavailable"} · validation {x.validation} · files {x.filesModified} · issues {x.unresolvedIssues} · v{x.version}
+						</div>
+					))}
+				</>
+			)}
+			{(c.compactionRecords ?? []).length > 0 && (
+				<>
+					<h3 style={{ fontSize: 12, textTransform: "uppercase", opacity: 0.7, margin: "12px 0 6px" }}>Compaction records</h3>
+					{(c.compactionRecords ?? []).map((x) => (
+						<div key={x.compactionId} style={{ fontSize: 11, padding: "3px 0", borderBottom: "1px solid #2a2a2a", opacity: 0.85 }}>
+							{x.scope} v{x.version} · seq {x.from}-{x.to} · {x.preservedReferences} evidence refs preserved
+						</div>
+					))}
+				</>
+			)}
 			<h3 style={{ fontSize: 12, textTransform: "uppercase", opacity: 0.7, margin: "12px 0 6px" }}>Execution stats</h3>
 			<table style={{ width: "100%", fontSize: 12, borderCollapse: "collapse" }}>
 				<thead><tr style={{ textAlign: "left", opacity: 0.6, fontSize: 10, textTransform: "uppercase" }}><th style={{ padding: 4 }}>Tool</th><th>Calls</th><th>Failed</th></tr></thead>

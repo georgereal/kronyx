@@ -50,6 +50,8 @@ export default function SandboxDetailPage() {
 	const state = sb.state ?? "—";
 	const paused = state === "paused";
 	const dead = state === "dead" || state === "killed" || state === "terminated";
+	const inaccessible = state === "inaccessible" || state === "unknown" || state === "replaced";
+	const operable = !dead && !inaccessible;
 
 	return (
 		<div className="page">
@@ -58,9 +60,9 @@ export default function SandboxDetailPage() {
 				<h1 className="mono" style={{ fontSize: 18, margin: 0 }}>{sb.sandboxId}</h1>
 				<span className={`sbx-pill ${state}`}>{state}</span>
 				<span style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
-					{paused && <button className="sbx-btn primary" disabled={!!busy} onClick={() => void doResume()}>▶ Resume</button>}
-					{!paused && !dead && <button className="sbx-btn" disabled={!!busy} onClick={() => void doPause()}>⏸ Pause</button>}
-					{!dead && <button className="sbx-btn" disabled={!!busy} onClick={() => void doSnapshot()}>⧉ Snapshot</button>}
+					{paused && operable && <button className="sbx-btn primary" disabled={!!busy} onClick={() => void doResume()}>▶ Resume</button>}
+					{!paused && operable && <button className="sbx-btn" disabled={!!busy} onClick={() => void doPause()}>⏸ Pause</button>}
+					{operable && <button className="sbx-btn" disabled={!!busy} onClick={() => void doSnapshot()}>⧉ Snapshot</button>}
 					{!dead && <button className="sbx-btn danger" disabled={!!busy} onClick={() => void doKill()}>Kill</button>}
 				</span>
 			</div>
@@ -79,6 +81,12 @@ export default function SandboxDetailPage() {
 					</>
 				)}
 			</div>
+
+			{inaccessible && (
+				<div className="card" style={{ padding: 12, marginBottom: 12, borderColor: "rgba(216, 166, 87, 0.4)" }}>
+					<b>Inaccessible sandbox.</b> <span className="muted">It is retained for audit and quota cleanup, but sessions will not reuse it. Pause, resume and snapshot are unavailable; manual kill is still allowed.</span>
+				</div>
+			)}
 
 			<div className="card" style={{ padding: 18 }}>
 				<SandboxDetailPanel id={id} detail={d} />

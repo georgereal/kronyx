@@ -2988,6 +2988,12 @@ tbody tr:hover {
   color: var(--err);
   border-color: rgba(214, 123, 123, 0.4);
 }
+.sbx-pill.inaccessible,
+.sbx-pill.unknown,
+.sbx-pill.replaced {
+  color: var(--warn);
+  border-color: rgba(216, 166, 87, 0.4);
+}
 .sbx-pill.baking,
 .sbx-pill.building {
   color: var(--accent);

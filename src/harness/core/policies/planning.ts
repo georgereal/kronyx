@@ -5,7 +5,7 @@
  * proposal only.
  */
 
-import type { ModelPort, Task, Usage } from "../contracts";
+import type { ModelPort, ModelRequest, Task, Usage } from "../contracts";
 
 export interface PlanResult {
 	tasks: Task[];
@@ -23,6 +23,6 @@ export interface PlanningPolicy {
 	plan(
 		model: ModelPort,
 		taskText: string,
-		opts: { writable: boolean; board?: string; plans?: string[]; signal?: AbortSignal },
+		opts: { writable: boolean; board?: string; plans?: string[]; signal?: AbortSignal; onRequest?: (request: Pick<ModelRequest, "system" | "messages">) => Promise<void> },
 	): Promise<PlanResult>;
 }

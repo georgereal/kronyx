@@ -156,8 +156,14 @@ async function runJob(job: CloudJob): Promise<void> {
 		await db.collection("cloud_jobs").updateOne({ jobId: job.jobId }, { $set: { status: stopped ? "stopped" : "done", finishedAt: new Date() } });
 		log(`job ${job.jobId} ${status}`);
 	} catch (error) {
-		const message = stopped || error instanceof Error && error.message === "Stopped by user" ? "Stopped by user" : String(error);
-		await sink.emit({ type: "run-failed", error: message }).catch(swallow("loop", "op"));
+		const message = stopped || error instanceof Error && error.message === "Stopped by user" ? "Stopped by user" : error instanceof Error ? error.message : String(error);
+		// Harness-reported model failures are already in the durable run_events lane;
+		// the job-level catch still owns the status patch, but must not duplicate the card.
+		const alreadyReported = await db
+			.collection("run_events")
+			.findOne({ uid: job.uid, runId: job.runId, "event.type": "run-failed", "event.error": message }, { projection: { _id: 1 } })
+			.catch(swallow("loop", "op", null));
+		if (!alreadyReported) await sink.emit({ type: "run-failed", error: message }).catch(swallow("loop", "op"));
 		await sink.patchRun({ status: stopped ? "stopped" : "failed", error: message, finishedAt: new Date() }).catch(swallow("loop", "op"));
 		await db
 			.collection("cloud_jobs")

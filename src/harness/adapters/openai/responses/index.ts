@@ -18,7 +18,10 @@ export { parseArguments } from "./args";
 export class ResponsesApiPort implements ModelPort {
 	readonly capabilities: AdapterCapabilities;
 
+	readonly identity: { providerId: string; modelId: string; contextWindow?: number };
+
 	constructor(private readonly config: OpenAIPortConfig) {
+		this.identity = { providerId: config.providerId, modelId: config.modelId, ...(config.contextWindow !== undefined ? { contextWindow: config.contextWindow } : {}) };
 		this.capabilities = { wire: "responses", serverConversations: false, reasoningItems: true, store: config.stateless ? false : (config.store ?? true) };
 	}
 
